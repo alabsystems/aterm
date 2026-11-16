@@ -2129,15 +2129,16 @@ gate_pinned_channel() { # <root>
 # has the same body); on macOS atpkg's `targo` and `targo-tippy` shims first run
 # a block of shell builtins that may put `--config build.build-dir=…` in front
 # of "$@", or export CARGO_BUILD_BUILD_DIR for `targo trust`
-# (crates/atpkg/src/build_cache.rs), so their exec is the last of about a
-# hundred and twenty lines. Following such a shim is sound: it is read here, never run,
-# only to LOCATE the store file, which gate_store_targo must then prove and every
+# (crates/atpkg/src/build_cache.rs), so their exec is the last of about three
+# hundred lines, some 17 KB (the bound is aterm's own shim reader's, 64 KiB).
+# Following such a shim is sound: it is read here, never run, only to LOCATE
+# the store file, which gate_store_targo must then prove and every
 # build runs by its physical path; a prelude runs only when the shim itself is
 # executed, so it cannot change what is selected. A second `exec` (atpkg's
 # compat route guard among them: that shim may run another file than the one
 # its last line names) or any shape not recognised here is not followed. A
 # Mach-O targo on PATH is not read past its magic (`head -c 2`).
-GATE_SHIM_MAX_BYTES=16384
+GATE_SHIM_MAX_BYTES=65536
 gate_shim_target() { # <file>
 	local line="" cmd="" last="" prev="" target="" size="" first=1 bad=""
 	local word='(^|[^[:alnum:]_])exec([^[:alnum:]_]|$)'
