@@ -23,6 +23,10 @@ mod reply_tests;
 mod crossing_tests;
 
 #[cfg(test)]
+#[path = "server/fence_tests.rs"]
+mod fence_tests;
+
+#[cfg(test)]
 #[path = "server/takes_over_tests.rs"]
 mod takes_over_tests;
 
@@ -1046,6 +1050,9 @@ struct Tuning {
     linger: Duration,
     /// How long a pull from a `>= 0.146` peer may take ([`PEER_PULL_BUDGET`]).
     peer_pull: Duration,
+    /// The most bytes of records one records GET reply carries
+    /// ([`crate::membership_log::store::REPLY_CAP`]): a test lowers it to page a small log.
+    reply_cap: usize,
     /// The addresses a host name resolves to within a budget, `None` for none
     /// ([`resolve_peer_host`]): where a pass pulls a peer named by its host
     /// ([`peer_endpoints`]).
@@ -1074,6 +1081,7 @@ impl Default for Tuning {
             join_change_gap: JOIN_CHANGE_GAP,
             linger: LINGER_DEADLINE,
             peer_pull: PEER_PULL_BUDGET,
+            reply_cap: crate::membership_log::store::REPLY_CAP,
             resolve: resolve_peer_host,
             now,
             is_local: this_machine,
@@ -1707,12 +1715,42 @@ impl Shared {
         Ok(crossed)
     }
 
-    /// [`Shared::crossed`], taking the state lock.
+    /// `name`'s format mark ([`crate::crossing::FormatMark`]), beside its records file.
+    fn format_mark(&self, name: &str) -> crate::crossing::FormatMark {
+        crate::crossing::FormatMark::at(self.store.join(format!("{name}.format")))
+    }
+
+    /// What this server states of `name`'s records ([`crate::crossing::RecordsBound`]): this
+    /// build's held bound, whether they crossed ([`Shared::crossed`]) and the format its mark
+    /// names, so the version-1 bound byte for byte until a format mark is stored.
     ///
     /// # Errors
-    /// As [`Shared::crossed`].
-    fn records_crossed(&self, name: &str) -> Result<bool, Reply> {
-        self.crossed(&mut self.lock_server_state(), name)
+    /// The look for either mark failed, or the format mark names no format this build reads: a
+    /// `500` the caller answers, stating no bound, serving and taking nothing.
+    fn records_here(
+        &self,
+        state: &mut State,
+        name: &str,
+    ) -> Result<crate::crossing::RecordsBound, Reply> {
+        let crossed = self.crossed(state, name)?;
+        let format = self.format_mark(name).stored().map_err(|e| {
+            note(&format!(
+                "{name}: could not read the records format mark: {e}"
+            ));
+            Reply::text(
+                500,
+                "the server could not read which format its records are in",
+            )
+        })?;
+        Ok(crate::crossing::RecordsBound::here(crossed).at_format(format))
+    }
+
+    /// [`Shared::records_here`], taking the state lock.
+    ///
+    /// # Errors
+    /// As [`Shared::records_here`].
+    fn records_bound_here(&self, name: &str) -> Result<crate::crossing::RecordsBound, Reply> {
+        self.records_here(&mut self.lock_server_state(), name)
     }
 
     /// Store `name`'s crossed mark, before this server takes a record of a crossed log or holds
@@ -2572,7 +2610,8 @@ struct Reply {
     status: u16,
     body: Body,
     etag: Option<u64>,
-    vault_head: Option<[u8; 32]>,
+    /// The optional envelope head, boxed to keep `Result<_, Reply>` compact, like records heads.
+    vault_head: Option<Box<[u8; 32]>>,
     allow: Option<&'static str>,
     /// `Retry-After`, in seconds: when a refused request may be sent again and be taken.
     retry_after: Option<u64>,
@@ -2583,10 +2622,12 @@ struct Reply {
     /// error variant clippy calls too large.
     records_boot: bool,
     /// What the reply states of the vault's records ([`crate::transport::RECORDS_BOUND_HEADER`]),
-    /// as every records reply does: `Some(crossed)`, stated with this build's held bound
-    /// ([`crate::crossing::RecordsBound::here`]). Whether crossed alone, for the same reason
+    /// as every records reply does ([`Shared::records_here`]). Boxed for the reason
     /// `records_boot` is a flag.
-    records_bound: Option<bool>,
+    records_bound: Option<Box<crate::crossing::RecordsBound>>,
+    /// The reply's records are a prefix of what the GET lacks, and more follow
+    /// ([`crate::transport::RECORDS_MORE_HEADER`]).
+    records_more: bool,
     /// The heads digest of the records a records GET reply answered from
     /// ([`crate::transport::RECORDS_HEADS_HEADER`]), taken from the store the reply's records came
     /// from, under the same lock. Boxed for the reason `records_boot` is a flag.
@@ -2614,6 +2655,7 @@ impl Reply {
             records_need: false,
             records_boot: false,
             records_bound: None,
+            records_more: false,
             records_heads: None,
         }
     }
@@ -2621,7 +2663,7 @@ impl Reply {
     fn conflict_with_head(held: &Held, why: impl Into<String>) -> Reply {
         let mut reply = Self::text(409, why);
         reply.etag = Some(held.seq);
-        reply.vault_head = Some(held.head);
+        reply.vault_head = Some(Box::new(held.head));
         reply
     }
 
@@ -2636,6 +2678,7 @@ impl Reply {
             records_need: false,
             records_boot: false,
             records_bound: None,
+            records_more: false,
             records_heads: None,
         }
     }
@@ -2726,10 +2769,10 @@ fn write_reply_to(
     if let Some(seq) = reply.etag {
         head.push_str(&format!("ETag: \"{seq}\"\r\n"));
     }
-    if let Some(digest) = reply.vault_head {
+    if let Some(digest) = &reply.vault_head {
         head.push_str(&format!(
             "{VAULT_HEAD_HEADER}: {}\r\n",
-            hex32_encode(&digest)
+            hex32_encode(digest)
         ));
     }
     if let Some(allow) = reply.allow {
@@ -2746,12 +2789,15 @@ fn write_reply_to(
             crate::transport::RECORDS_BOOT_HEADER
         ));
     }
-    if let Some(crossed) = reply.records_bound {
+    if let Some(bound) = &reply.records_bound {
         head.push_str(&format!(
             "{}: {}\r\n",
             crate::transport::RECORDS_BOUND_HEADER,
-            crate::crossing::RecordsBound::here(crossed).value()
+            bound.value()
         ));
+    }
+    if reply.records_more {
+        head.push_str(&format!("{}: 1\r\n", crate::transport::RECORDS_MORE_HEADER));
     }
     if let Some(heads) = &reply.records_heads {
         head.push_str(&format!(
@@ -3136,8 +3182,8 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, request: Reque
     };
     let mut reply = answer(shared, stream, peer, request);
     if let Some(name) = records {
-        match shared.records_crossed(&name) {
-            Ok(crossed) => reply.records_bound = Some(crossed),
+        match shared.records_bound_here(&name) {
+            Ok(bound) => reply.records_bound = Some(Box::new(bound)),
             Err(failed) => reply = failed,
         }
     }
@@ -3173,17 +3219,20 @@ fn fenced() -> Reply {
         project = "aterm_secrets::server::crossing_tests::records_capacity_crossing"
     )
 )]
-fn records_fence(crossed: bool, peer: Option<crate::crossing::RecordsBound>) -> Option<Reply> {
-    let own = crate::crossing::RecordsBound::here(crossed);
+fn records_fence(
+    own: crate::crossing::RecordsBound,
+    peer: Option<crate::crossing::RecordsBound>,
+) -> Option<Reply> {
     match peer {
         Some(peer) if !own.can_exchange(peer) => Some(Reply::text(
             409,
             format!(
                 "incompatible membership records capacities: local {}, peer {}",
-                own.held, peer.held
+                own.value(),
+                peer.value()
             ),
         )),
-        None if crossed => Some(fenced()),
+        None if own.fenced() => Some(fenced()),
         _ => None,
     }
 }
@@ -3226,13 +3275,27 @@ fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Re
     // refuses unread ([`crate::transport::CROSSED_POST_QUERY`]), and says it crossed.
     let crossed_post = matches!((&route, method), (Route::Records(_), "POST"))
         && request.query.as_deref() == Some(crate::transport::CROSSED_POST_QUERY);
-    if request.query.is_some() && !waits && !crossed_post {
+    // A format-2 poster's carries the one every build before the format fence refuses unread
+    // ([`crate::crossing::FORMAT_POST_QUERY`]), beside a bound that states its format.
+    let format_post = matches!((&route, method), (Route::Records(_), "POST"))
+        && request.query.as_deref() == Some(crate::crossing::FORMAT_POST_QUERY);
+    if request.query.is_some() && !waits && !crossed_post && !format_post {
         return Reply::text(400, "this path takes no query");
     }
     if crossed_post && !request.records_bound.is_some_and(|bound| bound.crossed) {
         return Reply::text(
             400,
             "a records POST carries crossed=2 only beside a records bound that says crossed",
+        );
+    }
+    if format_post
+        && !request
+            .records_bound
+            .is_some_and(|bound| bound.format != crate::crossing::FORMAT_ONE)
+    {
+        return Reply::text(
+            400,
+            "a records POST carries format=2 only beside a records bound that states a format",
         );
     }
     match (route, method) {
@@ -3288,11 +3351,12 @@ fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Re
             reply
         }
         (Route::Records(name), _) => {
-            // Before the body is read: a crossed server takes no record from a poster that
-            // states no bound ([`apply_records`] asks again once it holds the store).
-            match shared.records_crossed(name) {
-                Ok(crossed) => {
-                    if let Some(reply) = records_fence(crossed, request.records_bound) {
+            // Before the body is read: a crossed or format-2 server takes no record from a poster
+            // that states no bound it can exchange with ([`apply_records`] asks again once it
+            // holds the store).
+            match shared.records_bound_here(name) {
+                Ok(own) => {
+                    if let Some(reply) = records_fence(own, request.records_bound) {
                         return reply;
                     }
                 }
@@ -3486,12 +3550,13 @@ fn envelope_reply(held: &Held) -> Reply {
         status: 200,
         body: Body::Envelope(Arc::clone(&held.bytes)),
         etag: Some(held.seq),
-        vault_head: Some(held.head),
+        vault_head: Some(Box::new(held.head)),
         allow: None,
         retry_after: None,
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_more: false,
         records_heads: None,
     }
 }
@@ -4200,13 +4265,15 @@ fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId
     Ok(out)
 }
 
-/// A records GET reply bringing `records`, from a store whose heads digest is `heads`
-/// ([`Reply::records_heads`]).
+/// A records GET reply bringing `missing`, from a store whose heads digest is `heads`
+/// ([`Reply::records_heads`]). A prefix that more follow ([`Reply::records_more`]) states no
+/// heads digest: no puller may take it for the store's whole log.
 fn records_reply(
-    records: Vec<crate::membership_log::Record>,
+    missing: crate::membership_log::store::Missing,
     records_need: bool,
     heads: Option<[u8; 32]>,
 ) -> Reply {
+    let crate::membership_log::store::Missing { records, more } = missing;
     Reply {
         status: 200,
         body: Body::Records(records),
@@ -4217,7 +4284,8 @@ fn records_reply(
         records_need,
         records_boot: false,
         records_bound: None,
-        records_heads: heads.map(Box::new),
+        records_more: more,
+        records_heads: heads.filter(|_| !more).map(Box::new),
     }
 }
 
@@ -4287,12 +4355,12 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     if !known_vault {
         return Reply::text(404, format!("no vault named {name} here"));
     }
-    match shared.crossed(&mut state, name) {
-        Ok(crossed) => {
+    match shared.records_here(&mut state, name) {
+        Ok(own) => {
             // MUTANT (`crate::crossing::Faults::capped_prefix`): a crossed log's first records,
             // capped at the legacy bound, for a client that states no bound.
             #[cfg(test)]
-            if crossed
+            if own.crossed
                 && stated.is_none()
                 && crate::crossing::faults(shared.crossing_mark(name).path()).capped_prefix
             {
@@ -4301,9 +4369,16 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
                     .get(name)
                     .map_or_else(Vec::new, |slot| slot.store.missing(&have));
                 first.truncate(crate::membership_log::LEGACY_RECORDS);
-                return records_reply(first, false, None);
+                return records_reply(
+                    crate::membership_log::store::Missing {
+                        records: first,
+                        more: false,
+                    },
+                    false,
+                    None,
+                );
             }
-            if let Some(reply) = records_fence(crossed, stated) {
+            if let Some(reply) = records_fence(own, stated) {
                 return reply;
             }
         }
@@ -4317,9 +4392,10 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
             return Reply::text(503, "heard history is not tracking reads".to_owned());
         }
     }
+    let cap = shared.tuning.reply_cap;
     if let Some(slot) = state.records.get(name) {
-        let missing = slot.store.missing(&have);
-        if !missing.is_empty() {
+        let missing = slot.store.missing_within(&have, cap);
+        if !missing.records.is_empty() {
             let need = server_lacks_have(&state, name, &have);
             let heads = slot.store.records_digest();
             drop(state);
@@ -4361,8 +4437,8 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     });
     let lacks = server_lacks_have(&state, name, &have);
     // The records may have crossed while it waited: what came may be a crossed log's.
-    let fence = match shared.crossed(&mut state, name) {
-        Ok(crossed) => records_fence(crossed, stated),
+    let fence = match shared.records_here(&mut state, name) {
+        Ok(own) => records_fence(own, stated),
         Err(failed) => Some(failed),
     };
     let reply = if let Some(fence) = fence {
@@ -4372,9 +4448,9 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
         match state
             .records
             .get(name)
-            .map(|slot| slot.store.missing(&have))
+            .map(|slot| slot.store.missing_within(&have, cap))
         {
-            Some(missing) if !missing.is_empty() => records_reply(missing, lacks, heads),
+            Some(missing) if !missing.records.is_empty() => records_reply(missing, lacks, heads),
             _ => {
                 let mut reply = Reply::empty(204);
                 reply.records_need = lacks;
@@ -4671,9 +4747,9 @@ fn apply_records(
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
         }
-        match shared.crossed(&mut state, name) {
-            Ok(crossed) => {
-                if let Some(reply) = records_fence(crossed, stated) {
+        match shared.records_here(&mut state, name) {
+            Ok(own) => {
+                if let Some(reply) = records_fence(own, stated) {
                     return reply;
                 }
             }
@@ -4700,13 +4776,14 @@ fn apply_records(
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
         }
-        let crossed = match shared.crossed(&mut state, name) {
-            Ok(crossed) => crossed,
+        let own = match shared.records_here(&mut state, name) {
+            Ok(own) => own,
             Err(failed) => return failed,
         };
-        if let Some(reply) = records_fence(crossed, stated) {
+        if let Some(reply) = records_fence(own, stated) {
             return reply;
         }
+        let crossed = own.crossed;
         if state.records.get(name).is_some_and(|slot| {
             staged
                 .records()
@@ -5199,6 +5276,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_more: false,
         records_heads: None,
     }
 }
@@ -5293,6 +5371,7 @@ fn list_heard(shared: &Shared, name: &str) -> Reply {
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_more: false,
         records_heads: None,
     }
 }
@@ -5318,6 +5397,7 @@ fn list_verdicts(shared: &Shared, name: &str) -> Reply {
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_more: false,
         records_heads: None,
     }
 }
@@ -5339,7 +5419,11 @@ fn list_verdicts(shared: &Shared, name: &str) -> Reply {
 ///   takes to reach that server, and a sweep its pull did not finish is made again by the next
 ///   round past [`PULL_SPACING`];
 /// - peers are told apart, and this server from them, by the addresses they resolve to, never by
-///   a TXT's `label`, and an instance only adds to what its endpoints are pulled for.
+///   a TXT's `label`, and an instance only adds to what its endpoints are pulled for, but for one
+///   naming a `rec` on the host an `alab-secrets` instance's `label` names, which stands for the
+///   records of that instance, whose TXT names none, where both resolve to the same endpoints,
+///   in its round and those up to [`NAMED_FOR`] after it until a catch-up ([`pull_due`],
+///   [`PullGate::names_rec`]), so a forged one holds them back within the bound above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultTxt {
     /// Vault name (`[a-z0-9][a-z0-9-]{0,62}`).
@@ -5350,7 +5434,15 @@ pub struct VaultTxt {
     pub seq: u64,
     /// SHA-256 digest of the held envelope bytes ([`envelope::Envelope::digest`]).
     pub head: [u8; 32],
-    /// Optional canonical label of the server advertising this instance (`label=<mN>`, F7).
+    /// Optional canonical label of the server advertising this instance (`label=<mN>`, F7): the
+    /// name it registers its own instance under, named on that instance and on its
+    /// `alab-secrets` one ([`advertised_vault`]), where holders contesting `alab-secrets` rank
+    /// one another by it ([`AlabNameWatcher`]). A pull reads it on an `alab-secrets` TXT to tell
+    /// which instance may stand for that TXT's records, the one on the host `<label>.local`
+    /// ([`PullGate::names_rec`]), never as a sign that one does: the instance under that name
+    /// carries the TXT of whichever vault its server advertises there, which can be another than
+    /// the `alab-secrets` one names, so only that instance's own TXT, as a round resolved it,
+    /// shows it named the records ([`pull_due`]).
     pub label: Option<String>,
     /// The digest of the records it holds of the vault (`rec=<64 hex>`,
     /// [`crate::membership_log::Store::records_digest`], the empty log's while its store holds no
@@ -6231,33 +6323,48 @@ pub(crate) struct Own {
     pub(crate) follows: [u8; 32],
 }
 
-/// What a gated pass pulls of a vault a peer's TXT names, given what this server holds of it
-/// (`own`) and whether a pull it finished proved a records digest (`proven`, [`PullGate`]):
+/// What a gated pass pulls of the vault a peer's TXT names (`peer`, as a browse handed it), given
+/// whether the instance its TXT's `label` names, resolving to the peer's endpoints, named a `rec`
+/// for that vault, in the round or one within [`NAMED_FOR`] before it and since the last
+/// catch-up (`named_elsewhere`, [`PullGate::names_rec`]), what this server holds of it (`own`)
+/// and whether a pull it finished proved a records digest (`proven`, [`PullGate`]):
 ///
 /// - its envelope when this server takes the vault's envelopes and holds none, or the TXT names
 ///   a higher `seq` than the one held: exactly when the `?after=<held seq>` ask would answer a
 ///   body;
 /// - its records when this server takes them and the TXT names a `rec` other than the one held
-///   and other than every digest the server at the endpoints pulled proved; a TXT with no `rec`
-///   (a server before it: since it, a server with no genesis names the empty log's) says nothing
-///   of its records, and has them pulled at every visit, as every peer's were before.
+///   and other than every digest the server at the endpoints pulled proved. A TXT with no `rec`
+///   says nothing of its records, and has them pulled at every visit, as every peer's were
+///   before: an older build's (since `rec`, a server with no genesis names the empty log's), and
+///   an `alab-secrets` instance's ([`PullGate::alab_instance`]), which never names `rec`
+///   ([`advertised_vault`]). An `alab-secrets` instance is excused where `named_elsewhere` (its
+///   server's own-label instance named the records): that instance's TXT makes them due in each
+///   round whose rotating batch resolves it, and this one makes them due by none. Its `label`
+///   names the instance that may stand for it and proves none did: the instance under that
+///   label carries the TXT of whichever vault its server advertises there, which can be
+///   another, and a peer resolves only an instance whose TXT names ALab's vault
+///   ([`crate::discover::Watch::peer_vaults`]); a TXT naming no label is never excused. A
+///   forged instance on the labelled host, resolving to the same endpoints and naming a `rec`,
+///   holds those records back as a forged TXT holds back any gated pull, until the group's sweep
+///   ([`VaultTxt`]).
 ///
 /// A peer with no TXT (an empty store, several unrelated vaults and no single pin) is pulled by
 /// sweeps alone. The TXT is a suppression signal, bounded as [`VaultTxt`] says.
 pub(crate) fn pull_due(
-    txt: Option<&VaultTxt>,
+    peer: &crate::discover::DiscoveredVault,
+    named_elsewhere: bool,
     own: &Own,
     proven: impl Fn(&[u8; 32]) -> bool,
 ) -> Due {
-    let Some(txt) = txt else {
+    let Some(txt) = &peer.txt else {
         return Due::NONE;
     };
     let envelope = own.takes_envelope && own.seq.is_none_or(|held| txt.seq > held);
     let records = own.takes_records
-        && txt
-            .rec
-            .as_ref()
-            .is_none_or(|rec| *rec != own.rec && !proven(rec));
+        && match &txt.rec {
+            Some(rec) => *rec != own.rec && !proven(rec),
+            None => !(named_elsewhere && PullGate::alab_instance(&peer.url)),
+        };
     Due { envelope, records }
 }
 
@@ -6303,8 +6410,52 @@ const ANTI_ENTROPY_EVERY: Duration = Duration::from_secs(15 * 60);
 /// comes due first goes, and is swept again the next time a round resolves it.
 const SWEPT_KEPT: usize = crate::membership_log::untaken::UNTAKEN_URLS;
 
+/// How long [`PullGate`] remembers an instance whose TXT named a `rec`, past the last round that
+/// resolved it so ([`PullGate::note_named`]), where no catch-up comes first
+/// ([`PullGate::catch_up`]): a sweep's period, [`ANTI_ENTROPY_EVERY`]. A round
+/// resolves the holders every round but its other names in a rotating batch of at most
+/// [`crate::discover::MAX_CANDIDATES`], so where a browse hears more names than that, a holder's
+/// own-label instance is in one round of every `ceil(names / 16)`: for a fleet of the size
+/// [`crate::membership_log::untaken::UNTAKEN_URLS`] is chosen for, some 17 rounds, under 9
+/// minutes with a round at least every [`ADVERTISE_EVERY`], within this. While it stands the
+/// group's sweeps still come, so one that went or names another vault (which a round's resolve
+/// leaves out) holds back the records an `alab-secrets` TXT beside it would have made due within
+/// the bound [`VaultTxt`] states.
+const NAMED_FOR: Duration = ANTI_ENTROPY_EVERY;
+
+/// How many instances naming a `rec` [`PullGate`] remembers ([`PullGate::note_named`]): a fleet
+/// of the size [`crate::membership_log::untaken::UNTAKEN_URLS`] is chosen for. Past it the one a
+/// round last resolved longest ago goes, which only adds pulls.
+const NAMED_KEPT: usize = crate::membership_log::untaken::UNTAKEN_URLS;
+
+/// An instance as a round tells it again ([`PullGate::note_named`]): its URL's host, with no
+/// trailing dot and in lowercase, and its port. A server registers each name with a host of its
+/// own (`<name>.local`, [`vault_advert`]), the host an `alab-secrets` TXT's `label` names its
+/// own-label instance by ([`PullGate::names_rec`]); `alab-secrets` instances share one.
+type InstanceKey = (String, u16);
+
+/// [`InstanceKey`] of the instance whose URL is `url` (`None`: a URL a pull cannot parse, which
+/// resolves to no endpoint either).
+fn instance_key(url: &str) -> Option<InstanceKey> {
+    let uri = aterm_http::Uri::parse(url)?;
+    Some((
+        trimmed_dns_host(uri.host()).to_ascii_lowercase(),
+        uri.port(),
+    ))
+}
+
+/// Where and when a round last resolved an instance whose TXT named a `rec` ([`PullGate::named`]).
+#[derive(Clone, Debug)]
+struct Named {
+    /// The exact list of endpoints it resolved to, as [`grouped`] keys a group.
+    endpoints: Vec<SocketAddr>,
+    /// The round's instant ([`Pass::Gated`]).
+    at: Instant,
+}
+
 /// What a round's pulls remember ([`pull_pass`]): the records digests a pull it finished proved,
-/// when each group was last pulled, and when each is next swept.
+/// when each group was last pulled, when each is next swept, and where an instance whose TXT
+/// named a `rec` was resolved.
 #[derive(Default)]
 pub(crate) struct PullGate {
     /// The digests answering servers stated on records answers this server judged whole, each
@@ -6320,6 +6471,10 @@ pub(crate) struct PullGate {
     /// How many catch-ups the rounds made ([`Self::catch_up`]): a group last swept before the
     /// latest is due again.
     catch_ups: u64,
+    /// Each instance whose TXT named a `rec`, by [`InstanceKey`] and the vault it named, with
+    /// where and when a round last resolved it so ([`Self::note_named`]), at most
+    /// [`NAMED_KEPT`].
+    named: HashMap<(InstanceKey, String), Named>,
 }
 
 /// When a group's next sweep comes due ([`PullGate::swept`]).
@@ -6414,20 +6569,116 @@ impl PullGate {
     }
 
     /// A round caught up ([`CatchUp`]): every group is swept again the next time a round resolves
-    /// it. After this Mac woke (`woke`) the pacing is forgotten too: an [`Instant`] does not move
-    /// while the Mac sleeps, so a pull just before the sleep would otherwise hold back the
+    /// it, and the instances noted naming a `rec` are forgotten ([`Self::note_named`]): after
+    /// this Mac's addresses changed it may be on another network, where another server answers
+    /// at an endpoint one was noted at (two labs on one subnet, a DHCP lease handed on), and
+    /// after a wake an [`Instant`] that stood still through the sleep would keep one standing
+    /// longer than [`NAMED_FOR`] of the clock. After a wake (`woke`) the pacing is forgotten
+    /// too, for the same reason: a pull just before the sleep would otherwise hold back the
     /// catch-up after it.
     fn catch_up(&mut self, woke: bool) {
         self.catch_ups += 1;
+        self.named.clear();
         if woke {
             self.pulled.clear();
         }
     }
 
+    /// Note what a round at `now` resolved (`resolved`: each peer, with the endpoints its host
+    /// resolved to), before it decides what is due ([`Self::names_rec`]). Of each instance
+    /// ([`InstanceKey`]) whose host resolved to endpoints, what an earlier round noted is
+    /// forgotten, and where its TXT names a `rec` it is remembered at exactly those endpoints,
+    /// for the vault its TXT names: one resolving elsewhere, or naming no `rec` now, stands
+    /// nowhere it stood. Of one whose host resolved to none (a lookup that timed out or
+    /// failed), the round knows its TXT and nowhere: what was noted of it for a vault its TXT
+    /// now names no `rec` for is forgotten, and the rest stands as for an instance the round
+    /// did not resolve. What was noted [`NAMED_FOR`] or longer before `now` is forgotten. A round's
+    /// resolve leaves out an instance whose TXT names another vault than ALab's
+    /// ([`crate::discover::Watch::peer_vaults`]), so what was noted of one that went on to
+    /// name another vault goes only with its age or a catch-up ([`Self::catch_up`]).
+    fn note_named<'a>(
+        &mut self,
+        resolved: impl IntoIterator<
+            Item = (
+                &'a crate::discover::DiscoveredVault,
+                &'a [(SocketAddr, String)],
+            ),
+        >,
+        now: Instant,
+    ) {
+        let resolved: Vec<_> = resolved
+            .into_iter()
+            .filter_map(|(peer, endpoints)| Some((instance_key(&peer.url)?, peer, endpoints)))
+            .collect();
+        // Whether `peer`'s TXT names a `rec` for `vault`.
+        let names = |peer: &crate::discover::DiscoveredVault, vault: &str| {
+            peer.txt
+                .as_ref()
+                .is_some_and(|txt| txt.vault == vault && txt.rec.is_some())
+        };
+        self.named.retain(|(instance, vault), named| {
+            now.saturating_duration_since(named.at) < NAMED_FOR
+                && !resolved.iter().any(|(seen, peer, endpoints)| {
+                    seen == instance && (!endpoints.is_empty() || !names(peer, vault))
+                })
+        });
+        for (instance, peer, endpoints) in resolved {
+            if endpoints.is_empty() {
+                continue;
+            }
+            let Some(txt) = peer.txt.as_ref().filter(|txt| txt.rec.is_some()) else {
+                continue;
+            };
+            let key = (instance, txt.vault.clone());
+            if self.named.len() >= NAMED_KEPT
+                && !self.named.contains_key(&key)
+                && let Some(oldest) = self
+                    .named
+                    .iter()
+                    .min_by_key(|(_, named)| named.at)
+                    .map(|(key, _)| key.clone())
+            {
+                self.named.remove(&oldest);
+            }
+            self.named.insert(
+                key,
+                Named {
+                    endpoints: endpoints.iter().map(|(at, _)| *at).collect(),
+                    at: now,
+                },
+            );
+        }
+    }
+
+    /// Whether the instance `txt`'s `label` names, on the host `<label>.local` (as
+    /// [`vault_advert`] registers each name, and [`advertised_vault`] labels a server's
+    /// `alab-secrets` TXT with its own-label instance's name), named a `rec` for `txt`'s vault
+    /// at exactly `endpoints` in a round noted within [`NAMED_FOR`] and not forgotten since
+    /// ([`Self::note_named`]): the round deciding, which noted what it resolved first, or one
+    /// before it. An instance on another host stands for nothing here, whatever endpoints it
+    /// resolved to: another server that answered at those endpoints before (a DHCP lease handed
+    /// on) holds back no records of the one there now. A TXT naming no label (its server's only
+    /// registration, or an older build's) is answered `false`.
+    fn names_rec(&self, endpoints: &[SocketAddr], txt: &VaultTxt) -> bool {
+        let Some(label) = txt.label.as_deref() else {
+            return false;
+        };
+        self.named.iter().any(|(((host, _), vault), named)| {
+            *vault == txt.vault
+                && named.endpoints == endpoints
+                && host
+                    .strip_suffix(".local")
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(label))
+        })
+    }
+
     /// Whether `url` names a holder's `alab-secrets` instance (its host is `alab-secrets.local`,
     /// every collision rename's too), whose TXT never names its server's records
-    /// ([`VaultTxt::rec`]): a TXT there with no `rec` says nothing of them, where it is an older
-    /// build's on any other instance ([`group_wants`]).
+    /// ([`VaultTxt::rec`]): a TXT there makes them due by none where the instance its `label`
+    /// names, resolving to its endpoints, named a `rec` for its vault, in the round or one
+    /// within [`NAMED_FOR`] before it ([`Self::names_rec`]), and has them pulled at every visit
+    /// where none did, as a TXT with no `rec` on any other instance (an older build's) always
+    /// has ([`pull_due`]).
     fn alab_instance(url: &str) -> bool {
         aterm_http::Uri::parse(url).is_some_and(|uri| {
             strip_local_suffix(uri.host()).eq_ignore_ascii_case(crate::alab_advertised())
@@ -6563,6 +6814,13 @@ fn grouped<'a>(
     groups
 }
 
+/// One group's endpoints, requested vault parts and sweep decision for a pass.
+struct Pull {
+    endpoints: Vec<(SocketAddr, String)>,
+    wants: Vec<Want>,
+    sweep: bool,
+}
+
 /// Pull from `peers` as `pass` says: every vault each names in a whole pass, and in a round's of
 /// each group a sweep is due of ([`PullGate::sweep_due`]); of every other group what its peers'
 /// TXT makes due ([`pull_due`]). A sweep an endpoint of the group answered whole is marked
@@ -6572,9 +6830,13 @@ fn grouped<'a>(
 /// this server's own ([`is_self_addr`]): the `alab-secrets` instance this server holds resolves
 /// to this server's address, and is not pulled. Peers resolving to the same endpoints in the
 /// same order are one group ([`Group`]), pulled once for every vault and part any of them makes
-/// due: the holder's own-label and `alab-secrets` instances are one server. An instance (a forged
-/// one) only adds to what its group pulls, never takes a pull away, and one resolving elsewhere
-/// is a group of its own; peers are told apart by address, never by a TXT's label. A round's
+/// due: the holder's own-label and `alab-secrets` instances are one server. A round notes what
+/// it resolved before it decides ([`PullGate::note_named`]). An instance (a forged one) only adds
+/// to what its group pulls, but for one naming a `rec` on the host an `alab-secrets` instance's
+/// `label` names, which stands for that instance's records where both resolve to the same
+/// endpoints, in its round and those up to [`NAMED_FOR`] after it until a catch-up
+/// ([`pull_due`], [`PullGate::names_rec`]), and one resolving elsewhere is a group of its own;
+/// peers are told apart by address, never by a TXT's label. A round's
 /// passes pull a group only where no round pulled that exact list of endpoints within
 /// [`PULL_SPACING`] ([`PullGate::pace`]); a sweep held back so stays due.
 ///
@@ -6628,13 +6890,22 @@ fn pull_pass(
             })
             .collect()
     });
-    let groups = grouped(unique.into_iter().zip(resolved));
     let round = match pass {
         Pass::Whole => None,
         Pass::Gated(now) => Some(now),
     };
+    if let Some(now) = round {
+        shared.lock_gate().note_named(
+            unique
+                .iter()
+                .copied()
+                .zip(resolved.iter().map(Vec::as_slice)),
+            now,
+        );
+    }
+    let groups = grouped(unique.into_iter().zip(resolved));
     // Each group with what is due of it, and whether this is its sweep.
-    let mut pulls: Vec<(Vec<(SocketAddr, String)>, Vec<Want>, bool)> = Vec::new();
+    let mut pulls = Vec::new();
     {
         let mut owns: Vec<(String, Own)> = Vec::new();
         for group in groups {
@@ -6642,32 +6913,36 @@ fn pull_pass(
             let sweep = round.is_some_and(|now| shared.lock_gate().sweep_due(&at, now));
             let wants = group_wants(shared, &group, round.is_none() || sweep, &mut owns);
             if !wants.is_empty() {
-                pulls.push((group.endpoints, wants, sweep));
+                pulls.push(Pull {
+                    endpoints: group.endpoints,
+                    wants,
+                    sweep,
+                });
             }
         }
     }
     if let Some(now) = round {
         let mut gate = shared.lock_gate();
-        pulls.retain(|(endpoints, _, _)| {
-            let at: Vec<SocketAddr> = endpoints.iter().map(|(at, _)| *at).collect();
+        pulls.retain(|pull| {
+            let at: Vec<SocketAddr> = pull.endpoints.iter().map(|(at, _)| *at).collect();
             gate.pace(&at, now)
         });
     }
-    let pull = |(endpoints, wants, sweep): &(Vec<(SocketAddr, String)>, Vec<Want>, bool)| {
+    let pull = |pull: &Pull| {
         let pulled = pull_endpoints(
-            endpoints,
+            &pull.endpoints,
             shared.tuning.peer_pull,
             Instant::now,
-            |at, url| pull_from_peer(shared, at, url, wants),
+            |at, url| pull_from_peer(shared, at, url, &pull.wants),
         );
         if pulled.stored != 0 {
             shared.counts.add(Count::PullsStored);
         }
-        if *sweep
+        if pull.sweep
             && pulled.whole
             && let Some(now) = round
         {
-            let at: Vec<SocketAddr> = endpoints.iter().map(|(at, _)| *at).collect();
+            let at: Vec<SocketAddr> = pull.endpoints.iter().map(|(at, _)| *at).collect();
             shared.lock_gate().swept(&at, now, draw());
         }
         pulled.stored
@@ -6703,9 +6978,14 @@ fn named_by_host(url: &str) -> bool {
 /// What a pass asks `group` for ([`pull_pass`]): each vault its peers name, all of it where the
 /// pull is `ungated` (a whole pass, a sweep), else what each peer's TXT makes due ([`pull_due`]);
 /// `owns` keeps what this server holds of each vault the pass looked at. An `alab-secrets`
-/// instance's TXT names no `rec` by design ([`PullGate::alab_instance`]), so it makes its
-/// server's records due by none: they come with that server's own-label instance, which
-/// resolves to the same group, and with its sweeps.
+/// instance's TXT names no `rec` by design ([`PullGate::alab_instance`]): where the instance its
+/// `label` names (its server's own-label instance, which a round's rotating batch may leave
+/// out), resolving to the group's endpoints, named a `rec` for its vault, in this round or one
+/// within [`NAMED_FOR`] before it and since the last catch-up ([`PullGate::names_rec`]), the
+/// `alab-secrets` TXT makes the records due by none, and that instance's TXT makes them due in
+/// each round that resolves it; where none did (its server's only registration, whose TXT names
+/// no label, or an own-label instance that no round within that period resolved naming the
+/// records), they are pulled at every visit.
 fn group_wants(
     shared: &Shared,
     group: &Group<'_>,
@@ -6738,15 +7018,12 @@ fn group_wants(
             (Some(txt), false) => {
                 let own = own_of(shared, &txt.vault, owns);
                 let at: Vec<SocketAddr> = group.endpoints.iter().map(|(at, _)| *at).collect();
-                let mut due = {
+                let due = {
                     let gate = shared.lock_gate();
-                    pull_due(Some(txt), &own, |rec| {
+                    pull_due(peer, gate.names_rec(&at, txt), &own, |rec| {
                         gate.proved(&txt.vault, rec, &at, &own.follows)
                     })
                 };
-                if txt.rec.is_none() && PullGate::alab_instance(&peer.url) {
-                    due.records = false;
-                }
                 add_want(
                     &mut wants,
                     Want {
@@ -7068,8 +7345,9 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                     None => (Vec::new(), Vec::new()),
                 }
             };
-            // A pull that cannot say whether the records crossed takes nothing this pass.
-            let Ok(crossed) = shared.records_crossed(vault_name) else {
+            // A pull that cannot say what this server states of its records takes nothing this
+            // pass.
+            let Ok(own) = shared.records_bound_here(vault_name) else {
                 whole = false;
                 continue;
             };
@@ -7079,7 +7357,7 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
                 None,
                 budget,
                 None,
-                crate::crossing::RecordsBound::here(crossed),
+                own,
                 |id| records_input::known_record(shared, vault_name, id),
             ) {
                 Ok(answer) => {
@@ -7097,10 +7375,13 @@ fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) ->
             };
             answered = true;
             let stated = answer.bound.stated();
-            // A crossed server takes nothing from a peer of a build before the fence.
-            if crossed && stated.is_none() {
+            // A crossed or format-2 server takes nothing from a peer of a build before the fence.
+            if own.fenced() && stated.is_none() {
                 continue;
             }
+            // A prefix of what the peer holds past this pull (`Store::missing_within`) is not the
+            // whole of it, and proves no digest: the next round asks again past what it took.
+            whole &= !answer.more;
             let heads = answer.heads;
             let received = answer.received;
             if received.byte_len() == 0 {

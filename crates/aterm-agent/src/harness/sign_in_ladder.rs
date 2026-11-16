@@ -229,6 +229,9 @@ pub(super) enum Unfinished {
     Unread,
     /// A signal ended it: it gave no exit code.
     Signal,
+    /// The Mac slept while it ran ([`interrupted_by_sleep`]): its deadline, its page and its
+    /// mailbox wait all stood still, so how it ended says nothing of the sign-in.
+    Interrupted,
 }
 
 impl Unfinished {
@@ -253,8 +256,49 @@ impl Unfinished {
             Self::TimedOut => "it timed out",
             Self::Unread => "its output could not be read",
             Self::Signal => "a signal ended it",
+            Self::Interrupted => "this Mac slept while it ran",
         }
     }
+}
+
+/// The least sleep that interrupts a sign-in's run ([`interrupted_by_sleep`]): shorter than any
+/// wait a sign-in page or a mailbox survives, longer than a clock's jitter.
+pub(super) const INTERRUPTING_SLEEP: Duration = Duration::from_secs(30);
+
+/// How many of one row's unattended runs in a row a sleep may interrupt and still be tried
+/// again at once ([`Ladder::run_ended`]); the next one a sleep spans is counted as it ended,
+/// with the backoff every failure sets. A lid shut over a Mac that wakes in the dark every
+/// few minutes would otherwise end one run and start the next at every wake, all night.
+pub(super) const MOST_INTERRUPTED_RUNS: u32 = 2;
+
+/// Whether a sleep of `slept` across a run is long enough to interrupt it
+/// ([`INTERRUPTING_SLEEP`]); no clock that counts sleep (`None`) shows none.
+#[must_use]
+pub(super) fn slept_across(slept: Option<Duration>) -> bool {
+    slept.is_some_and(|slept| slept >= INTERRUPTING_SLEEP)
+}
+
+/// AN UNATTENDED ATTEMPT WHOSE RUN SPANNED A SYSTEM SLEEP IS INTERRUPTED, NOT TIMED OUT (plan
+/// package FL-174). `slept` is how long the Mac slept across the run
+/// ([`super::wake_deadline::SleepWatch::slept`]); the run is interrupted where that reaches
+/// [`INTERRUPTING_SLEEP`], it made no login (`published` false) and nothing a person must
+/// answer stopped it (`stopped` false: a bot protection, a closed window, a wrong account and a
+/// desk with no desktop stay what they are, sleep or no sleep). An interrupted run of the
+/// ladder's own is tried again, counted neither failed nor blocked and starting no backoff,
+/// for as long as its row's runs in a row a sleep interrupted number no more than
+/// [`MOST_INTERRUPTED_RUNS`] ([`Ladder::run_ended`]); it gives its spacing back only where it
+/// never reached the provider ([`Begun::refund_spacing`]). A run a person started (a click, a
+/// saved choice, a Next selection) is never waived by this, whatever it answers: its caller
+/// counts it as it ended and retires its request, since a saved choice left pending is run
+/// again by every pass with no cooldown. On 2026-11-15 two unattended runs "timed out" after
+/// 718 s and 1016 s against a 240 s bound: the lid was shut over both.
+#[must_use]
+pub(super) fn interrupted_by_sleep(
+    slept: Option<Duration>,
+    published: bool,
+    stopped: bool,
+) -> bool {
+    !published && !stopped && slept_across(slept)
 }
 
 /// A route the ladder found ready ([`Read::route`]).
@@ -552,6 +596,9 @@ pub(super) struct Ladder {
     /// The workflow each row's vault route last refreshed the vault for
     /// ([`Self::token_refreshed`]).
     token_refreshed: BTreeMap<String, super::accounts::WorkflowToken>,
+    /// How many of each row's unattended runs in a row a sleep interrupted
+    /// ([`Self::run_ended`]).
+    interrupted: BTreeMap<String, u32>,
 }
 
 /// What [`Ladder::vault_turn`] says of the vault now.
@@ -665,6 +712,27 @@ impl Ladder {
             },
         );
         wait
+    }
+
+    /// NOTES HOW ONE OF `label`'S UNATTENDED RUNS ENDED AGAINST THE MAC'S SLEEP, and returns
+    /// whether the run is waived: tried again at once and counted against nothing. `slept`:
+    /// the Mac slept across it ([`slept_across`]); `interrupted`: it is one a sleep interrupted
+    /// ([`interrupted_by_sleep`]) that nothing else ended. A run no sleep spanned ends the
+    /// row's count, however it ended. An interrupted one adds to it and is waived while the
+    /// count is no more than [`MOST_INTERRUPTED_RUNS`]; past that it is not, and its caller
+    /// counts it as it ended ([`Self::failed`]), so the row's backoff holds the next. The count
+    /// stands until a run of the row ends with no sleep across it.
+    pub(super) fn run_ended(&mut self, label: &str, slept: bool, interrupted: bool) -> bool {
+        if !slept {
+            self.interrupted.remove(label);
+            return false;
+        }
+        if !interrupted {
+            return false;
+        }
+        let in_a_row = self.interrupted.entry(label.to_owned()).or_default();
+        *in_a_row = in_a_row.saturating_add(1);
+        *in_a_row <= MOST_INTERRUPTED_RUNS
     }
 
     /// Notes that a page stopped `label`'s last failure, which it waits on until `until`, or, with
@@ -1566,6 +1634,7 @@ impl SignIn {
             cli: self.cli,
             label: self.label,
             selection_owner: self.selection_owner,
+            spacing: None,
         })
     }
 
@@ -1601,17 +1670,20 @@ impl SignIn {
         if let Some(until) = self.spaced(store, now)? {
             return Err(Refused::Spaced { until });
         }
-        super::atomic_write::write_atomic(
-            &spacing_path(store),
-            &Started::new(cli, label, now).text(),
-        )
-        .map_err(|e| Refused::Record(e.to_string()))?;
+        // The record this start replaces, kept so a run that is superseded or interrupted
+        // before it reaches the provider gives its spacing back ([`Begun::refund_spacing`]); one
+        // that does not read is none.
+        let before = last_started(store).ok().flatten();
+        let own = Started::new(cli, label, now);
+        super::atomic_write::write_atomic(&spacing_path(store), &own.text())
+            .map_err(|e| Refused::Record(e.to_string()))?;
         Ok(Begun {
             _running: RunningMark::note(store, cli, label, now),
             signin: SigninOwner::Global(signin),
             cli: self.cli,
             label: self.label,
             selection_owner: self.selection_owner,
+            spacing: Some((own, before)),
         })
     }
 }
@@ -1629,6 +1701,9 @@ pub(super) struct Begun {
     cli: super::accounts::Cli,
     label: String,
     selection_owner: Option<super::accounts_sync::ManualSelectionOwner>,
+    /// This start's own spacing record and the one it replaced ([`Self::refund_spacing`]);
+    /// `None` for a start that records its spacing elsewhere or records none.
+    spacing: Option<(Started, Option<Started>)>,
 }
 
 #[derive(Debug)]
@@ -1654,7 +1729,35 @@ impl Begun {
             cli: store.cli(),
             label: label.to_owned(),
             selection_owner: None,
+            spacing: None,
         })
+    }
+
+    /// GIVES BACK THE SPACING THIS START SPENT, for a run that was superseded or that a sleep
+    /// interrupted ([`interrupted_by_sleep`]) before it reached the provider: its caller calls
+    /// this only where the run never started its provider's step, so it loaded no sign-in the
+    /// provider counts and the next account's sign-in does not wait [`SPACING_S`] on it. A run
+    /// that started that step keeps its spacing however it ended: its page may have loaded.
+    /// Where the spacing record is still this start's own, the record it replaced is put back,
+    /// or the file removed where it replaced none. Called while this sign-in still holds the
+    /// sign-in lock, under which alone the record is written, so no other start's record is
+    /// undone.
+    pub(super) fn refund_spacing(&self, store: &super::accounts::Store) {
+        let Some((own, before)) = &self.spacing else {
+            return;
+        };
+        if last_started(store).ok().flatten().as_ref() != Some(own) {
+            return;
+        }
+        let path = spacing_path(store);
+        match before {
+            Some(before) => {
+                let _ = super::atomic_write::write_atomic(&path, &before.text());
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
     pub(super) fn native_recovery_scope(
         &self,
@@ -1680,6 +1783,7 @@ impl Begun {
             cli: store.cli(),
             label: label.to_owned(),
             selection_owner: None,
+            spacing: None,
         })
     }
     pub(super) fn check_store(&self, store: &super::accounts::Store) -> Result<(), String> {
@@ -1750,6 +1854,7 @@ pub(super) fn begun_fixture(
         cli,
         label: label.to_owned(),
         selection_owner: None,
+        spacing: None,
     }
 }
 

@@ -799,6 +799,95 @@ pub fn render(base: &Base) -> String {
     text
 }
 
+/// The text a save reads for an edit of `base` made without a file (the Tables page): each of
+/// `cells` (by row key and column) in place of what it showed, then each of `born`, a new row's
+/// cells by column name, as a row of its own after the exported ones with its key left empty,
+/// which [`plan`] reads as a row to be born. A cell `born` does not name is empty.
+pub fn staged_text(
+    base: &Base,
+    cells: &BTreeMap<(String, String), String>,
+    born: &[BTreeMap<String, String>],
+) -> String {
+    let mut edited = base.clone();
+    for (pk, seen) in &mut edited.rows {
+        for (column, cell) in seen.iter_mut() {
+            if let Some(text) = cells.get(&(pk.clone(), column.clone())) {
+                cell.shown.clone_from(text);
+            }
+        }
+    }
+    edited.rows.extend(born.iter().map(|row| {
+        let seen = row
+            .iter()
+            .map(|(column, text)| {
+                (
+                    column.clone(),
+                    Seen {
+                        shown: text.clone(),
+                        ..Seen::default()
+                    },
+                )
+            })
+            .collect();
+        (String::new(), seen)
+    }));
+    render(&edited)
+}
+
+/// The row a [`Problem`]'s record is in a [`staged_text`] of `base`: the header, an exported
+/// row by its key, or the `n`th born row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordOf<'a> {
+    Header,
+    Row(&'a str),
+    Born(usize),
+}
+
+impl<'a> RecordOf<'a> {
+    /// What record `record` of a [`staged_text`] of `base` is.
+    pub fn of(base: &'a Base, record: usize) -> Self {
+        match record.checked_sub(1) {
+            None => Self::Header,
+            Some(at) => match base.rows.get(at) {
+                Some((pk, _)) => Self::Row(pk),
+                None => Self::Born(at - base.rows.len()),
+            },
+        }
+    }
+}
+
+/// The word of a lifecycle that is live: the only word under which a row counts as one.
+pub const LIVE: &str = "live";
+
+/// A cells collection's lifecycle as the grid writes it: the column, the words it takes and the
+/// word a row the owner removes takes. A row is never deleted; its lifecycle cell says it ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lifecycle {
+    pub column: &'static Column,
+    /// The words the column takes, as its enum declares them; empty where it is no enum.
+    pub words: &'static [&'static str],
+    /// The word a removed row takes: `ended` for a collection whose rows end (a link,
+    /// [`Table::ends`]), else `retired`.
+    pub ends: &'static str,
+}
+
+/// `collection`'s lifecycle in `table`, where it has a lifecycle column ([`LIFECYCLE`]).
+pub fn lifecycle(table: &Table, collection: &'static Collection) -> Option<Lifecycle> {
+    let column = collection.column(LIFECYCLE)?;
+    Some(Lifecycle {
+        column,
+        words: match column.ty {
+            Ty::Enum(words) => words,
+            _ => &[],
+        },
+        ends: if table.ends.contains(&collection.name) {
+            "ended"
+        } else {
+            "retired"
+        },
+    })
+}
+
 /// A cell the owner's save cannot take: where, and the rule, never the value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Problem {
@@ -1247,12 +1336,12 @@ pub fn plan(
         }
     }
     // Rows the owner deleted: retired, or ended, so their history stays.
-    let word = if table.ends.contains(&collection.name) {
-        "ended"
-    } else {
-        "retired"
-    };
-    if let Some(lifecycle) = collection.column(LIFECYCLE) {
+    if let Some(Lifecycle {
+        column: lifecycle,
+        ends: word,
+        ..
+    }) = self::lifecycle(table, collection)
+    {
         for (pk, seen) in &base.rows {
             if present.contains(pk.as_str()) {
                 continue;

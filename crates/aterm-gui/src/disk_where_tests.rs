@@ -139,7 +139,7 @@ fn a_survey_reads_only_and_never_enters_guarded_folders() {
     assert_eq!(paths.len(), 3, "{hogs:?} of {found:?} under {roots:?}");
     assert!(paths.contains(&"~/proj/target"), "{hogs:?}");
     let beside = outside.join("target");
-    let beside = aterm_sysprobe::paths::plain(&beside).display().to_string();
+    let beside = aterm_path::plain(&beside).display().to_string();
     assert!(!beside.starts_with(r"\\?\"), "{beside}");
     assert!(paths.contains(&beside.as_str()), "{hogs:?}");
     let wt = hogs.iter().find(|h| h.path == "~/wt").expect("grouped");
@@ -147,7 +147,7 @@ fn a_survey_reads_only_and_never_enters_guarded_folders() {
     assert!(wt.bytes >= 30_000, "{wt:?}");
     // Below the scratch root: Windows keeps the root itself in a guarded
     // folder (AppData\Local\Temp).
-    let scratch = aterm_sysprobe::paths::plain(&root).display().to_string();
+    let scratch = aterm_path::plain(&root).display().to_string();
     assert!(
         !paths.iter().any(|p| p
             .strip_prefix(scratch.as_str())

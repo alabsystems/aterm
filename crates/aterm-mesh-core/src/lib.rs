@@ -5,9 +5,8 @@
 //! for every size (`docs/DESIGN-one-mesh-proofs-2026-11-05.md`).
 //!
 //! The crate has no dependencies, no proc macros and no anchors (PM-1). Its spec islands are
-//! elaborated in the three `aterm-mesh-core-islands` crates (`cfg(clean_islands)`), which every
-//! build of the `aterm` package, a bare build and this crate's tests check and nothing on the
-//! mesh's compile chain waits for (`aterm-mesh-core-islands`' lib.rs says why): the spec islands
+//! elaborated in the three `aterm-mesh-core-islands` crates (`cfg(clean_islands)`), which this
+//! crate's tests check and nothing on the mesh's compile chain waits for (`aterm-mesh-core-islands`' lib.rs says why): the spec islands
 //! name no Rust, so outside the Trust lane this crate's compile carries none of them. A decision is
 //! a scalar `contract!` kernel whose clause cites an island definition (`ensures result ==
 //! spec_k(..) by k_is_exact`); the binding islands, which prove each compiled kernel equal to its

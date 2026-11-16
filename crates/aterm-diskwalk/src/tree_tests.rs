@@ -88,6 +88,14 @@ fn a_huge_directory_is_a_note_then_a_warning() {
             .sentence()
             .contains("huge directory: slow for anything that lists it")
     );
+    // Each states its fact and asks nothing of anyone: the disk pass takes what it may.
+    for h in &huge {
+        let said = h.sentence();
+        assert!(
+            !said.contains("targo clean") && !said.contains("remove"),
+            "{said}"
+        );
+    }
 }
 
 /// Out-of-bounds or wrapping `(name_at, name_len)` spans return an empty slice without panicking.

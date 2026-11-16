@@ -34,7 +34,9 @@ pub mod retain;
 pub mod snapshot;
 pub mod status;
 
-pub use file::{File, Opened, Pass, Projected, Read, Recorded};
+#[cfg(any(unix, windows))]
+pub use file::Look;
+pub use file::{File, Opened, Pass, Projected, Projection, Read, Recorded};
 pub use frontier::Frontier;
 pub use layout::Root;
 pub use name::{Name, NotAName};

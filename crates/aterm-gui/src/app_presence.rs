@@ -181,7 +181,9 @@ impl App {
         let hand = if matches!(hand, Hand::None) {
             self.driving_target(&ctx.self_id)
                 .map_or(Hand::None, |dst| Hand::Driving {
-                    sid: presence::short_sid(dst.as_str()),
+                    // `status hand=` is read by tools: the fixed cut, not the window's form,
+                    // which lengthens as twins come and go.
+                    sid: aterm_messages::presence::short_sid(dst.as_str()),
                 })
         } else {
             hand
@@ -711,14 +713,15 @@ impl App {
             return;
         }
         self.harness_wait_epoch += 1;
-        if let Some(session) = self.local_session_of(&SessionId::new(sid)) {
+        if let Some(session) = SessionId::parse(sid).and_then(|sid| self.local_session_of(&sid)) {
             self.refresh_presence_session(session);
         }
     }
 
     /// What the harness loop of `sid` told the window.
     pub(crate) fn apply_harness_fact(&mut self, sid: &str, fact: crate::HarnessFact) {
-        let Some(session) = self.local_session_of(&SessionId::new(sid)) else {
+        let Some(session) = SessionId::parse(sid).and_then(|sid| self.local_session_of(&sid))
+        else {
             return;
         };
         match fact {
@@ -1075,7 +1078,6 @@ impl App {
             return;
         };
         let front = ws.tab_set.active_index();
-        let tab_count = ws.tab_set.shown_len();
         let denial_marks =
             self.effective_observer_mode() == crate::consent_observer::ObserverMode::Full;
         for (index, (tab, item)) in ws
@@ -1085,7 +1087,6 @@ impl App {
             .zip(metadata.iter_mut())
             .enumerate()
         {
-            item.load = self.chip_load(tab_count, tab);
             let mut level = item.attention;
             let mut read = |canonical: usize, tab: &crate::tab_model::Tab| {
                 tab.root.any_leaf(&mut |view| {

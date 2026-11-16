@@ -136,5 +136,89 @@ fn a_rename_of_a_name_kept_elsewhere_writes_no_row() {
             state.display()
         );
         assert_eq!(row_nick(&state), None, "{}", state.display());
+        assert!(super::for_follow(&state).is_none(), "{}", state.display());
     }
+}
+
+#[test]
+fn automatic_follow_requires_admission_and_the_current_owning_number() {
+    use crate::harness::{account_sync_error::SyncError, alab_roster::SourceGuard};
+    use crate::machine_name::{file, follow_registry};
+    use aterm_net::fleet_member::name_record::NickClass;
+    use aterm_types::machine_name::{Class, Number};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct Admission(Arc<AtomicBool>);
+    impl SourceGuard for Admission {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn same_source(&self, other: &dyn SourceGuard) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<Self>()
+                .is_some_and(|other| Arc::ptr_eq(&self.0, &other.0))
+        }
+        fn with_admitted(
+            &self,
+            save: Box<dyn FnOnce() -> Result<(), SyncError> + '_>,
+        ) -> Result<(), SyncError> {
+            if !self.0.load(Ordering::Acquire) {
+                return Err("the retained source no longer admits local writes".into());
+            }
+            save()
+        }
+    }
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let number = Number::new(85).unwrap();
+    let mut held = file::MachineName::unnumbered(Nickname::parse("dog").unwrap(), 1);
+    held.num = Some(number);
+    held.class = Class::Chosen;
+    held.nick_class = NickClass::Chosen;
+    held.row = file::RowSeen::Saw(Some(held.nick.clone()));
+    file::read_or_create(root.path(), || Ok(held.clone())).unwrap();
+    let allowed = Arc::new(AtomicBool::new(false));
+    let input = super::Follow {
+        number: Some(number),
+        nickname: Some(heron()),
+        guard: Some(super::ReceiptGuard::new(Admission(allowed.clone()))),
+        row: None,
+    };
+    let previous = super::ROW.with(|row| row.replace(Some(input.clone())));
+    struct Reset(Option<super::Follow>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::ROW.with(|row| row.replace(self.0.take()));
+        }
+    }
+    let _reset = Reset(previous);
+
+    assert_eq!(
+        row_nick(root.path()),
+        Some(Some(heron())),
+        "history remains readable"
+    );
+    assert!(follow_registry(root.path(), 2).is_err());
+    assert_eq!(
+        file::read(root.path()).unwrap(),
+        Some(held.clone()),
+        "a refused source changes neither nickname, RowSeen nor history"
+    );
+
+    allowed.store(true, Ordering::Release);
+    super::ROW.with(|row| row.borrow_mut().as_mut().unwrap().number = Number::new(86));
+    assert_eq!(follow_registry(root.path(), 3).unwrap(), None);
+    assert_eq!(file::read(root.path()).unwrap(), Some(held.clone()));
+    super::ROW.with(|row| row.borrow_mut().as_mut().unwrap().number = Some(number));
+    let followed = follow_registry(root.path(), 4).unwrap().unwrap();
+    assert_eq!(followed.nick, heron());
+    assert_eq!(followed.num, held.num);
+    assert_eq!(followed.rev, held.rev + 1);
+    assert_eq!(followed.row, file::RowSeen::Saw(Some(heron())));
+    assert_eq!(followed.history.len(), held.history.len() + 1);
+    assert_eq!(follow_registry(root.path(), 5).unwrap(), None);
 }

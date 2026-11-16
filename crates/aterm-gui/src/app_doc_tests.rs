@@ -148,7 +148,7 @@ fn edit_waited(app: &mut App, session: u64, uri: &str) -> (EditOk, Receiver<Stri
     let line = answer.try_recv().expect("an inline edit answers at once");
     let ok = EditOk::parse(&line).unwrap_or_else(|error| panic!("{line:?}: {error}"));
     static WAITER: AtomicU64 = AtomicU64::new(3 << 40);
-    let (reply, parked) = std::sync::mpsc::channel();
+    let (reply, parked) = crate::control::control_media::DoorReply::pair();
     app.await_edit(AwaitCall {
         waiter: WaiterId(WAITER.fetch_add(1, Ordering::Relaxed)),
         key: AwaitKey::Ticket(ticket),

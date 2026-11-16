@@ -231,7 +231,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Record a host-typed turn (`kind`) against wall memory. A fact (`HostTurn::Fact`: the
-    /// quiet upgrade's line, the disk-free ask's) keeps a record of its own at an idle point as at
+    /// quiet upgrade's line) keeps a record of its own at an idle point as at
     /// a break ([`super::policy::turn_end::TurnEndState::fact_typed`]), so what the loop awaits or
     /// owes past it (a land check, a continuation's answer) stays. A replay of a tape whose
     /// recording build had no break door with guards (`host.at_background_on`) records it as

@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use crate::{
-    Column, Face, File, Frontier, Kept, Name, Opened, Pass, Projected, Recorded, Root, Row,
-    Snapshot, Source, Why, Word,
+    Column, Face, File, Frontier, Kept, Name, Opened, Pass, Projected, Projection, Recorded, Root,
+    Row, Snapshot, Source, Why, Word,
     cli::{self, Known, Run},
     exit,
     file::cut,
@@ -106,17 +106,23 @@ fn frontier(era: u64, ids: &[u8]) -> Frontier {
     }
 }
 
+/// A pass that opened custody: its projection where `snapshot` is one, else one that projected
+/// nothing at the key a projection of the same frontier is recorded at (these tests' key is the
+/// frontier's fingerprint).
 fn opened(newest: bool, frontier: Frontier, snapshot: Option<Snapshot>) -> Pass {
+    let key = frontier.fingerprint();
     Pass::Opened(Box::new(Opened {
         newest,
         frontier,
-        projection: 1,
-        withheld: 0,
-        inert: 0,
-        projected: snapshot.map(|snapshot| Projected {
-            snapshot,
-            history: Vec::new(),
-            baseline: None,
+        key,
+        projection: snapshot.map_or(Projection::Unchanged, |snapshot| {
+            Projection::Fresh(Box::new(Projected {
+                snapshot,
+                history: Vec::new(),
+                baseline: None,
+                withheld: 0,
+                inert: 0,
+            }))
         }),
     }))
 }
@@ -297,7 +303,7 @@ fn a_pass_records_its_word_and_a_refusal_leaves_the_snapshot_as_it_was() {
     let file = File::at(&scratch.root, &name("ai/accounts"));
 
     // A refusal before anything was materialized: never, with the why.
-    let look = file.look();
+    let look = file.look().expect("a look");
     let refused = Pass::Refused {
         word: Word::Held,
         why: Why::Membership,
@@ -314,7 +320,7 @@ fn a_pass_records_its_word_and_a_refusal_leaves_the_snapshot_as_it_was() {
     assert_eq!(read.status.line(), "never (membership)");
 
     // An open on the newest home: live, revision 1, the face written.
-    let look = file.look();
+    let look = file.look().expect("a look");
     let pass = opened(true, frontier(0, &[1]), Some(accounts(vec![ada()])));
     assert_eq!(
         file.record(look, pass, 20).expect("records"),
@@ -336,7 +342,7 @@ fn a_pass_records_its_word_and_a_refusal_leaves_the_snapshot_as_it_was() {
 
     // Each refusal after it: held with its why, the snapshot's bytes untouched.
     for why in [Why::Succession, Why::Membership, Why::Busy, Why::Keys] {
-        let look = file.look();
+        let look = file.look().expect("a look");
         let refused = Pass::Refused {
             word: Word::Held,
             why,
@@ -354,7 +360,7 @@ fn a_pass_records_its_word_and_a_refusal_leaves_the_snapshot_as_it_was() {
     assert_eq!(file.read().status.line(), "held (keys) · rev 1 · 1 rows");
 
     // Policy turns it off: the word is off, the rows stay.
-    let look = file.look();
+    let look = file.look().expect("a look");
     let off = Pass::Refused {
         word: Word::Off,
         why: Why::Policy,
@@ -395,8 +401,11 @@ fn the_records_a_pass_counted_inert_are_shown_by_ls_and_status() {
     else {
         unreachable!("an open")
     };
-    counted.inert = 2;
-    file.record(file.look(), Pass::Opened(counted), 20)
+    let Projection::Fresh(projected) = &mut counted.projection else {
+        unreachable!("a projection")
+    };
+    projected.inert = 2;
+    file.record(file.look().expect("a look"), Pass::Opened(counted), 20)
         .expect("records");
     assert_eq!(file.state().expect("a state").inert, Some(2));
     assert_eq!(file.status().line(), "live · rev 1 · 1 rows · 2 inert");
@@ -439,7 +448,8 @@ fn off_before_anything_was_materialized_reads_off() {
         word: Word::Off,
         why: Why::Policy,
     };
-    file.record(0, off, 1).expect("records");
+    file.record(file.look().expect("a look"), off, 1)
+        .expect("records");
     let read = file.read();
     assert_eq!(
         (read.status.word, read.status.why),
@@ -453,13 +463,17 @@ fn a_fenced_home_is_held_and_an_older_view_never_replaces_the_snapshot() {
     let scratch = scratch();
     let file = File::at(&scratch.root, &name("ai/accounts"));
     let both = accounts(vec![ada(), ada_at_oai()]);
-    file.record(0, opened(true, frontier(1, &[1, 2]), Some(both)), 1)
-        .expect("records");
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(1, &[1, 2]), Some(both)),
+        1,
+    )
+    .expect("records");
     assert_eq!(file.read().status.rev(), 1);
 
     // The fenced original, an earlier home, read after the successor's: its word is recorded
     // (held, succession), its rows are not.
-    let look = file.look();
+    let look = file.look().expect("a look");
     let older = opened(false, frontier(0, &[1, 2, 3]), Some(accounts(vec![ada()])));
     assert_eq!(
         file.record(look, older, 2).expect("records"),
@@ -476,7 +490,7 @@ fn a_fenced_home_is_held_and_an_older_view_never_replaces_the_snapshot() {
 
     // The same home with a record missing: not replaced either, and not called live, since
     // the rows read are not that pass's.
-    let look = file.look();
+    let look = file.look().expect("a look");
     let partial = opened(true, frontier(1, &[1]), Some(accounts(vec![ada()])));
     assert_eq!(
         file.record(look, partial, 3).expect("records"),
@@ -495,7 +509,7 @@ fn a_fenced_home_is_held_and_an_older_view_never_replaces_the_snapshot() {
     assert_eq!(file.frontier(), Some(frontier(1, &[1, 2])));
 
     // The same content at a grown frontier keeps the revision; new content moves it by one.
-    let look = file.look();
+    let look = file.look().expect("a look");
     let same = opened(
         true,
         frontier(1, &[1, 2, 3]),
@@ -503,7 +517,7 @@ fn a_fenced_home_is_held_and_an_older_view_never_replaces_the_snapshot() {
     );
     file.record(look, same, 4).expect("records");
     assert_eq!(file.read().status.rev(), 1);
-    let look = file.look();
+    let look = file.look().expect("a look");
     let fewer = opened(
         true,
         frontier(1, &[1, 2, 3, 4]),
@@ -516,12 +530,21 @@ fn a_fenced_home_is_held_and_an_older_view_never_replaces_the_snapshot() {
     assert_eq!(read.status.word, Word::Live);
 }
 
+/// A pass whose look another pass's record overtook records nothing, so a view of live
+/// custody taken before a fence never turns the fenced pass's `held` into `live`. That holds
+/// where the later pass changed nothing too: with the earlier look's lease outstanding, it moves
+/// the count alone ([`Recorded::Fenced`], the status its one write), and the earlier look
+/// records nothing; with no look outstanding, it writes nothing ([`Recorded::Settled`]).
+/// NEGATIVE CONTROL, observed: with `record` taking a look lock it could not take alone for one
+/// it took (`Ok(None) | Err(_)` returning `Recorded::Settled`), the late live view records over
+/// the held pass that changed nothing: `` left: (Live, None) right: (Held, Some(Succession)) ``,
+/// `` the late live view did not turn held into live ``.
 #[test]
 fn a_pass_that_another_pass_overtook_records_nothing() {
     let scratch = scratch();
     let file = File::at(&scratch.root, &name("ai/accounts"));
     file.record(
-        0,
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         1,
     )
@@ -529,12 +552,13 @@ fn a_pass_that_another_pass_overtook_records_nothing() {
 
     // A refresh notes the count and opens live custody; before it records, the home is fenced
     // and the fenced pass records held.
-    let stale_look = file.look();
+    let stale_look = file.look().expect("a look");
     let fenced = Pass::Refused {
         word: Word::Held,
         why: Why::Succession,
     };
-    file.record(file.look(), fenced, 2).expect("records");
+    file.record(file.look().expect("a look"), fenced, 2)
+        .expect("records");
     let before = std::fs::read(scratch.root.state(&name("ai/accounts"))).expect("state");
 
     let late = opened(
@@ -557,6 +581,197 @@ fn a_pass_that_another_pass_overtook_records_nothing() {
         std::fs::read(scratch.root.state(&name("ai/accounts"))).expect("state"),
         before
     );
+
+    // Another refresh looks; before it records, a pass finds the home fenced again, which is
+    // what the status says. It changes nothing, and the look is outstanding: the count moves.
+    let outstanding = file.look().expect("a look");
+    let puts = crate::file::test_puts();
+    let seq = outstanding.seq();
+    let fencing = file
+        .record(file.look().expect("a look"), fenced_again(), 4)
+        .expect("records");
+    let fenced_puts = crate::file::test_puts() - puts;
+    let late = opened(
+        true,
+        frontier(0, &[1, 2]),
+        Some(accounts(vec![ada(), ada_at_oai()])),
+    );
+    let overtaken = file.record(outstanding, late, 5).expect("no error");
+    let read = file.read();
+    assert_eq!(
+        (read.status.word, read.status.why),
+        (Word::Held, Some(Why::Succession)),
+        "the late live view did not turn held into live"
+    );
+    assert_eq!((fencing, overtaken), (Recorded::Fenced, Recorded::Raced));
+    assert_eq!(fenced_puts, 1, "the status alone");
+    assert_eq!(file.state().expect("a state").seq, seq + 1);
+    // With no look outstanding, the same pass writes nothing at all.
+    let before = std::fs::read(scratch.root.state(&name("ai/accounts"))).expect("state");
+    let puts = crate::file::test_puts();
+    assert_eq!(
+        file.record(file.look().expect("a look"), fenced_again(), 6)
+            .expect("records"),
+        Recorded::Settled
+    );
+    assert_eq!(crate::file::test_puts(), puts);
+    assert_eq!(
+        std::fs::read(scratch.root.state(&name("ai/accounts"))).expect("state"),
+        before
+    );
+}
+
+/// The pass of a fenced home that refuses as the one before it did.
+fn fenced_again() -> Pass {
+    Pass::Refused {
+        word: Word::Held,
+        why: Why::Succession,
+    }
+}
+
+/// Each file a recording writes beside the status, and the status: its bytes, and on Unix the
+/// inode a write's rename would replace.
+fn written(root: &Root, name: &Name) -> Vec<(Vec<u8>, u64)> {
+    [
+        root.state(name),
+        root.frontier(name),
+        root.snapshot(name),
+        root.history(name),
+        root.baseline(name, 1),
+        root.face(name, "tsv"),
+    ]
+    .iter()
+    .map(|path| {
+        let bytes = std::fs::read(path).expect("written");
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(path).expect("there").ino()
+        };
+        #[cfg(not(unix))]
+        let inode = 0;
+        (bytes, inode)
+    })
+    .collect()
+}
+
+/// A pass that changes nothing writes nothing: the same projection again (later, so its
+/// snapshot's time differs), a pass that projected nothing at the recorded key, and the same
+/// refusal again each record [`Recorded::Settled`], with no durable write and no folder mode
+/// set on the thread, and every file the recording writes (status, frontier, snapshot,
+/// history, baseline, face) the same bytes at the same inode. A face removed is written again,
+/// which is a change; a folder whose mode another hand changed is set back once, and the pass
+/// is settled all the same.
+/// NEGATIVE CONTROLS, observed (puts, chmods): with `record` writing the status whatever it
+/// found (its settled rule never met), the same projection again makes one write,
+/// `` the same projection, later: no write and no mode set `` `` left: (7, 0) right: (6, 0) ``;
+/// with `put_new` writing whatever is there, it makes five (frontier, baseline, history, face
+/// and so the status), `` left: (11, 0) right: (6, 0) ``.
+#[test]
+fn a_pass_that_changes_nothing_writes_nothing() {
+    let scratch = scratch();
+    let accounts_name = name("ai/accounts");
+    let file = File::at(&scratch.root, &accounts_name);
+    let projected = |at_ms: u64| {
+        let mut snapshot = accounts(vec![ada()]);
+        snapshot.at_ms = at_ms;
+        Pass::Opened(Box::new(Opened {
+            newest: true,
+            frontier: frontier(0, &[1]),
+            key: frontier(0, &[1]).fingerprint(),
+            projection: Projection::Fresh(Box::new(Projected {
+                snapshot,
+                history: vec![aterm_json::from_str(r#"{"op":"put"}"#).expect("JSON")],
+                baseline: Some(b"{\"cells\":[]}\n".to_vec()),
+                withheld: 0,
+                inert: 0,
+            })),
+        }))
+    };
+    let counts = || (crate::file::test_puts(), crate::file::test_chmods());
+    assert_eq!(
+        file.record(file.look().expect("a look"), projected(1), 1)
+            .expect("records"),
+        Recorded::Recorded { replaced: true }
+    );
+    let live = written(&scratch.root, &accounts_name);
+    for (step, pass) in [
+        ("the same projection, later", projected(2)),
+        (
+            "nothing projected at its key",
+            opened(true, frontier(0, &[1]), None),
+        ),
+    ] {
+        let before = counts();
+        let recorded = file
+            .record(file.look().expect("a look"), pass, 2)
+            .expect("records");
+        assert_eq!(counts(), before, "{step}: no write and no mode set");
+        assert_eq!(recorded, Recorded::Settled, "{step}");
+        assert_eq!(written(&scratch.root, &accounts_name), live, "{step}");
+    }
+
+    // The same refusal twice: the first records its word, the second finds it.
+    let busy = || Pass::Refused {
+        word: Word::Held,
+        why: Why::Busy,
+    };
+    assert_eq!(
+        file.record(file.look().expect("a look"), busy(), 3)
+            .expect("records"),
+        Recorded::Recorded { replaced: false }
+    );
+    let held = written(&scratch.root, &accounts_name);
+    let before = counts();
+    assert_eq!(
+        file.record(file.look().expect("a look"), busy(), 4)
+            .expect("records"),
+        Recorded::Settled
+    );
+    assert_eq!(counts(), before);
+    assert_eq!(written(&scratch.root, &accounts_name), held);
+
+    // A face removed: the next pass writes it again, a change, and the one after writes
+    // nothing.
+    std::fs::remove_file(scratch.root.face(&accounts_name, "tsv")).expect("remove");
+    assert_eq!(
+        file.record(file.look().expect("a look"), busy(), 5)
+            .expect("records"),
+        Recorded::Recorded { replaced: false }
+    );
+    assert_eq!(file.face(), Face::Written);
+    let before = counts();
+    assert_eq!(
+        file.record(file.look().expect("a look"), busy(), 6)
+            .expect("records"),
+        Recorded::Settled
+    );
+    assert_eq!(counts(), before);
+
+    // A folder another hand opened up is made the owner's alone again, once.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch.root.state_dir(&accounts_name);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let (puts, chmods) = counts();
+        assert_eq!(
+            file.record(file.look().expect("a look"), busy(), 7)
+                .expect("records"),
+            Recorded::Settled
+        );
+        assert_eq!(counts(), (puts, chmods + 1));
+        assert_eq!(
+            std::fs::metadata(&dir).expect("there").permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            file.record(file.look().expect("a look"), busy(), 8)
+                .expect("records"),
+            Recorded::Settled
+        );
+        assert_eq!(counts(), (puts, chmods + 1));
+    }
 }
 
 #[test]
@@ -565,7 +780,7 @@ fn an_edited_face_is_left_alone_and_a_missing_one_is_written_again() {
     let accounts_name = name("ai/accounts");
     let file = File::at(&scratch.root, &accounts_name);
     file.record(
-        0,
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         1,
     )
@@ -575,7 +790,7 @@ fn an_edited_face_is_left_alone_and_a_missing_one_is_written_again() {
 
     std::fs::write(&face, "a person's bytes\n").expect("edit");
     assert_eq!(file.face(), Face::Edited);
-    let look = file.look();
+    let look = file.look().expect("a look");
     let grown = opened(
         true,
         frontier(0, &[1, 2]),
@@ -592,7 +807,7 @@ fn an_edited_face_is_left_alone_and_a_missing_one_is_written_again() {
     // Removed, the next pass writes it from the snapshot, even one that projected nothing.
     std::fs::remove_file(&face).expect("remove");
     assert_eq!(file.face(), Face::Missing);
-    let look = file.look();
+    let look = file.look().expect("a look");
     file.record(look, opened(true, frontier(0, &[1, 2]), None), 3)
         .expect("records");
     assert_eq!(file.face(), Face::Written);
@@ -611,7 +826,7 @@ fn a_snapshot_that_cannot_be_read_answers_as_none_with_the_problem() {
     let accounts_name = name("ai/accounts");
     let file = File::at(&scratch.root, &accounts_name);
     file.record(
-        0,
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         1,
     )
@@ -631,7 +846,7 @@ fn a_snapshot_that_cannot_be_read_answers_as_none_with_the_problem() {
         read.status.problem
     );
     // The next pass that opens writes it again.
-    let look = file.look();
+    let look = file.look().expect("a look");
     file.record(
         look,
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
@@ -683,13 +898,18 @@ fn the_read_verbs_answer_in_every_state() {
 
     let file = File::at(root, &name("ai/accounts"));
     let both = accounts(vec![ada(), ada_at_oai()]);
-    file.record(0, opened(true, frontier(0, &[1]), Some(both)), 1)
-        .expect("records");
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(0, &[1]), Some(both)),
+        1,
+    )
+    .expect("records");
     let held = Pass::Refused {
         word: Word::Held,
         why: Why::Succession,
     };
-    file.record(file.look(), held, 2).expect("records");
+    file.record(file.look().expect("a look"), held, 2)
+        .expect("records");
 
     let cat = answer(root, &["cat", "ai/accounts", "--published"]);
     assert_eq!(cat.code, exit::OK);
@@ -757,9 +977,10 @@ fn the_read_verbs_answer_in_every_state() {
 fn rows_joins_a_column_to_the_file_it_names() {
     let scratch = scratch();
     let root = &scratch.root;
-    File::at(root, &name("ai/accounts"))
+    let accounts_file = File::at(root, &name("ai/accounts"));
+    accounts_file
         .record(
-            0,
+            accounts_file.look().expect("a look"),
             opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
             1,
         )
@@ -781,8 +1002,13 @@ fn rows_joins_a_column_to_the_file_it_names() {
         ],
         ..accounts(Vec::new())
     };
-    File::at(root, &name("ai/links"))
-        .record(0, opened(true, frontier(0, &[1]), Some(links)), 1)
+    let links_file = File::at(root, &name("ai/links"));
+    links_file
+        .record(
+            links_file.look().expect("a look"),
+            opened(true, frontier(0, &[1]), Some(links)),
+            1,
+        )
         .expect("records");
 
     let joined = answer(root, &["rows", "ai/links", "--join", "account"]);
@@ -831,7 +1057,8 @@ fn watch_writes_a_line_for_each_recorded_change() {
                     why: Why::Busy,
                 },
             };
-            file.record(file.look(), pass, step).expect("records");
+            file.record(file.look().expect("a look"), pass, step)
+                .expect("records");
         },
     );
     assert_eq!(code, exit::OK);
@@ -854,14 +1081,18 @@ fn another_replicas_read_replaces_the_snapshot_outright() {
     let scratch = scratch();
     let file = File::at(&scratch.root, &name("ai/accounts"));
     let both = accounts(vec![ada(), ada_at_oai()]);
-    file.record(0, opened(true, frontier(2, &[1, 2, 3]), Some(both)), 1)
-        .expect("records");
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(2, &[1, 2, 3]), Some(both)),
+        1,
+    )
+    .expect("records");
 
     let elsewhere = Frontier {
         source: [8; 32],
         ..frontier(0, &[9])
     };
-    let look = file.look();
+    let look = file.look().expect("a look");
     assert_eq!(
         file.record(
             look,
@@ -878,15 +1109,35 @@ fn another_replicas_read_replaces_the_snapshot_outright() {
     assert_eq!(file.frontier(), Some(elsewhere));
 }
 
-/// What a recording writes, in order: the frontier, the snapshot, the history, the face, the
-/// status.
+/// What a recording that changes each of them writes, in order: the frontier, the snapshot,
+/// the history, the face, the status.
 const WRITES: u32 = 5;
+
+/// [`opened`]'s projection of `snapshot`, with a history of one operation for each record of
+/// `frontier`: a pass at a frontier that grew writes its history too, as the materializer's
+/// does.
+fn logged(newest: bool, frontier: Frontier, snapshot: Snapshot) -> Pass {
+    let history = frontier
+        .ids
+        .iter()
+        .map(|id| aterm_json::from_str(&format!(r#"{{"op":"{}"}}"#, id[0])).expect("JSON"))
+        .collect();
+    let mut pass = opened(newest, frontier, Some(snapshot));
+    if let Pass::Opened(open) = &mut pass
+        && let Projection::Fresh(fresh) = &mut open.projection
+    {
+        fresh.history = history;
+    }
+    pass
+}
 
 /// A pass killed before any one of its writes leaves files the next pass takes up: a read
 /// answers one pass's rows whole, the face a pass wrote is never taken for a person's edit, and
 /// a read of the replica older than the one cut short does not replace what it wrote. The rows
 /// a pass wrote before it was cut are never called `live` on the word of the pass before it,
-/// which matters most where the pass cut short read a fenced home.
+/// which matters most where the pass cut short read a fenced home. The pass that finishes what
+/// was cut writes only what did not land: a snapshot that did (two writes or more) is not
+/// written again.
 /// NEGATIVE CONTROLS: with the face judged by the status file's digest alone, the pass cut
 /// before its status leaves `` 4 writes landed … left: Edited right: Written ``; with the
 /// snapshot written before the frontier, a pass cut after one write has already replaced the
@@ -902,16 +1153,16 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
         let scratch = scratch();
         let file = File::at(&scratch.root, &accounts_name);
         file.record(
-            0,
-            opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
+            file.look().expect("a look"),
+            logged(true, frontier(0, &[1]), accounts(vec![ada()])),
             1,
         )
         .expect("records");
 
         cut::after(Some(landed));
         let cut_short = file.record(
-            file.look(),
-            opened(true, frontier(0, &[1, 2, 3]), Some(two())),
+            file.look().expect("a look"),
+            logged(true, frontier(0, &[1, 2, 3]), two()),
             2,
         );
         cut::after(None);
@@ -947,7 +1198,8 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
                 Some(accounts(vec![ada_at_oai()])),
             );
             assert_eq!(
-                file.record(file.look(), stale, 3).expect("records"),
+                file.record(file.look().expect("a look"), stale, 3)
+                    .expect("records"),
                 Recorded::Kept(Kept::Behind),
                 "{landed} writes landed"
             );
@@ -955,10 +1207,13 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
         }
 
         // The next pass over the same replica finishes what was cut.
-        let again = opened(true, frontier(0, &[1, 2, 3]), Some(two()));
+        let again = logged(true, frontier(0, &[1, 2, 3]), two());
         assert_eq!(
-            file.record(file.look(), again, 4).expect("records"),
-            Recorded::Recorded { replaced: true },
+            file.record(file.look().expect("a look"), again, 4)
+                .expect("records"),
+            Recorded::Recorded {
+                replaced: landed < 2
+            },
             "{landed} writes landed"
         );
         let read = file.read();
@@ -977,14 +1232,25 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
         let scratch = scratch();
         let file = File::at(&scratch.root, &accounts_name);
         cut::after(Some(landed));
-        let cut_short = file.record(0, opened(true, frontier(0, &[1]), Some(two())), 1);
+        let cut_short = file.record(
+            file.look().expect("a look"),
+            logged(true, frontier(0, &[1]), two()),
+            1,
+        );
         cut::after(None);
         assert!(cut_short.is_err());
         assert_ne!(file.face(), Face::Edited, "{landed} writes landed");
         assert_eq!(
-            file.record(0, opened(true, frontier(0, &[1]), Some(two())), 2)
-                .expect("records"),
-            Recorded::Recorded { replaced: true }
+            file.record(
+                file.look().expect("a look"),
+                logged(true, frontier(0, &[1]), two()),
+                2
+            )
+            .expect("records"),
+            Recorded::Recorded {
+                replaced: landed < 2
+            },
+            "{landed} writes landed"
         );
         assert_eq!(file.face(), Face::Written, "{landed} writes landed");
         assert_eq!(file.read().status.line(), "live · rev 1 · 2 rows");
@@ -996,15 +1262,15 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
         let scratch = scratch();
         let file = File::at(&scratch.root, &accounts_name);
         file.record(
-            0,
-            opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
+            file.look().expect("a look"),
+            logged(true, frontier(0, &[1]), accounts(vec![ada()])),
             1,
         )
         .expect("records");
-        let fenced = || opened(false, frontier(0, &[1, 2, 3]), Some(two()));
+        let fenced = || logged(false, frontier(0, &[1, 2, 3]), two());
 
         cut::after(Some(landed));
-        let cut_short = file.record(file.look(), fenced(), 2);
+        let cut_short = file.record(file.look().expect("a look"), fenced(), 2);
         cut::after(None);
         assert!(cut_short.is_err(), "{landed} writes landed");
         let read = file.read();
@@ -1027,8 +1293,11 @@ fn a_pass_cut_short_before_any_write_leaves_files_the_next_pass_takes_up() {
 
         // The fenced pass again records its own word.
         assert_eq!(
-            file.record(file.look(), fenced(), 3).expect("records"),
-            Recorded::Recorded { replaced: true },
+            file.record(file.look().expect("a look"), fenced(), 3)
+                .expect("records"),
+            Recorded::Recorded {
+                replaced: landed < 2
+            },
             "{landed} writes landed"
         );
         let read = file.read();
@@ -1056,11 +1325,16 @@ fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
     let file = File::at(&scratch.root, &accounts_name);
     let sidecar = scratch.root.frontier(&accounts_name);
     let both = || accounts(vec![ada(), ada_at_oai()]);
-    file.record(0, opened(true, frontier(1, &[1, 2]), Some(both())), 1)
-        .expect("records");
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(1, &[1, 2]), Some(both())),
+        1,
+    )
+    .expect("records");
 
     // The fenced original's read, an earlier home, with the successor's frontier removed and
-    // then damaged: behind either way.
+    // then damaged: behind either way. The second pass finds what the first recorded, and
+    // writes nothing.
     let garbage: &[u8] = b"aterm-file-frontier/0\n";
     for damage in [None, Some(garbage)] {
         match damage {
@@ -1070,9 +1344,18 @@ fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
         assert_eq!(file.frontier(), None);
         let older = opened(false, frontier(0, &[1, 2, 3]), Some(accounts(vec![ada()])));
         assert_eq!(
-            file.record(file.look(), older, 2).expect("records"),
-            Recorded::Kept(Kept::Behind),
+            file.record(file.look().expect("a look"), older, 2)
+                .expect("records"),
+            if damage.is_none() {
+                Recorded::Kept(Kept::Behind)
+            } else {
+                Recorded::Settled
+            },
             "{damage:?}"
+        );
+        assert_eq!(
+            file.state().and_then(|state| state.kept),
+            Some(Kept::Behind)
         );
         let read = file.read();
         assert_eq!(read.rows(), [ada(), ada_at_oai()], "{damage:?}");
@@ -1087,7 +1370,8 @@ fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
     // The newest home's read replaces it, and its frontier is here again.
     let newest = opened(true, frontier(1, &[1, 2, 3]), Some(accounts(vec![ada()])));
     assert_eq!(
-        file.record(file.look(), newest, 3).expect("records"),
+        file.record(file.look().expect("a look"), newest, 3)
+            .expect("records"),
         Recorded::Recorded { replaced: true }
     );
     let read = file.read();
@@ -1110,8 +1394,12 @@ fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
     let limit = usize::try_from(crate::snapshot::MAX_BYTES).expect("fits");
     let fits = (limit - frontier(1, &[1, 2, 3]).encode().len()) / 32;
     assert_eq!(
-        file.record(file.look(), opened(true, records(fits), Some(both())), 4)
-            .expect("records"),
+        file.record(
+            file.look().expect("a look"),
+            opened(true, records(fits), Some(both())),
+            4
+        )
+        .expect("records"),
         Recorded::Recorded { replaced: true }
     );
     assert_eq!(
@@ -1120,7 +1408,7 @@ fn a_fenced_homes_read_never_replaces_a_snapshot_whose_frontier_is_not_here() {
     );
     assert_eq!(
         file.record(
-            file.look(),
+            file.look().expect("a look"),
             opened(true, records(fits + 1), Some(accounts(vec![ada()]))),
             5
         )
@@ -1154,7 +1442,7 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     let file = File::at(&scratch.root, &accounts_name);
     let face = scratch.root.face(&accounts_name, "tsv");
     file.record(
-        0,
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         1,
     )
@@ -1166,7 +1454,7 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     let large = accounts(vec![row("ac-1111111111111111", &[("note", &wide)])]);
     assert_eq!(
         file.record(
-            file.look(),
+            file.look().expect("a look"),
             opened(true, frontier(0, &[1, 2]), Some(large)),
             2
         )
@@ -1185,7 +1473,7 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     let huge = accounts(vec![row("ac-1111111111111111", &[("note", &wider)])]);
     assert_eq!(
         file.record(
-            file.look(),
+            file.look().expect("a look"),
             opened(true, frontier(0, &[1, 2, 3]), Some(huge)),
             3
         )
@@ -1214,7 +1502,7 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     // The table small again: its snapshot is taken, and its face is written.
     assert_eq!(
         file.record(
-            file.look(),
+            file.look().expect("a look"),
             opened(
                 true,
                 frontier(0, &[1, 2, 3, 4]),
@@ -1227,6 +1515,120 @@ fn a_projection_too_large_to_read_is_not_taken_and_a_face_too_large_is_removed()
     );
     assert_eq!(file.read().status.line(), "live · rev 3 · 1 rows");
     assert_eq!(file.face(), Face::Written);
+}
+
+/// A pass that projected nothing is that read's only where the status records the snapshot at
+/// its key: there it is `live` and, finding what the files say, writes nothing; at any other
+/// key the snapshot is not the read's, so the word is `held` and the frontier stays the
+/// snapshot's. The status records the
+/// key and the digest of the history written with each snapshot.
+/// NEGATIVE CONTROL, observed: with `record` taking `Projection::Unchanged` as current whatever
+/// its key, the read at another key is called live:
+/// `` left: (Live, None) right: (Held, Some(Custody)) ``.
+#[test]
+fn a_pass_that_projected_nothing_is_live_only_at_the_recorded_key() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    let mut projected = opened(true, frontier(0, &[1]), Some(accounts(vec![ada()])));
+    if let Pass::Opened(open) = &mut projected
+        && let Projection::Fresh(fresh) = &mut open.projection
+    {
+        fresh.history = vec![aterm_json::from_str(r#"{"op":"put"}"#).expect("JSON")];
+    }
+    file.record(file.look().expect("a look"), projected, 1)
+        .expect("records");
+    let state = file.state().expect("a state");
+    let key = aterm_codec::hex::encode_lower(&frontier(0, &[1]).fingerprint());
+    assert_eq!(state.key.as_deref(), Some(key.as_str()));
+    assert_eq!(state.history, file.history_digest());
+    assert!(state.history.is_some());
+
+    assert_eq!(
+        file.record(
+            file.look().expect("a look"),
+            opened(true, frontier(0, &[1]), None),
+            2
+        )
+        .expect("records"),
+        Recorded::Settled
+    );
+    let read = file.read();
+    assert_eq!((read.status.word, read.status.why), (Word::Live, None));
+
+    let Pass::Opened(mut elsewhere) = opened(true, frontier(0, &[1, 2]), None) else {
+        unreachable!("an open")
+    };
+    elsewhere.key = [9; 32];
+    file.record(file.look().expect("a look"), Pass::Opened(elsewhere), 3)
+        .expect("records");
+    let read = file.read();
+    assert_eq!(
+        (read.status.word, read.status.why),
+        (Word::Held, Some(Why::Custody))
+    );
+    assert_eq!(file.frontier(), Some(frontier(0, &[1])));
+    assert_eq!(read.status.state.expect("a state").key, Some(key));
+}
+
+/// A projection too large to take records its key, and a pass at that key that projected
+/// nothing keeps the snapshot for the same reason, which is what the status says already, so it
+/// writes nothing; a refusal forgets the key, so a later read is projected again.
+/// NEGATIVE CONTROL, observed: with `record` not writing `kept_key`, the status does not name
+/// the key a later pass is kept at: `` left: None right: Some("c1e69c34…") ``.
+#[test]
+fn a_kept_too_large_key_holds_until_another_pass_records() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
+        1,
+    )
+    .expect("records");
+    let wider = "n".repeat(usize::try_from(crate::snapshot::MAX_BYTES / 2).expect("fits") + 1);
+    let huge = accounts(vec![row("ac-1111111111111111", &[("note", &wider)])]);
+    let kept = || {
+        let Pass::Opened(mut open) = opened(true, frontier(0, &[1, 2]), None) else {
+            unreachable!("an open")
+        };
+        open.projection = Projection::Kept(Kept::TooLarge);
+        Pass::Opened(open)
+    };
+    assert_eq!(
+        file.record(
+            file.look().expect("a look"),
+            opened(true, frontier(0, &[1, 2]), Some(huge)),
+            2
+        )
+        .expect("records"),
+        Recorded::Kept(Kept::TooLarge)
+    );
+    let key = aterm_codec::hex::encode_lower(&frontier(0, &[1, 2]).fingerprint());
+    assert_eq!(
+        file.state().expect("a state").kept_key.as_deref(),
+        Some(key.as_str())
+    );
+    assert_eq!(
+        file.record(file.look().expect("a look"), kept(), 3)
+            .expect("records"),
+        Recorded::Settled
+    );
+    assert_eq!(
+        file.state().and_then(|state| state.kept),
+        Some(Kept::TooLarge)
+    );
+    assert_eq!(
+        file.state().expect("a state").kept_key.as_deref(),
+        Some(key.as_str())
+    );
+    let busy = Pass::Refused {
+        word: Word::Held,
+        why: Why::Busy,
+    };
+    file.record(file.look().expect("a look"), busy, 4)
+        .expect("records");
+    assert_eq!(file.state().expect("a state").kept_key, None);
+    assert_eq!(file.read().status.rev(), 1);
 }
 
 /// `watch --timeout` takes any count of seconds: one past what the clock can add is no timeout,
@@ -1380,7 +1782,7 @@ fn a_write_is_queued_durably_and_read_back_over_the_snapshot() {
     assert!(file.published().snapshot.is_none());
 
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         20,
     )
@@ -1548,7 +1950,7 @@ fn an_intent_leaves_the_outbox_only_marked_or_held_and_a_held_one_is_shown_not_a
     let scratch = scratch();
     let file = File::at(&scratch.root, &name("ai/accounts"));
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         10,
     )
@@ -1584,7 +1986,7 @@ fn an_intent_leaves_the_outbox_only_marked_or_held_and_a_held_one_is_shown_not_a
     file.settle_done().expect("settled");
     assert!(!file.outbox().done[0].seen);
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1, 2]), Some(accounts(vec![ada()]))),
         40,
     )
@@ -1800,7 +2202,7 @@ fn a_value_the_guard_refuses_is_never_queued_nor_shown() {
 
     // A line another build wrote: a read shows the guard's mark, queued and then held.
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         10,
     )
@@ -1842,7 +2244,7 @@ fn a_held_intent_is_resolved_once_whatever_a_crash_between_its_two_writes_left()
     let scratch = scratch();
     let file = File::at(&scratch.root, &name("ai/accounts"));
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         10,
     )
@@ -1904,7 +2306,7 @@ fn a_marker_a_later_generation_restated_is_seen() {
     let scratch = scratch();
     let file = File::at(&scratch.root, &name("ai/accounts"));
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
         10,
     )
@@ -1929,7 +2331,7 @@ fn a_marker_a_later_generation_restated_is_seen() {
     assert!(dequeue(&file, &intent.id));
     // The same generation, without the operation: still laid over.
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, frontier(0, &[1, 2]), Some(accounts(vec![ada()]))),
         40,
     )
@@ -1943,7 +2345,7 @@ fn a_marker_a_later_generation_restated_is_seen() {
         ..frontier(0, &[9])
     };
     file.record(
-        file.look(),
+        file.look().expect("a look"),
         opened(true, rolled, Some(accounts(vec![ada()]))),
         50,
     )

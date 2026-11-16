@@ -22,7 +22,8 @@ const VERB: &str = "aterm file";
 /// The most bytes `set … --stdin` reads: more than any cell of a shared file holds.
 const STDIN_BYTES: u64 = 1024 * 1024;
 
-/// What `refresh` prints for one file: its name, the state the pass left, and what refused.
+/// What `refresh` prints for one file: its name, the state the pass left, what recording did
+/// (`nothing changed` where the pass found what the files already say), and what refused.
 fn line(outcome: &Outcome) -> String {
     let mut line = format!("{}: {}", outcome.name, outcome.word.as_str());
     if let Some(why) = outcome.why {
@@ -32,6 +33,10 @@ fn line(outcome: &Outcome) -> String {
         Some(Recorded::Recorded { replaced: true }) => line.push_str(" · snapshot written"),
         Some(Recorded::Recorded { replaced: false } | Recorded::Kept(_)) => {
             line.push_str(" · snapshot kept");
+        }
+        Some(Recorded::Settled) => line.push_str(" · nothing changed"),
+        Some(Recorded::Fenced) => {
+            line.push_str(" · nothing changed · fenced another pass's look");
         }
         Some(Recorded::Raced) => line.push_str(" · another pass recorded first"),
         None => {}
@@ -59,6 +64,8 @@ fn json(outcome: &Outcome) -> Value {
             Some(Recorded::Recorded { replaced: true }) => Some("written"),
             Some(Recorded::Recorded { replaced: false }) => Some("kept"),
             Some(Recorded::Kept(kept)) => Some(kept.as_str()),
+            Some(Recorded::Settled) => Some("settled"),
+            Some(Recorded::Fenced) => Some("fenced"),
             Some(Recorded::Raced) => Some("raced"),
             None => None,
         }),
@@ -141,7 +148,15 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         let Some(config) = aterm_types::dirs::aterm_config_path() else {
             return usage("no configuration folder");
         };
-        return match refresh(&paths, &config, &words[1..], &Pass::now(true)) {
+        return match refresh(
+            &paths,
+            &config,
+            &words[1..],
+            &Pass {
+                again: true,
+                ..Pass::now()
+            },
+        ) {
             Ok((text, code)) => aterm_uds::stdout::answer_exit(VERB, &text, code),
             Err(why) => usage(&why),
         };

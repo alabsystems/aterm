@@ -425,3 +425,72 @@ fn a_device_writes_no_secret_file_only_on_a_recent_report_of_the_release_that_st
     assert!(Version::own() < release);
     assert!(!own.writes_no_secret_file(&new, NOW));
 }
+
+/// The format fence's floor ([`FENCE`]) holds for every member heard within 7 days while no
+/// release reads format 2 ([`READS_FORMAT`] is `None`): a Mac on the release that shipped the
+/// fence, or any later one, cannot follow a format-2 node, so the first format-2 write would cut
+/// it off. A member unheard for 7 days through a watch that long passes, as [`CAPS`] does: with
+/// most seats silent, a floor that waited on each would never open, and a Mac that returns below
+/// it is fenced by its bound, not misled. Once a release is named, a member reporting it passes
+/// and one before it holds.
+/// NEGATIVE CONTROL: with [`READS_FORMAT`] the fence's own release, 0.205.0 (as first built),
+/// members reporting 0.205.0 and 9.0.0 passed [`FENCE`]: only the silent one held it
+/// (`left: [(.., Older(None))]`, `right` the three holds below).
+/// In the test: the same release under a floor that counts only members it heard ([`in_place`])
+/// holds for the unheard member, and before the watch is 7 days long the unheard member holds
+/// [`FENCE`] too.
+#[test]
+fn vault_fence_the_floor_lets_an_unheard_seat_pass() {
+    let (fenced, _) = member(1);
+    let (later, _) = member(2);
+    let (unheard, _) = member(3);
+    let (silent, _) = member(4);
+    assert!(FENCE.unheard_passes);
+    assert_eq!(FENCE.version, READS_FORMAT);
+    let shipped_fence = Version(0, 205, 0);
+    let mut ledger = Ledger::watched(TRUST, NOW - 2 * RECENT, NOW);
+    ledger.record(fenced.actor(), NOW - DAY_MS, Said::Version(shipped_fence));
+    ledger.record(later.actor(), NOW - DAY_MS, Said::Version(Version(9, 0, 0)));
+    ledger.record(silent.actor(), NOW - DAY_MS, Said::Nothing);
+    let members = [&fenced, &later, &unheard, &silent];
+    assert_eq!(
+        ledger.holding_below(members, NOW, FENCE),
+        vec![
+            (fenced.actor(), Hold::Older(Some(shipped_fence))),
+            (later.actor(), Hold::Older(Some(Version(9, 0, 0)))),
+            (silent.actor(), Hold::Older(None)),
+        ]
+    );
+    // Once a release reads format 2 (FL-148 names it), the floor is FENCE's shape at it.
+    let reads = Version(0, 210, 0);
+    let named = Floor {
+        version: Some(reads),
+        ..FENCE
+    };
+    ledger.record(later.actor(), NOW - DAY_MS, Said::Version(reads));
+    assert_eq!(
+        ledger.holding_below(members, NOW, named),
+        vec![
+            (fenced.actor(), Hold::Older(Some(shipped_fence))),
+            (silent.actor(), Hold::Older(None)),
+        ]
+    );
+    assert_eq!(
+        ledger.holding_below(members, NOW, in_place(Some(reads))),
+        vec![
+            (fenced.actor(), Hold::Older(Some(shipped_fence))),
+            (unheard.actor(), Hold::Unheard),
+            (silent.actor(), Hold::Older(None)),
+        ],
+        "control"
+    );
+    let young = Ledger::watched(TRUST, NOW - DAY_MS, NOW);
+    assert_eq!(
+        young.holding_below([&unheard], NOW, FENCE),
+        vec![(unheard.actor(), Hold::Unwatched)],
+        "control"
+    );
+    ledger.record(fenced.actor(), NOW, Said::Version(Version(0, 210, 1)));
+    ledger.record(silent.actor(), NOW, Said::Version(reads));
+    assert!(ledger.holding_below(members, NOW, named).is_empty());
+}

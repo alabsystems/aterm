@@ -798,12 +798,9 @@ pub(crate) fn parse_injected_identity(
     sid: Option<&str>,
     nonce_hex: Option<&str>,
 ) -> Option<(SessionId, LaunchNonce)> {
-    let sid = sid?;
-    if !is_valid_session_id(sid) {
-        return None;
-    }
+    let sid = SessionId::parse(sid?)?;
     let nonce = LaunchNonce::from_hex(nonce_hex?)?;
-    Some((SessionId::new(sid), nonce))
+    Some((sid, nonce))
 }
 
 fn adopt_injected_identity() -> Option<(SessionId, LaunchNonce)> {
@@ -977,10 +974,9 @@ pub(crate) fn install_parent_edges(
     write_hex: Option<&str>,
     signal_hex: Option<&str>,
 ) -> usize {
-    let Some(parent) = parent_sid.filter(|s| is_valid_session_id(s)) else {
+    let Some(src) = parent_sid.and_then(SessionId::parse) else {
         return 0;
     };
-    let src = SessionId::new(parent);
     let mut n = 0;
     for (hex, op) in [
         (read_hex, Op::ReadScreen),

@@ -296,6 +296,17 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
     }
     let f = &r.f;
     let row = match r.k {
+        // A row a `state` record wrote names the record (`hseq=`) where a screen's names the
+        // screen it was read from (`gen=`, `fp=`).
+        Kind::Agent if f.get_u(Key::Hseq).is_some() => (
+            "agent-change",
+            format!(
+                "{} rev={} hseq={}",
+                f.get_word(Key::Word).unwrap_or("unknown"),
+                text(f, Key::Rev),
+                text(f, Key::Hseq)
+            ),
+        ),
         Kind::Agent => (
             "agent-change",
             format!(

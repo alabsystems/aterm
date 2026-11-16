@@ -9,8 +9,8 @@ use crate::session_store::{SessionHandle, SessionState};
 
 fn ids() -> (SessionId, SessionId, LaunchNonce) {
     (
-        SessionId::new("s-a"),
-        SessionId::new("s-b"),
+        SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(0xc0_0001)),
+        SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(0xc0_0002)),
         LaunchNonce::from_bytes([7u8; 16]),
     )
 }
@@ -379,7 +379,7 @@ fn roles_computes_the_mark_predicate_per_scenario() {
     let r = roles([(&a, &ta)]);
     assert_eq!(r[&a], SessionRoles::default());
 
-    let x = SessionId::new("s-foreign");
+    let x = SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(0xc0_00ff));
     let mut tb = EdgeTable::new();
     let _ = tb.grant(x.clone(), b.clone(), Op::WriteInput, nonce);
     let r = roles([(&b, &tb)]);

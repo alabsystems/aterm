@@ -2467,6 +2467,7 @@ fn a_compose_rect_past_the_offscreen_is_refused() {
     };
     let encode = |copy_rect| {
         let seq = PresentSequence {
+            dock: None,
             offscreen: &offscreen,
             present_off: Some(&copy),
             copy_rect,
@@ -2782,4 +2783,469 @@ fn the_blit_places_the_frame_after_the_side_inset() {
             .0
             >= 40
     );
+}
+
+/// The product's virtual-present entry point carries the second source, not only its encoder.
+#[test]
+fn a_dock_reaches_the_virtual_present_and_fences_overlay_reuse() {
+    let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+    gpu.set_bloom(false);
+    gpu.set_shimmer(false);
+    let mut term = Terminal::new(6, 20);
+    term.process(b"\x1b[?25lwindow chrome beside this grid");
+    let input = term.cell_frame(6, 20);
+    let (fw, fh) = gpu.frame_size(6, 20);
+    let crop = super::PresentCrop {
+        source_y: 0,
+        height: fh as u32,
+    };
+    let snapshot = |gpu: &super::GpuRenderer, win: &WindowGpu| {
+        gpu.virtual_presented_snapshot_current(win, win.resident_input_epoch(), 1)
+            .expect("a resident destination")
+            .convert()
+            .expect("RGBA pixels")
+    };
+    let mut bare = WindowGpu::new();
+    assert!(gpu.present_virtual(&mut bare, &input, false, None, None));
+    let before = snapshot(&gpu, &bare);
+    #[cfg(target_os = "macos")]
+    let bare_passes = {
+        let before = crate::metal::encoder::render_census::opened();
+        assert!(gpu.present_virtual(&mut bare, &input, false, None, None));
+        let count = crate::metal::encoder::render_census::opened() - before;
+        assert!(count > 0, "positive control: the frame has a blit pass");
+        count
+    };
+    let width = 24;
+    let red = [220, 30, 40, 255].repeat(width * fh);
+    let blue = [20, 40, 230, 255].repeat(width * fh);
+    let quad = |rgba, serial| super::TrayQuad {
+        rgba,
+        pw: width as u32,
+        ph: fh as u32,
+        dx: 0,
+        dy: 0,
+        scrim: None,
+        serial,
+        delta: None,
+        above: &[],
+    };
+    let mut win = WindowGpu::new();
+    win.set_side_inset_px(width as u32);
+    win.set_dock_quad(Some(quad(&red, 71)), (0, 0));
+    let destination = ((fw + width) as u32, fh as u32);
+    assert!(gpu.present_virtual_cropped_with_effects_transport(
+        &mut win,
+        &input,
+        false,
+        None,
+        None,
+        crop,
+        0,
+        destination
+    ));
+    let shown = snapshot(&gpu, &win);
+    assert_eq!((shown.w, shown.h), destination);
+    for y in 0..fh {
+        let dock = &shown.rgba[(y * (fw + width)) * 4..(y * (fw + width) + width) * 4];
+        assert!(
+            dock.chunks_exact(4).all(|pixel| pixel[0] > pixel[2] * 2),
+            "a present that ignores the dock fails"
+        );
+        let pane = &shown.rgba[(y * (fw + width) + width) * 4..((y + 1) * (fw + width)) * 4];
+        assert!(
+            pane == &before.rgba[y * fw * 4..(y + 1) * fw * 4],
+            "the second source changes no frame pixel"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    let passes_before = crate::metal::encoder::render_census::opened();
+    let uploads = gpu.tray_uploads();
+    assert!(gpu.present_virtual_cropped_with_effects_transport(
+        &mut win,
+        &input,
+        false,
+        None,
+        None,
+        crop,
+        0,
+        destination
+    ));
+    assert_eq!(
+        gpu.tray_uploads(),
+        uploads,
+        "unchanged chrome uploads no bytes"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        crate::metal::encoder::render_census::opened() - passes_before,
+        bare_passes,
+        "an unchanged dock draws in the frame's existing blit pass"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(
+            gpu.present_overlay_virtual(&mut win, false, None, None, Some(crop), destination),
+            Ok(true)
+        );
+        assert_eq!(
+            snapshot(&gpu, &win).rgba,
+            shown.rgba,
+            "overlay-only presents keep the dock"
+        );
+        win.set_dock_quad(Some(quad(&red, 71)), (1, 0));
+        assert_eq!(
+            gpu.present_overlay_virtual(&mut win, false, None, None, Some(crop), destination),
+            Err(super::OverlayRefusal::ShapeChanged)
+        );
+    }
+    win.set_dock_quad(Some(quad(&blue, 72)), (0, 0));
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        gpu.present_overlay_virtual(&mut win, false, None, None, Some(crop), destination),
+        Err(super::OverlayRefusal::ShapeChanged)
+    );
+    assert!(gpu.present_virtual_cropped_with_effects_transport(
+        &mut win,
+        &input,
+        false,
+        None,
+        None,
+        crop,
+        0,
+        destination
+    ));
+    let changed = snapshot(&gpu, &win);
+    assert!(
+        changed.rgba[..4][2] > changed.rgba[..4][0] * 2,
+        "the changed serial paints its own source"
+    );
+    assert!(gpu.tray_uploads() > uploads);
+    win.set_dock_quad(None, (0, 0));
+    win.set_side_inset_px(0);
+    assert!(gpu.present_virtual(&mut win, &input, false, None, None));
+    assert!(
+        snapshot(&gpu, &win).rgba == before.rgba,
+        "removing the source restores the ordinary destination"
+    );
+}
+
+/// A dock fixture: a renderer, the frame of a small terminal beside a dock `width` px wide, the
+/// virtual destination that holds both, and a present of the frame into it.
+#[cfg(target_os = "macos")]
+fn dock_rig(
+    width: usize,
+) -> (
+    super::GpuRenderer,
+    RenderInput,
+    super::PresentCrop,
+    (usize, usize),
+    (u32, u32),
+) {
+    let mut gpu = super::gpu_renderer_for_test(None, 18.0, Theme::default());
+    gpu.set_bloom(false);
+    gpu.set_shimmer(false);
+    let mut term = Terminal::new(6, 20);
+    term.process(b"\x1b[?25lthe dock beside this grid");
+    let input = term.cell_frame(6, 20);
+    let (fw, fh) = gpu.frame_size(6, 20);
+    let crop = super::PresentCrop {
+        source_y: 0,
+        height: fh as u32,
+    };
+    (gpu, input, crop, (fw, fh), ((fw + width) as u32, fh as u32))
+}
+
+/// A dock card whose delta names the card the window holds patches that card's rows in place:
+/// the held copy keeps its buffer, and a renderer holding the base card uploads the band alone,
+/// comparing nothing. The patched rows reach the destination.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dock_delta_patches_the_held_card_and_uploads_its_rows_alone() {
+    let width = 24;
+    let (mut gpu, input, crop, (fw, fh), destination) = dock_rig(width);
+    let stride = width * 4;
+    let red = [220, 30, 40, 255].repeat(width * fh);
+    let rows = (2_u32, 5_u32);
+    let mut patched = red.clone();
+    for pixel in patched[rows.0 as usize * stride..rows.1 as usize * stride].chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[20, 40, 230, 255]);
+    }
+    let quad = |rgba, serial, delta| super::TrayQuad {
+        rgba,
+        pw: width as u32,
+        ph: fh as u32,
+        dx: 0,
+        dy: 0,
+        scrim: None,
+        serial,
+        delta,
+        above: &[],
+    };
+    let present = |gpu: &mut super::GpuRenderer, win: &mut WindowGpu| {
+        assert!(gpu.present_virtual_cropped_with_effects_transport(
+            win,
+            &input,
+            false,
+            None,
+            None,
+            crop,
+            0,
+            destination
+        ));
+    };
+    let mut win = WindowGpu::new();
+    win.set_side_inset_px(width as u32);
+    win.set_dock_quad(Some(quad(&red, 81, None)), (0, 0));
+    present(&mut gpu, &mut win);
+    let held = win
+        .dock_card
+        .as_ref()
+        .expect("a held dock card")
+        .rgba
+        .as_ptr();
+    win.set_dock_quad(
+        Some(quad(&patched, 82, Some(TrayDelta { since: 81, rows }))),
+        (0, 0),
+    );
+    let card = win.dock_card.as_ref().expect("a held dock card");
+    assert_eq!(
+        card.rgba.as_ptr(),
+        held,
+        "the held card is patched in place, not copied"
+    );
+    assert!(card.rgba == patched, "the patched card is the new card");
+    let compared = gpu.tray_compare_bytes();
+    present(&mut gpu, &mut win);
+    assert_eq!(
+        gpu.tray_compare_bytes(),
+        compared,
+        "a delta from the resident card compares nothing"
+    );
+    // The ring's second slot is minted whole by that first change; once both slots stand, a
+    // change uploads its rows and the rows the slot missed, here the same band.
+    let mut again = patched.clone();
+    for pixel in again[rows.0 as usize * stride..rows.1 as usize * stride].chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[30, 50, 240, 255]);
+    }
+    win.set_dock_quad(
+        Some(quad(&again, 83, Some(TrayDelta { since: 82, rows }))),
+        (0, 0),
+    );
+    assert_eq!(
+        win.dock_card
+            .as_ref()
+            .expect("a held dock card")
+            .rgba
+            .as_ptr(),
+        held,
+        "a second delta patches the same card"
+    );
+    let uploaded = gpu.tray_upload_bytes();
+    present(&mut gpu, &mut win);
+    assert_eq!(
+        gpu.tray_compare_bytes(),
+        compared,
+        "a second delta compares nothing"
+    );
+    assert_eq!(
+        gpu.tray_upload_bytes() - uploaded,
+        u64::from(rows.1 - rows.0) * stride as u64,
+        "and uploads its rows alone"
+    );
+    let shown = gpu
+        .virtual_presented_snapshot_current(&win, win.resident_input_epoch(), 1)
+        .expect("a resident destination")
+        .convert()
+        .expect("RGBA pixels");
+    for y in 0..fh {
+        let pixel = &shown.rgba[y * (fw + width) * 4..][..4];
+        assert_eq!(
+            u16::from(pixel[2]) > u16::from(pixel[0]) * 2,
+            (rows.0 as usize..rows.1 as usize).contains(&y),
+            "row {y} shows the patched card"
+        );
+    }
+}
+
+/// Hiding the dock releases what the renderer kept for it: the next present drops the resident
+/// dock card and its stage, as a tray card is dropped once no tray is drawn.
+#[cfg(target_os = "macos")]
+#[test]
+fn hiding_the_dock_releases_its_resident_card_and_stage() {
+    let width = 24;
+    let (mut gpu, input, crop, (_, fh), destination) = dock_rig(width);
+    let red = [220, 30, 40, 255].repeat(width * fh);
+    let mut win = WindowGpu::new();
+    win.set_side_inset_px(width as u32);
+    win.set_dock_quad(
+        Some(super::TrayQuad {
+            rgba: &red,
+            pw: width as u32,
+            ph: fh as u32,
+            dx: 0,
+            dy: 0,
+            scrim: None,
+            serial: 91,
+            delta: None,
+            above: &[],
+        }),
+        (0, 0),
+    );
+    assert!(gpu.present_virtual_cropped_with_effects_transport(
+        &mut win,
+        &input,
+        false,
+        None,
+        None,
+        crop,
+        0,
+        destination
+    ));
+    assert!(
+        win.metal_dock_card.is_some() && win.metal_dock_stage.is_some(),
+        "positive control: a shown dock keeps its card and stage resident"
+    );
+    win.set_dock_quad(None, (0, 0));
+    win.set_side_inset_px(0);
+    assert!(gpu.present_virtual(&mut win, &input, false, None, None));
+    assert!(
+        win.metal_dock_card.is_none(),
+        "the hidden dock's resident card is released"
+    );
+    assert!(
+        win.metal_dock_stage.is_none(),
+        "the hidden dock's stage is released"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_dock_stage_writer_is_repainted_without_reupload_or_an_idle_poll() {
+    use crate::metal::encoder::{CbProbe, RenderPassDesc, StoreAction};
+    use crate::metal::ffi::{ClearColor, LoadAction};
+    use crate::metal::loss::{CbOutcome, ERROR_OUT_OF_MEMORY, ERROR_TIMEOUT, STATUS_COMMITTED};
+    let mut gpu = super::gpu_renderer_for_test(None, 18.0, Theme::default());
+    gpu.set_bloom(false);
+    gpu.set_shimmer(false);
+    let mut term = Terminal::new(6, 20);
+    term.process(b"\x1b[?25lresident frame beside retryable chrome");
+    let input = term.cell_frame(6, 20);
+    let (fw, fh) = gpu.frame_size(6, 20);
+    let crop = super::PresentCrop {
+        source_y: 0,
+        height: fh as u32,
+    };
+    let width = 24;
+    let rgba = [220, 30, 40, 255].repeat(width * fh);
+    let destination = ((fw + width) as u32, fh as u32);
+    let present = |gpu: &mut super::GpuRenderer, win: &mut WindowGpu| {
+        assert!(gpu.present_virtual_cropped_with_effects_transport(
+            win,
+            &input,
+            false,
+            None,
+            None,
+            crop,
+            0,
+            destination
+        ));
+        gpu.virtual_presented_snapshot_current(win, win.resident_input_epoch(), 1)
+            .unwrap()
+            .convert()
+            .unwrap()
+            .rgba
+    };
+    for outcome in [
+        CbOutcome::Completed,
+        CbOutcome::Unfinished {
+            status: STATUS_COMMITTED,
+        },
+        CbOutcome::Retryable {
+            code: ERROR_TIMEOUT,
+            name: "injected timeout",
+        },
+        CbOutcome::Retryable {
+            code: ERROR_OUT_OF_MEMORY,
+            name: "injected out of memory",
+        },
+    ] {
+        let mut win = WindowGpu::new();
+        win.set_side_inset_px(width as u32);
+        win.set_dock_quad(
+            Some(super::TrayQuad {
+                rgba: &rgba,
+                pw: width as u32,
+                ph: fh as u32,
+                dx: 0,
+                dy: 0,
+                scrim: None,
+                serial: 71,
+                delta: None,
+                above: &[],
+            }),
+            (0, 0),
+        );
+        let expected = present(&mut gpu, &mut win);
+        assert!(
+            expected[0] > expected[2] * 2,
+            "positive control: the dock really painted red"
+        );
+        let before = crate::metal::encoder::render_census::opened();
+        assert!(present(&mut gpu, &mut win) == expected);
+        let healthy_passes = crate::metal::encoder::render_census::opened() - before;
+        assert!(healthy_passes > 0);
+        let failed = matches!(outcome, CbOutcome::Retryable { .. });
+        let stage = win.metal_dock_stage.as_mut().unwrap();
+        let live = gpu.metal_arm.as_mut().unwrap().live_mut();
+        let mut cb = live.session.begin().unwrap();
+        if failed {
+            // Emulate the incomplete stage a failed writer can leave: keep its claimed serial,
+            // but replace its pixels with black through an actual GPU render pass.
+            let _pass = cb
+                .render_pass(&RenderPassDesc {
+                    target: &stage.target,
+                    load: LoadAction::Clear(ClearColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: StoreAction::Store,
+                    viewport: None,
+                    scissor: None,
+                })
+                .unwrap();
+        }
+        let submitted = cb.commit();
+        assert_eq!(submitted.wait_outcome(), CbOutcome::Completed);
+        let mut probe = CbProbe::of(&submitted);
+        probe.override_outcome_for_test(outcome);
+        stage.pending_writer = Some(probe);
+        let uploads = gpu.tray_uploads();
+        let before = crate::metal::encoder::render_census::opened();
+        let actual = present(&mut gpu, &mut win);
+        let passes = crate::metal::encoder::render_census::opened() - before;
+        assert!(
+            actual == expected,
+            "a retryable writer cannot leave stale dock pixels: {outcome:?}"
+        );
+        assert_eq!(
+            gpu.tray_uploads(),
+            uploads,
+            "the resident card needs no input upload"
+        );
+        assert_eq!(
+            passes,
+            healthy_passes + u64::from(failed),
+            "only a failed writer owes a restorative Tray pass: {outcome:?}"
+        );
+        let before = crate::metal::encoder::render_census::opened();
+        assert!(present(&mut gpu, &mut win) == expected);
+        assert_eq!(
+            crate::metal::encoder::render_census::opened() - before,
+            healthy_passes,
+            "the repair leaves no continuing work"
+        );
+    }
 }

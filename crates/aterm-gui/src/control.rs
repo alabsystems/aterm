@@ -181,6 +181,8 @@ pub(crate) type ActiveHandle = Arc<Mutex<Option<ActiveSession>>>;
 /// One coherent `dims` observation assembled on the main thread.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DimsSnapshot {
+    pub(crate) dock: Option<u64>,
+    pub(crate) dock_cells: u16,
     /// The session whose grid `rows`x`cols` is; `None` for a window's own grid (no terminal in
     /// front: [`crate::App::window_dims_snapshot`]).
     pub(crate) session: Option<u64>,
@@ -2880,6 +2882,10 @@ impl Drop for ControlPreparationGuard {
 }
 
 impl control_lanes::LaneService for ControlWorkerContext {
+    fn request(&self, line: String, scope: Scope) -> Request {
+        Request::spelled(line, &self.store, scope)
+    }
+
     fn owed_input_reply(&self, request: &Request) -> Option<FinalReply> {
         owed_input_reply(&self.store, request)
     }
@@ -2933,6 +2939,10 @@ impl control_lanes::LaneService for ControlWorkerContext {
             return false;
         }
         if let Some(refusal) = empty_selector_refusal(request) {
+            out.extend_from_slice(refusal.as_bytes());
+            return false;
+        }
+        if let Some(refusal) = &request.refusal {
             out.extend_from_slice(refusal.as_bytes());
             return false;
         }
@@ -3270,8 +3280,30 @@ pub(crate) fn hosts_or_keeps(sid: &SessionId) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get() else {
         return false;
     };
-    let store = context.store.read().unwrap_or_else(|p| p.into_inner());
-    store.by_sid(sid).is_some() || store.table().holds(sid)
+    hosts_or_keeps_in(&context.store, sid)
+}
+
+#[cfg(unix)]
+fn hosts_or_keeps_in(store: &Store, sid: &SessionId) -> bool {
+    let store = store.read().unwrap_or_else(|p| p.into_inner());
+    if store.by_sid(sid).is_some() {
+        return true;
+    }
+    let table = store.table();
+    drop(store);
+    table.holds(sid)
+}
+
+/// Whether the machine's session table keeps an ended row for `sid` (the fleet drive gate's
+/// `ended`, [`drive_admission`]). The lookup may stat or read the row's file on the state
+/// volume, so it runs on the table alone: the store's read guard is let go first, and the
+/// window's store writer never waits on that disk.
+#[cfg(any(unix, test))]
+fn keeps_ended_row(store: &Store, sid: &SessionId) -> bool {
+    let guard = store.read().unwrap_or_else(|p| p.into_inner());
+    let table = guard.table();
+    drop(guard);
+    table.holds(sid)
 }
 
 /// [`crate::fabric::lift_ungranted_remote_holds`] over this instance's sessions: how many it lifted.
@@ -4097,6 +4129,9 @@ struct Request {
     spans: control_request::Spans,
     form: Option<Resolved>,
     body: usize,
+    /// The refusal of a leading `@<prefix>` two or more tabs' IDs begin ([`Request::spelled`]),
+    /// answered before anything else reads the line.
+    refusal: Option<String>,
 }
 
 impl Request {
@@ -4110,6 +4145,22 @@ impl Request {
             spans,
             form,
             body,
+            refusal: None,
+        }
+    }
+
+    /// The request `line` is from a connection of `scope`: a leading `@<prefix>` of a tab ID
+    /// ([`aterm_types::tab_id::is_prefix`]) that exactly one of this instance's tabs begins, live
+    /// or ended, is spelled as that tab's whole ID, so every reader after this one (the drive
+    /// gate, the verb, its records and replies) sees the tab's own ID and judges it as it would
+    /// the whole ID typed. One two or more begin is refused naming each. Only a scope that may
+    /// list the tabs reads a prefix ([`names_by_prefix`]): for any other the line stays as typed,
+    /// so its answers never tell it which IDs exist.
+    fn spelled(line: String, store: &Store, scope: Scope) -> Self {
+        let (line, refusal) = whole_tab_selector(line, store, scope);
+        Self {
+            refusal,
+            ..Self::parse(line)
         }
     }
 
@@ -4140,6 +4191,65 @@ impl Request {
         match self.form?.row.body {
             Body::PostLen => post_frame_len(self.head().rest),
             Body::None | Body::Counted { .. } => None,
+        }
+    }
+}
+
+/// Whether a connection of `scope` names a tab by a prefix of its ID: one that may already list
+/// this Mac's tabs (the owner's, the bridge's, and a fleet drive's, which `survey --host` shows
+/// them to). An edge names only whole IDs.
+const fn names_by_prefix(scope: Scope) -> bool {
+    match scope {
+        Scope::Owner => true,
+        #[cfg(any(unix, test))]
+        Scope::Bridge => true,
+        Scope::Edge(_) => false,
+        #[cfg(any(unix, test))]
+        Scope::Fleet { drive, .. } => drive,
+    }
+}
+
+/// `line` with its leading `@<prefix>` spelled as the whole ID of the one tab that begins it
+/// ([`Request::spelled`]), with the refusal of a prefix two or more begin; any other line as it
+/// came.
+fn whole_tab_selector(line: String, store: &Store, scope: Scope) -> (String, Option<String>) {
+    if !names_by_prefix(scope) {
+        return (line, None);
+    }
+    let Some(span) = control_request::Spans::of(&line).selector else {
+        return (line, None);
+    };
+    let prefix = &line[span.clone()];
+    if !aterm_types::tab_id::is_prefix(prefix)
+        || !matches!(Selector::parse(prefix), Selector::Invalid(_))
+    {
+        return (line, None);
+    }
+    let mut begun = {
+        let guard = store.read().unwrap_or_else(|p| p.into_inner());
+        let mut begun = guard.sids_beginning(prefix);
+        begun.extend(guard.table().sids_beginning(prefix));
+        begun
+    };
+    begun.sort_unstable();
+    begun.dedup();
+    match begun.as_slice() {
+        [] => (line, None),
+        [whole] => {
+            let mut spelled = String::with_capacity(line.len() + whole.len());
+            spelled.push_str(&line[..span.start]);
+            spelled.push_str(whole);
+            spelled.push_str(&line[span.end..]);
+            (spelled, None)
+        }
+        all => {
+            let mut refusal = format!("ERR ambiguous tab ID @{prefix}: it begins");
+            for sid in all {
+                refusal.push_str(" @");
+                refusal.push_str(sid);
+            }
+            refusal.push('\n');
+            (line, Some(refusal))
         }
     }
 }
@@ -4362,7 +4472,7 @@ fn cmd_fabric_retire(words: &[&str], store: &Store) -> String {
     }
     let mut g = store.write().unwrap_or_else(|p| p.into_inner());
     for sid in words {
-        if g.by_sid(&SessionId::new((*sid).to_string())).is_some() {
+        if SessionId::parse(sid).is_some_and(|sid| g.by_sid(&sid).is_some()) {
             return format!("ERR hosted {sid}\n");
         }
     }
@@ -5630,7 +5740,7 @@ fn resolve(store: &Store, selector: &Selector<'_>) -> Resolution {
         .map(|h| (h.term.clone(), h.master, h.local_id, h.ctx.clone()));
     match (&found, selector) {
         (None, Selector::Sid(id)) => {
-            crate::spare::control_refusal(Some(&SessionId::new(id.as_str())), None);
+            crate::spare::control_refusal(SessionId::parse(id.as_str()).as_ref(), None);
         }
         (None, Selector::Local(id)) => crate::spare::control_refusal(None, Some(*id)),
         (Some((_, _, _, ctx)), _) => crate::spare::note_control(&ctx.witness),
@@ -5726,7 +5836,9 @@ fn closed_session_reply_with(
         let index = guard.closed_logs();
         match selector {
             Some(Selector::Local(id)) => index.by_local(*id),
-            Some(Selector::Sid(sid)) => index.by_sid(&SessionId::new(sid.as_str())),
+            Some(Selector::Sid(sid)) => {
+                SessionId::parse(sid.as_str()).and_then(|sid| index.by_sid(&sid))
+            }
             None | Some(Selector::SelfTok | Selector::Invalid(_)) => None,
         }
         .map(crate::session_log::ClosedLog::read)
@@ -5824,13 +5936,16 @@ fn ended_record(
     let (table, may_edge) = {
         let guard = store.read().unwrap_or_else(|p| p.into_inner());
         let table = guard.table();
+        drop(guard);
         let head = match selector {
-            Selector::Sid(sid) => table.head(&SessionId::new(sid.as_str())),
+            Selector::Sid(sid) => SessionId::parse(sid.as_str()).and_then(|sid| table.head(&sid)),
             Selector::Local(id) => table.by_local(*id),
             Selector::SelfTok | Selector::Invalid(_) => None,
         }?;
         let may = match scope {
-            Scope::Edge(presented) => guard
+            Scope::Edge(presented) => store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
                 .closed_logs()
                 .by_sid(&head.sid)
                 .is_some_and(|log| log.read().edge_may_read(&presented)),
@@ -7030,7 +7145,7 @@ fn serve_preresolved(
             let _ = out.finish_waiting(stream, &mut reader);
             return ServeDisposition::Close;
         };
-        let request = Request::parse(line);
+        let request = Request::spelled(line, store, scope);
         let _final_reply = FINAL_REPLIES
             .enter(&request.head())
             .or_else(|| owed_input_reply(store, &request));
@@ -7235,6 +7350,23 @@ pub(crate) fn fleet_access_now() -> FleetAccess {
     fleet_access_stated().0
 }
 
+/// The state home this window reads its fleet access from ([`fleet_access_stated`],
+/// [`fleet_access_basis`]), stores the lock's change under ([`store_fleet_access`]) and hears a
+/// change of ([`fleet_access_changed`]): aterm's state root (`aterm_types::dirs::state_dir`).
+#[cfg(unix)]
+fn fleet_access_home() -> Option<std::path::PathBuf> {
+    aterm_types::dirs::state_dir()
+}
+
+/// The notification the status item hears once the level stored under [`fleet_access_home`]
+/// changed (`aterm_agent::fleet_access::changed`): the one `aterm fleet access`, a join, a leave
+/// and another window's lock post for that home, and no other home's. `None` where no state
+/// folder is named.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+pub(crate) fn fleet_access_changed() -> Option<std::ffi::CString> {
+    fleet_access_home().map(|home| aterm_agent::fleet_access::changed(&home))
+}
+
 /// [`fleet_access_now`], with how long ago that level was stated where the file says when
 /// (whole seconds, so never more than it was): a drop that has rested lifts the remote holds
 /// (`crate::fleet_listen::observe_access`).
@@ -7245,7 +7377,7 @@ pub(crate) fn fleet_access_stated() -> (FleetAccess, Option<std::time::Duration>
     }
     #[cfg(unix)]
     {
-        aterm_types::dirs::state_dir().map_or((FleetAccess::ReadOnly, None), |state| {
+        fleet_access_home().map_or((FleetAccess::ReadOnly, None), |state| {
             let reading = aterm_agent::fleet_access::read(&state);
             let age = reading
                 .at
@@ -7271,7 +7403,7 @@ pub(crate) fn fleet_access_basis() -> aterm_agent::fleet_access::Basis {
     }
     #[cfg(all(unix, not(test)))]
     {
-        aterm_types::dirs::state_dir()
+        fleet_access_home()
             .map(|state| aterm_agent::fleet_access::basis(&state))
             .unwrap_or_default()
     }
@@ -7285,16 +7417,17 @@ pub(crate) fn fleet_access_basis() -> aterm_agent::fleet_access::Basis {
 /// which a join, an init or a leave holds while it writes: the main thread's wait, so a short
 /// one. A level that does not get it is not stored, and the lock shows the level in force
 /// again; Read Only waits for no lock.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 const RAISE_WITHIN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Store `level` as this machine's fleet access, the menu-bar lock's change, and tell every
-/// running window (`announce`): `Ok(true)` once it is stored as the listeners read it. A raise
-/// is asked `over` the state its click or pick read (`aterm_agent::fleet_access::raise_over`)
-/// and answers `Ok(false)`, nothing written, where that state stands no more: the level was
-/// stated again elsewhere, or this machine left or changed its fleet. A lower (`over` is
-/// `None`) is written whatever stands (`aterm_agent::fleet_access::set_within`). A test stores
-/// the level as its thread's, under the same rule, and posts nothing.
+/// running window of the same state home (`announce`): `Ok(true)` once it is stored as the
+/// listeners read it. A raise is asked `over` the state its click or pick read
+/// (`aterm_agent::fleet_access::raise_over`) and answers `Ok(false)`, nothing written, where
+/// that state stands no more: the level was stated again elsewhere, or this machine left or
+/// changed its fleet. A lower (`over` is `None`) is written whatever stands
+/// (`aterm_agent::fleet_access::set_within`). A test stores the level as its thread's, under
+/// the same rule, and posts nothing.
 ///
 /// # Errors
 /// No state folder is named, the book's lock was not taken for a level above Read Only, or the
@@ -7315,19 +7448,33 @@ pub(crate) fn store_fleet_access(
     }
     #[cfg(not(test))]
     {
-        use aterm_agent::fleet_access::{By, announce, raise_over, set_within};
-        let state =
-            aterm_types::dirs::state_dir().ok_or_else(|| "no state folder is named".to_string())?;
-        let stored = match over {
-            Some(over) => raise_over(&state, level, By::Menu, &over, RAISE_WITHIN),
-            None => set_within(&state, level, By::Menu, Some(RAISE_WITHIN)).map(Some),
-        }
-        .map_err(|e| e.to_string())?;
-        if stored.is_some() {
-            announce();
-        }
-        Ok(stored.is_some())
+        let state = fleet_access_home().ok_or_else(|| "no state folder is named".to_string())?;
+        store_fleet_access_under(&state, level, over)
     }
+}
+
+/// [`store_fleet_access`]'s write of `level` under the state home `state`, and its post for that
+/// home once stored (`aterm_agent::fleet_access::announce`): the window's store, and a test's of
+/// a scratch home, whose post no window of another home hears.
+///
+/// # Errors
+/// As [`store_fleet_access`]'s, but for no state folder named.
+#[cfg(target_os = "macos")]
+fn store_fleet_access_under(
+    state: &std::path::Path,
+    level: FleetAccess,
+    over: Option<aterm_agent::fleet_access::Basis>,
+) -> Result<bool, String> {
+    use aterm_agent::fleet_access::{By, announce, raise_over, set_within};
+    let stored = match over {
+        Some(over) => raise_over(state, level, By::Menu, &over, RAISE_WITHIN),
+        None => set_within(state, level, By::Menu, Some(RAISE_WITHIN)).map(Some),
+    }
+    .map_err(|e| e.to_string())?;
+    if stored.is_some() {
+        announce(state);
+    }
+    Ok(stored.is_some())
 }
 
 #[cfg(test)]
@@ -7477,13 +7624,7 @@ fn drive_admission(
         };
         let spawned = |sid: &SessionId| drive_may_close(store, sid, &driver.node);
         let shell = |sid: &SessionId| drive_owns_shell(store, sid, &driver.node);
-        let ended = |sid: &SessionId| {
-            store
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .table()
-                .holds(sid)
-        };
+        let ended = |sid: &SessionId| keeps_ended_row(store, sid);
         // A line the gate passes was admitted by the lock and is served: its row. One the gate
         // refuses in its own words (no such session, a close of a tab that is not the driver's)
         // was decided by no lock and does nothing here: it has none.
@@ -7714,16 +7855,10 @@ fn drive_gate(
     } = head;
     // The selector as the line spells it, which a refusal of it names.
     let selected = line.split_whitespace().next().unwrap_or_default();
-    let hosted = |sid: &str| {
-        let sid = SessionId::new(sid);
-        (names_tab(sid.as_str()) && hosts(&sid)).then_some(sid)
-    };
+    let hosted = |sid: &str| SessionId::parse(sid).filter(|sid| hosts(sid));
     // An ended session keeps a row ([`crate::session_table`]) its manager's reads answer from, a
     // manager on another Mac's too.
-    let kept = |sid: &str| {
-        let sid = SessionId::new(sid);
-        names_tab(sid.as_str()) && ended(&sid)
-    };
+    let kept = |sid: &str| SessionId::parse(sid).is_some_and(|sid| ended(&sid));
     // The hosted session the line's selector names, or why it names none.
     let session = || match selector {
         Some(Selector::Sid(sid)) => match hosted(sid.as_str()) {
@@ -7881,7 +8016,7 @@ fn drive_gate(
 }
 
 /// The sessions a drive's `line` names, in its order, once each: its `@<sid>` selector, a
-/// `hold <sid>`'s sid, or each target of `await task @a,@b,…`. Only tab IDs ([`names_tab`]), the only ones
+/// `hold <sid>`'s sid, or each target of `await task @a,@b,…`. Only tab IDs ([`SessionId::parse`]), the only ones
 /// [`drive_gate`] serves; a `spawn`'s `from=` is the driver's own session, on its own Mac, and
 /// names none here. Node serve hands the line to the window that hosts or keeps every one
 /// (`node_serve::route_drive`).
@@ -7911,9 +8046,8 @@ pub(crate) fn drive_line_sessions(line: &str) -> Vec<SessionId> {
         },
     };
     let mut sids: Vec<SessionId> = Vec::new();
-    for sid in named {
-        let sid = SessionId::new(sid);
-        if names_tab(sid.as_str()) && !sids.contains(&sid) {
+    for sid in named.iter().filter_map(|sid| SessionId::parse(sid)) {
+        if !sids.contains(&sid) {
             sids.push(sid);
         }
     }
@@ -8235,7 +8369,7 @@ fn drive_spawn(
                     token,
                 ));
             }
-            "from" if hosts(&SessionId::new(value)) => {
+            "from" if SessionId::parse(value).is_some_and(|sid| hosts(&sid)) => {
                 return Err(drive_refused(
                     "a drive's from= is its own session, never one of the driven Mac's",
                     token,
@@ -8450,7 +8584,8 @@ fn record_drive_worker(store: &Store, sid: &SessionId, node: &str) {
             let hosted = entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| hosts.by_sid(&SessionId::new(name)).is_some());
+                .and_then(SessionId::parse)
+                .is_some_and(|sid| hosts.by_sid(&sid).is_some());
             let expired = !hosted
                 && entry
                     .metadata()
@@ -8480,7 +8615,9 @@ fn drive_read_still_owned(act: &DriveAct, store: &Store) -> bool {
 pub(crate) fn record_driven_shell(store: &Store, sid: &str, node: &str) -> bool {
     #[cfg(any(unix, test))]
     {
-        let sid = SessionId::new(sid);
+        let Some(sid) = SessionId::parse(sid) else {
+            return false;
+        };
         if !shell_untouched(store, &sid) {
             return false;
         }
@@ -8614,11 +8751,7 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
     };
     let sid = match act.kind {
         DriveKind::Spawn => {
-            let worker = reply
-                .split_whitespace()
-                .nth(1)
-                .filter(|sid| names_tab(sid))
-                .map(SessionId::new);
+            let worker = reply.split_whitespace().nth(1).and_then(SessionId::parse);
             if let Some(worker) = &worker
                 && !act.shell
             {
@@ -8729,6 +8862,11 @@ fn serve_request_line(
     // Before drive attribution, forwarding, subscribe, askpass, frames or dispatch:
     // no ID or history/since anchor can escape while an old journal is offerable.
     if let Some(refusal) = recovery_count_refusal(recovery_count_admission) {
+        out.extend_from_slice(refusal.as_bytes());
+        return Some(ServeDisposition::Close);
+    }
+    // An ambiguous tab ID prefix ([`Request::spelled`]) names no session for anything to act on.
+    if let Some(refusal) = &request.refusal {
         out.extend_from_slice(refusal.as_bytes());
         return Some(ServeDisposition::Close);
     }
@@ -8858,8 +8996,7 @@ fn serve_request_line(
         && head.selector.is_none()
         && crate::parked_awaits::is_elsewhere(head.rest)
     {
-        let reply =
-            crate::parked_awaits::elsewhere(head.rest, aterm_control::hangup::caller_hung_up);
+        let reply = crate::parked_awaits::elsewhere(head.rest);
         out.push_owned(reply.into_bytes());
         return Some(ServeDisposition::Close);
     }
@@ -10311,7 +10448,7 @@ fn ambiguous_sid_refusal(sel: &Selector<'_>) -> Option<String> {
     let Selector::Sid(sid) = sel else {
         return None;
     };
-    let pid = crate::identity_claim::live_holder(&SessionId::new(sid.as_str()))?;
+    let pid = crate::identity_claim::live_holder(&SessionId::parse(sid.as_str())?)?;
     Some(format!(
         "ERR ambiguous session id {} also served by pid {pid}; use aterm ctl --pid {pid}\n",
         sid.as_str()
@@ -11576,7 +11713,7 @@ fn serve_session_verb(
             control_session::cmd_await_momentum(term, store, session, ctx, rest, &read)
         }
         "await" if rest.split_whitespace().next() == Some("edit") => {
-            crate::control_edit::await_edit(proxy, scope, rest)
+            crate::control_edit::await_edit(&mut control_media::MainPost::new(proxy), scope, rest)
         }
         "await" if rest.split_whitespace().next() == Some("wake") => {
             crate::occupancy_wakes::cmd_await_wake(store, session, rest)
@@ -12154,6 +12291,10 @@ mod ended_row_tests;
 #[cfg(test)]
 #[path = "fleet_access_model_tests.rs"]
 mod fleet_access_model_tests;
+
+#[cfg(all(test, unix))]
+#[path = "control_fleet_access_notify_tests.rs"]
+mod control_fleet_access_notify_tests;
 
 #[cfg(test)]
 #[path = "control_native_observe_tests.rs"]

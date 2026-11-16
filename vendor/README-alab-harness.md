@@ -21,7 +21,7 @@ reaches: a plain copy keeps public clones and hermetic releases complete.
 
 | crate | how |
 |---|---|
-| `alab-policy` | the one copy of the turn-end deciders: needs, credentials, Land's check, the go-ahead, Cruise's carry, the press guard, approval classification, the ladder, the words each act types, the screen-reader vocabulary and the policy keys and timings. The root `[workspace.dependencies]` points `alab-policy` at `vendor/alab-harness/crates/alab-policy`; aterm, aterm-agent, aterm-gui, aterm-lab, aterm-phase, aterm-slog and aterm-types inherit it. `verify vendor-out` relays this copy to claude-code-alab. aterm-agent still runs its own sleeps, git-config and shell-startup readers; switching them onto alab-policy's is HX-21c. |
+| `alab-policy` | the one source of the turn-end deciders: needs, credentials, Land's check, the go-ahead, Cruise's carry, the press guard, approval classification, the ladder, the words each act types, the screen-reader vocabulary and the policy keys and timings. The root `[workspace.dependencies]` points `alab-policy` at `vendor/alab-harness/crates/alab-policy`; aterm, aterm-agent, aterm-gui, aterm-lab, aterm-phase, aterm-slog and aterm-types inherit it. claude-code-alab carries an independent whole canonical pin for policy and wire. aterm-agent still runs its own sleeps, git-config and shell-startup readers; switching them onto alab-policy's is HX-21c. |
 | `alab-wire` | carried with the tag, linked by nothing here (HX-15b1 links it). |
 
 ## The rule: change it in alab-harness, tag, repin
@@ -38,9 +38,18 @@ targo update -p alab-policy          # when the tag's version moved
 targo --unverified forge check
 ```
 
-`-f` because the copy is whole even where an ignore rule names a path. After a repin lands, run
-`targo --unverified verify vendor-out --into <claude-code-alab checkout>` and land the copy there
-(AGENTS.md).
+`-f` because the copy is whole even where an ignore rule names a path. Each receiving harness
+chooses its own qualified canonical tag; its pin need not equal aterm's.
+
+`verify vendor-out --into <claude-code-alab checkout>` projects only `aterm-phase` and
+`aterm-agent-names`, with `vendor/VENDORED` sealing those projections. The receiving checkout
+must first carry and stage its own whole canonical copy and pin, written by `tools/pin`.
+Vendor-out checks that target pin independently before checking or writing projections, leaves
+both canonical artifacts untouched, and makes phase depend on
+`../alab-harness/crates/alab-policy`. No seal or new output may claim canonical paths; all
+other unowned vendor files still refuse the write. Old flattened policy files are removed
+only where the prior valid sealed list owns them. After a phase or name-table change lands,
+regenerate and land those projections (AGENTS.md); aterm's repin alone does not update them.
 
 ## What holds it
 

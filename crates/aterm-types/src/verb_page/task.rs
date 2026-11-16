@@ -81,7 +81,7 @@ pub(crate) const PAGE: Page = Page {
                      worker's reply whose first line starts `Could not finish: <why>`; `why=off`, \
                      a person turned its Autopilot Off and it stayed Off 3 s, `why=off-ctl`, a \
                      manager or a script did, and turning it on again reopens either; \
-                     `why=expired`, the disk worker's time ran out; `why=repeated`, Land stopped \
+                     `why=expired`, aterm ended the worker's time; `why=repeated`, Land stopped \
                      typing to a reply that came back the same with no work), reopened `working \
                      why=turn` by a turn into it or by Cruise set after it failed.",
                 ),

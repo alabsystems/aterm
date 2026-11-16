@@ -1376,7 +1376,7 @@ impl SessionStore {
 
     /// Queues a request for the fabric bridge to retire an orphaned presence row `sid`.
     pub(crate) fn request_retire(&mut self, sid: &str) -> bool {
-        if self.by_sid(&SessionId::new(sid.to_string())).is_some() {
+        if self.by_id.contains_key(sid) {
             return false;
         }
         self.record_roster(
@@ -1738,6 +1738,16 @@ impl SessionStore {
         self.by_local
             .get(&local_id)
             .and_then(|sid| self.by_id.get(sid))
+    }
+
+    /// The live tab IDs that begin `prefix` ([`aterm_types::tab_id::is_prefix`]).
+    pub(crate) fn sids_beginning(&self, prefix: &str) -> Vec<String> {
+        self.by_id
+            .keys()
+            .map(SessionId::as_str)
+            .filter(|sid| aterm_types::tab_id::is_tab_id(sid) && sid.starts_with(prefix))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Resolves a wire `@<selector>` (`Id` or `Sid`) to a [`SessionHandle`].

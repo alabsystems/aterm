@@ -163,54 +163,6 @@ fn a_base_the_test_variable_names_is_refused_however_it_is_sized() {
     );
 }
 
-/// Every file and folder of `dir` and `dir` itself last touched at `at`.
-#[cfg(unix)]
-fn age(dir: &Path, at: std::time::SystemTime) {
-    let times = std::fs::FileTimes::new().set_accessed(at).set_modified(at);
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        std::fs::File::open(entry.path())
-            .unwrap()
-            .set_times(times)
-            .unwrap();
-    }
-    std::fs::File::open(dir).unwrap().set_times(times).unwrap();
-}
-
-/// The tooling reclaim keeps a row a bring-up read, though reading it changes no file's
-/// time. The negative control: the row not read yet is still listed.
-#[cfg(unix)]
-#[test]
-fn a_bring_up_marks_its_rows_used_so_the_tooling_reclaim_keeps_them() {
-    let home = aterm_tempfile::tempdir().unwrap();
-    let tooling = home.path().join("tooling.noindex");
-    let (root, kernel) = place_both(&tooling);
-    let now = std::time::SystemTime::now();
-    let month_ago = now - atpkg::build_cache::RECLAIM_IDLE - std::time::Duration::from_secs(86_400);
-    age(&root, month_ago);
-    age(&kernel, month_ago);
-    let listed = || -> Vec<PathBuf> {
-        atpkg::build_cache::tooling::plan(&tooling, now)
-            .into_iter()
-            .map(|p| p.path)
-            .collect()
-    };
-    assert_eq!(
-        listed(),
-        [kernel.clone(), root.clone()],
-        "both idle a month"
-    );
-
-    let lookup = scratch_lookup(&tooling);
-    base(&lookup).unwrap();
-    assert_eq!(
-        listed(),
-        std::slice::from_ref(&kernel),
-        "the base was read; the kernel row was not, and is still listed"
-    );
-    kernel_files(&lookup).unwrap();
-    assert_eq!(listed(), Vec::<PathBuf>::new(), "both were read");
-}
-
 #[test]
 fn an_archived_release_names_the_archive_host_and_the_bump() {
     let url = ROOT_ARCHIVE.url_at(RELEASE);

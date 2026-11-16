@@ -370,33 +370,94 @@ fn intern_rows(rows: Vec<Row>) -> &'static [Row] {
     kept
 }
 
-/// A file's identity as the fingerprint keeps it: its name, and its metadata as the kernel
-/// keeps it (length, inode, and change time, which no user call can set back).
+/// A file's identity as the fingerprint keeps it: its name, and what [`file_id`] reads of it.
 type Stamp = (String, FileId);
 
-/// What [`file_id`] reads of a file: length, device, inode, modification and change time.
-type FileId = (u64, u64, u64, i128, i128);
-
-/// `path`'s identity, not following a final link; zeros when it is not there.
-fn file_id(path: &std::path::Path) -> FileId {
-    let Ok(m) = std::fs::symlink_metadata(path) else {
-        return (0, 0, 0, 0, 0);
-    };
-    let modified = m
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX));
+/// What [`file_id`] reads of a file, all zero (and no counter) where nothing is there: its
+/// length, which file it is, its modification time, and what tells a change those cannot (a
+/// rewrite of as many bytes in the clock step of the write before it, or with its modification
+/// time put back), which no user call sets back. That last does not count such a rewrite every
+/// time: not on Windows by a writer that held the file open since its write before, nor on unix
+/// where the clock steps coarser than the writes (ATERM-KI-1115-47201).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct FileId {
+    /// Its length in bytes.
+    len: u64,
+    /// The device it is on: on Windows its volume's serial number.
+    dev: u64,
+    /// Its inode: on Windows its file id on that volume (`FILE_ID_INFO`'s, 128 bits on ReFS).
+    ino: u128,
+    /// Its modification time, in nanoseconds since the epoch.
+    modified: i128,
+    /// Its status change time, in nanoseconds since the epoch: the clock's now at each change of
+    /// its data or metadata, a modification time put back included.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let changed = i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec());
-        (m.len(), m.dev(), m.ino(), modified, changed)
-    }
-    #[cfg(not(unix))]
-    {
-        (m.len(), 0, 0, modified, 0)
-    }
+    changed: i128,
+    /// Its counter in its volume's change journal ([`aterm_dirfd::usn`]), as the journal's id and
+    /// the USN: it moves at the first change of each kind made while the file stays open, a
+    /// modification time put back included, and as its last handle closes, whatever the clock
+    /// reads. `None` where the volume keeps no journal (FAT, exFAT, a network share, a journal
+    /// turned off) or the counter could not be read, where the rest tells only what its times do.
+    #[cfg(windows)]
+    journal: Option<(u64, i64)>,
+}
+
+/// `path`'s [`FileId`], not following a final link; all zero when it is not there.
+fn file_id(path: &std::path::Path) -> FileId {
+    read_file_id(path).unwrap_or_default()
+}
+
+/// `time` in nanoseconds since the epoch; 0 where there is none or it is before the epoch.
+fn since_epoch(time: std::io::Result<std::time::SystemTime>) -> i128 {
+    time.ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
+}
+
+/// [`file_id`]'s read: one `lstat`.
+#[cfg(unix)]
+fn read_file_id(path: &std::path::Path) -> std::io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = std::fs::symlink_metadata(path)?;
+    Ok(FileId {
+        len: m.len(),
+        dev: m.dev(),
+        ino: u128::from(m.ino()),
+        modified: since_epoch(m.modified()),
+        changed: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
+    })
+}
+
+/// [`file_id`]'s read: one handle on the entry itself, opened as `symlink_metadata` opens it
+/// ([`aterm_uds::line_log::look`]: no right asked, which none of the reads needs; every sharing
+/// allowed; a folder, a link or another reparse point opened as itself), through which its
+/// volume, id and length ([`aterm_uds::line_log::identity_of`]), its modification time and its
+/// change-journal counter are read, so all of them name the one file that was there.
+#[cfg(windows)]
+fn read_file_id(path: &std::path::Path) -> std::io::Result<FileId> {
+    let file = aterm_uds::line_log::look(path)?;
+    let identity = aterm_uds::line_log::identity_of(&file)?;
+    Ok(FileId {
+        len: identity.len,
+        dev: identity.dev,
+        ino: identity.ino,
+        modified: since_epoch(file.metadata()?.modified()),
+        journal: aterm_dirfd::usn(&file)
+            .ok()
+            .flatten()
+            .map(|usn| (usn.journal, usn.usn)),
+    })
+}
+
+/// [`file_id`]'s read where neither of the above is: its length and modification time.
+#[cfg(not(any(unix, windows)))]
+fn read_file_id(path: &std::path::Path) -> std::io::Result<FileId> {
+    let m = std::fs::symlink_metadata(path)?;
+    Ok(FileId {
+        len: m.len(),
+        modified: since_epoch(m.modified()),
+        ..FileId::default()
+    })
 }
 
 /// What the registry was last read from: the store's harness holdings and each one's kept
@@ -420,7 +481,7 @@ impl Fingerprint {
             return Self {
                 holdings: Vec::new(),
                 linked: Vec::new(),
-                cache: (0, 0, 0, 0, 0),
+                cache: FileId::default(),
                 currents: Vec::new(),
                 config,
             };

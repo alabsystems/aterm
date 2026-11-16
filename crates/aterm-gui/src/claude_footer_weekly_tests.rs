@@ -301,6 +301,7 @@ fn reading(
         ctx_left: None,
         dur_us: 0,
         row: None,
+        route: None,
     };
     std::fs::create_dir_all(rl()).unwrap();
     std::fs::write(file(pid), reading.to_json()).unwrap();
@@ -884,6 +885,7 @@ fn a_week_the_tap_re_reports_after_a_reset_is_as_old_as_its_first_report() {
         pid: Some(PID.to_string()),
         login: None,
         home: None,
+        route: None,
     };
     let run = |five: bool, now: i64| {
         let five = if five {

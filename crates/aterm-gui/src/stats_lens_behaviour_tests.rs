@@ -866,8 +866,91 @@ fn a_rest_on_the_decks_header_opens_how_to_read() {
     );
 }
 
+/// The Disk Custody band under the Deck opens the Disk lens as the Deck's Disk row does: a rest
+/// on any of its parts opens the hover lens on Disk, the machine's scope, and a click pins it,
+/// and so does a click on the band as a whole. The program sees none of it. CONTROL: a click on
+/// the Network State band under it opens Network State, so the hit is the band's own.
 #[test]
-fn why_now_reads_the_front_tab_by_every_pane() {
+fn a_rest_or_a_click_on_the_disk_custody_band_opens_the_disk_lens() {
+    use crate::stats_lens::disk_band::Part;
+    use crate::stats_paint::HitKind;
+    let mut r = rig("deck");
+    r.deck(DeckForm::Folded, Some(1400.0));
+    let disk = |how| {
+        Some(Lens {
+            focus: Instrument::Disk,
+            bar: Bar::Global,
+            how,
+        })
+    };
+    for part in [Part::Space, Part::Did, Part::Next] {
+        r.app.close_stats_lens(r.wid);
+        r.rest_on_hit(|h| h.kind == HitKind::DiskCustody(part));
+        assert_eq!(r.lens(), disk(Opened::Hover), "a rest on {part:?}");
+        r.click(MouseButton::Left);
+        assert_eq!(r.lens(), disk(Opened::Pinned), "a click on {part:?}");
+    }
+    r.app.close_stats_lens(r.wid);
+    let (on, _) = r.hit(|h| h.kind == HitKind::DiskCustody(Part::Band));
+    r.move_to(on);
+    r.click(MouseButton::Left);
+    assert_eq!(r.lens(), disk(Opened::Pinned), "a click on the band");
+    assert_eq!(r.sent(), "", "the program sees none of it");
+
+    r.app.close_stats_lens(r.wid);
+    let (on, _) = r.hit(|h| matches!(h.kind, HitKind::Network(_)));
+    r.move_to(on);
+    r.click(MouseButton::Left);
+    assert_eq!(
+        r.lens().map(|l| l.focus),
+        Some(Instrument::NetworkState),
+        "CONTROL: Network State's band"
+    );
+}
+
+/// A retained pre-SD91 covering claim, fresh enough to pass the former age guard. The
+/// published-counter basis remains explicit even when ownership coverage is complete.
+fn retained_cpu_claims(
+    mut facts: Arc<aterm_vitals::explain::WhyFacts>,
+    snap: &aterm_vitals::Snapshot,
+) -> Arc<aterm_vitals::explain::WhyFacts> {
+    use aterm_vitals::explain::{
+        ActivityId, Candidate, CauseId, Context, DeckCause, Evidence, OpenCause,
+    };
+    let kept = Arc::make_mut(&mut facts);
+    kept.at_ns = snap.at_ns;
+    kept.at_unix_ms = snap.at_unix_ms;
+    kept.split.coverage_complete = true;
+    kept.split.ownership_incomplete = false;
+    kept.causes = vec![Candidate {
+        id: CauseId::Activity(ActivityId::Spotlight),
+        covers_mc: 1420,
+        coalitions: vec![307, 491],
+        since_ms: Some(1),
+        evidence: Evidence::Activity {
+            deferred_pm: Some(722),
+            read_bps: 22_900_000,
+        },
+        contexts: vec![Context::Startup],
+    }];
+    kept.open = vec![OpenCause {
+        id: CauseId::Activity(ActivityId::Spotlight),
+        opened_unix_ms: 1,
+        since_ms: Some(1),
+        holds: true,
+        covers_mc: 1420,
+        contexts: vec![Context::Startup],
+    }];
+    kept.clause = Some(DeckCause {
+        activity: ActivityId::Spotlight,
+        word: "Spotlight",
+        context: Some(Context::Startup),
+    });
+    facts
+}
+
+#[test]
+fn reported_cpu_retained_claims_cannot_restore_a_front_tabs_cause_or_partition() {
     use aterm_vitals::explain::fixtures;
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
@@ -876,14 +959,21 @@ fn why_now_reads_the_front_tab_by_every_pane() {
         crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
     drop(ws);
     let other = r.app.split_active_stub_tab(r.wid);
-    assert!(
-        other > r.session,
-        "PRECONDITION: the focused pane is not the least key"
-    );
+    assert!(other > r.session, "the focused pane is not the least key");
     assert_eq!(r.app.deck_tab_panes(r.wid), [other, r.session]);
+    let mut snap = crate::stats_deck::tests::split_tab(r.session, other);
+    r.app.vitals.snapshot = Some(Arc::new(snap.clone()));
+    r.app
+        .open_stats_lens(r.wid, Instrument::Cpu, Bar::Global, Opened::Pinned);
+    let (_, _, before) = r.app.stats_lens_words(r.wid).expect("the lens is laid");
+    let sentence = r
+        .app
+        .stats_lens_sentence(r.wid)
+        .expect("reported CPU sentence");
 
     let scene = fixtures::Scene {
         tabs: vec![fixtures::tab(r.session, 1200)],
+        unanswered: 0,
         ..fixtures::spotlight_1032()
     };
     let mut vitals = aterm_vitals::Vitals::new();
@@ -892,32 +982,42 @@ fn why_now_reads_the_front_tab_by_every_pane() {
         .iter()
         .map(|reading| vitals.absorb(reading))
         .last()
-        .and_then(|s| s.why);
-    let mut snap = r
-        .app
-        .vitals
-        .snapshot
-        .as_deref()
-        .expect("a snapshot")
-        .clone();
-    snap.why = facts;
+        .and_then(|s| s.why)
+        .expect("reported coalition observations");
+    let retained = retained_cpu_claims(facts, &snap);
+    assert!(retained.causes.iter().any(|cause| cause.id.covering()));
+    assert!(retained.open.iter().any(|cause| cause.holds));
+    assert!(retained.clause.is_some());
+    snap.why = Some(retained);
     r.app.vitals.snapshot = Some(Arc::new(snap));
-    r.app
-        .open_stats_lens(r.wid, Instrument::Cpu, Bar::Global, Opened::Pinned);
-    let (_, _, laid) = r.app.stats_lens_words(r.wid).expect("the lens is laid");
-    let why = laid
-        .wells
-        .iter()
-        .find(|(name, _)| name == "Why now")
-        .map(|(_, words)| words.as_str());
+    let (_, _, after) = r.app.stats_lens_words(r.wid).expect("the lens is laid");
+    assert_eq!(
+        after.wells, before.wells,
+        "retained physical claims cannot alter the reported lens"
+    );
+    assert_eq!(
+        r.app.stats_lens_sentence(r.wid).as_deref(),
+        Some(sentence.as_str())
+    );
+    assert!(after.wells.iter().all(|(name, _)| name != "Why now"));
     assert!(
-        why.is_some_and(|w| w.contains(" \u{b7} aterm 0.40, Tab 1 0.20.")),
-        "{why:?}"
+        after
+            .wells
+            .iter()
+            .any(|(name, _)| name.starts_with("Cores,"))
+    );
+    assert!(
+        after
+            .wells
+            .iter()
+            .any(|(name, words)| name == "Largest reported CPU"
+                && words.contains("cargo")
+                && words.contains("2.0 reported cores"))
     );
 }
 
 /// A split front tab is one tab through the App: the CPU lens's sentence names Tab 1 with
-/// both panes' cores (claude's 1 and cargo's 2), and the tab's chip meters both panes. CONTROL:
+/// both panes' reported cores (claude's 1 and cargo's 2). CONTROL:
 /// the focused pane alone, what the deck read before tabs were summed, says 2 cores.
 #[test]
 fn a_split_front_tab_reads_every_pane() {
@@ -942,25 +1042,16 @@ fn a_split_front_tab_reads_every_pane() {
         .app
         .stats_lens_sentence(r.wid)
         .expect("the lens's sentence");
-    assert!(said.contains(", Tab 1 3.0 cores."), "{said}");
+    assert!(said.contains(", Tab 1 3.0 reported cores."), "{said}");
     let alone = super::lens_sentence(
         &snap,
         Instrument::Cpu,
         &[other],
         &crate::stats_deck::tests::input(&snap).locale,
     );
-    assert!(alone.contains(", Tab 1 2.0 cores."), "CONTROL: {alone}");
-
-    let level = |key: u64| snap.tab(key).map_or(0.0, |t| t.scope.cores.level);
-    let both = crate::tab_bar::chip_load_step(level(r.session) + level(other), 10.0);
-    let focused = crate::tab_bar::chip_load_step(level(other), 10.0);
-    assert!(both > focused, "CONTROL: {both} vs {focused}");
-    let ws = &r.app.windows[&r.wid];
-    let tab = ws.tab_set.tab_at(0).expect("the front tab");
-    assert_eq!(
-        r.app.chip_load(2, tab),
-        both,
-        "the chip meters the whole tab"
+    assert!(
+        alone.contains(", Tab 1 2.0 reported cores."),
+        "CONTROL: {alone}"
     );
 }
 
@@ -989,10 +1080,39 @@ fn the_tree_reads_the_deck_and_its_lens() {
         &names[..6],
         ["CPU", "GPU", "Memory", "Disk", "Network", "Processes"]
     );
+    // The parts the paint drew, by their hits: the tree reads those, not a second layout of its
+    // own that could keep a part the paint shed.
+    let _ = r.app.stats_deck_fp(r.wid);
+    let disk: Vec<String> = r.app.windows[&r.wid]
+        .stats_hits
+        .borrow()
+        .iter()
+        .filter_map(|h| match h.kind {
+            crate::stats_paint::HitKind::DiskCustody(part)
+                if part != crate::stats_lens::disk_band::Part::Band =>
+            {
+                Some(format!(
+                    "{}: {}",
+                    crate::stats_lens::disk_band::NAME,
+                    part.word()
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !disk.is_empty(),
+        "PRECONDITION: the Disk Custody band draws parts"
+    );
+    assert_eq!(
+        &names[6..6 + disk.len()],
+        disk,
+        "the Disk Custody band's parts"
+    );
     assert_eq!(
         names.len(),
-        10,
-        "four network and shared-service cells are read too"
+        10 + disk.len(),
+        "the Disk Custody band's parts and four network and shared-service cells are read too"
     );
     assert_eq!(group.meters[0].words, r.sentence(Instrument::Cpu));
     assert_eq!(group.meters[2].words, r.sentence(Instrument::Memory));
@@ -1026,23 +1146,27 @@ fn the_tree_reads_the_deck_and_its_lens() {
         .as_deref()
         .expect("a snapshot")
         .clone();
-    snap.why = Some(crate::stats_deck::paint_tests::spotlight_after_start_up());
+    let retained = retained_cpu_claims(
+        crate::stats_deck::paint_tests::spotlight_after_start_up(),
+        &snap,
+    );
+    assert!(retained.causes.iter().any(|cause| cause.id.covering()));
+    assert!(retained.clause.is_some());
+    snap.why = Some(retained);
     r.app.vitals.snapshot = Some(Arc::new(snap));
     let lens = r
         .app
         .stats_a11y(r.wid)
         .and_then(|s| s.lens)
         .expect("the lens is read");
-    let why = lens
-        .wells
-        .iter()
-        .find(|(name, _)| name == "Why now")
-        .map(|(_, words)| words.as_str());
+    assert!(lens.wells.iter().all(|(name, _)| name != "Why now"));
     assert!(
-        why.is_some_and(|w| w.starts_with("Why: Spotlight, after start-up, 1.42 cores. ")),
-        "{:?}",
         lens.wells
+            .iter()
+            .any(|(name, _)| name.starts_with("Cores,"))
     );
+    assert!(lens.wells.iter().any(|(name, words)|
+        name == "Largest reported CPU" && words.contains("reported cores")));
     assert!(
         lens.wells
             .iter()

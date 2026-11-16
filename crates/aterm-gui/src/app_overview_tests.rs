@@ -110,7 +110,7 @@ fn a_typist_tab_is_named_by_its_role_its_pin_or_its_id() {
     let (app, _wid, sids) = app_with_three();
     let tab = &sids[1];
     let local = local_of(&app, tab);
-    let id = aterm_messages::presence::short_sid(tab.as_str());
+    let id = crate::presence::short_sid(tab.as_str());
     let named = |app: &App| {
         let named = app.typist_tab(local).expect("pooled");
         (named.words, named.facts)

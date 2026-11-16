@@ -584,6 +584,30 @@ impl FleetSnapshot {
         ids
     }
 
+    /// Names each need, hold and manager that a read named by its ID's shown form again, as the
+    /// IDs known now show it ([`crate::presence::short_sid`]). A read builds those names as it
+    /// parses, before its own IDs are known ([`crate::tab_ids::note_fleet`]), so two tabs that
+    /// share their first five characters and arrive in one read are told apart only here. A name
+    /// a person or program gave (a title, a role) is no prefix of the ID and is kept.
+    pub(crate) fn rename_by_id(&mut self) {
+        let fresh = |sid: &str, name: &mut String| {
+            if aterm_types::tab_id::is_prefix(name) && sid.starts_with(name.as_str()) {
+                *name = crate::presence::short_sid(sid);
+            }
+        };
+        for mac in &mut self.macs {
+            for need in &mut mac.needs {
+                fresh(&need.sid, &mut need.who);
+            }
+            for held in &mut mac.held_here {
+                fresh(&held.sid, &mut held.who);
+            }
+            for manager in &mut mac.managers {
+                fresh(&manager.sid, &mut manager.label);
+            }
+        }
+    }
+
     /// Whether the read itself is no older than [`COUNT_FRESH`] at `now_ms`, without a future
     /// timestamp (each Mac's own rows: [`FleetMac::fresh`]).
     pub(crate) fn fresh(&self, now_ms: u64) -> bool {
@@ -1494,6 +1518,9 @@ pub(crate) struct ReaderSeams {
     pub(crate) book: Box<dyn Fn() -> BookFacts + Send>,
     /// `[fleet] watch`, current.
     pub(crate) watch: Arc<std::sync::atomic::AtomicBool>,
+    /// The current authoritative sharing choice. Tests inject an inert gate; the live reader
+    /// uses the cached file switch, so refused or synthesized UI config cannot enable a read.
+    pub(crate) sharing: Box<dyn FnMut() -> bool + Send>,
     /// This machine's node id, to drop its own answer and to know the holds its drives placed ([`FleetMac::held_here`]).
     pub(crate) own_node: Option<String>,
     /// Now, unix ms.
@@ -1520,6 +1547,18 @@ pub(crate) struct ReaderSeams {
 thread_local! {
     /// How many times this thread read [`FleetGlance::generation`]: the Fleet Field's idle tax.
     pub(crate) static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The authoritative switch for an automatic read, independent of the window's typed config.
+/// A missing config is on; a read failure or an unavailable home holds the read.
+#[cfg(unix)]
+fn automatic_sharing(home: Option<PathBuf>) -> impl FnMut() -> bool + Send {
+    let mut sharing = home.map(|home| aterm_secrets::swarm::Switch::new(&home));
+    move || {
+        sharing.as_mut().is_some_and(|sharing| {
+            sharing.enabled_saying(&|line| aterm_log::warn!("fleet glance: {line}")) == Ok(true)
+        })
+    }
 }
 
 /// The fleet glance's handle: the slot and the kick channel.
@@ -1623,7 +1662,7 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, mut seams: ReaderSeams) -> Opt
         .name("aterm-fleet-glance".to_string())
         .spawn(move || {
             crate::qos::set_self(crate::qos::Role::Background);
-            reader_loop(runner, &seams, &thread_slot, &rx);
+            reader_loop(runner, &mut seams, &thread_slot, &rx);
         })
         .ok()?;
     Some(FleetGlance {
@@ -1642,7 +1681,7 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, mut seams: ReaderSeams) -> Opt
 /// ([`FleetSnapshot::next_freshness_change`]), whichever is first.
 fn reader_loop(
     mut runner: Box<dyn FleetRunner>,
-    seams: &ReaderSeams,
+    seams: &mut ReaderSeams,
     slot: &Arc<Mutex<FleetSlot>>,
     rx: &Receiver<Kick>,
 ) {
@@ -1663,8 +1702,9 @@ fn reader_loop(
         let watch = !dials || seams.watch.load(std::sync::atomic::Ordering::Acquire);
         // The broker is asked last, only for a read this tick makes: a tick that reads nothing
         // dials nothing, and a read of this Mac's own copy dials no Mac.
-        let read =
-            should_poll(&book, watch, tried, now, quiet.every()) && (!dials || (seams.lan)());
+        let read = should_poll(&book, watch, tried, now, quiet.every())
+            && (seams.sharing)()
+            && (!dials || (seams.lan)());
         // A move of the network that came while a read ran: that read went out on the old one.
         let mut moved_since = false;
         let book_moved = {
@@ -1706,13 +1746,14 @@ fn reader_loop(
                     Ok(snapshot) => {
                         // A silent seat on this Mac's copy is the node's judgment over a row
                         // that stopped advancing: no last rows of its are carried.
-                        let snapshot = if dials {
+                        let mut snapshot = if dials {
                             carry(slot.snapshot.as_deref(), snapshot, now)
                         } else {
                             snapshot
                         };
                         slot.generation = slot.generation.wrapping_add(1);
                         crate::tab_ids::note_fleet(snapshot.tab_ids());
+                        snapshot.rename_by_id();
                         slot.snapshot = Some(Arc::new(snapshot));
                         slot.error = None;
                     }
@@ -1786,9 +1827,14 @@ impl crate::App {
         #[cfg(unix)]
         let place_state = state.clone();
         let mesh_state = state.clone();
+        #[cfg(unix)]
+        let sharing = Box::new(automatic_sharing(aterm_types::dirs::home_dir()));
+        #[cfg(not(unix))]
+        let sharing: Box<dyn FnMut() -> bool + Send> = Box::new(|| false);
         let seams = ReaderSeams {
             book: Box::new(move || state.as_deref().map(read_book).unwrap_or_default()),
             watch,
+            sharing,
             own_node,
             now_ms: Box::new(|| aterm_time::unix_millis().unwrap_or(0)),
             post: Box::new(move || proxy.send_event(crate::Wake::FleetRead).is_ok()),

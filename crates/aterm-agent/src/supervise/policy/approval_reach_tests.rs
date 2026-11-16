@@ -187,11 +187,13 @@ fn a_link_below_a_tree_is_followed_where_some_reader_follows_it() {
 }
 
 /// A walk that is cut proves nothing: a folder below the tree that cannot be listed leaves the
-/// tree unproven, and the same tree, listed, is read.
+/// tree unproven, and the same tree, listed, is read. As root a folder of mode 000 is listed
+/// still, so the test is COULD NOT RUN there.
 #[cfg(unix)]
 #[test]
 fn a_tree_whose_walk_is_cut_is_unproven() {
     use std::os::unix::fs::PermissionsExt;
+    aterm_uds::host::could_not_run_as_root("a folder of mode 000");
     let dir = crate::supervise::ScratchDir::new("approval-reach", "cut");
     let root = crate::supervise::test_canonical(&dir);
     plant(&root, &["t/x.rs", "t/locked/y.rs"]);

@@ -36,6 +36,18 @@ fn status_of(name: &str) -> SetupStatus {
     fixture_status(name).expect("a named scenario")
 }
 
+#[test]
+fn compact_password_scrollbar_keeps_the_four_point_grid() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let app = reading(&status_of("required-password"));
+    let view = SystemStateViewState::default();
+    let _compiled = compile_in(&app, &view, 346.0, 400.0);
+    assert!(view.limit.get() > 0.0);
+    let room = view.room.get();
+    assert!(room > 0.0);
+    assert!((room / 4.0 - (room / 4.0).round()).abs() < 0.01);
+}
+
 /// A page that reads `status` under its own plan.
 fn reading(status: &SetupStatus) -> SystemStateApp {
     let mut app = SystemStateApp::new(status.plan.clone().unwrap_or_default());
@@ -1859,4 +1871,44 @@ fn a_needs_you_headline_has_its_card_item() {
         }
     }
     assert!(bare.is_empty(), "{}", bare.join("\n"));
+}
+
+#[test]
+fn independent_password_steps_have_visible_actions_without_missing_tools() {
+    let mut status = status_of("set-up");
+    for access in [
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkHelper,
+    ] {
+        let mut row = Observation::unknown(Subject::Access(access));
+        row.standing = Standing::NeedsYou;
+        row.now = Some("Incomplete".into());
+        row.note = Some("Your Mac password is required".into());
+        status.observed.retain(|seen| seen.subject != row.subject);
+        status.observed.push(row);
+    }
+    let app = reading(&status);
+    let (_, card, _) = drawn(&app);
+    let item = card
+        .iter()
+        .find(|item| item.id == "mac-password")
+        .expect("one shared password episode");
+    assert!(item.title.contains("Mac password"));
+    assert_eq!(item.button.as_ref().unwrap().face, "Finish setup…");
+    status.mac_setup = Some(ToolsInstall::Password);
+    let app = reading(&status);
+    assert!(app.headline().go_to_tab);
+    let (_, card, _) = drawn(&app);
+    assert_eq!(
+        card.iter()
+            .find(|item| item.id == "mac-password")
+            .unwrap()
+            .button
+            .as_ref()
+            .unwrap()
+            .action,
+        GO_TO_TOOLS_TAB
+    );
+    compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
 }

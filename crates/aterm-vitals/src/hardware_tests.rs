@@ -89,7 +89,7 @@ fn sustained_episode_keeps_bounded_raw_evidence_and_survives_recovery() {
         None,
         "unread core counters do not establish recovery"
     );
-    recovered.global.wait = Some(0.0);
+    recovered.cpu.as_mut().unwrap().cores[1].load.raw = 0.89;
     let kept = r.observe(&recovered, None).unwrap();
     assert_eq!(kept.resolved_ns, Some(recovered.at_ns));
     assert_eq!(kept.frames, first.frames);
@@ -157,6 +157,45 @@ fn underuse_thresholds_do_not_claim_every_performance_core_is_idle() {
     s.cpu.as_mut().unwrap().cores[1].load.raw = 0.89;
     assert_eq!(all_e_busy_p_idle(&s), Some(false));
     s.cpu.as_mut().unwrap().cores[1].load.raw = 1.0;
-    s.global.wait = Some(0.99);
+    let mut second_p = CoreView {
+        measured: true,
+        ..CoreView::default()
+    };
+    second_p.load.raw = 0.5;
+    let cpu = s.cpu.as_mut().unwrap();
+    cpu.cores.push(second_p);
+    cpu.clusters[0].cores.push(2);
+    assert_eq!(
+        all_e_busy_p_idle(&s),
+        Some(true),
+        "the P-core threshold is their mean, even when one is half busy"
+    );
+    s.cpu.as_mut().unwrap().cores[2].load.raw = 0.502;
     assert_eq!(all_e_busy_p_idle(&s), Some(false));
+}
+
+#[test]
+fn core_tick_observation_is_independent_of_the_reported_counter_difference() {
+    let mut s = anomaly(1);
+    for difference in [None, Some(0.0), Some(0.99), Some(4.0), Some(f32::NAN)] {
+        s.global.wait = difference;
+        assert_eq!(all_e_busy_p_idle(&s), Some(true));
+    }
+    s.cpu.as_mut().unwrap().cores[1].load.raw = 0.89;
+    for difference in [None, Some(0.0), Some(4.0)] {
+        s.global.wait = difference;
+        assert_eq!(all_e_busy_p_idle(&s), Some(false));
+    }
+}
+
+#[test]
+fn invalid_e_core_values_do_not_establish_an_episode_or_recovery() {
+    for busy in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+        let mut s = anomaly(1);
+        s.cpu.as_mut().unwrap().cores[1].load.raw = busy;
+        assert_eq!(all_e_busy_p_idle(&s), None);
+    }
+    let mut s = anomaly(1);
+    s.cpu.as_mut().unwrap().clusters[1].cores = vec![2];
+    assert_eq!(all_e_busy_p_idle(&s), None);
 }

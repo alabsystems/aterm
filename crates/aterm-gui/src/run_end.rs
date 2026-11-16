@@ -141,7 +141,7 @@ impl App {
     /// it left none). The task files and results of every worker session this process still
     /// holds, and of those the quit closed first, go, but the results the layout's task rows
     /// name: the next launch seeds records that read them
-    /// (`task_launch::retire_task_files_at_quit`). A quit that came before a restore finished
+    /// (`task_launch::retire_task_files_at_quit`). A quit that came before a restore's sweep finished
     /// also clears what the layout that restore took left. Where the quit published a layout,
     /// that is what it left under the session IDs of the tabs it had placed, which `published`
     /// names by their new IDs (`task_launch::RestoredTasks::sweep_at_quit`). Where it published
@@ -185,6 +185,11 @@ impl App {
                  every result",
                 crate::session_table::LOAD_WAIT.as_millis()
             );
+        }
+        // Claim the pending sweep after the load wait, even when that wait timed out.
+        // A worker that already took it keeps the restore's snapshot of live results.
+        if let Some(sweep) = self.restored_tasks_sweep.take() {
+            sweep.at_quit(&self.store, published);
         }
         if !self.handoff_successor
             && let Some(drain) = self.restore_drain.as_deref()

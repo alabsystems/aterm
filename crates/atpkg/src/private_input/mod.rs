@@ -168,12 +168,15 @@ pub struct Producer {
 #[must_use = "an error does not release or replace original custody"]
 pub struct Refused<T> {
     error: io::Error,
-    original: T,
+    original: Box<T>,
 }
 
 impl<T> Refused<T> {
     pub(crate) fn new(error: io::Error, original: T) -> Self {
-        Self { error, original }
+        Self {
+            error,
+            original: Box::new(original),
+        }
     }
 
     /// The original transition error.
@@ -185,7 +188,7 @@ impl<T> Refused<T> {
     /// Recover the same original owner; no pathname recovery is attempted.
     #[must_use]
     pub fn into_parts(self) -> (io::Error, T) {
-        (self.error, self.original)
+        (self.error, *self.original)
     }
 }
 
@@ -440,3 +443,7 @@ impl InputUse {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "refused_tests.rs"]
+mod refused_tests;

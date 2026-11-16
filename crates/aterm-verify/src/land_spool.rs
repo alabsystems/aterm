@@ -36,6 +36,15 @@ pub trait Spool {
     /// It could not be written.
     fn put(&self, record: &Signed) -> Result<(), String>;
 
+    /// Confirm that successful puts can be left to a later process, including the spool's
+    /// directory entries. A spool without a durable confirmation keeps publication enabled.
+    ///
+    /// # Errors
+    /// The spool cannot establish that promise.
+    fn flush(&self) -> Result<(), String> {
+        Err("this spool provides no durable-write confirmation".to_owned())
+    }
+
     /// Every record kept, in name order, and each file that could not be read, with why.
     ///
     /// # Errors
@@ -188,13 +197,50 @@ impl Spool for Dir {
         let file = self.dir.join(file_of(&record.path)?);
         let _lock = self.lock()?;
         self.expire(day);
-        if fail && file.exists() {
-            return Ok(());
+        let kept = if fail && file.exists() {
+            // Preserve the first FAIL's exact bytes, but do not treat an unreadable or merely
+            // present entry as evidence that the spool durably kept this record.
+            let (bytes, _) =
+                aterm_uds::atomic_file::read_regular(&file, crate::land_record::MAX_BYTES)
+                    .map_err(|e| format!("{} was not read: {e}", file.display()))?;
+            crate::land_record::Entry::read(
+                &record.path,
+                &bytes,
+                crate::land_record::Origin::Spool,
+            )
+            .body
+            .map(drop)
+            .map_err(|why| format!("{} does not read: {why}", file.display()))?;
+            Some(bytes)
+        } else {
+            None
+        };
+        let bytes = kept.as_deref().unwrap_or(&record.bytes);
+        // A conflict may return without publishing once the spool has kept every record.
+        // Require the entry's flush too before promising that this put kept it.
+        aterm_uds::atomic_file::write_entry_flushed(
+            &file,
+            bytes,
+            0o644,
+            aterm_durable::Flush::Durable,
+        )
+        .map_err(|e| format!("{} was not durably written: {e}", file.display()))?;
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        let _lock = self.lock()?;
+        let dir = self
+            .dir
+            .canonicalize()
+            .map_err(|e| format!("the spool {} was not located: {e}", self.dir.display()))?;
+        // A first put can have created more than the leaf directory. Finish each parent
+        // entry as well before a conflict relies on the spool instead of publication.
+        for parent in dir.ancestors() {
+            aterm_durable::Flush::Durable
+                .dir_diagnosed(parent)
+                .map_err(|e| format!("{} was not durably flushed: {e}", parent.display()))?;
         }
-        // The inner result is the directory's flush after the rename: either way the record is
-        // in place for every later reader while the machine runs, which is what a spool keeps.
-        let _flushed = aterm_uds::atomic_file::write_landed(&file, &record.bytes, 0o644)
-            .map_err(|e| format!("{} was not written: {e}", file.display()))?;
         Ok(())
     }
 

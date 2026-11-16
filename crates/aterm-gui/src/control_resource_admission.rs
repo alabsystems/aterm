@@ -79,7 +79,7 @@ fn capture(store: &Store, sid: &str) -> Option<SessionFence> {
     // A busy or poisoned registry is unknown authorization, never permission
     // to wait past the socket handoff deadline while holding a control lane.
     let current = store.try_read().ok()?;
-    let handle = current.by_sid(&SessionId::new(sid.to_owned()))?;
+    let handle = current.by_sid(&SessionId::parse(sid)?)?;
     if handle.state != SessionState::Alive
         || handle.sid.as_str() != sid
         || handle.shell_identity.pid <= 1

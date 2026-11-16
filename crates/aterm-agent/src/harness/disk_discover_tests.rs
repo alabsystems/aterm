@@ -601,10 +601,9 @@ fn consecutive_automatic_disk_passes_reach_an_eligible_cache_beyond_the_static_p
 }
 
 #[test]
-fn a_stable_unreclaimable_selection_cycle_can_handoff_to_one_disk_worker() {
+fn a_stable_unreclaimable_selection_cycle_runs_out_on_its_last_page() {
     use crate::harness::cli::{DiskLook, DiskTick, disk_tick_paged};
-    use crate::harness::disk::{Level, ask};
-    let tmp = Tmp::new("discover-cycle-worker");
+    let tmp = Tmp::new("discover-cycle-pages");
     let home = mkdirs(&tmp.path().join("home"));
     let state = mkdirs(&tmp.path().join("state"));
     let now = now_after_write(4);
@@ -655,35 +654,6 @@ fn a_stable_unreclaimable_selection_cycle_can_handoff_to_one_disk_worker() {
     let mut remove =
         |row: &Row| panic!("fresh target unexpectedly granted: {}", row.path.display());
     let mut cursor = Cursor::new();
-    let host = ask::HostId {
-        pid: NO_PID,
-        start: "controlled-host-start".into(),
-    };
-    let alive = |_: &ask::HostId| true;
-    let at = |done, now_ms| ask::Look {
-        now_ms,
-        host: &host,
-        key: "test:cycle-volume",
-        level: Level::Short,
-        free: GIB,
-        floor: config.auto_free_gib * GIB,
-        files_free: None,
-        files_floor: crate::harness::disk::EMERGENCY_FILES_FREE,
-        done: if done { Some(ask::Done::Spent) } else { None },
-        seats: &[],
-        supervised: &[],
-        barred: &[],
-        live: &[],
-        held: &[],
-        reclaimed: &[],
-        passing: false,
-        alive: &alive,
-        ahead: ask::Ahead {
-            worker_ok: true,
-            ..Default::default()
-        },
-    };
-    let mut lease = ask::Lease::default();
     let DiskTick::Reclaimed(first, _) =
         disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
     else {
@@ -693,9 +663,6 @@ fn a_stable_unreclaimable_selection_cycle_can_handoff_to_one_disk_worker() {
         !first.ran_out(),
         "one page cannot exhaust the larger inventory"
     );
-    let early = at(first.ran_out(), now * 1000);
-    let _ = ask::step(&mut lease, &early);
-    assert_eq!(ask::worker_step(&mut lease, &early), None);
 
     let DiskTick::Reclaimed(last, _) =
         disk_tick_paged(&look, config, &mut remove, &mut || Some(GIB), &mut cursor)
@@ -705,25 +672,6 @@ fn a_stable_unreclaimable_selection_cycle_can_handoff_to_one_disk_worker() {
     assert!(
         last.ran_out(),
         "every target in this stable, fully traversed cycle was inspected without a granted removal"
-    );
-    let opened = at(last.ran_out(), now * 1000 + 1);
-    assert!(matches!(
-        ask::step(&mut lease, &opened),
-        ask::Said::Opened { .. }
-    ));
-    assert_eq!(ask::worker_step(&mut lease, &opened), None);
-    let nominated = at(last.ran_out(), opened.now_ms + ask::NOMINATE_MS);
-    let _ = ask::step(&mut lease, &nominated);
-    assert_eq!(
-        ask::worker_step(&mut lease, &nominated),
-        Some(ask::WorkerSaid::Claimed)
-    );
-    let repeated = at(last.ran_out(), nominated.now_ms + 1);
-    let _ = ask::step(&mut lease, &repeated);
-    assert_eq!(
-        ask::worker_step(&mut lease, &repeated),
-        None,
-        "one worker per episode"
     );
 }
 
@@ -2466,6 +2414,7 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
         holds_source: None,
         walk_cut_short: None,
         profiles: Vec::new(),
+        stages: Vec::new(),
         device: Some(1),
         volume: None,
         probed_recent: false,
@@ -2474,6 +2423,7 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
         total: Some((gib * GIB, false)),
         foreign: None,
         idle: None,
+        deps_unwalked: None,
     };
     let xpy = Origin::Bootstrap {
         repo: home.join("trust"),
@@ -2549,6 +2499,7 @@ fn a_hog_says_when_it_was_last_built() {
         in_use: None,
         bytes: 0,
         bytes_partial: false,
+        deps_entries: None,
         died: crate::harness::disk::target::Died::default(),
     };
     let td =
@@ -2558,6 +2509,7 @@ fn a_hog_says_when_it_was_last_built() {
             holds_source: None,
             walk_cut_short: None,
             profiles,
+            stages: Vec::new(),
             device: Some(1),
             volume: None,
             probed_recent: false,
@@ -2569,6 +2521,7 @@ fn a_hog_says_when_it_was_last_built() {
             total: Some((gib * GIB, false)),
             foreign: None,
             idle: None,
+            deps_unwalked: None,
         };
     let mut s = Survey::new(NOW);
     s.home = Some(PathBuf::from("/h"));
@@ -3499,7 +3452,8 @@ fn survey_projected(
     report(&s, config)
 }
 
-/// The night's incident (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2), and m20's on
+/// The night's incident (a 460 GiB volume, floor 47 GiB, 75 GiB free and falling, 118.6 GiB of
+/// removed worktrees' build caches kept "inside the 1d quiet window"), and m20's on
 /// 2026-11-05: a removed workspace's build cache two hours quiet waited out the day's window. At
 /// `low` above the floor, and under a projection, it goes whole after the ten minutes every
 /// pressure tier holds, every other fence standing.

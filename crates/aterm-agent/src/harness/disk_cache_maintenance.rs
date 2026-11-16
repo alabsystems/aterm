@@ -13,7 +13,14 @@ use aterm_uds::private_file::{self, PrivateFileError, PrivateLock};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const RETRY: Duration = Duration::from_secs(10 * 60);
+/// The least time from any stamped sweep to one taken early ([`claim_held_early`]): the
+/// entry-bound pass's own hour.
+const EARLY: Duration = Duration::from_secs(60 * 60);
+/// The daily turn's stamp: its sweep, the holders' measure and the branch-name step.
 const STAMP: &str = "cache-maintenance.stamp";
+/// The early sweep's own stamp ([`claim_held_early`]), which the daily claim never reads: an
+/// early sweep that ran every hour would otherwise hold the daily turn off for good.
+const EARLY_STAMP: &str = "cache-maintenance-early.stamp";
 const MAGIC: &[u8; 4] = b"ACM1";
 
 /// Whether ordinary daily upkeep is admitted by the current automatic policy and volume facts.
@@ -72,8 +79,8 @@ pub fn run<G>(
     Ok(true)
 }
 
-fn read_stamp(dir: &Path) -> io::Result<Option<Vec<u8>>> {
-    match private_file::read_private(dir, STAMP, 12) {
+fn read_stamp(dir: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
+    match private_file::read_private(dir, name, 12) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(PrivateFileError::Missing) => Ok(None),
         Err(error) => Err(io::Error::other(error)),
@@ -123,7 +130,7 @@ pub fn claim(dir: &Path, now: i64) -> io::Result<Option<PrivateLock>> {
     // PrivateLock supplies exclusion; the existing private-file reader also checks the
     // file's ownership, link count and permissions before this new proactive path uses it.
     let _ = private_file::open_private(dir, "pass.lock").map_err(io::Error::other)?;
-    Ok(stamp(dir, now)?.then_some(held))
+    Ok(stamp(dir, now, (STAMP, DAY), &[])?.then_some(held))
 }
 
 /// Stamp daily admission while borrowing the standalone watch's genuine lifetime guard.
@@ -131,40 +138,78 @@ pub fn claim(dir: &Path, now: i64) -> io::Result<Option<PrivateLock>> {
 /// # Errors
 /// The guard no longer names this pass file, or private directory/stamp validation failed.
 pub fn claim_held(dir: &Path, now: i64, held: &super::reserve::PassLock) -> io::Result<bool> {
+    claim_held_after(dir, now, held, (STAMP, DAY), &[])
+}
+
+/// Take a sweep early under the pass lock `held`, for a build cache over the entry bound:
+/// admitted where no sweep, daily or early, was stamped within the last hour (one that was
+/// already took what this one would), and stamped under its own name, so the daily turn, which
+/// also measures the holders and prunes stale branch names, keeps its own day however often a
+/// growing cache brings this one back.
+/// # Errors
+/// As [`claim_held`].
+pub fn claim_held_early(dir: &Path, now: i64, held: &super::reserve::PassLock) -> io::Result<bool> {
+    claim_held_after(dir, now, held, (EARLY_STAMP, EARLY), &[STAMP])
+}
+
+fn claim_held_after(
+    dir: &Path,
+    now: i64,
+    held: &super::reserve::PassLock,
+    own: (&str, Duration),
+    also: &[&str],
+) -> io::Result<bool> {
     held.validate_for(&dir.join("pass.lock"))?;
     prepare_dir(dir)?;
     let _ = private_file::open_private(dir, "pass.lock").map_err(io::Error::other)?;
-    let due = stamp(dir, now)?;
+    let due = stamp(dir, now, own, also)?;
     held.validate_for(&dir.join("pass.lock"))?;
     Ok(due)
 }
 
-fn stamp(dir: &Path, now: i64) -> io::Result<bool> {
+/// The unix second the stamp `name` in `dir` holds, `None` where there is none.
+fn stamped_at(dir: &Path, name: &str) -> io::Result<(Option<Vec<u8>>, Option<i64>)> {
+    let bytes = read_stamp(dir, name)?;
+    let Some(record) = &bytes else {
+        return Ok((None, None));
+    };
+    let record: &[u8; 12] = record
+        .as_slice()
+        .try_into()
+        .map_err(|_| io::Error::other("invalid cache maintenance stamp"))?;
+    if &record[..4] != MAGIC {
+        return Err(io::Error::other("invalid cache maintenance stamp"));
+    }
+    let previous = i64::from_le_bytes(record[4..].try_into().expect("eight-byte stamp"));
+    if previous <= 0 {
+        return Err(io::Error::other("invalid cache maintenance stamp"));
+    }
+    Ok((bytes, Some(previous)))
+}
+
+/// Stamp `now` under `own`'s name where neither it nor any stamp of `also` was written within
+/// `own`'s span of it; `false` where one was.
+fn stamp(dir: &Path, now: i64, own: (&str, Duration), also: &[&str]) -> io::Result<bool> {
     if now <= 0 {
         return Err(io::Error::other("cache maintenance clock unavailable"));
     }
-    let before = read_stamp(dir)?;
-    if let Some(bytes) = &before {
-        let record: &[u8; 12] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| io::Error::other("invalid cache maintenance stamp"))?;
-        if &record[..4] != MAGIC {
-            return Err(io::Error::other("invalid cache maintenance stamp"));
-        }
-        let previous = i64::from_le_bytes(record[4..].try_into().expect("eight-byte stamp"));
-        if previous <= 0 {
-            return Err(io::Error::other("invalid cache maintenance stamp"));
-        }
-        if now.saturating_sub(previous) < DAY.as_secs() as i64 {
+    let (name, after) = own;
+    let within =
+        |at: Option<i64>| at.is_some_and(|at| now.saturating_sub(at) < after.as_secs() as i64);
+    let (before, at) = stamped_at(dir, name)?;
+    if within(at) {
+        return Ok(false);
+    }
+    for other in also {
+        if within(stamped_at(dir, other)?.1) {
             return Ok(false);
         }
     }
     let mut bytes = [0u8; 12];
     bytes[..4].copy_from_slice(MAGIC);
     bytes[4..].copy_from_slice(&now.to_le_bytes());
-    aterm_uds::atomic_file::write_checked(&dir.join(STAMP), &bytes, 0o600, || {
-        if read_stamp(dir)? == before {
+    aterm_uds::atomic_file::write_checked(&dir.join(name), &bytes, 0o600, || {
+        if read_stamp(dir, name)? == before {
             Ok(())
         } else {
             Err(io::Error::other("cache maintenance stamp changed"))

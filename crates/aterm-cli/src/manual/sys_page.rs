@@ -79,7 +79,7 @@ pub(super) const SECTIONS: &[Section] = &[
 pub(super) const VIEW_ROWS: &[(&str, &str)] = &[
     (
         "overview",
-        "(the default) the machine, aterm and this tab in a line each, and the CPU split",
+        "(the default) the machine, aterm and this tab in a line each, with reported CPU rates",
     ),
     ("tab", "this tab across every resource"),
     (
@@ -88,7 +88,7 @@ pub(super) const VIEW_ROWS: &[(&str, &str)] = &[
     ),
     (
         "global",
-        "the machine across every resource; its CPU split into aterm, others, services",
+        "the machine across every resource, with independent app and service CPU counters",
     ),
     (
         "jobs",
@@ -333,18 +333,15 @@ LINES (stdout)
   "walked_age_s", write_bps= is "write_bytes_per_s").
 
 THE OVERVIEW'S LINES
-  global   the machine: busy cores of all and their motion; the thermal level; ≥<n>c waiting
-           for a core (your processes): cores' worth of your processes' threads that were ready
-           to run with no core free, summed over threads, so it can pass the core count (other
-           users' threads are not read, hence ≥); GPU <n>% busy device-wide · its name · its
+  global   the machine: busy cores of all and their motion; the thermal level; the signed
+           reported runnable-minus-CPU counter difference for readable processes. It is not
+           physical waiting during the read span. GPU <n>% busy device-wide · its name · its
            cores · renderer and tiler busy percents; memory (used is app, wired and compressed
            memory), swap, disk and network
-  aterm    aterm's CPU, its share of busy CPU, footprint and processes, shared app work included
-  tab <n>  this tab (its place in its window's tab bar, from 1): its program, CPU, footprint,
-           and, from 25%, the share of its demand spent waiting for a core
-  rest     the machine's CPU in parts: this tab, the rest of aterm, others (your other
-           processes), measured services and a signed unaccounted remainder. Without coalition
-           counters, services includes only independently observed other-user process CPU
+  aterm    aterm's reported CPU counter growth, footprint and processes, shared work included
+  tab <n>  this tab's program, reported CPU counter growth and live footprint
+  reported_cpu  independent app, tab, other-process and service counter rates. Updates can
+           arrive late: these readings do not partition machine CPU usage
   more=    the other views, and where this help is
   A footprint is the sum of what macOS charges each process: shares, not a split of RAM, so
   aterm's or a tab's can pass the machine's used memory (`sys mem` names the processes).
@@ -353,7 +350,9 @@ THE OVERVIEW'S LINES
 
 FIGURES
   ≥ and ≤ (JSON {"v","bound":"at_least|at_most","cause"}) mark a bound: unread counters or
-  unresolved ownership leave the true figure at least or at most the one printed.
+  unresolved ownership leave the corresponding measured account incomplete. CPU ownership
+  coverage does not establish an execution window: reported CPU rates carry no actual-window
+  lower or upper bound, machine share or claim of zero execution.
   Network link rx_bytes/tx_bytes are raw counters: byte_counter names their source, effective
   bit width and byte quantum. Darwin's non-platform NET_RT_IFLIST2 source is modulo 2^32,
   rounded down to 1024 bytes, not a lifetime total. Rates cross a wrap only where a bounded
@@ -363,9 +362,11 @@ FIGURES
   inconsistent movement reads counter_discontinuity; changed sources, unknown provenance and
   invalid intervals read counter_source_changed, counter_provenance_unknown and
   counter_interval_invalid respectively. Unchanged bytes and packets can still read zero.
-  CPU includes finished work where the source proves it. cpu_charge_mc retains attributed
-  counter charge, which may repeat or miss inherited work; cpu_floor_mc is independently
-  observed own CPU. Ambiguous inherited charge leaves actual CPU at its proved floor.
+  CPU is published counter growth divided by the separation between frontend readings.
+  cpu_read_span_ns is a read span, not a bounded kernel accounting epoch. cpu_charge_mc keeps
+  a separate inherited estimate that can repeat or miss work. cpu_execution_window remains
+  unavailable:execution_window_unknown, even with complete ownership coverage. Coalition and
+  process/reap channels remain separate; neither is normalized to machine busy ticks.
   unavailable(<why>) (JSON {"why"}) is not measured here, and never zero. unsupported: no
   reader on this OS; not_sampled: this build does not read it; refused: the OS refused the
   read; not_read: the measurement was unavailable, with other independent measurements retained;
@@ -593,25 +594,19 @@ NAMING A WAIT (owner, macOS)
 "#;
 
 const WHY_BODY: &str = r#"  aterm ctl @self sys why [cpu|mem] [top=<n>] [fresh=<ms>] [since=<cursor>] [--json]
-  Bare why picks what deviates most: the CPU, memory, or on a calm machine one sentence.
-  A calm reply needs the memory pressure, swap rates and thermal state read; where one is not
-  (Windows; Linux without PSI or a thermal reading) a bare why names the CPU or memory.
+  Bare why chooses memory for memory pressure, active swapping or a service over its huge
+  threshold; otherwise CPU. Published CPU counters cannot establish a calm execution interval
+  or a physical CPU cause, even with complete ownership coverage.
 
 LINES
-  why      the sentence: what is busy, mostly whose, the cause aterm names (or "no cause
-           open"), and this tab's CPU contribution: its part in that cause
-           ("this tab is the main cause", "part of", "not"), or with no cause named its share
-           of the figure ("uses most of it", "a large part of it", "little of it"). Memory
-           names charged footprint prominence, never a percentage or additive share of physical RAM
-  split    (cpu) tab_mc= aterm_rest_mc= others_mc= services_mc= unaccounted_mc=, per resource
-           coalition on macOS (via=coalitions), else process and reaper evidence
-           (via=subtraction). Unknown ownership remains unaccounted; services is never guessed
-           from the positive remainder
-  classes  (mem) total_bytes= app_bytes= wired_bytes= compressed_bytes= used_bytes=
-           cache_bytes= free_bytes=, and a derived class
-  you      this tab's role= main (at least half, the largest part), part (a fifth, or the
-           largest), minor, none or unavailable(<why>). CPU includes its share_pm; memory
-           includes fp_bytes only, because footprint and physical used RAM are different accounts
+  why      machine activity and current independently read pressure or thermal contexts.
+           CPU counters can publish earlier work late, so they do not certify a CPU cause
+  reported_cpu (cpu) independent reported tab, app, other-process and service rates, with
+           read_span_ns and ownership/read coverage. These are not parts of machine CPU
+  classes  (mem) physical-memory page classes and any derived class
+  you      CPU role is unavailable(execution_window_unknown); reported_cpu_mc keeps this
+           tab's observed growth rate. Memory keeps its charged-footprint prominence and
+           fp_bytes, never an additive share of physical RAM
   owners   (mem) fp_bytes= coalitions= live_only=1: the ranked coalitions' footprint summed
            over their live processes, and their count
   who      a coalition, busiest first (memory: by footprint), named by its lead process, which
@@ -623,18 +618,15 @@ LINES
            deferred_pm=] [finished_included=1: work of members now gone is counted] cause=<id|->,
            or (mem) fp_bytes= live=<n> (its live processes). `more` and `withheld` sum the rows
            left out. ownership=mixed marks a coalition shared by proved app and outside work:
-           cpu_mc is its whole counter, delegated_mc its independently attributed app CPU,
-           outside_floor_mc its independently observed outside CPU. Such raw rows do not
+           cpu_mc is its whole counter growth, delegated_mc its app-member process counter growth,
+           outside_reported_mc its independently observed outside counter rate. Such rows do not
            form an owner partition. Memory uses current ownership proofs independently of CPU
            history: scope=mixed keeps fp_bytes as the whole coalition charge and exposes
            app_fp_bytes, outside_fp_bytes and outside_part; unread or unassigned charges stay
            explicit, with scope=unknown when no current owner is proved
-  cause    id= spotlight, tab-work, aterm-work, app-work, unexplained or service-memory, or a
-           context: startup, wake, pressure or throttled. covers_mc= the busy figure it covers;
-           since= the earliest birth of the processes that lead its coalitions; opened= when its
-           episode opened; then its evidence (tab=, part=, level=, wake= …); sure=held: it held
-           over the window; src= says where its facts come from: kernel, signature (the code
-           signature) or derived. A sentence can say "no cause open" with no cause line
+  cause    current independently measured pressure or throttling contexts, or a memory
+           service cause. Published CPU growth does not establish a covering CPU cause.
+           src= names the source of each independent fact
   pass     trend= whether it is passing
   do       class=none may=agent destructive=0: nothing needs doing; class=restart service=<s>
            may=person destructive=1: only a person can do it (`aterm help sys privacy`)
@@ -652,11 +644,12 @@ LINES
   A caller that is not owner-class sees only the coalitions wholly in its target's tab, never
   aterm's; the rest sum on withheld. Past 2,048 bytes a text reply moves rows into more unless
   top= is given (--json is cut by top= alone; the events a since= reply carries never are).
-  `sys global`, `sys aterm`, `sys tab` and the overview use why's matched coalition window
-  when available. CPU reading time and window are printed separately from the latest live
-  memory reading. Without coalition evidence, CPU uses the current common process window
-  and keeps finished native work with its authenticated submitting tab. A control client
-  launched from another terminal cannot transfer that terminal's whole coalition CPU to aterm.
+  `sys global`, `sys aterm`, `sys tab` and the overview use live and retained process
+  counter growth for app/tab CPU. CPU read time and span are separate from live memory readings.
+  Without a scoped account, CPU timing uses the common live-process read span. Machine ticks,
+  coalition growth and inherited child estimates remain independent accounts. Finished native
+  work keeps its authenticated submitting tab. A control client launched from another terminal
+  cannot transfer that terminal's whole coalition CPU to aterm.
 "#;
 
 const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|request|aterm|global] [depth=<1-8>]
@@ -777,6 +770,12 @@ HELD
   The rows add up to used_bytes=: each is cut to what the rows above it leave (clamped=yes;
   a cloned file counts once per copy), and the last, project=other worktree=unclassified,
   holds the used bytes no row names.
+  On screen, the window that shows System Resources draws these readings in the Disk Custody
+  band under the Deck: the volume's used space by class with the budget's cap and the warn,
+  clean and emergency lines; the used space over 3 weeks with each removal marked; what aterm
+  freed today and the disk journal's newest entry; the largest holdings with their sessions'
+  marks; and what the budget's next pass does. Click the band, or rest the pointer on it, to
+  open the Disk lens (the Deck's Disk row does the same), which lists them all.
 "#;
 
 const LEFT_BODY: &str = r#"  aterm ctl @self sys left [scope=pane|tab|aterm] [top=<n>] [--json]
@@ -843,17 +842,19 @@ SCHEDULING AND QOS (sys procs, macOS)
   Each proc row's scheduling={…} carries Darwin nice, the target-application and
   requested-background bits, suppression, the application role and lifetime CPU nanoseconds by
   QoS class. Zero and false are measured values; refused, unsupported and an OS error stay
-  distinct. A row's cpu_mc (cpu_mc_scope=process_self) is the process's own interval CPU, not
-  its children's. JSON cpu_accounting keeps exact decimal-string cumulative self and
-  reaped-descendant CPU, the counter timestamp, the process identity and the automatic-reaping
+  distinct. A row's cpu_mc (cpu_mc_scope=process_self) is its own published counter growth rate, not
+  its children's. The read span does not bound the execution time of that growth.
+  JSON cpu_accounting keeps exact decimal-string cumulative self and reaped-descendant CPU,
+  the counter timestamp, the process identity and the automatic-reaping
   flag; `sys report --json` keeps them in its anomaly frames after workers exit. Compare
   counters only within one process generation. Do not add reaped-child CPU to the row's rate:
   it can overlap observed children, and Darwin's automatic reaping can charge it twice. QoS
   counters are lifetime CPU by class, not core residency.
-  cores, procs and why show cluster occupancy, and flag threads waiting to run while
-  performance cores sit idle only across aligned nominal sampling windows. Unchanged core
-  counters leave current use unavailable(no_counter_delta); a value the Deck keeps drawing is
-  not a new measurement. None of this proves which cores a worker used or why it waited.
+  cores and procs show independently reported cluster occupancy and process counter
+  differences. Matching nominal read spans do not establish concurrent physical waiting.
+  Unchanged core counters leave current use unavailable(no_counter_delta).
+  A value the Deck keeps drawing is not a new measurement. None of this proves which cores
+  a worker used or why it waited.
   nice=0 and background=false do not rule out a QoS ceiling. For a deliberate macOS policy
   change, `taskpolicy -a` must wrap the worker's own exec: an outer wrapper's role does not
   survive fork, and -B only clears Darwin backgrounding. Keep the loader environment and job
@@ -1043,8 +1044,8 @@ WHAT IT CANNOT MEASURE HERE
   - CPU frequency (delivered or requested): read as unavailable.
   - GPU use per core: one device-wide figure.
   - counters the OS refuses for another user's process. Coalition counters still provide
-    measured totals where available; otherwise services is an observed own-CPU floor and
-    unknown work remains in the signed unaccounted remainder.
+    independent reported totals where available. Process and coalition counters can publish
+    at different times; their disagreement is not unexplained actual work.
   - the size of a folder it does not walk (protected, another user's, remote, removable, too
     broad): unavailable(<why>), never zero.
   - which program macOS's program check holds, or stranded when syspolicyd crashed and

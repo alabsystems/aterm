@@ -172,7 +172,7 @@ fn a_windows_workspace_nested_in_a_removed_checkout_is_placed_by_its_volume_seri
     assert!(device_of(&home.join("missing")).is_err());
     let canonical = std::fs::canonicalize(&home).expect("canonical");
     let plain = PathBuf::from(
-        aterm_sysprobe::paths::plain(&canonical)
+        aterm_path::plain(&canonical)
             .to_string_lossy()
             .to_lowercase(),
     );
@@ -187,7 +187,7 @@ fn a_windows_workspace_nested_in_a_removed_checkout_is_placed_by_its_volume_seri
     let root = PathBuf::from(format!("{}:\\", char::from(letter)));
     let seen = gone_placed(&ws, Some(&plain), Some(&placing(vec![root.clone()], dev)));
     assert!(seen.is_ok(), "{seen:?}");
-    let between = aterm_sysprobe::paths::plain(&canonical.join("dev").join("gone-r3")).into_owned();
+    let between = aterm_path::plain(&canonical.join("dev").join("gone-r3")).into_owned();
     let kept = gone_placed(
         &ws,
         Some(&plain),

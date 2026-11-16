@@ -514,13 +514,15 @@ fn actual_profile_and_callback_resources_remain_exclusive_until_retirement() {
     assert!(profile_b.current(&b));
     // Kernel ownership and transfer are tested without consuming the real
     // machine's registered callback endpoints. Live acquire uses ONLY them.
+    // The port's release at the worker's drop is the kernel's and is not
+    // rebound here: an ephemeral port let go is free to any process's next
+    // `bind(0)`, so a rebind races every other test that binds one.
     let callback = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = callback.local_addr().unwrap();
     let worker = callback.try_clone().unwrap();
     drop(callback);
     assert!(TcpListener::bind(address).is_err());
     drop(worker);
-    TcpListener::bind(address).unwrap();
     drop(profile_a);
     browser_window::ProfileLock::claim(&a).unwrap();
 }

@@ -726,6 +726,7 @@ fn fx_window(
         WindowShow::UNKNOWN
     };
     crate::restore::WindowLayout {
+        dock: None,
         rows,
         cols,
         active_tab: 0,
@@ -1189,7 +1190,8 @@ fn fx_capture_held(
         }
         let screen = HeldScreen {
             local_id: pane.local_id,
-            sid: aterm_session::SessionId::new(fx_record(pane.local_id, "").sid),
+            sid: aterm_session::SessionId::parse(&fx_record(pane.local_id, "").sid)
+                .expect("a legacy tab's id"),
             checkpoint,
             exit: pane.exit,
             history_dropped,
@@ -3473,7 +3475,7 @@ fn fx_mailbox_handle(local_id: u64) -> crate::session_store::SessionHandle {
     let at = aterm_slog::Stamp::new(FixtureIdentity::for_release().wall_unix_ms, 2_000);
     crate::session_store::test_handle_identified(
         local_id,
-        aterm_session::SessionId::new(format!("s-{local_id:020x}")),
+        aterm_session::SessionId::parse(&format!("s-{local_id:020x}")).expect("a legacy tab's id"),
         aterm_session::LaunchNonce::from_bytes([u8::try_from(local_id + 1).unwrap(); 16]),
         fx_log_epochs(),
         at,
@@ -4270,6 +4272,9 @@ fn fx_carried_state_desk() -> FxDesk {
     );
     behind.workers_in_front = true;
     behind.active_item = None;
+    // The person hid the navigator in this window (View > Show Navigator), and its record
+    // carries that, so the successor births it hidden though windows dock by default (DK-4).
+    behind.dock = Some(0);
     if behind.show.z_order.is_some() {
         behind.show.z_order = Some(1);
         behind.show.key = Some(false);
@@ -5117,10 +5122,6 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     // run, and no handoff writes it. v0.140.0 recorded the former fields' omission; older
     // immutable desks continue to hold the reader to those bytes (tests/fixtures/handoff/README.md).
     ("layout", "AgentRestore.gemini"),
-    // A closed worker's row went to the machine's session table on disk (tracker ST-15), which
-    // outlives every update, so no handoff carries it; older immutable desks still write it and
-    // the reader ignores it.
-    ("manifest", "SessionHandoff.retired_workers"),
     ("layout", "NativeLeafRestore.metadata"),
     ("meta", "ColorRepr.stack"),
     ("meta", "CursorStyle::Hidden"),

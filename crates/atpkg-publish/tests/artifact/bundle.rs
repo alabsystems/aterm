@@ -53,7 +53,7 @@ struct World {
 }
 
 /// A rostered machine with a channel head, a dormant `$HOME/trust`, a promoter-shaped trust
-/// seal (closure beside it, rustc and rustdoc hard links, cargo) and a clean source
+/// seal (closure beside it, a rustc hard link and copied genuine aliases) and a clean source
 /// checkout.
 fn world(label: &str) -> World {
     let tmp = scratch(label);
@@ -74,13 +74,18 @@ fn world(label: &str) -> World {
     let (seal, private) = seal_fixture(&root);
     std::fs::hard_link(seal.join("bin/trustc"), seal.join("bin/rustc")).expect("rustc");
     put_exe(&seal.join("bin/trustdoc"), &native("trustdoc"));
-    std::fs::hard_link(seal.join("bin/trustdoc"), seal.join("bin/rustdoc")).expect("rustdoc");
-    put_exe(&seal.join("bin/cargo"), &native("cargo"));
     for tool in TRUST_EXPOSES {
         let bin = seal.join("bin").join(tool);
         if !bin.exists() {
             put_exe(&bin, &native(tool));
         }
+    }
+    for (canonical, alias) in [("targo", "cargo"), ("trustdoc", "rustdoc")] {
+        std::fs::copy(
+            seal.join("bin").join(canonical),
+            seal.join("bin").join(alias),
+        )
+        .expect("copy the genuine alias");
     }
     std::fs::create_dir_all(seal.join("libexec")).expect("libexec");
     let src = root.join("trust-src");
@@ -187,7 +192,7 @@ fn a_trust_bundle_ships_its_frozen_closure_and_one_inode_per_alias() {
         ino(&x.join("bin/trustdoc")),
         "the required alias"
     );
-    assert!(x.join("bin/cargo").is_file());
+    assert_eq!(ino(&x.join("bin/cargo")), ino(&x.join("bin/targo")));
     let text = std::fs::read_to_string(&out.manifest).expect("pkg");
     assert!(
         text.contains("kind = \"sysroot-bundle\"") && text.contains("reloc = \"self-contained\"")
@@ -523,6 +528,147 @@ fn the_one_compiler_gate_reads_the_final_bytes() {
     std::os::unix::fs::symlink("trustc", root.join("bin/rustc")).expect("ln -s");
     let err = bundle::compiler_gate(root).expect_err("a link");
     assert!(err.to_string().contains("regular files"), "{err}");
+}
+
+#[test]
+fn all_trust_aliases_survive_name_sensitive_signing_as_one_inode_per_program() {
+    let tmp = scratch("bundle-trust-alias-signatures");
+    let mut t = tools();
+    t.resign_by_name = true;
+    for normalize in [false, true] {
+        let root = tmp
+            .path()
+            .join(if normalize { "normalized" } else { "unlinked" });
+        for (canonical, alias) in [
+            ("trustc", "rustc"),
+            ("targo", "cargo"),
+            ("trustdoc", "rustdoc"),
+        ] {
+            let mut bytes = macho(CPU_ARM64);
+            bytes.extend(canonical.as_bytes());
+            put_exe(&root.join("bin").join(canonical), &bytes);
+            put_exe(&root.join("bin").join(alias), &bytes);
+            assert_ne!(
+                ino(&root.join("bin").join(canonical)),
+                ino(&root.join("bin").join(alias))
+            );
+        }
+        if normalize {
+            assert_eq!(
+                bundle::trust_aliases(&t, &root).expect("normalize all pairs"),
+                vec![OneCompiler::LinkedCopy; 3]
+            );
+        }
+        assert_eq!(
+            bundle::strip_symbols(&t, &root).expect("strip and sign"),
+            if normalize { (3, 3) } else { (6, 0) }
+        );
+        if normalize {
+            assert_eq!(
+                bundle::trust_alias_gate(&root).expect("final bytes"),
+                vec![OneCompiler::AlreadyLinked; 3]
+            );
+        } else {
+            let err = bundle::trust_alias_gate(&root).expect_err("file-name signatures differ");
+            assert!(err.to_string().contains("not byte-identical"), "{err}");
+            let mut unsigned = tools();
+            unsigned.same_unsigned = true;
+            assert_eq!(
+                bundle::trust_aliases(&unsigned, &root)
+                    .expect("existing unsigned-equivalence owner"),
+                vec![OneCompiler::LinkedResigned; 3]
+            );
+            assert_eq!(
+                unsigned
+                    .log()
+                    .iter()
+                    .filter(|line| line.starts_with("same_unsigned "))
+                    .count(),
+                3
+            );
+            bundle::trust_alias_gate(&root).expect("all three verified twins now agree");
+        }
+    }
+}
+
+#[test]
+fn full_trust_normalization_refuses_a_different_program_without_replacing_it() {
+    for alias in ["rustc", "cargo", "rustdoc"] {
+        let w = world("bundle-trust-different-alias");
+        std::fs::remove_file(w.seal.join("bin").join(alias)).expect("unlink alias");
+        let foreign = native("a different unsigned program");
+        put_exe(&w.seal.join("bin").join(alias), &foreign);
+        let t = tools();
+        let err =
+            bundle::pack_bundle_with(&w.ctx, &w.request(), &t).expect_err("different program");
+        assert!(
+            err.to_string().contains("different programs"),
+            "{alias}: {err}"
+        );
+        assert!(err.to_string().contains(alias), "{err}");
+        assert_eq!(
+            std::fs::read(w.seal.join("bin").join(alias)).expect("seal"),
+            foreign
+        );
+        assert!(!t.log().iter().any(|line| line.starts_with("relocate ")));
+    }
+}
+
+#[test]
+fn full_trust_alias_members_are_required_regular_executables() {
+    for damage in ["missing", "symlink", "not-executable"] {
+        let w = world("bundle-trust-alias-shape");
+        let alias = w.seal.join("bin/cargo");
+        if damage == "not-executable" {
+            set_mode(&alias, 0o644);
+        } else {
+            std::fs::remove_file(&alias).expect("unlink alias");
+            if damage == "symlink" {
+                std::os::unix::fs::symlink("targo", &alias).expect("symlink alias");
+            }
+        }
+        let err = bundle::trust_aliases(&tools(), &w.seal).expect_err("invalid full-Trust alias");
+        assert!(err.to_string().contains("bin/cargo"), "{damage}: {err}");
+    }
+}
+
+#[test]
+fn the_full_bundle_gate_refuses_every_alias_tampered_after_relocation() {
+    for alias in ["rustc", "cargo", "rustdoc"] {
+        let w = world("bundle-trust-alias-final-tamper");
+        let req = w.request();
+        let t = tools();
+        let relocated = bundle::admit(&w.ctx, &req, &t)
+            .expect("admitted")
+            .stage()
+            .and_then(bundle::Staged::mutate)
+            .and_then(bundle::Mutated::relocate)
+            .expect("relocated");
+        let stages: Vec<_> = std::fs::read_dir(&req.out)
+            .expect("out")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .starts_with(".atpkg-bundle-")
+            })
+            .collect();
+        assert_eq!(stages.len(), 1);
+        let root = stages[0].join("root");
+        bundle::trust_alias_gate(&root).expect("all aliases agree before tampering");
+        let tampered = root.join("bin").join(alias);
+        std::fs::remove_file(&tampered).expect("detach just the alias");
+        put_exe(&tampered, &native("tampered after relocation"));
+        let Err(err) = relocated.gate() else {
+            panic!("the actual full bundle gate accepted {alias}");
+        };
+        assert!(
+            err.to_string().contains("not byte-identical"),
+            "{alias}: {err}"
+        );
+        assert!(err.to_string().contains(alias), "{err}");
+    }
 }
 
 #[test]

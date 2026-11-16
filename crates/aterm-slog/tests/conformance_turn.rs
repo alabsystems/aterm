@@ -24,7 +24,7 @@ const TICK_MS: u64 = 500;
 /// The model's word code for a verdict.
 fn code(v: Verdict) -> i64 {
     match v {
-        Verdict::Unknown => 0,
+        Verdict::Unknown | Verdict::Walled | Verdict::Stopped => 0,
         Verdict::Busy => 1,
         Verdict::Idle => 2,
         Verdict::Prompt(b) if b.is_question() => 3,
@@ -49,7 +49,7 @@ fn see(v: Verdict) -> &'static str {
         Verdict::Idle => "SeeIdle",
         Verdict::Question => "SeeQuestion",
         Verdict::Gone => "SeeGone",
-        Verdict::Unknown => "SeeUnknown",
+        Verdict::Unknown | Verdict::Walled | Verdict::Stopped => "SeeUnknown",
     }
 }
 

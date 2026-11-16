@@ -284,6 +284,12 @@ pub(crate) struct Board {
     pub(crate) budget_cap: Cap,
     /// The volume the budget is sized on, as the last look said ([`Self::budget_look`]).
     pub(crate) budget_home: BudgetHome,
+    /// Whether the last look read removal as on (`disk.auto_free_gib` above 0); `None` before a
+    /// look ([`Self::budget_pass_look`]).
+    pub(crate) budget_cleanup: Option<bool>,
+    /// The budget pass's cannot-meet memo as the last look read it
+    /// (`aterm_agent::harness::disk::budget::UNMET_FILE`; [`Self::budget_pass_look`]).
+    pub(crate) budget_unmet: Option<aterm_agent::harness::disk::budget::Unmet>,
     /// The checkouts' `target*` links whose target a pass's search found not there, kept while
     /// each look finds them still dangling ([`Shelf::keep_dangling`]; the leftover view's `link`
     /// rows).
@@ -294,107 +300,8 @@ pub(crate) struct Board {
     pub(crate) episode: DiskEpisode,
     /// Today's freed-bytes tally.
     pub(crate) freed: FreedTally,
-    /// The `disk-free@v1` line owed a session of this process (`sid -> line`), as the lease
-    /// last read elected it (`crate::harness_host`'s ask).
-    pub(crate) asks: BTreeMap<String, AskOwed>,
-    /// Why a session of this process may not be asked to free space (`sid -> why`: its task
-    /// finished or landed, it has none, its Autopilot is Off, or it is the person's own exchange
-    /// or a manager's worker), as its worker found it at its last turn break: the ask seats none
-    /// of these while the finding holds ([`Unfit::bars`], `crate::harness_disk_ask`).
-    pub(crate) unfit: BTreeMap<String, Unfit>,
-    /// The usage-limit wall a session of this process stands at (`sid -> wall`), as its loop
-    /// opened its limit episode there and dated it, and its worker published it
-    /// (`crate::harness_host`'s `WorkerIdle::limit_wall`, again whenever the loop moves its
-    /// reset) until the episode closed: while the wall holds ([`Wall::holds`])
-    /// and the session's agent reads `limited`, the ask holds it out of its seats and waits for
-    /// it to be past rather than running out (`crate::harness_disk_ask`).
-    pub(crate) walls: BTreeMap<String, Wall>,
-    /// The lasting withhold of its loop's a session of this process stands at (`sid -> withhold`),
-    /// as its loop decided its last turn break and its worker published it
-    /// (`crate::harness_host`'s `WorkerIdle::lasting_hold`, again whenever it changes): the
-    /// credits hold until it lifts, or a wall that is no usage limit until the loop finds it gone
-    /// or reads the session working past it (a live read, never a break of its own background
-    /// work). While it holds ([`Withhold::holds`]) the ask holds the session
-    /// out of its seats and waits for it to be past rather than electing a session whose loop
-    /// would type it nothing (`crate::harness_disk_ask`).
-    pub(crate) withholds: BTreeMap<String, Withhold>,
     /// The next demand's id.
     next_demand: u64,
-}
-
-/// A lasting withhold of a session's loop at its turn breaks ([`Board::withholds`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Withhold {
-    /// The credits hold (`credits-hold@v1`): its loop types nothing until `until_s` (unix seconds:
-    /// the usage limit's reset plus the loop's grace, or the hold's bound); `None`, until its loop
-    /// finds it lifted.
-    Credits { until_s: Option<i64> },
-    /// A wall on screen that is no usage limit, by its kind's wire word (`wall:auth`, ...).
-    Wall { wire: &'static str },
-}
-
-impl Withhold {
-    /// Whether it holds the session from a line at `now_s` (unix seconds).
-    pub(crate) fn holds(&self, now_s: i64) -> bool {
-        match self {
-            Withhold::Credits { until_s } => until_s.is_none_or(|until| now_s < until),
-            Withhold::Wall { .. } => true,
-        }
-    }
-}
-
-/// A usage-limit wall a session's loop has open ([`Board::walls`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Wall {
-    /// When the loop takes the wall as spent and rests there, able to take a line (the reset its
-    /// limit episode holds the wall to, or where it knows none the one its transcript names, plus
-    /// the loop's grace, unix seconds); `None`: its reset is not known, so it holds until the loop
-    /// closes its episode.
-    pub(crate) until_s: Option<i64>,
-}
-
-impl Wall {
-    /// Whether the wall holds the session from a line at `now_s` (unix seconds).
-    pub(crate) fn holds(&self, now_s: i64) -> bool {
-        self.until_s.is_none_or(|until| now_s < until)
-    }
-}
-
-/// Why a session's worker found it may not be asked to free space at its last turn break
-/// ([`Board::unfit`]): what holds while the session rests there, and what holds across its turns.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct Unfit {
-    /// What the session itself was there: its task finished or landed (`finished`), nobody gave
-    /// it one (`taskless`), or its Autopilot is Off (`autopilot-off`). This holds only until the
-    /// session works again, as one that works was given something to do: its worker drops this at
-    /// the turn's first busy read, and the seat rule reads none of it while the session's agent
-    /// reads busy.
-    pub(crate) own: Option<&'static str>,
-    /// Whose the session is for as long as they keep it: the person's own exchange (`exchange`)
-    /// or a manager's wait (`managed`). This holds across the session's turns until its next turn
-    /// break finds it again.
-    pub(crate) theirs: Option<&'static str>,
-}
-
-impl Unfit {
-    /// The word that bars the session from a seat, its agent working now (`working`: it reads
-    /// busy) or not: whose it is alone while it works ([`Self::own`]). `None`: it may be seated.
-    pub(crate) fn bars(&self, working: bool) -> Option<&'static str> {
-        if working {
-            self.theirs
-        } else {
-            self.own.or(self.theirs)
-        }
-    }
-}
-
-/// A `disk-free@v1` line owed one session ([`Board::asks`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AskOwed {
-    /// The volume's lease key ([`VolumeKey::spelled`]).
-    pub(crate) key: String,
-    /// The line.
-    pub(crate) text: String,
 }
 
 impl Board {
@@ -424,6 +331,8 @@ impl Board {
             budget: None,
             budget_cap: Cap::Unwritten,
             budget_home: BudgetHome::Unlooked,
+            budget_cleanup: None,
+            budget_unmet: None,
             dangling: Vec::new(),
             demands: Vec::new(),
             episode: DiskEpisode {
@@ -436,10 +345,6 @@ impl Board {
                 alerted: false,
             },
             freed: FreedTally::new(),
-            asks: BTreeMap::new(),
-            unfit: BTreeMap::new(),
-            walls: BTreeMap::new(),
-            withholds: BTreeMap::new(),
             next_demand: 1,
         }
     }
@@ -539,6 +444,44 @@ impl Board {
     pub(crate) fn budget_look(&mut self, cap: Cap, home: Option<String>) {
         self.budget_cap = cap;
         self.budget_home = home.map_or(BudgetHome::Unsized, BudgetHome::Volume);
+    }
+
+    /// What a look read of the budget's pass: whether removal is on (`cleanup`) and its
+    /// cannot-meet memo (`unmet`).
+    pub(crate) fn budget_pass_look(
+        &mut self,
+        cleanup: bool,
+        unmet: Option<aterm_agent::harness::disk::budget::Unmet>,
+    ) {
+        self.budget_cleanup = Some(cleanup);
+        self.budget_unmet = unmet;
+    }
+
+    /// Whether the budget's pass may remove anything (`None` before a look read it), and where
+    /// its memo holds the next pass on the volume `key` off at `now_unix`: the unix second the
+    /// last pass of that volume, under the cap `budget` reads, ended unable to meet its target,
+    /// while the rebuildable bytes have not grown past what that pass saw and less than
+    /// `REPLAN_AFTER_S` has passed (a change of the live sessions, which plans again too, is
+    /// not read here).
+    pub(crate) fn budget_pass(
+        &self,
+        key: Option<&VolumeKey>,
+        budget: BudgetRead,
+        now_unix: Option<i64>,
+    ) -> (Option<bool>, Option<i64>) {
+        use aterm_agent::harness::disk::budget::REPLAN_AFTER_S;
+        let unmet = match (key, budget, now_unix, self.budget_unmet.as_ref()) {
+            (Some(key), BudgetRead::Sized(b), Some(now), Some(memo))
+                if memo.volume == key.spelled()
+                    && memo.cap == b.cap
+                    && b.rebuildable <= memo.seen_rebuildable
+                    && now.saturating_sub(memo.seen_unix) < REPLAN_AFTER_S =>
+            {
+                Some(memo.seen_unix)
+            }
+            _ => None,
+        };
+        (self.budget_cleanup, unmet)
     }
 
     /// Keep `sizing` as the budget's last one, unless the board holds one that ended later

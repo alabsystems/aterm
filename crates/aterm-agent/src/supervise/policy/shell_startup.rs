@@ -592,16 +592,10 @@ pub fn read(worker: &WorkerEnv, launch: &Path, windows: bool) -> Result<ShellSta
     Ok(state)
 }
 
-/// How [`read`]'s error starts when no snapshot stands ([`unwritten`]).
-pub const NO_SNAPSHOT: &str = "no shell snapshot of ";
-
-/// Whether `why`, a [`read`] error, says no snapshot stands: Claude Code writes one only once
-/// its Bash tool has run a command in a session, and removes it when that session ends, so in a
+/// How [`read`]'s error starts when no snapshot stands: Claude Code writes one only once its
+/// Bash tool has run a command in a session, and removes it when that session ends, so in a
 /// config folder where no running session ran one yet there is none.
-#[must_use]
-pub fn unwritten(why: &str) -> bool {
-    why.starts_with(NO_SNAPSHOT)
-}
+pub const NO_SNAPSHOT: &str = "no shell snapshot of ";
 
 /// Every snapshot of a shell in `kinds` under `claude`'s `shell-snapshots/`;
 /// `Err` when there is none ([`NO_SNAPSHOT`]), or more than [`MAX_SNAPSHOTS`].

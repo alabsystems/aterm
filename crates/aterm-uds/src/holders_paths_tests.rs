@@ -579,8 +579,12 @@ fn a_descriptor_on_a_revoked_terminal_holds_nothing() {
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_dead_working_directory_is_no_working_directory() {
-    use super::super::hook::{reading_cwd_dead, reading_dead_as_unknown};
+    use super::super::hook::reading_dead_as_unknown;
     use crate::spawnfd::Stdio;
+    fn reading_cwd_dead<R>(pid: i32, f: impl FnOnce() -> R) -> R {
+        use super::super::hook::{ALWAYS, Read, answering};
+        answering(Read::Cwd, pid, super::super::Failed::Dead, ALWAYS, f)
+    }
     let me = std::process::id();
     let base = fresh("deadcwd");
     let (mnt, held) = (base.join("mnt"), base.join("held"));
@@ -646,6 +650,144 @@ fn a_dead_working_directory_is_no_working_directory() {
         "the old reading: unreadable"
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_live_process_one_read_calls_exited_stays_in_the_scan() {
+    use super::super::Failed::{Exited, Refused};
+    use super::super::hook::{ALWAYS, Read, answering};
+    let me = std::process::id();
+    let dir = fresh("exitedonce");
+    let mut child = cat_in(&dir);
+    let pid = running(&child, "/bin/cat");
+    let n = i32::try_from(pid).expect("a pid");
+    let scan =
+        || super::scan_path_users_of(&[pid], std::slice::from_ref(&dir), &[me]).expect("scan");
+    let hows = |scan: &super::PathScan| scan.users.iter().map(|user| user.how).collect::<Vec<_>>();
+    let pids = |scan: &super::PathScan| scan.unreadable.iter().map(|(p, _)| *p).collect::<Vec<_>>();
+    let before = scan();
+    let no_exe = answering(Read::Exe, n, Exited, ALWAYS, scan);
+    let cwd_once = answering(Read::Cwd, n, Exited, 1, scan);
+    let cwd_always = answering(Read::Cwd, n, Exited, ALWAYS, scan);
+    crate::deadline::kill_within(&mut child, HANG);
+    let reaped = answering(Read::Exe, n, Exited, ALWAYS, scan);
+    let unconfirmed = answering(Read::Short, n, Refused, ALWAYS, scan);
+
+    assert_eq!(
+        hows(&before),
+        ["cwd"],
+        "a user through its working directory while it reads"
+    );
+    assert_eq!(
+        (hows(&no_exe), no_exe.unreadable),
+        (vec!["cwd"], Vec::new()),
+        "an executable read's ESRCH for a process the kernel still finds is read on, and its \
+         working directory names the user"
+    );
+    assert_eq!(
+        (hows(&cwd_once), cwd_once.unreadable),
+        (vec!["cwd"], Vec::new()),
+        "one ESRCH from a process the kernel still finds is read again, and the second read \
+         finds the user"
+    );
+    assert!(
+        cwd_always.users.is_empty(),
+        "the forced ESRCH stops the reads"
+    );
+    assert_eq!(
+        pids(&cwd_always),
+        [pid],
+        "a live process both reads call exited is unreadable, not gone"
+    );
+    assert!(
+        reaped.users.is_empty() && reaped.unreadable.is_empty(),
+        "a reaped process stays out of the scan: {reaped:?}"
+    );
+    assert_eq!(
+        (hows(&unconfirmed), pids(&unconfirmed)),
+        (Vec::new(), vec![pid]),
+        "a short BSD read refused confirms no exit, even of a pid reaped: unreadable"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_process_that_exits_between_its_two_reads_uses_nothing() {
+    use super::super::hook::{Read, after_next_listing, answering};
+    let me = std::process::id();
+    let (dir, elsewhere) = (fresh("betweenreads"), fresh("betweenreads-scanned"));
+    let child = cat_in(&dir);
+    let pid = running(&child, "/bin/cat");
+    let n = i32::try_from(pid).expect("a pid");
+    let listed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let seen = std::rc::Rc::clone(&listed);
+    after_next_listing(move |at, fds| {
+        assert_eq!(at, n);
+        seen.set(fds.len());
+        super::super::tests::kill_unreaped(pid);
+    });
+    let scan = answering(Read::Cwd, n, super::super::Failed::Exited, 1, || {
+        super::scan_path_users_of(&[pid], std::slice::from_ref(&elsewhere), &[me]).expect("scan")
+    });
+    reap(child);
+
+    assert!(
+        listed.get() > 0,
+        "the second read listed its descriptors, then read them after its exit"
+    );
+    assert_eq!(
+        (scan.scanned, scan.users, scan.unreadable),
+        (1, Vec::new(), Vec::new()),
+        "a process the first read found and the second saw exit uses nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_executable_read_that_answers_esrch_names_an_exit_only_once_no_process_is_found() {
+    use super::super::Failed::{Exited, Refused};
+    use super::super::hook::{ALWAYS, Read, answering};
+    let dir = fresh("exeexited");
+    let mut child = cat_in(&dir);
+    let pid = running(&child, "/bin/cat");
+    let n = i32::try_from(pid).expect("a pid");
+    let exe_of = || answering(Read::Exe, n, Exited, ALWAYS, || super::exe_of(pid));
+    let live = exe_of();
+    crate::deadline::kill_within(&mut child, HANG);
+    let reaped = exe_of();
+    let unconfirmed = answering(Read::Short, n, Refused, ALWAYS, exe_of);
+
+    assert_eq!(
+        live,
+        super::Exe::Unnamed,
+        "an ESRCH for a process the short BSD read still finds names nothing, and no exit"
+    );
+    assert_eq!(reaped, super::Exe::Exited, "a reaped process has exited");
+    assert_eq!(
+        unconfirmed,
+        super::Exe::Unnamed,
+        "a short BSD read refused confirms no exit, even of a pid reaped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `/bin/cat` working in `dir`, waiting on this process's end of its stdin.
+#[cfg(target_vendor = "apple")]
+fn cat_in(dir: &std::path::Path) -> crate::spawnfd::Child {
+    use crate::spawnfd::Stdio;
+    crate::spawnfd::command("/bin/sh")
+        .arg("-c")
+        .arg("exec /bin/cat")
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a child working in the folder")
 }
 
 #[cfg(target_vendor = "apple")]

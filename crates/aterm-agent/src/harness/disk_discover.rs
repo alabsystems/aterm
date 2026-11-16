@@ -380,7 +380,7 @@ impl Scratch {
     }
 
     fn long<'p>(&self, path: &'p Path) -> std::borrow::Cow<'p, Path> {
-        if aterm_sysprobe::paths::short_spelled(path).is_none() {
+        if aterm_path::short_spelled(path).is_none() {
             return std::borrow::Cow::Borrowed(path);
         }
         let _quiet = aterm_sysprobe::quiet_errors();
@@ -390,7 +390,7 @@ impl Scratch {
     }
 
     fn holds(&self, path: &Path) -> bool {
-        aterm_sysprobe::paths::windows_under(path, &self.root) == Some(true)
+        aterm_path::windows_under(path, &self.root) == Some(true)
     }
 }
 
@@ -399,7 +399,7 @@ fn claude_scratch_root() -> Option<PathBuf> {
         return None;
     }
     let root = claude_tmp_root(own_uid());
-    if aterm_sysprobe::paths::short_spelled(&root).is_none() {
+    if aterm_path::short_spelled(&root).is_none() {
         return Some(root);
     }
     let _quiet = aterm_sysprobe::quiet_errors();
@@ -500,7 +500,7 @@ fn in_aterm_state(dir: &Path, home: Option<&Path>) -> bool {
         ..aterm_types::dirs::StatePlatform::default()
     };
     aterm_types::dirs::resolve_state_dir(None, platform).is_some_and(|state| {
-        aterm_sysprobe::paths::is_under(dir, &state) == Some(true)
+        aterm_path::is_under(dir, &state) == Some(true)
             && !dir
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -1259,22 +1259,8 @@ pub fn linked_worktrees(home: &Path) -> Vec<(PathBuf, PathBuf)> {
     let Ok(home) = std::fs::canonicalize(home) else {
         return Vec::new();
     };
-    let Ok(rd) = std::fs::read_dir(&home) else {
-        return Vec::new();
-    };
     let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for e in rd.flatten().take(MAX_CHILDREN) {
-        let name = e.file_name();
-        if name.to_string_lossy().starts_with('.') || home_skipped(&name) {
-            continue;
-        }
-        if !e.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let child = e.path();
-        if !std::fs::symlink_metadata(child.join(".git")).is_ok_and(|m| m.is_dir()) {
-            continue;
-        }
+    for child in main_checkouts(&home) {
         for wt in worktrees(&child, &[&home]) {
             out.push((child.clone(), wt));
         }
@@ -1286,6 +1272,34 @@ pub fn linked_worktrees(home: &Path) -> Vec<(PathBuf, PathBuf)> {
     }
     out.sort();
     out.dedup();
+    out
+}
+
+/// Every main checkout among `home`'s children, resolved: a folder (not a link, not hidden,
+/// not one [`HOME_SKIP`] names) holding a `.git` folder, at most [`MAX_CHILDREN`] read.
+#[must_use]
+pub fn main_checkouts(home: &Path) -> Vec<PathBuf> {
+    let Ok(home) = std::fs::canonicalize(home) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&home) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten().take(MAX_CHILDREN) {
+        let name = e.file_name();
+        if name.to_string_lossy().starts_with('.') || home_skipped(&name) {
+            continue;
+        }
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let child = e.path();
+        if std::fs::symlink_metadata(child.join(".git")).is_ok_and(|m| m.is_dir()) {
+            out.push(child);
+        }
+    }
+    out.sort();
     out
 }
 
@@ -1331,7 +1345,7 @@ fn identity(p: &Path) -> Option<(u64, u128)> {
 
 fn strictly_inside(path: &Path, dir: &Path) -> bool {
     if cfg!(windows) {
-        use aterm_sysprobe::paths::{is_under, windows_key};
+        use aterm_path::{is_under, windows_key};
         is_under(path, dir) == Some(true) && windows_key(path) != windows_key(dir)
     } else {
         path.starts_with(dir) && path != dir
@@ -1516,7 +1530,7 @@ impl Walk {
                     !roots
                         .home
                         .as_deref()
-                        .is_some_and(|h| aterm_sysprobe::paths::is_under(h, m) == Some(true))
+                        .is_some_and(|h| aterm_path::is_under(h, m) == Some(true))
                 })
                 .cloned()
                 .collect(),
@@ -1589,7 +1603,7 @@ impl Walk {
             .parent()
             .map_or_else(|| to.clone(), |p| link_target(p, &to));
         if cfg!(windows) {
-            use aterm_sysprobe::paths::{key_under, windows_key};
+            use aterm_path::{key_under, windows_key};
             let Some(key) = windows_key(&abs) else {
                 return true;
             };
@@ -1606,13 +1620,13 @@ impl Walk {
 
     fn is_mount(&self, p: &Path) -> bool {
         if cfg!(windows) {
-            let Some(key) = aterm_sysprobe::paths::windows_key(p) else {
+            let Some(key) = aterm_path::windows_key(p) else {
                 return true;
             };
             return self
                 .mounts
                 .iter()
-                .any(|m| aterm_sysprobe::paths::windows_key(m).is_some_and(|m| m == key));
+                .any(|m| aterm_path::windows_key(m).is_some_and(|m| m == key));
         }
         self.mounts.contains(p)
     }
@@ -2497,7 +2511,7 @@ pub(crate) fn platform_service(exe: Option<&Path>) -> bool {
 /// Returns whether `exe` is a Windows system or Defender service binary.
 #[must_use]
 pub fn windows_service(exe: &Path, system: Option<&Path>, program_data: Option<&Path>) -> bool {
-    use aterm_sysprobe::paths::windows_key;
+    use aterm_path::windows_key;
     let Some(image) = windows_key(exe) else {
         return false;
     };
@@ -2636,10 +2650,10 @@ fn own_use(
             )
         })?;
         if dirs.iter().any(|d| {
-            table.as_ref().map_or_else(
-                || aterm_sysprobe::paths::is_under(&path, d),
-                |t| t.is_under(&path, d),
-            ) != Some(false)
+            table
+                .as_ref()
+                .map_or_else(|| aterm_path::is_under(&path, d), |t| t.is_under(&path, d))
+                != Some(false)
         }) {
             return Ok(Some((*how, path)));
         }

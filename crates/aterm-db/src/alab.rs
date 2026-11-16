@@ -8,7 +8,7 @@
 //! - [`registry`]: the compiled schemas of `alab/registry`, the one catalog table that holds the
 //!   owner's data. It takes a reserved catalog slot (`catalog::reserved`), so a new Mac can
 //!   always store it however many declarations precede it.
-//! - [`seeds`]: the provider, CLI and plan rows every build compiles in, written only into
+//! - [`seeds`]: the provider, CLI and plan rows this build compiles in, written only into
 //!   cells a complete scan found absent.
 //! - [`Registry`] (Unix): declare, read, seed and publish the registry's schema rows.
 //! - [`history`] (Unix): what a roll carries of a retired generation's history, a secret's
@@ -64,11 +64,13 @@ pub mod view;
 pub use crate::typed::View;
 #[cfg(unix)]
 pub use roll::Rolled;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use store::add_admission_counts_for_test;
 #[cfg(unix)]
 pub use store::{
-    CatalogAbsenceRead, CatalogAbsenceRevision, Discovered, Inventory, LabRead, LocalSourceRead,
-    LocalSourceRevision, Observed, ProjectionRead, ProjectionRevision, Registry, Seeded,
-    SourceRead, SourceRevision,
+    AdmissionCounts, CatalogAbsenceRead, CatalogAbsenceRevision, Discovered, Inventory, LabRead,
+    LocalSourceRead, LocalSourceRevision, Observed, ProjectionRead, ProjectionRevision, Registry,
+    Seeded, SourceRead, SourceRevision, admission_counts,
 };
 #[cfg(unix)]
 pub(crate) mod upkeep;

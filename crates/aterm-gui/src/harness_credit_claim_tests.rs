@@ -771,9 +771,9 @@ const fn ended(session: u64) -> ClaimWorker {
 }
 
 /// A HARNESS WORKER'S OWN SESSION NEVER RUNS THE ACT: a tab whose task record trusts a claim
-/// folder or the disk worker's folder is one of aterm's own workers, and so is a session the
-/// store no longer holds (fail closed). NEGATIVE CONTROL: a person's tab with no record, and a
-/// worker trusted a repository, run it.
+/// folder or the folder of a disk worker an earlier build left is one of aterm's own workers,
+/// and so is a session the store no longer holds (fail closed). NEGATIVE CONTROL: a person's tab
+/// with no record, and a worker trusted a repository, run it.
 #[test]
 fn a_harness_workers_own_session_never_runs_the_act() {
     let mut app = crate::App::headless_for_test();
@@ -782,16 +782,15 @@ fn a_harness_workers_own_session_never_runs_the_act() {
     let disk = new_tab(&mut app);
     let repo = new_tab(&mut app);
     set_task(&app, claim, &claim_folder());
-    let disk_folder = format!(
-        "/state/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        aterm_agent::harness::disk::fence::WORKER_FOLDER
-    );
+    let disk_folder = format!("/state/{}/disk-worker", aterm_agent::harness::cli::HARNESS);
     set_task(&app, disk, &disk_folder);
     set_task(&app, repo, "/Users//me/project");
     let sid = |session| live(&app, session).sid.as_str().to_owned();
     assert!(own_worker(&app.store, &sid(claim)), "a claim worker");
-    assert!(own_worker(&app.store, &sid(disk)), "the disk worker");
+    assert!(
+        own_worker(&app.store, &sid(disk)),
+        "a disk worker an earlier build left"
+    );
     assert!(
         own_worker(&app.store, "s-0000000000000000dead"),
         "a session the store lacks"

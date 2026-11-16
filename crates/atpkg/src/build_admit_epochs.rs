@@ -572,6 +572,8 @@ impl Owner {
                     key: ended.key,
                     own: ended.own,
                     cohort: true,
+                    #[cfg(target_os = "macos")]
+                    build_dir: None,
                 };
                 return Err(EpochRefused::new(error, held, cpu, config));
             }

@@ -1,0 +1,51 @@
+# claude-code 2.1.325 · MEASURED 2026-11-16, `aterm ctl text` of a private headless aterm (144x50) running the real Claude Code by `targo --unverified lab claude-wall-panel`, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`, the scopes user:inference user:profile, the composed oauthAccount of ana@example.com) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), the fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1), the harness off; the stub's answers carry 5h 0.62, 7d 0.71 and 7d_oi 0.40, a walled window 1.00 on its 429 · the week limit's wall standing (`lab limit seven_day 93600`), before anything was typed · the lab's random project dir is spelled /private/tmp/at.lab0 here, its run dir /private/tmp/at.lab0/run
+
+ ▐▛███▛█   Claude Code v2.1.325
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+▎ Debug mode enabled · logging to /private/tmp/at.lab0/run/scratch/claude-debug.log
+
+❯ say hello wombatfern
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Churned for 0s · done 6:23 AM
+
+❯ one more wombatfern into the session wall
+  ⎿  You've hit your 5-hour limit · resets 7:23am (America/Los_Angeles)
+
+⏺ Usage limit reached · continuing automatically at 7:23am · esc to cancel
+
+✻ Cogitated for 0s · done 6:23 AM
+
+❯ one more wombatfern into the week wall
+
+⏺ Automatic continue stopped · the usage limit now resets more than 24 hours out, so this task will not resume on its own
+  (/rate-limit-options to wait anyway)
+  ⎿  You've hit your weekly limit · resets Nov 17 at 8:24am (America/Los_Angeles)
+     /upgrade or /usage-credits to finish what you’re working on.
+
+✻ Worked for 0s · done 6:24 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Nov 17 at 8:24am
+     3. Add funds to continue with usage credits
+     4. Upgrade your plan
+
+   Enter to confirm · Esc to cancel

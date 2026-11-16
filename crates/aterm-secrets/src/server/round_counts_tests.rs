@@ -48,14 +48,20 @@ fn server(store: &Path, seq: u64) -> Running {
     running
 }
 
-/// [`server`], resolving `alab-secrets.local` to loopback and no other host.
+/// The label a holder's `alab-secrets` TXT names in these laws: its own-label instance's name,
+/// which its server registers on the host `m9.local` ([`vault_advert`]).
+const HOLDER_LABEL: &str = "m9";
+
+/// [`server`], resolving `alab-secrets.local` and the holder's own-label host `m9.local`
+/// ([`HOLDER_LABEL`]) to loopback and no other host.
 fn server_resolving_holders(store: &Path, seq: u64) -> Running {
     let running = launch(
         TcpListener::bind("127.0.0.1:0").expect("bind"),
         &alab_options(store),
         Tuning {
             resolve: |host, _| {
-                (host == "alab-secrets.local").then(|| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+                (host == "alab-secrets.local" || host.strip_suffix(".local") == Some(HOLDER_LABEL))
+                    .then(|| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
             },
             ..Tuning::default()
         },
@@ -163,9 +169,11 @@ fn seams_probing(
 }
 
 /// A watch that heard `names` and `alab-secrets`, and resolves each of `names` to the vault at
-/// the same place of `peers`, its TXT naming the `seq` at that place of `seqs` as it resolves and
-/// the records the servers here hold (none: the empty log's digest), and `alab-secrets` to the
-/// holder at `holder` (by the host `alab-secrets.local`, its TXT naming `seq` 5 and, as every
+/// the same place of `peers` (by its address, but for [`HOLDER_LABEL`], which it names by the
+/// host its server registers it on, `m9.local`, at that address's port), its TXT naming the
+/// `seq` at that place of `seqs` as it resolves and the records the servers here hold (none: the
+/// empty log's digest), and `alab-secrets` to the holder at `holder` (by the host
+/// `alab-secrets.local`, its TXT naming `seq` 5, the label [`HOLDER_LABEL`] and, as every
 /// `alab-secrets` TXT, no records) or to none, counting the names it is handed in `handed`. As
 /// the production resolver does, it starts one thread for each name it is handed, each run as a
 /// round's resolve thread is ([`crate::serve_counts::resolving`]).
@@ -213,12 +221,18 @@ fn watching(
                             holder.port(),
                             crate::ALAB_VAULT
                         ),
-                        txt: txt(5, Some("m9"), None),
+                        txt: txt(5, Some(HOLDER_LABEL), None),
                     });
                 }
                 let place = at.iter().position(|(known, _)| known == name)?;
+                let (known, addr) = &at[place];
+                let host = if known == HOLDER_LABEL {
+                    format!("{known}.local:{}", addr.port())
+                } else {
+                    addr.to_string()
+                };
                 Some(DiscoveredVault {
-                    url: format!("http://{}/v1/{}", at[place].1, crate::ALAB_VAULT),
+                    url: format!("http://{host}/v1/{}", crate::ALAB_VAULT),
                     txt: txt(
                         seqs.get(place).map_or(1, |seq| seq.load(Ordering::SeqCst)),
                         None,
@@ -497,12 +511,13 @@ fn probing_holder(
 /// a holder and a peer on loopback holding what this server holds, the first round sweeps both,
 /// and each round after it asks the holder one conditional request, the probe that looks for who
 /// holds `alab-secrets` (`?after=<seq>`, answered 204), and nothing else: no pull of the holder,
-/// whose `alab-secrets` TXT names what this server holds and no records, nor of the peer.
+/// whose `alab-secrets` TXT names what this server holds, its label `m9` and no records, and
+/// whose own-label instance (`m9`, on the host `m9.local` its label names, in the round beside
+/// it) names the records this server holds, nor of the peer.
 ///
-/// NEGATIVE CONTROLS (2026-11-15): with step 6's holder edge (a group holding an `alab-secrets`
-/// instance pulled whatever its TXT says), each idle round asks the holder its envelope and its
-/// records as well (`left: (4, 2)`, `right: (3, 1)`); with the rec-less `alab-secrets` TXT read
-/// as an older build's, it asks its records (`left: (3, 2)`).
+/// NEGATIVE CONTROL (2026-11-15): with no `alab-secrets` exception in `pull_due`
+/// (`None => true`), the rec-less `alab-secrets` TXT read as an older build's, each idle round
+/// asks the holder its records too (`left: (3, 2)`, `right: (3, 1)`).
 #[test]
 fn an_idle_round_asks_the_holder_nothing_beyond_its_probe() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -512,11 +527,13 @@ fn an_idle_round_asks_the_holder_nothing_beyond_its_probe() {
     *PROBED_HOLDER.lock().expect("holder") = Some(holder.addr);
     let bell = Arc::new(Bell::default());
     let handed = Arc::new(AtomicU64::new(0));
-    let seqs: Arc<Vec<AtomicU64>> = Arc::new(vec![AtomicU64::new(5)]);
+    let seqs: Arc<Vec<AtomicU64>> = Arc::new(vec![AtomicU64::new(5), AtomicU64::new(5)]);
+    // `m9` is the holder's own-label instance, resolving to the endpoint its `alab-secrets`
+    // instance does: one group, whose records `m9`'s TXT makes due.
     let watch = watching(
         &bell,
-        &["m10"],
-        &[peer.addr],
+        &["m10", HOLDER_LABEL],
+        &[peer.addr, holder.addr],
         &seqs,
         &handed,
         Some(holder.addr),
@@ -556,6 +573,177 @@ fn an_idle_round_asks_the_holder_nothing_beyond_its_probe() {
     for server in [own, holder, peer] {
         server.stop();
     }
+}
+
+/// What the holder's own-label instance `m9` of
+/// [`a_holders_own_label_instance_out_of_the_batch_gates_its_records_for_a_sweep_period`]
+/// resolves to.
+#[derive(Clone, Copy, Debug)]
+enum OwnLabel {
+    /// A TXT naming the ALab vault and the records the servers there hold.
+    Records,
+    /// A TXT naming the ALab vault and no `rec` (an older build's).
+    NoRec,
+    /// Nothing: it answers no resolve, or answers with a TXT naming another vault, which a
+    /// round's resolve leaves out as the production one does (`resolve_instances` keeps only
+    /// what `resolved_vault(event, ALAB_VAULT)` answers, `None` for another vault:
+    /// `discover_tests::browse_and_resolve_read_active_instances_and_order_txt_hints_behind_defaults`).
+    Unresolved,
+}
+
+/// A lab whose browse hears more names than a round resolves (ATERM-KI-1108-2): beside 30 other
+/// names, `alab-secrets` and its holder's own-label instance `m9` (on the host `m9.local`, the
+/// one its `alab-secrets` TXT's label names, [`PullGate::names_rec`]), so a round's rotating
+/// batch of 16 ([`crate::discover::MAX_CANDIDATES`]) holds `m9` in every other round, while the
+/// holders come every round. Through the production round and pull against the holder on
+/// loopback, holding what this server holds, past the first round's sweep (the holder's next
+/// sweep held off), its `alab-secrets` TXT naming no records: after a round that resolved `m9`
+/// naming those records, the next round, whose batch leaves it out, asks the holder nothing;
+/// with `m9` resolving to nothing (it answers no resolve, or names another vault, which the
+/// round's resolve leaves out), a round within [`NAMED_FOR`] of the last that resolved it
+/// naming the records asks nothing and each from then on asks the holder its records; and once
+/// a round resolves `m9` naming no `rec`, the rounds after it without `m9` ask the records too.
+/// The holder is asked no envelope past the sweep.
+///
+/// NEGATIVE CONTROLS (2026-11-15), each the holder's (envelope, records) GETs: with no memory
+/// past the round deciding (`note_named` clearing what earlier rounds noted, the group rule of
+/// 876a62565c2), the round whose batch leaves `m9` out asks the records (`left: (1, 2)`,
+/// `right: (1, 1)`); with no bound (`note_named` keeping what it noted whatever its age), the
+/// round at [`NAMED_FOR`] asks nothing (`left: (1, 1)`, `right: (1, 2)`); with no forget
+/// (`note_named` keeping what an earlier round noted of an instance this round resolved), and
+/// with no rec check (`note_named` noting a TXT naming none), the round after the one resolving
+/// `m9` naming no `rec`, whose batch leaves it out, asks nothing (`left: (1, 4)`,
+/// `right: (1, 5)`); the round resolving it asks the records whatever was noted, since that
+/// TXT, an older build's, makes them due itself.
+#[test]
+fn a_holders_own_label_instance_out_of_the_batch_gates_its_records_for_a_sweep_period() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = server_resolving_holders(&root.path().join("own"), 5);
+    let holder = server(&root.path().join("holder"), 5);
+    let bell = Arc::new(Bell::default());
+    let m9 = Arc::new(Mutex::new(OwnLabel::Records));
+    let watch = Watch::idle_resolving_vaults(&bell, &[], {
+        let m9 = Arc::clone(&m9);
+        let at = holder.addr;
+        move |asked, _| {
+            let txt = |rec| {
+                Some(VaultTxt {
+                    vault: crate::ALAB_VAULT.to_owned(),
+                    signer: crate::envelope::fingerprint(&signer_public(&SIGNER).expect("public")),
+                    seq: 5,
+                    head: [0; 32],
+                    label: Some(HOLDER_LABEL.to_owned()),
+                    rec,
+                })
+            };
+            asked
+                .iter()
+                .filter_map(|name| {
+                    if name == crate::alab_advertised() {
+                        return Some(DiscoveredVault {
+                            url: format!(
+                                "http://alab-secrets.local:{}/v1/{}",
+                                at.port(),
+                                crate::ALAB_VAULT
+                            ),
+                            txt: txt(None),
+                        });
+                    }
+                    if name != HOLDER_LABEL {
+                        return None;
+                    }
+                    let rec = match *m9.lock().expect("m9") {
+                        OwnLabel::Records => Some(crate::membership_log::empty_heads_digest()),
+                        OwnLabel::NoRec => None,
+                        OwnLabel::Unresolved => return None,
+                    };
+                    // By its own host, which resolves to the endpoint `alab-secrets.local` does:
+                    // one group.
+                    Some(DiscoveredVault {
+                        url: format!(
+                            "http://{HOLDER_LABEL}.local:{}/v1/{}",
+                            at.port(),
+                            crate::ALAB_VAULT
+                        ),
+                        txt: txt(rec),
+                    })
+                })
+                .collect()
+        }
+    });
+    // Sorted, `alab-secrets` and `m9` come first: each odd round's batch holds them.
+    let others: Vec<String> = (0..30).map(|n| format!("p{n:02}")).collect();
+    for name in others
+        .iter()
+        .map(String::as_str)
+        .chain([HOLDER_LABEL, crate::alab_advertised()])
+    {
+        watch.hear(true, 4, name);
+    }
+    let watch = Arc::new(watch);
+    let sharing = Arc::new(AtomicBool::new(true));
+    let mut seams = seams(&watch, &sharing, Seams::this_mac().pull);
+    let t0 = Instant::now();
+    let clock = Arc::new(Mutex::new(t0));
+    seams.now = Box::new({
+        let clock = Arc::clone(&clock);
+        move || *clock.lock().expect("clock")
+    });
+    let mut tending = tending(&own, &bell);
+    let mut round = |at: Instant| {
+        *clock.lock().expect("clock") = at;
+        assert!(!tending.round(&mut seams).closed);
+        tending.why = Some(Wake::Timer);
+    };
+    let asked = || (holder.envelope_gets(), holder.records_gets());
+    // The holder's next sweep comes `sweep_after(0)` past `at`: the rounds before it are gated.
+    let sweep_held = |at: Instant| own.shared.lock_gate().swept(&[holder.addr], at, 0);
+    let set = |to: OwnLabel| *m9.lock().expect("m9") = to;
+
+    round(t0);
+    assert_eq!(asked(), (1, 1), "the first round's sweep, m9 in its batch");
+    sweep_held(t0);
+    round(t0 + PULL_SPACING);
+    assert_eq!(asked(), (1, 1), "a batch without m9, after one with it");
+    let noted = t0 + PULL_SPACING * 2;
+    round(noted);
+    assert_eq!(asked(), (1, 1), "m9 in the batch again");
+
+    set(OwnLabel::Unresolved);
+    sweep_held(noted + NAMED_FOR - Duration::from_secs(2));
+    round(noted + NAMED_FOR - Duration::from_secs(1));
+    assert_eq!(
+        asked(),
+        (1, 1),
+        "within NAMED_FOR of the round that last resolved m9 naming the records"
+    );
+    let mut at = noted + NAMED_FOR;
+    round(at);
+    assert_eq!(asked(), (1, 2), "at NAMED_FOR: the records");
+    at += PULL_SPACING;
+    round(at);
+    assert_eq!(asked(), (1, 3), "and each round after");
+
+    // The next round is odd: its batch holds `m9`, the one after it does not.
+    set(OwnLabel::Records);
+    at += PULL_SPACING;
+    round(at);
+    at += PULL_SPACING;
+    round(at);
+    assert_eq!(asked(), (1, 3), "m9 naming the records, then out");
+    set(OwnLabel::NoRec);
+    at += PULL_SPACING;
+    round(at);
+    assert_eq!(
+        asked(),
+        (1, 4),
+        "m9 naming no rec, which makes them due itself"
+    );
+    at += PULL_SPACING;
+    round(at);
+    assert_eq!(asked(), (1, 5), "then out, after naming no rec");
+    own.stop();
+    holder.stop();
 }
 
 /// A first round that resolves no peer (its browse heard nothing yet, as every server's first

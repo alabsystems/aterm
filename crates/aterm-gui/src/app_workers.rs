@@ -329,15 +329,16 @@ impl App {
 
     /// The name of the group a manager's workers sit under, as Overview's Manages names it.
     fn worker_group_label(&self, from: &str) -> String {
-        let local = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(&aterm_session::SessionId::new(from))
-            .map(|handle| handle.local_id);
+        let local = aterm_session::SessionId::parse(from).and_then(|from| {
+            self.store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_sid(&from)
+                .map(|handle| handle.local_id)
+        });
         match local {
             Some(local) => self.tab_label_of_session(local),
-            None => format!("{} (not here)", aterm_messages::presence::short_sid(from)),
+            None => format!("{} (not here)", crate::presence::short_sid(from)),
         }
     }
 
@@ -430,13 +431,18 @@ impl App {
                 }
             }
             WorkersAction::Stop(session) => {
-                let peer = self.session_id_text(session);
+                let peer = self
+                    .store
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .by_local(session)
+                    .map(|h| h.sid.clone());
                 let tab = self.windows.get(&wid).and_then(|ws| ws.tab_set.home());
                 if let (Some(peer), Some(tab)) = (peer, tab) {
                     self.dispatch_tab_menu_connection(
                         wid,
                         tab,
-                        &aterm_session::SessionId::new(&peer),
+                        &peer,
                         crate::session_chrome::ConnVerb::StopWorker,
                     );
                 }
@@ -494,14 +500,19 @@ impl App {
         );
         self.note_tab_keep(&held);
         // A drive's spawn kept is the person's: its request says so, and no drive owns it now.
-        let sids: Vec<String> = held
-            .iter()
-            .filter_map(|local| self.session_id_text(*local))
-            .collect();
+        let sids: Vec<aterm_session::SessionId> = {
+            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+            held.iter()
+                .filter_map(|local| store.by_local(*local).map(|h| h.sid.clone()))
+                .collect()
+        };
         for sid in &sids {
-            crate::control::forget_driven(&aterm_session::SessionId::new(sid));
+            crate::control::forget_driven(sid);
         }
-        crate::requests_host::kept(sids, &crate::tab_marks::keep_actor());
+        crate::requests_host::kept(
+            sids.iter().map(|sid| sid.as_str().to_owned()).collect(),
+            &crate::tab_marks::keep_actor(),
+        );
         self.session_chrome.remove(&session);
         self.resync_active_or_window(wid);
         true
@@ -841,12 +852,13 @@ impl App {
                     let _ = app.open_workers_tab();
                 }
                 if open_one && index == 2 {
-                    let local = app
-                        .store
-                        .read()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .by_sid(&aterm_session::SessionId::new(&sid))
-                        .map(|handle| handle.local_id);
+                    let local = aterm_session::SessionId::parse(&sid).and_then(|sid| {
+                        app.store
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .by_sid(&sid)
+                            .map(|handle| handle.local_id)
+                    });
                     if let Some(local) = local {
                         app.focus_session_preferring(Some(wid), local);
                     }
@@ -862,7 +874,7 @@ impl App {
         let (role, managed, state, why, exit, result_bytes, agent, minutes, prints) = row;
         let handle = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-            store.by_sid(&aterm_session::SessionId::new(sid)).cloned()
+            aterm_session::SessionId::parse(sid).and_then(|sid| store.by_sid(&sid).cloned())
         };
         let Some(handle) = handle else {
             return;

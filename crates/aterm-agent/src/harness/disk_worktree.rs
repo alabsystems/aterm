@@ -72,6 +72,15 @@
 //! it holds a change, what its snapshot reads is more than [`pins::MAX_BYTES`] (the reason is
 //! in [`pins`]), or what its pins owe an origin cannot be recorded; a push that fails is owed,
 //! not a reason to keep it, and is tried again at a later step.
+//!
+//! ITS PINS AND PUSHES WAIT WHILE THE HOME VOLUME READS UNDER ITS EMERGENCY LINE (DC-06d,
+//! `aterm_capacity::floor::custody_writes_wait`, [`Hooks::custody`]): a snapshot writes git
+//! objects and a push writes a pack, so at zero free either fails or spends what recovery has
+//! just freed. Such a worktree stays, nothing of it written, and one `deferred` row goes on
+//! record for it ([`super::worktree_deferred_row`]); the owed pushes wait too, with one
+//! `deferred` push row. The merged rule's removals, which pin nothing, still run. The step is
+//! due again at the first look that reads the volume at or above the line ([`Schedule::due`]),
+//! not an hour on: the wait is for a measurement, never for a person.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -382,9 +391,22 @@ pub struct Done {
     pub parked: Vec<pins::Owed>,
     /// Why what the pins owe could not be read or written, when it could not.
     pub unrecorded: Option<String>,
+    /// The worktrees whose pins wait for the volume to read above its emergency line, each with
+    /// why ([`Hooks::custody`]): each stays, nothing of it written.
+    pub deferred: Vec<(PathBuf, String)>,
+    /// Why the owed pushes wait for the same, when some were owed and they did.
+    pub pushes_deferred: Option<String>,
 }
 
 impl Done {
+    /// Whether some write this step owed waits for the volume to read above its emergency line
+    /// ([`Self::deferred`], [`Self::pushes_deferred`]): the step is then due again at the first
+    /// look that reads it there ([`Schedule::ran`]).
+    #[must_use]
+    pub fn waits(&self) -> bool {
+        !self.deferred.is_empty() || self.pushes_deferred.is_some()
+    }
+
     /// The bytes the removed worktrees held, and those of the build directories given back.
     #[must_use]
     pub fn freed(&self) -> u64 {
@@ -411,14 +433,16 @@ impl Done {
 }
 
 /// When the step runs next on this host, the candidate it reached last, what it last put
-/// on record of each worktree it kept once admitted, and when it last judged each worktree
-/// that stays for its build directory and kept that.
+/// on record of each worktree it kept once admitted, when it last judged each worktree
+/// that stays for its build directory and kept that, and whether its last run left writes
+/// waiting for the volume to read above its emergency line.
 #[derive(Debug, Default)]
 pub struct Schedule {
     next: Option<Instant>,
     after: Option<PathBuf>,
     said: BTreeMap<PathBuf, String>,
     rested: BTreeMap<PathBuf, Instant>,
+    waiting: bool,
 }
 
 impl Schedule {
@@ -430,6 +454,7 @@ impl Schedule {
             after: None,
             said: BTreeMap::new(),
             rested: BTreeMap::new(),
+            waiting: false,
         }
     }
 
@@ -438,10 +463,21 @@ impl Schedule {
         &mut self.said
     }
 
-    /// Whether the step is due at `at`.
+    /// Whether the step is due at `at`: an hour after its last run ([`STEP_EVERY`]), or at once
+    /// where that run left writes waiting ([`Self::ran`]) and `clear` says the look reads the
+    /// home volume at or above its emergency line (`aterm_capacity::floor::custody_writes_wait`
+    /// false). `clear` is asked only then.
     #[must_use]
-    pub fn due(&self, at: Instant) -> bool {
-        self.next.is_none_or(|next| at >= next)
+    pub fn due(&self, at: Instant, clear: impl FnOnce() -> bool) -> bool {
+        self.next.is_none_or(|next| at >= next) || (self.waiting && clear())
+    }
+
+    /// Whether a run at `at` stands down at once: one before its hour, which only the writes
+    /// waiting for the volume made due, while `under` says the volume, read again now, is still
+    /// under its emergency line. `under` is asked only then.
+    #[must_use]
+    pub fn stands_down(&self, at: Instant, under: impl FnOnce() -> bool) -> bool {
+        self.waiting && self.next.is_some_and(|next| at < next) && under()
     }
 
     /// The candidate the last run reached before it stopped short: the next run starts after it.
@@ -450,9 +486,13 @@ impl Schedule {
         self.after.as_deref()
     }
 
-    /// The step ran at `at`, reaching `reached` when it stopped short.
-    pub fn ran(&mut self, at: Instant, reached: Option<PathBuf>) {
+    /// The step ran at `at`, reaching `reached` when it stopped short, and left writes waiting
+    /// for the volume (`waits`, [`Done::waits`]) or none. Writes the run before left waiting
+    /// still wait where this run stopped short, since it may not have reached them: the step
+    /// stays due at the next look above the line, starting after `reached`.
+    pub fn ran(&mut self, at: Instant, reached: Option<PathBuf>, waits: bool) {
         self.next = Some(at.checked_add(STEP_EVERY).unwrap_or(at));
+        self.waiting = waits || (self.waiting && reached.is_some());
         self.after = reached;
     }
 
@@ -1087,6 +1127,20 @@ pub struct Hooks<'a> {
     /// second judgment of a worktree that gives back a build directory holds it to, since
     /// [`Facts::starts`] is as old as the look that began the step.
     pub starts: &'a dyn Fn() -> Vec<Start>,
+    /// Whether the home volume, read now, lets the custody writes run (a snapshot, a push):
+    /// `Err` with why they wait, where it reads under its emergency line or could not be read
+    /// (`aterm_capacity::floor::custody_writes_wait`).
+    pub custody: &'a dyn Fn() -> Result<(), String>,
+}
+
+/// What [`Schedule::said`] holds of a worktree whose pins wait for room: its `deferred` row is
+/// on record, and is not written again while they wait.
+const DEFERRED_SAID: &str = "deferred until the volume reads above its emergency line";
+
+/// The [`Schedule::said`] key of the owed pushes' wait for room: beside the owed file (whose own
+/// key holds why it could not be read or written).
+fn pushes_deferred_key(owed: &Path) -> PathBuf {
+    owed.with_extension("deferred")
 }
 
 /// One step: [`plan`] the candidates, then remove each admitted one until `wall`, journalling
@@ -1099,7 +1153,11 @@ pub struct Hooks<'a> {
 /// removal never began, and marked its worktree's gone once it went. Every owed push that is
 /// due is then tried ([`pins::push_owed`]) and each that went, changed why it is owed, was
 /// parked or dropped journalled. A candidate outside an agent's shape the judgment admitted
-/// stays, and gives back its shared build directories ([`give_back`]). Returns what it did and
+/// stays, and gives back its shared build directories ([`give_back`]). While the home volume
+/// reads under its emergency line ([`Hooks::custody`], asked before each pin and before the
+/// pushes), a candidate the pinned rule admitted stays unpinned with one `deferred` row, and the
+/// owed pushes wait with one `deferred` push row ([`Done::waits`]), each once for each wait: a
+/// step that reads the volume above the line ends every wait on record. Returns what it did and
 /// the candidate it reached last when it stopped short.
 #[must_use]
 pub fn step(
@@ -1116,6 +1174,12 @@ pub fn step(
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0);
+    // A volume read above the line ends every wait on record, whether or not this step reaches
+    // its worktree (one resumed since is no candidate): a later wait is a new one, and its
+    // `deferred` row goes on record again.
+    if (hooks.custody)().is_ok() {
+        hooks.said.retain(|_, said| said != DEFERRED_SAID);
+    }
     let planned = plan(git, facts, found, after, now, wall);
     let mut done = Done {
         unfinished: planned.unfinished,
@@ -1162,6 +1226,17 @@ pub fn step(
             // Its worktree stays (`give_back`, above): it never reaches a remover.
             Verdict::BuildDir(_) => continue,
             Verdict::Pinned { quiet, .. } => {
+                if let Err(why) = (hooks.custody)() {
+                    if hooks.said.get(&wt).map(String::as_str) != Some(DEFERRED_SAID) {
+                        (hooks.journal)(&super::worktree_deferred_row(
+                            at,
+                            &row(&wt, &checkout, admitted, &why, None, 0),
+                        ));
+                        hooks.said.insert(wt.clone(), DEFERRED_SAID.to_owned());
+                    }
+                    done.deferred.push((wt, why));
+                    continue;
+                }
                 let asked = Ask {
                     git,
                     facts,
@@ -1267,7 +1342,12 @@ pub fn step(
         }
     }
     if let Some(owed) = facts.owed {
-        let round = if Instant::now() < wall {
+        let waits = (hooks.custody)().err();
+        let key = pushes_deferred_key(owed);
+        if waits.is_none() {
+            hooks.said.remove(&key);
+        }
+        let round = if Instant::now() < wall && waits.is_none() {
             pins::push_owed(
                 git,
                 hooks.agh,
@@ -1312,6 +1392,21 @@ pub fn step(
             None => {
                 hooks.said.remove(owed);
             }
+        }
+        if let Some(why) = waits
+            && !round.owed.is_empty()
+        {
+            if !hooks.said.contains_key(&key) {
+                let text = format!("{} owed push(es) wait: {why}", round.owed.len());
+                (hooks.journal)(&super::worktree_push_row(
+                    at,
+                    super::WORKTREE_DEFERRED,
+                    None,
+                    &text,
+                ));
+                hooks.said.insert(key, why.clone());
+            }
+            done.pushes_deferred = Some(why);
         }
         done.pushed = round.pushed.len();
         done.owed = round.owed;

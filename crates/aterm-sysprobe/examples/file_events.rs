@@ -4,7 +4,7 @@
 //! File-event census with the same probe used by doctor. Optional roots filter the report.
 
 fn footprint() -> Option<(u32, u64, u64)> {
-    match aterm_uds::services::look(&aterm_vitals::services::FSEVENTSD) {
+    match aterm_uds::services::look(aterm_vitals::services::FSEVENTSD.identity()) {
         aterm_uds::services::Look::Running(service, _) if service.live == 1 => {
             Some((service.pid, service.start_s, service.footprint))
         }

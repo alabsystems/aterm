@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exhaustion across a bounded two-page inventory, before the existing disk-worker lease.
+//! Exhaustion across a bounded two-page inventory: when a paged pass may say it ran out.
 
 use aterm_spec::derive::Model;
 

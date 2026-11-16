@@ -18,7 +18,7 @@ use super::approval::{SecretRule, walk_hit};
 use super::claude_settings::OwnerAsk;
 use super::git_config::{GitView, WorkerEnv};
 use super::probe::{Below, LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
-use super::rm_breaker::abs_components;
+use super::rm_breaker::{abs_components, folder_components};
 use super::shell_startup::ShellStartup;
 
 impl PolicyProbe for LiveProbe {
@@ -41,6 +41,15 @@ impl PolicyProbe for LiveProbe {
             "a Read's symbolic links",
             move || real_components(&comps),
             |_| None,
+        )
+    }
+
+    fn folder_leads(&self, spelled: &Path) -> Result<Vec<String>, String> {
+        let spelled = spelled.to_path_buf();
+        bounded(
+            "where a session's folder leads",
+            move || folder_leads(&spelled),
+            Err,
         )
     }
 
@@ -374,6 +383,46 @@ fn real_components(comps: &[String]) -> Option<Vec<String>> {
             Err(_) => return None,
         }
     }
+}
+
+/// Where the folder spelled `spelled` leads ([`PolicyProbe::folder_leads`]): its final path
+/// (`canonicalize`, every link on the way followed, on Windows an 8.3 short name read long), read
+/// by [`folder_components`]. On Windows, a directory on the final path's way (each one a name of
+/// it is looked up in, up to the volume's root) that tells names apart by case refuses it, and so
+/// does one whose case sensitivity cannot be read: the folder judgment folds case, as Windows
+/// compares names elsewhere, and in such a directory `proj` and `PROJ` are two folders.
+fn folder_leads(spelled: &Path) -> Result<Vec<String>, String> {
+    let real = std::fs::canonicalize(spelled)
+        .map_err(|e| format!("{} cannot be resolved: {e}", spelled.display()))?;
+    // Read as it was resolved: a verbatim spelling keeps a name's trailing dot or space, which its
+    // plain spelling would read away.
+    let comps = folder_components(&real.to_string_lossy()).ok_or_else(|| {
+        format!(
+            "{} leads to {}, which is no folder the judgment reads",
+            spelled.display(),
+            aterm_path::plain(&real).display()
+        )
+    })?;
+    #[cfg(windows)]
+    for dir in real.ancestors().skip(1) {
+        let shown = aterm_path::plain(dir);
+        match aterm_sysprobe::case_sensitive_dir(dir) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(format!(
+                    "{} tells names apart by case, which the trust roots do not",
+                    shown.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "whether {} tells names apart by case could not be read: {e}",
+                    shown.display()
+                ));
+            }
+        }
+    }
+    Ok(comps)
 }
 
 /// Most entries [`below_within`] reads below one tree before it refuses the tree as too big to

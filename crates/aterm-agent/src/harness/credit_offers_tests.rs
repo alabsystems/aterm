@@ -473,9 +473,11 @@ fn the_claim_tasks_last_reply_concludes_autopilot_land() {
     }
 }
 
-/// The claim worker's folder is read by its last two names, as the disk-free worker's is.
-/// CONTROL: the disk-free worker's folder, the ledger's folder, the same name under another
-/// parent, and a folder under the claim folder are no claim worker's.
+/// The claim worker's folder is read by its last two names ([`is_harness_folder`]).
+/// CONTROL: another folder of the harness state, the ledger's folder, the same name under another
+/// parent, and a folder under the claim folder are no claim worker's; the claim folder is no
+/// other name's harness folder, and the same name under a parent that is not the harness state
+/// directory is none.
 #[test]
 fn a_claim_folder_is_named_by_the_harness_state_and_its_own_name() {
     for yes in [
@@ -497,9 +499,13 @@ fn a_claim_folder_is_named_by_the_harness_state_and_its_own_name() {
     ] {
         assert!(!is_claim_folder(Path::new(no)), "{no}");
     }
-    assert!(!super::super::disk::fence::is_worker_folder(Path::new(
-        "/Users//a/state/harness/claude-harness/credit-claim"
-    )));
+    let claim = Path::new("/Users//a/state/harness/claude-harness/credit-claim");
+    assert!(is_harness_folder(claim, CLAIM_FOLDER));
+    assert!(!is_harness_folder(claim, "disk-worker"));
+    assert!(!is_harness_folder(
+        Path::new("/Users//a/state/harness/other-harness/credit-claim"),
+        CLAIM_FOLDER
+    ));
 }
 
 /// A page a claim worker may act on: `https://` on a vendor host or a name under one, with no

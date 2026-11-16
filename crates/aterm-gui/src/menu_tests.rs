@@ -477,6 +477,7 @@ fn the_native_bar_checks_and_greys_what_the_palette_does() {
         rain_on: true,
         kitty_favourited: true,
         front_tab_split: true,
+        navigator_shown: true,
         can_rewind: false,
         aos_attached: false,
         aos_unseen: false,
@@ -1694,4 +1695,43 @@ fn program_output_still_cannot_open_a_settings_pane() {
             );
         }
     }
+}
+
+/// Dock visibility and the front window's resources band drive different native menu rows.
+#[test]
+fn the_dock_menu_stays_independent_of_the_window_resources_band() {
+    use super::{MenuLive, menu_live, native_live_title, native_menu_checked, set_menu_live};
+    for action in [
+        MenuAction::Navigator,
+        MenuAction::NavigatorSplit,
+        MenuAction::ToggleNavigator,
+        MenuAction::ShowSystemResourcesHere,
+    ] {
+        assert_eq!(MenuAction::from_tag(action.tag()), Some(action));
+    }
+    let before = menu_live();
+    for navigator_shown in [false, true] {
+        for band_here in [false, true] {
+            set_menu_live(MenuLive {
+                navigator_shown,
+                band_here,
+                ..MenuLive::UNPUBLISHED
+            });
+            assert_eq!(
+                native_live_title(MenuAction::ToggleNavigator),
+                Some(if navigator_shown {
+                    "Hide Navigator"
+                } else {
+                    "Show Navigator"
+                }),
+                "dock={navigator_shown}, resources={band_here}"
+            );
+            assert_eq!(
+                native_menu_checked(MenuAction::ShowSystemResourcesHere),
+                Some(band_here),
+                "dock={navigator_shown}, resources={band_here}"
+            );
+        }
+    }
+    set_menu_live(before);
 }

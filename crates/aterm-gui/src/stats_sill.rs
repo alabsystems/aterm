@@ -227,38 +227,26 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         .is_some_and(|c| c.busy.level >= total_cores * 0.98);
     let tab = snap.tab_of(&input.tab_panes);
     let busy_level = snap.cpu.as_ref().map_or(0.0, |c| c.busy.level);
-    let lanes: [(Bar, Option<&TrendView>, Rgb); 3] = [
-        (
-            Bar::Global,
-            Some(&snap.global.cores),
-            inks.load_at(busy_level / total_cores),
-        ),
-        (
-            Bar::Aterm,
-            snap.aterm.as_ref().map(|a| &a.cores),
-            inks.aterm,
-        ),
-        (Bar::Tab, tab.as_ref().map(|t| &t.scope.cores), inks.tab),
-    ];
-    for (i, (bar, trend, ink)) in lanes.iter().enumerate() {
-        if !shown[i] {
-            continue;
-        }
-        let (ly, lh) = rows[i];
-        let slot = (x - 1.0, ly - 1.0, cpu_w + 2.0, lh + 2.0);
-        match trend {
-            Some(t) => {
-                let m = Mark::of(t, total_cores, words::CORES_GATE);
-                p.lane(x, ly, cpu_w, lh, m, *ink, slot, true);
-            }
-            None => groove(&mut p, x, ly, cpu_w, lh),
-        }
-        hits.push(Hit::row(
-            (x, ly - rows[0].0.min(1.0), cpu_w + bracket_room, lh + 2.0),
-            Instrument::Cpu,
-            *bar,
-        ));
-    }
+    // Only independently measured machine ticks can fill a bounded CPU-capacity lane.
+    // Published process growth remains in the lens and spoken scope figures.
+    let (ly, lh) = rows[0];
+    let slot = (x - 1.0, ly - 1.0, cpu_w + 2.0, lh + 2.0);
+    let m = Mark::of(&snap.global.cores, total_cores, words::CORES_GATE);
+    p.lane(
+        x,
+        ly,
+        cpu_w,
+        lh,
+        m,
+        inks.load_at(busy_level / total_cores),
+        slot,
+        true,
+    );
+    hits.push(Hit::row(
+        (x, ly - rows[0].0.min(1.0), cpu_w + bracket_room, lh + 2.0),
+        Instrument::Cpu,
+        Bar::Global,
+    ));
     let bh = (5.0 * s).round().min(band_h - rows[0].0);
     p.bracket(x + cpu_w + 1.0, rows[0].0, bh, pinned);
     x += cpu_w + bracket_room + gap;

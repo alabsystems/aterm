@@ -675,6 +675,12 @@ fn own_target() -> String {
     encode_target_identity(own_build(), crate::build_info::git_commit())
 }
 
+/// The legacy tab ID [`stage_outgoing_handoff`] gives its session `local_id`.
+#[cfg(unix)]
+fn e2e_sid(local_id: u64) -> String {
+    format!("s-{:020x}", 0x0e2e_0000 + local_id)
+}
+
 #[cfg(unix)]
 fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
     SessionRecord {
@@ -758,13 +764,15 @@ fn held_screen(local_id: u64, sid: SessionId, checkpoint: TerminalCheckpoint) ->
 }
 
 #[cfg(unix)]
-fn stamp_and_take_held(
+const HELD_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+/// The held panes' carry as an outgoing process stamps it into `dir`.
+#[cfg(unix)]
+fn stamp_held(
     dir: &std::path::Path,
     held: &[HeldScreen],
-    handed: &[(u64, &str)],
-) -> (Vec<crate::session_store::HeldPaneCarry>, Vec<HeldPane>) {
+) -> Vec<crate::session_store::HeldPaneCarry> {
     let mut manifest = bare_manifest(Vec::new());
-    let nonce = "0123456789abcdef0123456789abcdef";
     stamp_held_panes(
         &mut manifest,
         held,
@@ -772,16 +780,26 @@ fn stamp_and_take_held(
         &[],
         &mut 0,
         dir,
-        &OutgoingAttemptName::live(nonce),
+        &OutgoingAttemptName::live(HELD_NONCE),
         (0, 0),
         &mut Vec::new(),
     );
-    let stem = format!("seamless-{}-{nonce}", std::process::id());
+    manifest.held
+}
+
+/// The panes a successor takes from the carry [`stamp_held`] wrote into `dir`.
+#[cfg(unix)]
+fn take_stamped(
+    dir: &std::path::Path,
+    carried: &[crate::session_store::HeldPaneCarry],
+    handed: &[(u64, &str)],
+) -> Vec<HeldPane> {
+    let stem = format!("seamless-{}-{HELD_NONCE}", std::process::id());
     let mut remaining = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
     let mut history = crate::handoff_history::MAX_AGGREGATE_BYTES;
     let mut control = crate::handoff_carry::MAX_AGGREGATE_BYTES;
-    let shown = take_held_panes(
-        &manifest.held,
+    take_held_panes(
+        carried,
         handed,
         &dir.join(format!("{stem}.toml")),
         &stem,
@@ -790,13 +808,24 @@ fn stamp_and_take_held(
         &mut 0,
         &mut history,
         &mut control,
-    );
-    (manifest.held, shown)
+    )
+}
+
+#[cfg(unix)]
+fn stamp_and_take_held(
+    dir: &std::path::Path,
+    held: &[HeldScreen],
+    handed: &[(u64, &str)],
+) -> (Vec<crate::session_store::HeldPaneCarry>, Vec<HeldPane>) {
+    let carried = stamp_held(dir, held);
+    let shown = take_stamped(dir, &carried, handed);
+    (carried, shown)
 }
 
 #[cfg(unix)]
 fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
     RestoreManifest::new(vec![WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,
@@ -3143,7 +3172,7 @@ fn stage_outgoing_handoff_full(
                     .find(|(id, _)| *id == local_id)
                     .map(|(_, holder)| *holder)
             }),
-            ..zsh_record(local_id, &format!("s-e2e-{index}"))
+            ..zsh_record(local_id, &e2e_sid(local_id))
         };
         record.carry_render_debt(carry.and_then(|c| {
             c.render_debts
@@ -3187,8 +3216,8 @@ fn stage_outgoing_handoff_full(
             ["read-screen", "signal", "write-input"]
                 .into_iter()
                 .map(|op| ConnectionCarry {
-                    src: "s-e2e-0".to_string(),
-                    dst: "s-e2e-1".to_string(),
+                    src: e2e_sid(0),
+                    dst: e2e_sid(1),
                     op: op.to_string(),
                 })
                 .collect()
@@ -3458,8 +3487,8 @@ fn take_incoming_carries_the_tokenless_connection_triples() {
         ["read-screen", "signal", "write-input"]
             .into_iter()
             .map(|op| ConnectionCarry {
-                src: "s-e2e-0".to_string(),
-                dst: "s-e2e-1".to_string(),
+                src: e2e_sid(0),
+                dst: e2e_sid(1),
                 op: op.to_string(),
             })
             .collect::<Vec<_>>(),
@@ -4564,15 +4593,21 @@ fn a_held_panes_sid_crosses_unless_it_names_another_session() {
     let sids = [
         "s-0a0b0c0d0e0f10111213",
         "s-feedfacefeedfacefeed",
-        "../not-a-sid",
+        "tqn5r6e0148",
         "s-0a0b0c0d0e0f10111213",
     ];
     let held = sids
         .iter()
         .zip(5_u64..)
-        .map(|(sid, local_id)| held_screen(local_id, SessionId::new(*sid), screen()))
+        .map(|(sid, local_id)| {
+            held_screen(
+                local_id,
+                SessionId::parse(sid).expect("a tab's id"),
+                screen(),
+            )
+        })
         .collect::<Vec<_>>();
-    let (written, shown) = stamp_and_take_held(dir, &held, &[(99, "s-feedfacefeedfacefeed")]);
+    let mut written = stamp_held(dir, &held);
     assert_eq!(
         written
             .iter()
@@ -4581,6 +4616,9 @@ fn a_held_panes_sid_crosses_unless_it_names_another_session() {
         sids.iter().copied().map(Some).collect::<Vec<_>>(),
         "the writer carries every held pane's sid"
     );
+    // The carry is text an outgoing process wrote: one that names no session crosses as none.
+    written[2].sid = Some("../not-a-sid".to_string());
+    let shown = take_stamped(dir, &written, &[(99, "s-feedfacefeedfacefeed")]);
     assert_eq!(
         shown
             .iter()
@@ -5548,25 +5586,25 @@ fn a_stalled_launchs_exit_is_structural_to_a_parent_that_reads_no_progress() {
 }
 
 /// A seamless update adopts each tab under the ID its record carries, in either form: a tab an
-/// earlier build opened keeps its `s-` ID, a `t` tab keeps its `t` ID, and a looser `s-` ID the
-/// keeper path admits (upper-case hex) is kept as written, never renamed, because its shell, its
-/// carried Autopilot end, its status row and its rekey path are all keyed by it. Each is found by
-/// its ID, and a control request naming `@<id>` (what `aterm ctl` expands `@self` to from the
-/// shell's `ATERM_PARENT_SESSION_ID`) reaches the `s-` and the `t` tab. Negative controls: a
-/// malformed ID of each form is no selector at all, so it names nothing.
+/// earlier build opened keeps its `s-` ID, a `t` tab keeps its `t` ID, never renamed, because its
+/// shell, its carried Autopilot end, its status row and its rekey path are all keyed by it. Each
+/// is found by its ID, and a control request naming `@<id>` (what `aterm ctl` expands `@self` to
+/// from the shell's `ATERM_PARENT_SESSION_ID`) reaches the `s-` and the `t` tab. Negative
+/// controls: a malformed ID of each form is no selector at all, so it names nothing; a record
+/// whose ID names no session is refused ([`a_record_whose_id_names_no_session_is_the_producers_refusal`]).
 #[test]
 #[cfg(unix)]
 fn an_adopted_earlier_tab_keeps_its_s_id_and_its_selector() {
     const EARLIER: &str = "s-1a2b3c4d5e6f70819203";
     const LATER: &str = "tqn5r6e0148";
-    const LOOSE: &str = "s-1A2B3C4D5E6F70819203";
+    const SECOND: &str = "s-0a0b0c0d0e0f10111213";
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("earlier-sid", 3, None);
     let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
     let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
     let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
-    for (rec, sid) in published.sessions.iter_mut().zip([EARLIER, LATER, LOOSE]) {
+    for (rec, sid) in published.sessions.iter_mut().zip([EARLIER, LATER, SECOND]) {
         rec.sid = sid.to_string();
     }
     std::fs::write(
@@ -5587,7 +5625,7 @@ fn an_adopted_earlier_tab_keeps_its_s_id_and_its_selector() {
     );
     let (_, adopted) = child_proof_from(incoming).expect("the child adopts and proves");
     assert_eq!(adopted.len(), 3, "every session adopts");
-    for (local_id, sid) in [(0, EARLIER), (1, LATER), (2, LOOSE)] {
+    for (local_id, sid) in [(0, EARLIER), (1, LATER), (2, SECOND)] {
         let a = adopted
             .iter()
             .find(|a| a.local_id == local_id)
@@ -5610,12 +5648,12 @@ fn an_adopted_earlier_tab_keeps_its_s_id_and_its_selector() {
                 at,
             ));
     }
-    for (local_id, sid) in [(0, EARLIER), (1, LATER), (2, LOOSE)] {
+    for (local_id, sid) in [(0, EARLIER), (1, LATER), (2, SECOND)] {
         assert_eq!(
             store
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
-                .by_sid(&SessionId::new(sid))
+                .by_sid(&SessionId::parse(sid).expect("a tab's id"))
                 .map(|h| h.local_id),
             Some(local_id),
             "{sid}"
@@ -5649,6 +5687,39 @@ fn an_adopted_earlier_tab_keeps_its_s_id_and_its_selector() {
         assert_eq!(found(&line), None, "{malformed}");
     }
     drop(adopted);
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
+/// A record carries its tab's ID as text, and an ID that names no session (an `s-` spelling no
+/// build minted: upper-case hex) is no tab this process can adopt under its own ID, so the whole
+/// handoff is refused and the outgoing process keeps every session. Its control: the same staged
+/// handoff with exact IDs adopts (`an_adopted_earlier_tab_keeps_its_s_id_and_its_selector`).
+#[test]
+#[cfg(unix)]
+fn a_record_whose_id_names_no_session_is_the_producers_refusal() {
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let staged = stage_outgoing_handoff("loose-sid", 2, None);
+    let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+    let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+    let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
+    published.sessions[1].sid = "s-1A2B3C4D5E6F70819203".to_string();
+    std::fs::write(
+        &staged.manifest_path,
+        format!("{file_nonce}\n{}", published.to_toml().expect("toml")),
+    )
+    .expect("republish");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
+    staged.publish_env(ready_write, commit_read, None);
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert!(incoming.adopted.is_empty() && incoming.screen_digest.is_none());
+    assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
     for fd in [ready_read, ready_write, commit_read, commit_write] {
         aterm_pty::close_fd(fd);
     }

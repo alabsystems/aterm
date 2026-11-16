@@ -56,6 +56,7 @@ impl Lifetime {
             shared: self.0.clone(),
             epoch: state.epoch.clone(),
             status: Arc::new(Status::default()),
+            parent: None,
             #[cfg(test)]
             dropping: None,
         }));

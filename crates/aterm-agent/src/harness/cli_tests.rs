@@ -37,9 +37,6 @@ mod report_read;
 #[path = "cli_disk_output_tests.rs"]
 mod disk_output_results;
 
-#[path = "cli_disk_why_text_tests.rs"]
-mod disk_why_text;
-
 #[path = "cli_disk_free_text_tests.rs"]
 mod disk_free_text;
 
@@ -530,8 +527,6 @@ fn the_grammar_parses_what_the_help_text_advertises() {
                 json: true,
             },
         ),
-        ("disk why", Cmd::DiskWhy { json: false }),
-        ("disk why --json", Cmd::DiskWhy { json: true }),
         (
             "ledger",
             Cmd::Ledger {
@@ -761,6 +756,26 @@ fn the_accounts_page_says_what_the_limit_reset_reads_and_takes() {
         help_reset(ResetKind::takeable, anchors),
         lines,
         "the same verdicts and table give the same lines"
+    );
+}
+
+/// `disk why` was a verb until the disk ask went, and lines typed by an earlier build name it
+/// still: it is refused in words that say where its answer is now, never read as a report on a
+/// folder named `why`. NEGATIVE CONTROL: the same folder spelled as a path is a target.
+#[test]
+fn disk_why_is_refused_and_a_folder_of_that_name_is_a_path() {
+    for line in ["disk why", "disk why --json"] {
+        let refused = parse(&words(line)).expect_err(line);
+        assert!(refused.contains("ledger disk"), "{line}: {refused}");
+    }
+    let (cmd, _) = parse(&words("disk ./why")).expect("CONTROL: a path");
+    assert_eq!(
+        cmd,
+        Cmd::Disk {
+            targets: vec![PathBuf::from("./why")],
+            apply: None,
+            json: false,
+        }
     );
 }
 
@@ -2879,314 +2894,6 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
 }
 
 #[test]
-fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
-    use disk::ask;
-    let tmp = tmp_dir("disk-why");
-    let env = env_at(&tmp);
-    let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
-    assert!(ok, "{err}");
-    assert!(out.contains("the lease is empty"), "{out}");
-    assert!(out.contains("no free-ask rows"), "{out}");
-    let host = ask::HostId {
-        pid: 7,
-        start: "x".to_owned(),
-    };
-    let seats = [ask::Seat {
-        sid: "s-a".to_owned(),
-        held: 40 << 30,
-        at_break: true,
-    }];
-    let live = ["s-a".to_owned()];
-    let alive = |_: &ask::HostId| true;
-    let look = |now_ms| ask::Look {
-        now_ms,
-        host: &host,
-        key: "dev:1",
-        level: disk::Level::Short,
-        free: 9 << 30,
-        floor: 10 << 30,
-        files_free: None,
-        files_floor: disk::EMERGENCY_FILES_FREE,
-        done: Some(ask::Done::Spent),
-        seats: &seats,
-        supervised: &live,
-        barred: &[],
-        live: &live,
-        held: &[],
-        reclaimed: &[],
-        passing: false,
-        alive: &alive,
-        ahead: ask::Ahead::default(),
-    };
-    let t = env.now * 1000;
-    let mut rows = Vec::new();
-    for at in [t - ask::NOMINATE_MS, t] {
-        let said = ask::transact(&env.state, &ask::LOCK_LADDER, |l| ask::step(l, &look(at)))
-            .expect("lease")
-            .expect("free lock");
-        rows.push(ask::row(
-            at / 1000,
-            "dev:1",
-            &said,
-            disk::Level::Short,
-            9 << 30,
-            &host,
-        ));
-    }
-    disk_ask_journal(&env.state, &rows);
-    let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
-    assert!(ok, "{err}");
-    assert!(out.contains("volume=dev:1 episode since"), "{out}");
-    assert!(out.contains("held to 10"), "{out}");
-    assert!(out.contains("owed @s-a (host pid 7)"), "{out}");
-    assert!(out.contains(" opened dev:1 — "), "{out}");
-    assert!(out.contains(" elected @s-a dev:1 — "), "{out}");
-    let (ok, out, _) = go(&Cmd::DiskWhy { json: true }, &env);
-    assert!(ok);
-    let mut lines = out.lines();
-    assert!(
-        lines
-            .next()
-            .is_some_and(|l| l.contains("\"state\":\"owed\"")),
-        "{out}"
-    );
-    assert_eq!(lines.count(), 2, "{out}");
-}
-
-/// `disk why` SAYS WHAT THE WORKER REMOVED ITSELF, from the ledger's `disk-free` rows, which are
-/// not the rule's own `free-ask` rows it prints: it once counted only the rows it printed, and
-/// said `it removed 0 B itself` of every worker while Messages said the true figure. CONTROLS:
-/// another session's removal and the worker's own refused removal are not counted.
-#[test]
-fn disk_why_says_what_the_worker_removed_from_the_ledgers_other_rows() {
-    use disk::ask;
-    let tmp = tmp_dir("disk-why-removed");
-    let env = env_at(&tmp);
-    std::fs::create_dir_all(&env.state).expect("state");
-    let host = ask::HostId {
-        pid: 7,
-        start: "x".to_owned(),
-    };
-    let t = env.now * 1000;
-    let lease = ask::Lease {
-        volumes: vec![ask::Entry {
-            key: "dev:1".to_owned(),
-            worker: Some(ask::Worker {
-                host: host.clone(),
-                at_ms: t - 600_000,
-                state: ask::WorkerState::Over {
-                    why: "finished".to_owned(),
-                    sid: Some("s-w".to_owned()),
-                    at_ms: t,
-                    rose: 5 << 30,
-                    target_met: None,
-                },
-                orphan_ms: None,
-                free_at_claim: None,
-                target: None,
-            }),
-            ..ask::Entry::default()
-        }],
-        ..ask::Lease::default()
-    };
-    std::fs::write(env.state.join(ask::LEASE_FILE), lease.encode()).expect("lease");
-    let over = ask::WorkerSaid::Over {
-        sid: Some("s-w".to_owned()),
-        why: "finished".to_owned(),
-        rose: 5 << 30,
-        target_met: None,
-        here: true,
-    };
-    let removed = |sid: &str, action: &str, gib: u64| {
-        disk::free::row(
-            env.now,
-            sid,
-            &tmp.path().join("home/.cache/x"),
-            action,
-            Some(gib << 30),
-            "",
-        )
-    };
-    disk_ask_journal(
-        &env.state,
-        &[
-            removed("s-w", "removed", 3),
-            removed("s-w", "removed", 1),
-            removed("s-w", "refused", 7),
-            removed("s-other", "removed", 11),
-            ask::worker_row(env.now, "dev:1", &over, 9 << 30, &host),
-        ],
-    );
-    let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
-    assert!(ok, "{err}");
-    let line = out
-        .lines()
-        .find(|l| l.contains("worker: @s-w"))
-        .unwrap_or_else(|| panic!("a worker line: {out}"));
-    assert!(
-        line.contains(&format!("it removed {} itself", disk::human_bytes(4 << 30))),
-        "{line}"
-    );
-    assert!(
-        !out.contains("\"kind\":\"disk-free\""),
-        "only the rule's rows are printed: {out}"
-    );
-}
-
-#[test]
-fn lease_read_failure_is_reported_by_disk_why_without_false_empty_output() {
-    let cases = [
-        Vec::new(),
-        b"not json".to_vec(),
-        vec![0xff],
-        br#"{"schema":2,"volumes":[]}"#.to_vec(),
-        br#"{"schema":1}"#.to_vec(),
-    ];
-    let mut failures = Vec::new();
-    for json in [false, true] {
-        for bytes in &cases {
-            let tmp = tmp_dir("disk-why-lease-error");
-            let env = env_at(&tmp);
-            std::fs::create_dir_all(&env.state).expect("state");
-            let path = env.state.join(disk::ask::LEASE_FILE);
-            std::fs::write(&path, bytes).expect("bad lease");
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = run_disk_why(&env, json, &mut out, &mut err);
-            let diagnostic = String::from_utf8(err).expect("diagnostic");
-            if code != ExitCode::from(1)
-                || !out.is_empty()
-                || !diagnostic.contains("disk why")
-                || !diagnostic.contains(disk::ask::LEASE_FILE)
-            {
-                failures.push(format!(
-                    "json={json} input={bytes:?}: code={code:?}, out_len={}, err={diagnostic:?}",
-                    out.len()
-                ));
-            }
-            assert_eq!(std::fs::read(path).expect("lease remains"), *bytes);
-            assert!(!env.disk_ledger().exists());
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-fn disk_why_output_fixture(populated: bool, json: bool) -> (Tmp, Env, Vec<u8>) {
-    let tmp = tmp_dir("disk-why-output");
-    let env = env_at(&tmp);
-    if populated {
-        std::fs::create_dir_all(&env.state).expect("state");
-        std::fs::write(
-            env.state.join(disk::ask::LEASE_FILE),
-            disk::ask::Lease::default().encode(),
-        )
-        .expect("lease");
-        let host = disk::ask::HostId {
-            pid: 7,
-            start: "fixture".into(),
-        };
-        let rows = ["claimed", "released:finished"]
-            .map(|step| disk::ask::step_row(env.now, "s-worker", "dev:1", step, &host));
-        disk_ask_journal(&env.state, &rows);
-    }
-    let (mut bytes, mut err) = (Vec::new(), Vec::new());
-    assert_eq!(
-        run_disk_why(&env, json, &mut bytes, &mut err),
-        ExitCode::SUCCESS
-    );
-    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
-    if populated {
-        assert!(bytes.iter().filter(|b| **b == b'\n').count() >= 3);
-    }
-    (tmp, env, bytes)
-}
-
-fn disk_why_output_failure(flush: bool) {
-    let mut failures = Vec::new();
-    for json in [false, true] {
-        let (_tmp, env, complete) = disk_why_output_fixture(true, json);
-        let paths = [env.state.join(disk::ask::LEASE_FILE), env.disk_ledger()];
-        let before = paths.each_ref().map(|p| std::fs::read(p).expect("state"));
-        let limits = if flush {
-            vec![None]
-        } else {
-            let first_row = complete.iter().position(|b| *b == b'\n').expect("row") + 1;
-            vec![
-                Some(0),
-                Some(1),
-                Some(first_row + 1),
-                Some(complete.len() - 1),
-            ]
-        };
-        for remaining in limits {
-            let mut sink = ResultSink {
-                bytes: Vec::new(),
-                remaining,
-                fail_flush: flush,
-                flushed: false,
-            };
-            let mut err = Vec::new();
-            let code = run_disk_why(&env, json, &mut sink, &mut err);
-            let diagnostic = String::from_utf8(err).expect("diagnostic");
-            if code != ExitCode::from(1)
-                || !diagnostic.contains("disk why")
-                || !diagnostic.contains(OUTPUT_FAILURE)
-                || sink.flushed != flush
-            {
-                failures.push(format!(
-                    "json={json} remaining={remaining:?} flush={flush}: code={code:?}, \
-                     flushed={}, err={diagnostic:?}",
-                    sink.flushed
-                ));
-            }
-            assert_eq!(sink.bytes, complete[..remaining.unwrap_or(complete.len())]);
-            assert_eq!(
-                paths.each_ref().map(|p| std::fs::read(p).expect("state")),
-                before,
-                "reporting an output failure must not change the lease or ledger"
-            );
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
-fn disk_why_output_write_failures_are_nonzero_and_read_only() {
-    disk_why_output_failure(false);
-}
-
-#[test]
-fn disk_why_output_flush_failures_are_nonzero_and_read_only() {
-    disk_why_output_failure(true);
-}
-
-#[test]
-fn disk_why_output_success_flushes_complete_bytes_without_creating_state() {
-    for populated in [false, true] {
-        for json in [false, true] {
-            let (_tmp, env, complete) = disk_why_output_fixture(populated, json);
-            let paths = [env.state.join(disk::ask::LEASE_FILE), env.disk_ledger()];
-            let before = paths.each_ref().map(|p| std::fs::read(p).ok());
-            let mut sink = ResultSink {
-                bytes: Vec::new(),
-                remaining: None,
-                fail_flush: false,
-                flushed: false,
-            };
-            let mut err = Vec::new();
-            assert_eq!(
-                run_disk_why(&env, json, &mut sink, &mut err),
-                ExitCode::SUCCESS
-            );
-            assert!(err.is_empty());
-            assert_eq!(sink.bytes, complete);
-            assert!(sink.flushed);
-            assert_eq!(paths.each_ref().map(|p| std::fs::read(p).ok()), before);
-            assert_eq!(env.state.exists(), populated);
-        }
-    }
-}
-
-#[test]
 fn the_disk_verb_holds_the_error_boxes_off() {
     let tmp = tmp_dir("disk-quiet");
     let env = env_at(&tmp);
@@ -3859,7 +3566,7 @@ fn the_disk_tick_removes_with_cloud_placeholders_exposed() {
         panic!("below the floor, the tick applies");
     };
     assert_eq!(modes.len(), 1, "{modes:?} {done:?}");
-    let key = aterm_sysprobe::paths::windows_key;
+    let key = aterm_path::windows_key;
     assert_eq!(key(&modes[0].0), key(&target), "{modes:?}");
     assert_eq!(modes[0].1, 2, "exposed while the tick removes: {modes:?}");
     assert_eq!(thread_placeholder_mode(), 0, "the thread's own mode back");
@@ -4006,6 +3713,600 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
         "{done:?}"
     );
     assert!(target.join("debug/incremental").exists(), "the cache stays");
+}
+
+/// One day, in seconds.
+#[cfg(unix)]
+const CACHE_DAY: i64 = 86_400;
+
+/// A wall clock no test reaches: `disk::free::PASS_WALL` is a budget of the product's, and a
+/// test process stalled past it would be cut and fail on what it removed.
+#[cfg(unix)]
+const NO_WALL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Unix seconds now: the `T` the outside-cache fixtures are written at.
+#[cfg(unix)]
+fn cache_clock() -> i64 {
+    i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("the clock fits")
+}
+
+/// A scratch home, resolved so its paths are their own real paths, and the state folder beside
+/// it.
+#[cfg(unix)]
+fn cache_home(tmp: &Tmp) -> (PathBuf, PathBuf) {
+    let base = std::fs::canonicalize(tmp.path()).expect("resolved scratch");
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    (home, base.join("state"))
+}
+
+/// A cache folder `rel` under `home`, private, holding one file of `len` bytes; under
+/// `.cache`, its folder there tagged a cache by its tool (`CACHEDIR.TAG`), so the pass may take
+/// it ([`disk::free::evidence`]).
+#[cfg(unix)]
+fn cache_folder(home: &Path, rel: &str, len: usize) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let dir = home.join(rel);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .expect("private cache folders");
+    std::fs::write(dir.join("blob"), vec![7u8; len]).expect("cache file");
+    if rel.starts_with(".cache/") {
+        let top: PathBuf = rel.split('/').take(2).collect();
+        std::fs::write(
+            home.join(top).join(disk::free::CACHEDIR_TAG),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .expect("a cache tag");
+    }
+    dir
+}
+
+/// A process scan that finds nobody.
+#[cfg(unix)]
+fn nobody_uses(_: &[PathBuf], _: &[u32]) -> io::Result<aterm_uds::holders::PathScan> {
+    Ok(aterm_uds::holders::PathScan::default())
+}
+
+/// What a tick's outside-cache step reads in these tests: no process uses anything (the real
+/// scan would keep every folder wherever one process cannot be read), `wall` of dating, and
+/// the dater the product ships, its wait for a guarded read a one-minute hang detector.
+#[cfg(unix)]
+fn outside_with(wall: std::time::Duration) -> Outside<'static> {
+    Outside {
+        processes: &nobody_uses,
+        reads: disk::free::Reads {
+            dater: &disk::free::date_within,
+            wall,
+            wait: std::time::Duration::from_secs(60),
+        },
+    }
+}
+
+/// A mount table read whole that holds no mount.
+#[cfg(unix)]
+fn whole_table() -> aterm_sysprobe::volumes::Table {
+    aterm_sysprobe::volumes::Table {
+        complete: true,
+        ..aterm_sysprobe::volumes::Table::default()
+    }
+}
+
+/// A look at `now` over the volume of the home `roots` names, `free` bytes free.
+#[cfg(unix)]
+fn cache_look<'a>(
+    state: &'a Path,
+    roots: &'a disk::discover::Roots,
+    table: Option<&'a aterm_sysprobe::volumes::Table>,
+    now: i64,
+    free: u64,
+) -> DiskLook<'a> {
+    DiskLook {
+        state,
+        volume: roots.home.as_deref().expect("a home"),
+        free: Some(free),
+        targets: &[],
+        discover: Some(roots),
+        transcripts: None,
+        now,
+        room: None,
+        table,
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    }
+}
+
+/// One tick over `look` whose outside-cache step reads through `outside`: what it did. No tier
+/// has a row to remove in these homes.
+#[cfg(unix)]
+fn outside_tick(
+    look: &DiskLook<'_>,
+    config: disk::Config,
+    outside: &Outside<'_>,
+    measure: &mut disk::Measure<'_>,
+) -> disk::Applied {
+    let tick = disk_tick_with(
+        look,
+        config,
+        &mut |row| panic!("a tier removed {}", row.path.display()),
+        measure,
+        None,
+        None,
+        outside,
+    )
+    .tick;
+    match tick {
+        DiskTick::Reclaimed(done, _) => done,
+        DiskTick::Plenty => panic!("the look admitted no pass"),
+    }
+}
+
+/// The `disk-free` rows of `state`'s ledger, each `(action, path)`.
+#[cfg(unix)]
+fn disk_free_rows(state: &Path) -> Vec<(String, PathBuf)> {
+    std::fs::read_to_string(state.join(DISK_LEDGER))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<Value>(line).ok())
+        .filter(|row| row["kind"] == Value::from(disk::free::KIND))
+        .map(|row| {
+            (
+                row["action"].as_str().unwrap_or_default().to_owned(),
+                PathBuf::from(row["path"].as_str().unwrap_or_default()),
+            )
+        })
+        .collect()
+}
+
+/// THE PASS FREES AN UNUSED CACHE FOLDER BY LAST USE, THROUGH THE DISK-FREE FENCES, with no
+/// session asked for a path. Below its floor, with no build directory left to take, the tick
+/// removes the `~/.cache` folder written longest ago and stops once free space is back at its
+/// target: the folder written a day later, a `~/Library/Caches` folder written an hour after
+/// that, the one written yesterday, aterm's own and a link (with what it reaches) all stay; the
+/// bytes are in the tick's `freed_bytes`; and the ledger holds the folder's `disk-free`
+/// `removing` row, then its `removed` row. A second tick that stays short takes the next
+/// oldest, then the `~/Library/Caches` folder, which the dater the product ships read on a
+/// thread of its own, and never the fresh one. NEGATIVE CONTROLS: the same tree above the floor
+/// (the tiers' place, not this step's) loses nothing and gets no `disk-free` row; a look that
+/// measured another volume than the home's loses nothing either; with the grant off the tick
+/// is `Plenty`; and over a second home, a look that read no mount table removes nothing, since
+/// no fence admits a path without one, and has not run out.
+#[cfg(unix)]
+#[test]
+fn the_pass_frees_an_unused_cache_folder_by_last_use_through_the_disk_free_fences() {
+    let tmp = tmp_dir("disk-outside");
+    let (home, state) = cache_home(&tmp);
+    let t = cache_clock();
+    let older = cache_folder(&home, ".cache/older", 2 << 20);
+    let old = cache_folder(&home, ".cache/old", 4 << 20);
+    set_mtime(&old.join("blob"), t + CACHE_DAY);
+    let fresh = cache_folder(&home, ".cache/fresh", 2 << 20);
+    set_mtime(&fresh.join("blob"), t + 8 * CACHE_DAY);
+    let guarded = cache_folder(&home, "Library/Caches/pip", 2 << 20);
+    set_mtime(&guarded.join("blob"), t + CACHE_DAY + 3600);
+    let ours = cache_folder(&home, ".cache/aterm", 2 << 20);
+    let reached = cache_folder(&home, "elsewhere/kept", 2 << 20);
+    let link = home.join(".cache/linked");
+    std::os::unix::fs::symlink(&reached, &link).expect("a link");
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let table = whole_table();
+    let now = t + 9 * CACHE_DAY;
+    let gib = 1u64 << 30;
+    let cfg = disk::Config::default();
+    let outside = outside_with(NO_WALL);
+
+    let above = (cfg.auto_free_gib + 1) * gib;
+    assert!(cfg.below_warn(Some(above)) && !cfg.below_auto_floor(Some(above)));
+    let done = outside_tick(
+        &cache_look(&state, &roots, Some(&table), now, above),
+        cfg,
+        &outside,
+        &mut || Some(above),
+    );
+    assert_eq!(done.freed_bytes, 0, "{done:?}");
+    assert!(older.join("blob").is_file(), "above the floor it stays");
+    assert!(disk_free_rows(&state).is_empty(), "no `disk-free` row");
+    let elsewhere = Path::new("/dev");
+    assert_ne!(
+        volume_id(elsewhere, None),
+        volume_id(&home, None),
+        "the fixture needs two volumes"
+    );
+    let done = outside_tick(
+        &DiskLook {
+            volume: elsewhere,
+            ..cache_look(&state, &roots, Some(&table), now, gib)
+        },
+        cfg,
+        &outside,
+        &mut || Some(gib),
+    );
+    assert_eq!(done.freed_bytes, 0, "{done:?}");
+    assert!(older.join("blob").is_file(), "not the volume measured");
+    assert!(disk_free_rows(&state).is_empty(), "no `disk-free` row");
+    let off = disk::Config {
+        auto_free_gib: 0,
+        ..cfg
+    };
+    let plenty = disk_tick_with(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        off,
+        &mut |row| panic!("removed {} with the grant off", row.path.display()),
+        &mut || panic!("measured with the grant off"),
+        None,
+        None,
+        &outside,
+    )
+    .tick;
+    assert_eq!(plenty, DiskTick::Plenty);
+    assert!(older.join("blob").is_file(), "with the grant off it stays");
+
+    let target = cfg.pressure_target_bytes();
+    let done = outside_tick(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        cfg,
+        &outside,
+        &mut || Some(if older.exists() { gib } else { target }),
+    );
+    assert!(!older.exists(), "unused the longest: it goes");
+    assert!(done.freed_bytes >= 2 << 20, "{done:?}");
+    assert!(done.removed.is_empty(), "no tier's row: {done:?}");
+    assert!(done.ran_out(), "it stopped at its target: {done:?}");
+    for kept in [&old, &guarded, &fresh, &ours, &reached] {
+        assert!(kept.join("blob").is_file(), "{} stays", kept.display());
+    }
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("the link stays")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        disk_free_rows(&state),
+        [
+            ("removing".to_owned(), older.clone()),
+            ("removed".to_owned(), older.clone())
+        ]
+    );
+
+    let done = outside_tick(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        cfg,
+        &outside,
+        &mut || Some(gib),
+    );
+    assert!(!old.exists(), "the next oldest goes while it stays short");
+    assert!(!guarded.exists(), "then the `Library/Caches` folder");
+    assert!(done.freed_bytes >= 6 << 20, "{done:?}");
+    assert!(fresh.join("blob").is_file(), "written yesterday: it stays");
+    assert!(ours.join("blob").is_file() && reached.join("blob").is_file());
+    assert_eq!(
+        disk_free_rows(&state)[2..],
+        [
+            ("removing".to_owned(), old.clone()),
+            ("removed".to_owned(), old),
+            ("removing".to_owned(), guarded.clone()),
+            ("removed".to_owned(), guarded)
+        ]
+    );
+
+    let tmp = tmp_dir("disk-outside-no-table");
+    let (home, state) = cache_home(&tmp);
+    let older = cache_folder(&home, ".cache/older", 2 << 20);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let done = outside_tick(
+        &cache_look(&state, &roots, None, now, gib),
+        cfg,
+        &outside,
+        &mut || Some(gib),
+    );
+    assert_eq!(done.freed_bytes, 0, "{done:?}");
+    assert!(
+        older.join("blob").is_file(),
+        "no mount table read: it stays"
+    );
+    assert!(disk_free_rows(&state).is_empty(), "no `disk-free` row");
+    assert!(!done.ran_out(), "a step that could not look: {done:?}");
+}
+
+/// NO OUTSIDE CACHE GOES WITHOUT ITS INTENT ON RECORD: with the state directory unmakeable (a
+/// file sits where it goes) the ledger cannot be written, and the tick leaves a folder nine days
+/// unused in place and counts nothing freed, though its step chose the folder: the one scan of
+/// the running processes a pass makes for what it chose was made. NEGATIVE CONTROL: the same
+/// tree with a ledger it can write loses the folder (the exit test's tree), so it is the
+/// unwritten `removing` row that keeps it; a tick whose step never ran makes no scan.
+#[cfg(unix)]
+#[test]
+fn the_tick_removes_no_outside_cache_whose_intent_it_cannot_journal() {
+    let tmp = tmp_dir("disk-outside-unjournalled");
+    let (home, state) = cache_home(&tmp);
+    std::fs::write(&state, b"not a directory").expect("a file where the state dir goes");
+    let old = cache_folder(&home, ".cache/old", 2 << 20);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let table = whole_table();
+    let now = cache_clock() + 9 * CACHE_DAY;
+    let gib = 1u64 << 30;
+    let scans = std::cell::Cell::new(0);
+    let counting = |_: &[PathBuf], _: &[u32]| -> io::Result<aterm_uds::holders::PathScan> {
+        scans.set(scans.get() + 1);
+        Ok(aterm_uds::holders::PathScan::default())
+    };
+    let outside = Outside {
+        processes: &counting,
+        ..outside_with(NO_WALL)
+    };
+    let done = outside_tick(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        disk::Config::default(),
+        &outside,
+        &mut || Some(gib),
+    );
+    assert!(old.join("blob").is_file(), "nothing unjournalled goes");
+    assert_eq!(done.freed_bytes, 0, "{done:?}");
+    assert_eq!(scans.get(), 1, "the step chose the folder");
+}
+
+/// A STEP CUT SHORT HAS NOT RUN OUT, AND A HOME WITH NOTHING TO READ COSTS NOTHING. With no wall
+/// clock to read in, the step leaves an old folder, and the tick says it is unfinished, so
+/// nothing downstream reads it as a pass that ran out. Over a home with no cache folder the
+/// step never measures free space, and the tick still ran out. NEGATIVE CONTROL: with the
+/// shipped wall clock the first home's folder goes and the tick ran out; a step that measured
+/// before it listed would call the second home's measure.
+#[cfg(unix)]
+#[test]
+fn a_cut_outside_step_is_unfinished_and_a_home_with_no_cache_folder_asks_no_measure() {
+    let tmp = tmp_dir("disk-outside-cut");
+    let (home, state) = cache_home(&tmp);
+    let old = cache_folder(&home, ".cache/old", 2 << 20);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let table = whole_table();
+    let now = cache_clock() + 9 * CACHE_DAY;
+    let gib = 1u64 << 30;
+    let cfg = disk::Config::default();
+    let look = cache_look(&state, &roots, Some(&table), now, gib);
+    let done = outside_tick(
+        &look,
+        cfg,
+        &outside_with(std::time::Duration::ZERO),
+        &mut || Some(gib),
+    );
+    assert!(
+        done.unfinished
+            .as_deref()
+            .is_some_and(|why| why.contains("wall clock")),
+        "{done:?}"
+    );
+    assert!(!done.ran_out(), "{done:?}");
+    assert!(old.join("blob").is_file());
+    let done = outside_tick(&look, cfg, &outside_with(NO_WALL), &mut || Some(gib));
+    assert_eq!(done.unfinished, None, "{done:?}");
+    assert!(done.ran_out() && !old.exists(), "{done:?}");
+
+    let tmp = tmp_dir("disk-outside-bare");
+    let (home, state) = cache_home(&tmp);
+    cache_folder(&home, "proj/src", 4096);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let mut measured = 0;
+    let done = outside_tick(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        cfg,
+        &outside_with(NO_WALL),
+        &mut || {
+            measured += 1;
+            Some(gib)
+        },
+    );
+    assert_eq!(measured, 0, "nothing to read, nothing measured");
+    assert!(done.ran_out(), "{done:?}");
+    assert_eq!(done.freed_bytes, 0);
+}
+
+/// THE OUTSIDE CACHES WAIT FOR THE TIERS TO RUN OUT: a look whose search for build directories
+/// has pages left has not run out of what its tiers may take, and its step leaves a folder nine
+/// days unused in place, with no `disk-free` row. NEGATIVE CONTROL: the exit test's tree, whose
+/// tiers have nothing to search for, loses its folder to the same look; a step that ran
+/// whenever the volume is short would take this one too.
+#[cfg(unix)]
+#[test]
+fn a_tick_whose_tiers_have_not_run_out_leaves_the_outside_caches() {
+    let tmp = tmp_dir("disk-outside-tiers-first");
+    let (home, state) = cache_home(&tmp);
+    for n in 0..=disk::discover::MAX_FOUND {
+        let target = home.join(format!("source-{n:03}")).join("target");
+        std::fs::create_dir_all(&target).expect("a build directory");
+        std::fs::write(target.join(disk::RUSTC_INFO), b"{}").expect("its marker");
+    }
+    let old = cache_folder(&home, ".cache/old", 2 << 20);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let table = whole_table();
+    let now = cache_clock() + 9 * CACHE_DAY;
+    let gib = 1u64 << 30;
+    let config = disk::Config {
+        dead_build_dirs: false,
+        idle_build_dirs: false,
+        ..disk::Config::default()
+    };
+    let tick = disk_tick_with(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        config,
+        &mut |row| panic!("a marker-only target granted {}", row.path.display()),
+        &mut || Some(gib),
+        Some(&mut disk::discover::Cursor::new()),
+        None,
+        &outside_with(NO_WALL),
+    )
+    .tick;
+    let DiskTick::Reclaimed(done, _) = tick else {
+        panic!("the look admitted no pass");
+    };
+    assert!(!done.ran_out(), "its search has pages left: {done:?}");
+    assert!(old.join("blob").is_file(), "the tiers come first");
+    assert!(disk_free_rows(&state).is_empty(), "no `disk-free` row");
+}
+
+/// THE STEP STOPS AT THE PRESSURE TARGET, WHATEVER AN AGENT NEEDS: what goes outside aterm's
+/// own build output is taken only to end a shortage, so where an agent waits for more room than
+/// the pressure target leaves, the step still stops once free space reads that target: the
+/// oldest folder goes and the next oldest stays. NEGATIVE CONTROL: the same look reading free
+/// space short throughout takes the next oldest too, so it is the target that kept it; a step
+/// that went on to the agent's need takes it in the first look.
+#[cfg(unix)]
+#[test]
+fn the_outside_step_stops_at_the_pressure_target_whatever_an_agent_needs() {
+    let tmp = tmp_dir("disk-outside-demand");
+    let (home, state) = cache_home(&tmp);
+    let t = cache_clock();
+    let older = cache_folder(&home, ".cache/older", 2 << 20);
+    let old = cache_folder(&home, ".cache/old", 2 << 20);
+    set_mtime(&old.join("blob"), t + CACHE_DAY);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let table = whole_table();
+    let gib = 1u64 << 30;
+    let cfg = disk::Config::default();
+    let target = cfg.pressure_target_bytes();
+    assert!(
+        cfg.demand_target(target) > target,
+        "the need lies past the target"
+    );
+    let look = DiskLook {
+        demand: Some(target),
+        ..cache_look(&state, &roots, Some(&table), t + 9 * CACHE_DAY, gib)
+    };
+    let done = outside_tick(&look, cfg, &outside_with(NO_WALL), &mut || {
+        Some(if older.exists() { gib } else { target })
+    });
+    assert!(!older.exists(), "{done:?}");
+    assert!(old.join("blob").is_file(), "at the target: it stays");
+    let look = DiskLook {
+        now: t + 9 * CACHE_DAY + 7200,
+        ..look
+    };
+    let done = outside_tick(&look, cfg, &outside_with(NO_WALL), &mut || Some(gib));
+    assert!(!old.exists(), "still short: {done:?}");
+}
+
+/// A budget page over the home `roots` names: a 1000 GiB volume with 900 GiB used under an
+/// 800 GiB cap, so 100 GiB free is 100 GiB short of the free target. The page's tick and its
+/// plan's ask, the step reading through `outside`.
+#[cfg(unix)]
+fn outside_budget_page(
+    look: &DiskLook<'_>,
+    budget: &BudgetLook<'_>,
+    config: disk::Config,
+    outside: &Outside<'_>,
+    measure: &mut disk::Measure<'_>,
+) -> (disk::Applied, Option<disk::budget::Ask>) {
+    let mut take = || -> Result<(), String> { Ok(()) };
+    let taking: &mut Take<'_> = &mut take;
+    let Ticked { tick, ask, .. } = disk_tick_with(
+        look,
+        config,
+        &mut |row| panic!("a tier removed {}", row.path.display()),
+        measure,
+        Some(&mut disk::discover::Cursor::new()),
+        Some((Admitted::Budget(budget), taking)),
+        outside,
+    );
+    match tick {
+        DiskTick::Reclaimed(done, _) => (done, ask),
+        DiskTick::Plenty => panic!("the look admitted no page"),
+    }
+}
+
+/// A BUDGET PAGE TAKES NO OUTSIDE CACHE: over its rebuildable budget with plenty free, the
+/// cap is no shortage, and what goes outside aterm's own build output is taken only to end one,
+/// so a page leaves an unused, tagged `.cache` folder in place and writes no `disk-free` row.
+/// NEGATIVE CONTROL: the same home, read below its floor by a pressure tick, loses the folder,
+/// so every fence admits it and it is the budget page that left it.
+#[cfg(unix)]
+#[test]
+fn an_over_budget_page_takes_no_outside_cache() {
+    use disk::budget::{Live, Sizing, over};
+    let gib = 1u64 << 30;
+    let config = disk::Config {
+        cap_used_gib: disk::Cap::Written(800),
+        ..disk::Config::default()
+    };
+    let sizing = Sizing {
+        volume: "v".to_owned(),
+        total: 1000 * gib,
+        used: 900 * gib,
+        sized: disk::Rebuildable {
+            bytes: 50 * gib,
+            partial: false,
+        },
+        sized_unix: 1,
+    };
+    let over_cap = over(&sizing, config.cap_used_gib, "v", 100 * gib).expect("over its cap");
+    let free_target = over_cap.free_target;
+    assert_eq!(free_target, 200 * gib);
+    let live = Live::default();
+    let budget = BudgetLook {
+        sizing: &sizing,
+        over: over_cap,
+        live: &live,
+        page: 1,
+    };
+    let table = whole_table();
+    let now = cache_clock() + 9 * CACHE_DAY;
+
+    let tmp = tmp_dir("disk-outside-budget");
+    let (home, state) = cache_home(&tmp);
+    let older = cache_folder(&home, ".cache/older", 2 << 20);
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let plenty = 100 * gib;
+    assert!(
+        !config.pressed(Some(plenty), None),
+        "the page is no shortage"
+    );
+    let look = cache_look(&state, &roots, Some(&table), now, plenty);
+    let (done, _) =
+        outside_budget_page(&look, &budget, config, &outside_with(NO_WALL), &mut || {
+            Some(plenty)
+        });
+    assert!(
+        older.join("blob").is_file(),
+        "over the budget alone: it stays"
+    );
+    assert_eq!(done.freed_bytes, 0, "{done:?}");
+    assert!(disk_free_rows(&state).is_empty(), "no `disk-free` row");
+
+    let done = outside_tick(
+        &cache_look(&state, &roots, Some(&table), now, gib),
+        config,
+        &outside_with(NO_WALL),
+        &mut || Some(gib),
+    );
+    assert!(!older.exists(), "below the floor it goes: {done:?}");
 }
 
 #[test]
@@ -10072,6 +10373,7 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
             pid: Some(FakeClaude::PID.to_string()),
             login: None,
             home: None,
+            route: None,
         };
         let stdin = r#"{"cost":{"total_api_duration_ms":9},"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1758420000},"seven_day":{"used_percentage":61,"resets_at":1758900000}}}"#;
         let mut out = Vec::new();
@@ -10167,6 +10469,7 @@ fn usage_says_why_claude_code_reports_no_five_hour_window() {
         pid: Some(FakeClaude::PID.to_string()),
         login: None,
         home: None,
+        route: None,
     };
     let week_reset = env.now + 6 * 86_400;
     let stdin = include_str!("testdata/tap/claude-2.1.316-statusline-week-only.json")
@@ -10288,6 +10591,7 @@ fn usage_takes_the_usage_cache_only_as_the_default_logins_own_account() {
         pid: Some(FakeClaude::PID.to_string()),
         login: None,
         home: None,
+        route: None,
     };
     let week_reset = env.now + 6 * 86_400;
     let stdin = include_str!("testdata/tap/claude-2.1.316-statusline-week-only.json")
@@ -14126,7 +14430,11 @@ fn disk_free_parses_its_paths_and_flags_and_is_on_the_disk_page() {
     );
     let page = help_page(HelpPage::Disk);
     assert!(page.contains("aterm harness disk free <path>... [--dry-run] [--json]"));
-    assert!(page.contains("`disk free <path>...` is the one way"));
+    assert!(page.contains("the window's own pass removes such caches behind the same fences"));
+    assert!(
+        !page.contains("disk-free worker"),
+        "no worker is left to name"
+    );
 }
 
 #[test]
@@ -14999,7 +15307,7 @@ fn an_emergency_pass_with_nothing_to_remove_writes_one_cannot_meet_row() {
             free: Some(GIB),
             fruitless: true,
             level: emergency_level,
-            low_every: LOW_EVERY,
+            every: LOW_EVERY,
         })
     };
     // Whether `look` runs a pass with the wait standing, past the interval since a fruitless

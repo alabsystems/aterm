@@ -350,6 +350,12 @@ pub struct Caps {
     /// answers such a wait as it always did, so there a switch is seen at the loop's next wake; a
     /// host that refused the token as a usage error would get each wait bare.
     pub await_autopilot: Option<bool>,
+    /// Whether a wait that carried `autopilot=<word>` was answered `OK autopilot <word>` on this
+    /// connection: the host wakes such a wait on a switch of the session's word, which an older
+    /// host that reads only the arguments it knows never does, though it takes the token
+    /// ([`Self::await_autopilot`] reads `Some(true)` for both). The Off park waits whole only on a
+    /// host that answered ([`Session::park_while_off`]).
+    pub word_answered: bool,
     /// `Some(false)` once a host refused `autopilot=<word>` on the loop's `await log` as a usage
     /// error and answered the wait bare (a build from before the log wait took it): the loop's log
     /// waits go bare until a reconnect, and there a switch made while the agent works is seen at
@@ -391,8 +397,8 @@ fn host_step_word(line: &str) -> Option<&str> {
 pub struct IdlePoint {
     /// Whether the task has landed and been defended under Autopilot Land (`Nothing left:`).
     pub done_under_land: bool,
-    /// What holds a fact the host would type at this point of its own (`HostTurn::Fact`: the ask
-    /// to free disk space), by the occupancy door's own guards
+    /// What holds a fact the host would type at this point of its own (`HostTurn::Fact`), by
+    /// the occupancy door's own guards
     /// ([`crate::supervise::occupancy::Guards::held_host_fact`]): a person typed within
     /// `[harness] human_grace_s` or another driver's hand is on the session ([`Guard::Person`]),
     /// the turn was the person's own exchange ([`Guard::Exchange`]), or a manager awaits the
@@ -458,9 +464,8 @@ impl std::fmt::Debug for IdlePoint {
 
 /// A withhold of the loop's at a turn break that lasts past any grace, told to the host as the
 /// loop decides each break ([`IdleHost::lasting_hold`]): nothing the host would type there goes
-/// until it is over, so a host that offers the session work it would type at a break (the
-/// `disk-free@v1` seat rule's) holds it out meanwhile, as it does at a usage-limit wall
-/// ([`IdleHost::limit_wall`]).
+/// until it is over, so a host that offers the session work it would type at a break holds it
+/// out meanwhile, as it does at a usage-limit wall ([`IdleHost::limit_wall`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lasting {
     /// The credits hold ([`Guard::Credits`]: `[harness] usage_credits = false`, and usage credits
@@ -960,6 +965,10 @@ const AGENT_RECHECK: Duration = Duration::from_secs(5);
 
 const HANDBACK_POLL: Duration = Duration::from_secs(2);
 const OFF_STEP: Duration = Duration::from_secs(5);
+/// The longest one wait of an Off park lasts on a host that answers the session's word
+/// ([`Session::park_while_off`]): the longest a host holds a wait (`aterm_control`'s
+/// `WAIT_MAX_MS`), which answers a longer one at it, so the reply's own bound counts from this.
+const OFF_REST: Duration = Duration::from_secs(600);
 /// How long a switch of the session's Autopilot word stands before the loop decides on it (v6
 /// §14.10): a chip click passing through Land on its way to Off types nothing.
 const WORD_SETTLE: Duration = Duration::from_secs(1);
@@ -4321,6 +4330,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.caps.await_autopilot = Some(false);
                 return Ok((Wait::Latched, None));
             }
+            self.caps.word_answered = true;
             return Ok((Wait::Word(read), None));
         }
         if r.ok() {
@@ -7914,9 +7924,9 @@ impl<C: Ctl> Session<'_, C> {
             *since = None;
             line_gone = Some(Guard::HostLine);
         } else if let Some(step) = self.background_fact(screen, cfg, host.as_ref(), review)? {
-            // The host's own fact at the break (the `disk-free@v1` ask's line), where the upgrade
-            // typed nothing: what a turn of the session's that ends with its own background work
-            // still running would otherwise never take.
+            // The host's own fact at the break, where the upgrade typed nothing: what a turn of
+            // the session's that ends with its own background work still running would otherwise
+            // never take.
             review.note(&format!("HOST seq={} background {}", screen.seq, step.line));
             if step.moved {
                 self.turn_end.host_moved();
@@ -8163,10 +8173,10 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The turn break `point` rests at, just decided, told to the host before it is asked
     /// whether it wants a step there ([`IdleHost::turn_break`]), so what the host finds of the
-    /// session there (the `disk-free@v1` seat rule's finding, which every host's disk look reads)
-    /// is made at every decided turn break, not only at one where the host owes a step. It is
-    /// told once per decision: the wait's later looks at the same point find nothing new, and the
-    /// host's finding reads the session's records. A point mid-turn (a box) is no turn break.
+    /// session there (the window's look at the session's work) is made at every decided turn
+    /// break, not only at one where the host owes a step. It is told once per decision: the
+    /// wait's later looks at the same point find nothing new, and the host's finding reads the
+    /// session's records. A point mid-turn (a box) is no turn break.
     /// What lasting withhold holds the session at it is told as well ([`Self::tell_lasting`]).
     fn tell_break(&mut self, opts: &SuperviseOpts, point: &Turn) {
         if let Some(host) = opts.idle_host.as_ref()

@@ -994,17 +994,22 @@ where
                             }
                             permit
                         },
-                        &mut |b, resources| {
-                            waits.waits(
-                                b.index,
-                                test_waits::Wait::For(test_waits::Reason::local(b, resources)),
-                            );
-                        },
-                        &|look| {
-                            probes
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .again(look)
+                        LookHooks {
+                            rejected:
+                                &mut |b: &Planned, resources: test_plan::DispatchResources| {
+                                    waits.waits(
+                                        b.index,
+                                        test_waits::Wait::For(test_waits::Reason::local(
+                                            b, resources,
+                                        )),
+                                    );
+                                },
+                            again: &|look| {
+                                probes
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .again(look)
+                            },
                         },
                     );
                     let Some((planned, permit)) = next else {
@@ -1561,7 +1566,7 @@ fn enter_in(
 struct AdmissionPass {
     generation: Option<u64>,
     sampled: Option<Instant>,
-    probe: Option<aterm_capacity::admit::ResourceProbe>,
+    probe: Option<Box<aterm_capacity::admit::ResourceProbe>>,
     /// The look that met another admission's hold of the ledger's lock, and that holder.
     turn: Option<(u64, Option<u32>)>,
     /// The ledger the look of that number resolved ([`Self::ledger`]).
@@ -1671,15 +1676,19 @@ impl AdmissionPass {
     }
 }
 
+/// Enter one request at its retained place, preserving the caller's borrowed lifetime.
+type EnterWaiter<'l> = dyn Fn(
+        aterm_capacity::Need,
+        Option<&aterm_capacity::admit::Place>,
+    ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>
+    + 'l;
+
 /// Where a dispatch's binaries ask for their claims: the ledger (the user's, resolved once per
 /// look; `None` with no home), the machine its looks read, and how a request is entered there.
 struct Asking<'l> {
     ledger: Option<&'l aterm_capacity::Ledger>,
     machine: &'l dyn aterm_capacity::Machine,
-    enter: &'l dyn Fn(
-        aterm_capacity::Need,
-        Option<&aterm_capacity::admit::Place>,
-    ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
+    enter: &'l EnterWaiter<'l>,
 }
 
 /// [`binary_permit_in`] in the user's ledger on this machine: during a dispatch's `look`, the
@@ -2031,8 +2040,10 @@ fn admitted_holding<T>(
         stop,
         after_stop,
         &mut |_, b, _| acquire(b),
-        &mut |_, _| {},
-        &|_| LOOK_AGAIN,
+        LookHooks {
+            rejected: &mut |_: &Planned, _: test_plan::DispatchResources| {},
+            again: &|_| LOOK_AGAIN,
+        },
     )
 }
 
@@ -2052,9 +2063,17 @@ fn admitted_holding_pass<T>(
         stop,
         after_stop,
         &mut |look, b, _| acquire(look, b),
-        &mut |_, _| {},
-        &|_| LOOK_AGAIN,
+        LookHooks {
+            rejected: &mut |_: &Planned, _: test_plan::DispatchResources| {},
+            again: &|_| LOOK_AGAIN,
+        },
     )
+}
+
+/// Rejection notification and next-look pacing for one dispatch look.
+struct LookHooks<'a, R> {
+    rejected: &'a mut R,
+    again: &'a dyn Fn(test_plan::Look) -> Duration,
 }
 
 /// The next binary a look of the dispatch admits, `None` once none is left to start or the run
@@ -2064,16 +2083,18 @@ fn admitted_holding_pass<T>(
 /// back) with the look's identity and the cores the running binaries hold; a pass that starts
 /// nothing is stamped when it ends, the next look at that generation due `again(look)` after
 /// it. A worker whose look is not due waits until it is, or until a binary starts or ends.
-fn admitted_holding_observed<T>(
+fn admitted_holding_observed<T, R>(
     state: &Mutex<Dispatcher>,
     turn: &Condvar,
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
     after_stop: &(impl Fn() + Sync),
     acquire: &mut impl FnMut(test_plan::Look, &Planned, u32) -> Option<T>,
-    rejected: &mut impl FnMut(&Planned, test_plan::DispatchResources),
-    again: &dyn Fn(test_plan::Look) -> Duration,
-) -> Option<(Planned, T)> {
+    hooks: LookHooks<'_, R>,
+) -> Option<(Planned, T)>
+where
+    R: FnMut(&Planned, test_plan::DispatchResources),
+{
     loop {
         let stopping = stop() || exec::ending();
         after_stop();
@@ -2100,11 +2121,11 @@ fn admitted_holding_observed<T>(
                     permit = acquire(look, b, held);
                     permit.is_some()
                 },
-                rejected,
+                hooks.rejected,
             ) {
                 return Some((b, permit.expect("admission acquired its resources")));
             }
-            let again = again(look);
+            let again = (hooks.again)(look);
             d.looked(look, Instant::now(), again);
             again
         };

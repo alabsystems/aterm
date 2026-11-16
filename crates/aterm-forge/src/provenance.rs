@@ -55,8 +55,10 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
           a similar name — so this is aterm's own code, not a redistribution. alab-harness holds \
           the one copy of alab-policy, the turn-end deciders aterm's supervisor and every ALab \
           harness share: aterm, aterm-agent, aterm-gui, aterm-lab, aterm-phase, aterm-slog and \
-          aterm-types link it by path, and claude-code-alab receives this copy through `verify \
-          vendor-out`. The directory is the whole tree of one alab-harness release tag, copied \
+          aterm-types link it by path. claude-code-alab carries its own independently pinned \
+          whole copy; `verify vendor-out` projects only aterm-phase and aterm-agent-names, \
+          with policy dependencies pointing into the receiving repository's canonical copy. \
+          The directory is the whole tree of one alab-harness release tag, copied \
           by alab-harness's tools/pin and held to that tag's git tree id in \
           vendor/alab-harness.pin, which [OB-1], aterm-verify before any check runs and verify \
           vendor-out before it reads the copy check; alab-harness's \

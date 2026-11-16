@@ -690,13 +690,71 @@ fn every_kind_in_the_design_tables_round_trips() {
 }
 
 #[test]
+fn an_unknown_kind_counts_remaining_member_occurrences() {
+    let line = concat!(
+        r#"{"k":"later","seq":18446744073709551615,"ms":18446744073709551615,"#,
+        r#""model":{"state":"is","state":"later","value":false,"value":0},"#,
+        r#""\u006dodel":null,"x":{"same":1,"same":2},"x":{"same":1,"\u0073ame":2}}"#,
+    );
+    let decoded = read(line).expect("an unknown kind does not interpret its payload schema");
+    assert_eq!(decoded.record.seq, u64::MAX);
+    assert_eq!(decoded.record.ms, u64::MAX);
+    assert_eq!(decoded.record.body, Body::Unknown { k: s("later") });
+    assert_eq!(
+        decoded.unknown, 4,
+        "each member counts once with its opaque subtree"
+    );
+}
+
+#[test]
+fn an_unknown_kind_still_validates_the_envelope_and_complete_json() {
+    let cases = [
+        (r#"{"k":"later","ms":0}"#, LineError::Missing("seq")),
+        (r#"{"k":"later","seq":1}"#, LineError::Missing("ms")),
+        (
+            r#"{"k":"later","seq":0,"ms":0}"#,
+            LineError::Malformed("seq"),
+        ),
+        (
+            r#"{"k":"later","seq":18446744073709551616,"ms":0}"#,
+            LineError::Malformed("seq"),
+        ),
+        (
+            r#"{"k":"later","seq":1,"ms":-1}"#,
+            LineError::Malformed("ms"),
+        ),
+        (
+            r#"{"k":"later","\u006b":"later","seq":1,"ms":0}"#,
+            LineError::Repeated("k"),
+        ),
+        (
+            r#"{"k":"later","seq":1,"\u0073eq":1,"ms":0}"#,
+            LineError::Repeated("seq"),
+        ),
+        (
+            r#"{"k":"later","seq":1,"ms":0,"\u006ds":0}"#,
+            LineError::Repeated("ms"),
+        ),
+    ];
+    for (line, error) in cases {
+        assert_eq!(read(line), Err(error), "{line}");
+    }
+    for line in [
+        r#"{"k":"later","seq":1,"ms":0,"x":{"bad":}}"#,
+        r#"{"k":"later","seq":1,"ms":0} {}"#,
+    ] {
+        assert!(matches!(read(line), Err(LineError::Syntax(_))), "{line}");
+    }
+}
+
+#[test]
 fn an_unknown_kind_or_field_is_counted_never_refused() {
     let future = read(r#"{"k":"telepathy","seq":3,"ms":1,"x":{"deep":[1,2.5e-3,true]},"x":null}"#)
         .expect("an unknown kind reads");
     assert_eq!(future.record.body, Body::Unknown { k: s("telepathy") });
     assert_eq!(future.record.body.kind(), None);
     assert_eq!(future.record.body.word(), "telepathy");
-    assert_eq!(future.unknown, 0, "the kind is counted, not its fields");
+    assert_eq!(future.unknown, 2, "each ignored payload member is counted");
     assert!(
         future.record.body.admitted(&[], act_table),
         "counted, not refused for scope"
@@ -1055,7 +1113,7 @@ fn each_kind_needs_the_scope_the_design_table_names() {
 }
 
 #[test]
-fn the_stream_reply_reads_epoch_acked_and_in() {
+fn the_stream_request_uses_the_locator_session_ids() {
     assert_eq!(stream_request("s-1f").as_deref(), Some("stream @s-1f v=1"));
     for sid in [
         "self",
@@ -1064,19 +1122,48 @@ fn the_stream_reply_reads_epoch_acked_and_in() {
         "s-xyz",
         "s-1 x",
         "s-1\nstatus",
+        "tqn5r",
+        "tqn5r6e014",
+        "tqn5r6e01480",
+        "Tqn5r6e0148",
+        "tQN5R6E0148",
+        "tqn5r6e0i48",
+        "tqn5r6e0l48",
+        "tqn5r6e0o48",
+        "tqn5r6e0u48",
+        "tqn5r6e0_48",
+        "tqn5r6e0148\nstatus",
         ".",
         "",
     ] {
         assert_eq!(stream_request(sid), None, "{sid:?}");
         assert!(!crate::wire::session_id(sid), "the wire agrees: {sid:?}");
     }
-    for sid in ["s-0", "s-1f", "s-DEADbeef"] {
+    for sid in [
+        "tqn5r6e0148",
+        "t0000000000",
+        "tzzzzzzzzzz",
+        "s-0",
+        "s-1f",
+        "s-DEADbeef",
+    ] {
         assert!(
             stream_request(sid).is_some() && crate::wire::session_id(sid),
             "{sid}"
         );
+        let locator = crate::wire::Locator::new(PathBuf::from("/run/aterm"), sid)
+            .expect("a validated ID needs no discovery");
+        let expected = format!("stream @{sid} v=1");
+        assert_eq!(
+            stream_request(locator.sid()).as_deref(),
+            Some(expected.as_str()),
+            "the locator's exact ID is the selector"
+        );
     }
+}
 
+#[test]
+fn the_stream_reply_reads_epoch_acked_and_in() {
     let epoch = "p4242-0123456789abcdef01234567";
     let ok = format!("OK stream v=1 epoch={epoch} acked=12 in=3");
     let reply = StreamReply::parse(&ok).expect("the OK line reads");

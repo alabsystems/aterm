@@ -14,6 +14,8 @@ mod tests;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 
+use aterm_process_facts::program_check::HELD_AT_ONCE;
+
 pub use step::{Fault, Progress, Tick, Track};
 pub use units::{Jobs, NamingError, NamingSelector, NamingTicket, NamingWaiter};
 pub use wait::TierB;
@@ -42,11 +44,6 @@ pub const KERNEL_WAIT_MS: u64 = 10_000;
 pub const NEVER_RETURNS_MS: u64 = 10_000;
 /// How long an orphan must burn a core with no side writes to be a busy-silent orphan finding.
 pub const BUSY_ORPHAN_MS: u64 = 600_000;
-/// How many programs macOS's program check holds at one reading that make a backed-up queue: a
-/// normal exec reads held for under 0.3 ms, so this many at once is a line. The rule's other half
-/// is one held across two readings; a reader that keeps a count, not rows, reads that half as
-/// programs held at both of its readings (`aterm_uds::process::HeldNow::backed_up`).
-pub const HELD_AT_ONCE: usize = 3;
 /// The intervals a job's own μ is the median of (the last ones).
 pub const OWN_RING: usize = 32;
 /// Intervals a job needs before its own median is its μ (and before it teaches its command class).

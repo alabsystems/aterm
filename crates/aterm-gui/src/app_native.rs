@@ -86,6 +86,18 @@ pub(crate) fn native_ui_compile_count() -> u64 {
     NATIVE_UI_COMPILES.with(std::cell::Cell::get)
 }
 
+/// The damage of a native leaf whose compiled page moved and whose pixels did not: nodes it
+/// lists off its screen read differently, and a client that reads its tree must be told. A page
+/// is one compile, from which its pixels, the tree the pointer is routed by and the tree a client
+/// reads all come, so the leaf owes a frame; this is the least a frame rasters. The frame compiles
+/// the page, finds no paint node changed, and paints this one pixel as it was.
+pub(crate) const TREE_ONLY: DamageRegion = DamageRegion::Rect {
+    x: 0,
+    y: 0,
+    width: 1,
+    height: 1,
+};
+
 static NEXT_CONTROL_SETTINGS_REQUEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -1725,6 +1737,20 @@ pub(crate) struct NativeLeafScene {
     pub(crate) motion_ms: u64,
 }
 
+/// A native view's host in window pixels, independent of whether a tab owns it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NativeHostGeometry {
+    pub(crate) origin: (i64, i64),
+    pub(crate) size: (u32, u32),
+    pub(crate) viewport: crate::native_ui::LogicalRect,
+}
+
+struct NativeArtifactHost<'a> {
+    geometry: NativeHostGeometry,
+    card: &'a crate::SettingsCard,
+    card_offset: (u32, u32),
+}
+
 /// Immutable view of one compositor-retained native leaf.
 pub(crate) struct RetainedNativeLeafArtifact<'a> {
     pub(crate) instance: crate::tab_model::AppInstanceId,
@@ -2791,6 +2817,12 @@ impl App {
         let Some(window) = self.windows.get(&wid) else {
             return Err("unknown window".to_string());
         };
+        if self.dock_view(wid) == Some(view) {
+            return self
+                .dock_geometry(wid)
+                .map(|host| host.viewport)
+                .ok_or_else(|| "dock has no viewport".to_owned());
+        }
         let Some(tab) = window
             .tab_set
             .tabs()
@@ -2890,8 +2922,10 @@ impl App {
             .map(|snapshot| snapshot.seq.0);
         let (cw, ch) = self.win_cell_size(wid);
         let mut geometry = std::collections::hash_map::DefaultHasher::new();
-        ws.cols.hash(&mut geometry);
-        ws.rows.hash(&mut geometry);
+        if self.dock_view(wid) != Some(view) {
+            ws.cols.hash(&mut geometry);
+            ws.rows.hash(&mut geometry);
+        }
         cw.hash(&mut geometry);
         ch.hash(&mut geometry);
         self.win_pad(wid).hash(&mut geometry);
@@ -2932,7 +2966,7 @@ impl App {
             view,
             generation,
             geometry: geometry.finish(),
-            config_revision: self.native_config_service.snapshot().revision,
+            config_revision: self.native_config_service.revision(),
             update_revision: self.native_updater_service.snapshot().revision,
             document_seq,
             presentation_revision,
@@ -2942,14 +2976,67 @@ impl App {
         })
     }
 
-    /// Return the compiled artifact retained for glass only while every live input still matches the stamp captured with it.
+    /// Return the compiled artifact retained for glass only while every live input still matches the stamp captured with it,
+    /// and while none of the nodes it lists off its screen fell behind the model ([`Self::note_native_nodes_behind`]).
     pub(crate) fn cached_native_ui(&self, wid: WindowId) -> Option<&NativeCompiledFrame> {
         let stamp = self.native_ui_compile_stamp(wid).ok()?;
-        self.windows
-            .get(&wid)?
-            .native_ui_compiled
-            .as_ref()
-            .filter(|frame| frame.stamp == stamp)
+        let window = self.windows.get(&wid)?;
+        window.native_ui_compiled.as_ref().filter(|frame| {
+            frame.stamp == stamp
+                && window
+                    .leaf_render_cache
+                    .get(&frame.stamp.view)
+                    .is_none_or(|cache| !cache.native_nodes_behind)
+        })
+    }
+
+    /// The model moved under nodes `view`'s page lists and paints none of (a row a list holds off
+    /// its screen): no pixel and no hit target of its retained compile moved, so it asks for no
+    /// frame, and its compile no longer answers a reader of its nodes. `inspect` and the
+    /// keyboard's walk compile the page as it stands until the leaf's next raster
+    /// ([`Self::cached_native_ui`], `App::retained_visible_native_ui`), and an assistive client
+    /// that begins reading the window is owed the least frame ([`Self::owe_client_native_nodes`]).
+    pub(crate) fn note_native_nodes_behind(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
+            window
+                .leaf_render_cache
+                .entry(view)
+                .or_default()
+                .native_nodes_behind = true;
+        }
+    }
+
+    /// An assistive client began reading window `wid`: it reads every node a page lists, so each
+    /// leaf whose nodes fell behind the model ([`Self::note_native_nodes_behind`]) is owed the
+    /// least frame now ([`TREE_ONLY`]), which compiles the page as it stands. Until it lands the
+    /// client's tree is read from the model, as for any paint owed.
+    #[cfg(a11y_tree)]
+    pub(crate) fn owe_client_native_nodes(&mut self, wid: WindowId) {
+        let behind: Vec<crate::tab_model::ViewId> = self
+            .windows
+            .get(&wid)
+            .map(|window| {
+                window
+                    .leaf_render_cache
+                    .iter()
+                    .filter(|(_, cache)| cache.native_nodes_behind)
+                    .map(|(view, _)| *view)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for view in &behind {
+            self.invalidate_native_view_cache(wid, *view, TREE_ONLY);
+        }
+        if !behind.is_empty()
+            && let Some(window) = self.windows.get(&wid)
+        {
+            window.request_redraw();
+        }
     }
 
     pub(crate) fn invalidate_native_ui_cache(&mut self, wid: WindowId) {
@@ -3056,10 +3143,14 @@ impl App {
         view: crate::tab_model::ViewId,
         damage: DamageRegion,
     ) {
+        // The window's card is its tab page's; the dock's own card is replaced by its re-raster.
+        let page = self.dock_view(wid) != Some(view);
         self.invalidate_native_view_cache(wid, view, damage);
         if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
             let window = &mut **route_guard_window;
-            window.settings_card = None;
+            if page {
+                window.settings_card = None;
+            }
             if let Some(window) = window.os_window.as_ref() {
                 window.request_redraw();
             }
@@ -3277,29 +3368,95 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         pointer_feedback: bool,
     ) -> Option<RetainedNativeLeafArtifact<'_>> {
-        let window = self.windows.get(&wid)?;
-        if window.overlay.is_some() {
-            return None;
+        if self.dock_view(wid) == Some(view) {
+            return self.native_dock_artifact(wid, require_presented, pointer_feedback);
         }
+        let window = self.windows.get(&wid)?;
         let leaf = plan.leaf(view)?;
-        let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
-            return None;
-        };
-        let generation = self.native_runtime.view_generation(view)?;
         let (cw, ch) = self.win_cell_size(wid);
-        let scale = window.scale.max(f64::EPSILON);
+        let scale = window.scale.max(f64::EPSILON) as f32;
         let viewport = if plan.leaves.len() == 1 {
             self.native_ui_full_viewport(wid).ok()?
         } else {
             crate::native_ui::LogicalRect::new(
                 0.0,
                 0.0,
-                leaf.rect.size.width * cw as f32 / scale as f32,
-                leaf.rect.size.height * ch as f32 / scale as f32,
+                leaf.rect.size.width * cw as f32 / scale,
+                leaf.rect.size.height * ch as f32 / scale,
             )
         };
+        let card = window.settings_card.as_ref()?;
+        let raster = window.leaf_render_cache.get(&view)?.native.as_ref()?;
+        let (frame_x, frame_y) = self.frame_origin(wid);
+        let origin = (
+            frame_x
+                .checked_add(i64::from(card.dx))?
+                .checked_add(i64::from(raster.presented_x))?,
+            frame_y
+                .checked_add(i64::from(card.dy))?
+                .checked_add(i64::from(raster.presented_y))?,
+        );
+        self.native_artifact_for_host(
+            wid,
+            view,
+            require_presented,
+            pointer_feedback,
+            NativeArtifactHost {
+                geometry: NativeHostGeometry {
+                    origin,
+                    size: (raster.width, raster.height),
+                    viewport,
+                },
+                card,
+                card_offset: (raster.presented_x, raster.presented_y),
+            },
+        )
+    }
+
+    pub(crate) fn native_dock_artifact(
+        &self,
+        wid: WindowId,
+        require_presented: bool,
+        pointer_feedback: bool,
+    ) -> Option<RetainedNativeLeafArtifact<'_>> {
+        let view = self.dock_view(wid)?;
+        let window = self.windows.get(&wid)?;
+        let geometry = self.dock_geometry(wid)?;
+        if window.pending_close || require_presented && window.dock.presented != Some(geometry) {
+            return None;
+        }
+        self.native_artifact_for_host(
+            wid,
+            view,
+            require_presented,
+            pointer_feedback,
+            NativeArtifactHost {
+                geometry,
+                card: window.dock_card.as_ref()?,
+                card_offset: (0, 0),
+            },
+        )
+    }
+
+    /// Validate a retained scene against its actual host, independently of tab ownership.
+    fn native_artifact_for_host(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        require_presented: bool,
+        pointer_feedback: bool,
+        host: NativeArtifactHost<'_>,
+    ) -> Option<RetainedNativeLeafArtifact<'_>> {
+        let window = self.windows.get(&wid)?;
+        if window.overlay.is_some() {
+            return None;
+        }
+        let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
+            return None;
+        };
+        let generation = self.native_runtime.view_generation(view)?;
         let expected_stamp = self
-            .native_ui_compile_stamp_for(wid, native.instance, view, viewport)
+            .native_ui_compile_stamp_for(wid, native.instance, view, host.geometry.viewport)
             .ok()?;
         let cache = window.leaf_render_cache.get(&view)?;
         let raster = cache.native.as_ref()?;
@@ -3312,12 +3469,13 @@ impl App {
             || raster.stamp != expected_stamp
             || raster.stamp.generation != generation
             || require_presented && !raster.presented
+            || host.geometry.size != (raster.width, raster.height)
         {
             return None;
         }
-        let card = window.settings_card.as_ref()?;
-        if raster.presented_x.checked_add(raster.width)? > card.pw
-            || raster.presented_y.checked_add(raster.height)? > card.ph
+        let card = host.card;
+        if host.card_offset.0.checked_add(raster.width)? > card.pw
+            || host.card_offset.1.checked_add(raster.height)? > card.ph
             || usize::try_from(card.pw)
                 .ok()?
                 .checked_mul(usize::try_from(card.ph).ok()?)?
@@ -3326,13 +3484,7 @@ impl App {
         {
             return None;
         }
-        let (frame_x, frame_y) = self.frame_origin(wid);
-        let device_x = frame_x
-            .checked_add(i64::from(card.dx))?
-            .checked_add(i64::from(raster.presented_x))?;
-        let device_y = frame_y
-            .checked_add(i64::from(card.dy))?
-            .checked_add(i64::from(raster.presented_y))?;
+        let (device_x, device_y) = host.geometry.origin;
         if let Some(size) = window.win_px {
             let right = device_x.checked_add(i64::from(raster.width))?;
             let bottom = device_y.checked_add(i64::from(raster.height))?;
@@ -3356,7 +3508,7 @@ impl App {
             device_y,
             width: raster.width,
             height: raster.height,
-            scale,
+            scale: window.scale.max(f64::EPSILON),
         })
     }
 
@@ -3419,6 +3571,21 @@ impl App {
     ) -> Option<(RetainedNativeLeafArtifact<'_>, f32, f32)> {
         if !x.is_finite() || !y.is_finite() {
             return None;
+        }
+        if let Some(host) = self.dock_geometry(wid) {
+            let (ox, oy) = host.origin;
+            if x >= ox as f64
+                && y >= oy as f64
+                && x < ox as f64 + f64::from(host.size.0)
+                && y < oy as f64 + f64::from(host.size.1)
+            {
+                let artifact = self.native_dock_artifact(wid, true, true)?;
+                let point = (
+                    ((x - artifact.device_x as f64) / artifact.scale) as f32,
+                    ((y - artifact.device_y as f64) / artifact.scale) as f32,
+                );
+                return Some((artifact, point.0, point.1));
+            }
         }
         let owned_plan;
         let plan = match frame_plan {
@@ -3651,11 +3818,10 @@ impl App {
         lines: i32,
         key: Option<crate::native_ui::UiKey>,
     ) -> Result<EventResult, String> {
-        if !self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| crate::active_tab_shows(ws, |candidate| candidate == view))
-        {
+        if !self.windows.get(&wid).is_some_and(|ws| {
+            crate::active_tab_shows(ws, |candidate| candidate == view)
+                || (ws.dock.cells != 0 && ws.dock.view == Some(view))
+        }) {
             return Err("native scroll target is no longer visible".to_string());
         }
         let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
@@ -3694,7 +3860,9 @@ impl App {
     /// Every input reaches a native app's reducer here. A person-only press no person is known to
     /// stand behind is refused before anything of it is taken, whichever way it came: a control,
     /// a palette command or an accessibility request ([`App::person_only_press_refusal`]).
-    fn dispatch_native_target_event(
+    /// Lifecycle settlement may finish an owned drag on an exact live view after its tab
+    /// stopped being active. Ordinary input passes the active/presented-view gates first.
+    pub(crate) fn dispatch_native_target_event(
         &mut self,
         wid: WindowId,
         instance: crate::native_app::AppInstanceId,
@@ -4037,6 +4205,14 @@ impl App {
         expected_view: crate::tab_model::ViewId,
         event: AppEvent,
     ) -> Result<EventResult, String> {
+        if self.dock_view(wid) == Some(expected_view) {
+            let Some(crate::tab_model::View::Native(native)) =
+                self.view_store.get(expected_view).copied()
+            else {
+                return Err("dock target is no longer native".into());
+            };
+            return self.dispatch_native_target_event(wid, native.instance, expected_view, event);
+        }
         let (_, active_view) = self
             .active_native_view(wid)
             .ok_or_else(|| "active tab is not a native app".to_string())?;
@@ -4055,14 +4231,9 @@ impl App {
         invocation: crate::native_app::ActionInvocation,
         focus_visible: bool,
     ) -> Result<EventResult, String> {
-        let (_, active_view) = self
-            .active_native_view(wid)
-            .ok_or_else(|| "active tab is not a native app".to_string())?;
-        if active_view != expected_view {
-            return Err("native app target is stale or no longer active".to_string());
-        }
+        self.native_pointer_target_stands(wid, expected_view)?;
         let focus_viewport = {
-            let compiled = self.current_native_ui(wid)?;
+            let compiled = self.current_native_ui_for_view(wid, expected_view)?;
             let node = compiled
                 .semantic(&key)
                 .ok_or_else(|| "unknown or stale UI key".to_string())?;
@@ -4106,7 +4277,7 @@ impl App {
         invocation: crate::native_app::ActionInvocation,
     ) -> Result<EventResult, String> {
         let picture = {
-            let compiled = self.current_native_ui(wid)?;
+            let compiled = self.current_native_ui_for_view(wid, expected_view)?;
             compiled.semantic(&key).is_none()
                 && compiled
                     .picture_hits
@@ -4116,12 +4287,7 @@ impl App {
         if !picture {
             return self.dispatch_native_control_action(wid, expected_view, key, invocation, false);
         }
-        let (_, active_view) = self
-            .active_native_view(wid)
-            .ok_or_else(|| "active tab is not a native app".to_string())?;
-        if active_view != expected_view {
-            return Err("native app target is stale or no longer active".to_string());
-        }
+        self.native_pointer_target_stands(wid, expected_view)?;
         self.dispatch_native_view_event(wid, expected_view, AppEvent::Action(invocation))
     }
 
@@ -4873,6 +5039,39 @@ impl App {
             }
         }
         true
+    }
+
+    /// A pointer action's target is the window's dock, or else the front tab's native page,
+    /// refused in the words a page target always had.
+    fn native_pointer_target_stands(
+        &self,
+        wid: WindowId,
+        expected_view: crate::tab_model::ViewId,
+    ) -> Result<(), String> {
+        if self.dock_view(wid) == Some(expected_view) {
+            return Ok(());
+        }
+        let (_, active_view) = self
+            .active_native_view(wid)
+            .ok_or_else(|| "active tab is not a native app".to_string())?;
+        if active_view != expected_view {
+            return Err("native app target is stale or no longer active".to_string());
+        }
+        Ok(())
+    }
+
+    fn current_native_ui_for_view(
+        &self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+    ) -> Result<std::borrow::Cow<'_, crate::native_ui::CompiledUi>, String> {
+        if self.dock_view(wid) == Some(view) {
+            return self
+                .native_dock_artifact(wid, true, true)
+                .map(|artifact| std::borrow::Cow::Borrowed(artifact.compiled))
+                .ok_or_else(|| "dock input waits for its current presented tree".into());
+        }
+        self.current_native_ui(wid)
     }
 
     /// The active native page's compiled tree as the window holds it now.

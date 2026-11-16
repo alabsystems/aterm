@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_vitals::services::{FSEVENTSD, HOLD_MS, Service};
+use aterm_process_facts::services::Service;
+use aterm_vitals::services::{FSEVENTSD, HOLD_MS};
 
 const GIB: u64 = 1 << 30;
 

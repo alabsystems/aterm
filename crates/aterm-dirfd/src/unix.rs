@@ -389,6 +389,71 @@ pub fn fstat<Fd: AsFd>(fd: Fd) -> Result<Stat> {
     Ok(Stat::of(&raw))
 }
 
+/// `fgetattrlist(2)`'s `ATTR_DIR_ENTRYCOUNT` of the open directory `fd`: how many entries it
+/// holds, `.` and `..` not counted, read off the directory itself in one call, without listing
+/// it or resolving any name.
+///
+/// # Errors
+/// The raw `errno` from the call, or `EIO` where the reply's own length word says it holds no
+/// count (what is open is no directory).
+#[cfg(target_vendor = "apple")]
+pub fn dir_entry_count<Fd: AsFd>(fd: Fd) -> Result<u32> {
+    /// `<sys/attr.h>`'s `struct attrlist`.
+    #[repr(C)]
+    struct AttrList {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+    /// `<sys/attr.h>`: the attribute groups an `attrlist` names.
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    /// `<sys/attr.h>`: a directory's entry count.
+    const ATTR_DIR_ENTRYCOUNT: u32 = 0x0000_0002;
+    // SAFETY (declaration): libSystem exports `fgetattrlist` with this C signature on every
+    // supported macOS (`int` return, errno on failure).
+    unsafe extern "C" {
+        fn fgetattrlist(
+            fd: libc::c_int,
+            attr_list: *mut AttrList,
+            attr_buf: *mut libc::c_void,
+            attr_buf_size: usize,
+            options: libc::c_uint,
+        ) -> libc::c_int;
+    }
+    let mut al = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: 0,
+        dirattr: ATTR_DIR_ENTRYCOUNT,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // The reply: its own `u32` length, then the `u32` count.
+    let mut buf = [0u8; 16];
+    // SAFETY: `fd` is live, `al` is a valid `attrlist`, and `buf` is writable for the length
+    // passed with it.
+    check(unsafe {
+        fgetattrlist(
+            fd.as_fd().as_raw_fd(),
+            &raw mut al,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+        )
+    })?;
+    let [l0, l1, l2, l3, c0, c1, c2, c3, ..] = buf;
+    // The kernel writes how many bytes of the reply it filled: under eight, no count follows.
+    if u32::from_ne_bytes([l0, l1, l2, l3]) < 8 {
+        return Err(Errno(libc::EIO));
+    }
+    Ok(u32::from_ne_bytes([c0, c1, c2, c3]))
+}
+
 /// `fstatat(2)`: the entry `name` of the directory `dirfd`, a link at `name` read as itself under
 /// [`AtFlags::SYMLINK_NOFOLLOW`]. `name` is looked up in `dirfd` alone: no path above it is
 /// resolved again.

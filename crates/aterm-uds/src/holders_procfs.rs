@@ -93,6 +93,86 @@ fn state_of(
     }
 }
 
+/// The executable `<proc>/<pid>/exe` names ([`super::exe_of`]), each read made through one open
+/// of the process's directory, so of one process even once its pid is reused. No directory
+/// (`ENOENT`, `ESRCH`) is `Exited`. A link that does not read so names an exit only when the
+/// `stat` and `status` read through that open show one ([`state_of`]: reaped, or a zombie that
+/// is its process's only thread); otherwise (a zombie leader whose other threads run, a kernel
+/// thread, a `stat` that does not read) it is `Unnamed`, as is a directory or link that fails
+/// any other way, or a link too long to read.
+pub(super) fn exe_in(proc: &Path, pid: u32) -> super::Exe {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
+    let dir = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(proc.join(pid.to_string()))
+    {
+        Ok(dir) => dir,
+        Err(e) if gone(&e) => return super::Exe::Exited,
+        Err(_) => return super::Exe::Unnamed,
+    };
+    let mut buf = [0u8; 4096];
+    // SAFETY: `dir` is open, the name is NUL-terminated, and `readlinkat` writes at most
+    // `buf.len()` bytes.
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            c"exe".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let Ok(len) = usize::try_from(n) else {
+        if !gone(&io::Error::last_os_error()) {
+            return super::Exe::Unnamed;
+        }
+        let read = |name: &std::ffi::CStr| read_at(&dir, name);
+        return match state_of(read(c"stat"), || read(c"status").ok()) {
+            Some(ProcessState::Reaped | ProcessState::Zombie) => super::Exe::Exited,
+            Some(ProcessState::LeaderOnly | ProcessState::Live) | None => super::Exe::Unnamed,
+        };
+    };
+    match buf.get(..len) {
+        Some(path) if len < buf.len() => {
+            super::Exe::At(PathBuf::from(OsString::from_vec(path.to_vec())))
+        }
+        _ => super::Exe::Unnamed,
+    }
+}
+
+/// The file `name` in the directory `dir` holds open, decoded lossily and bounded as
+/// [`crate::process::read_proc_text`] reads a `/proc` text file.
+fn read_at(dir: &std::fs::File, name: &std::ffi::CStr) -> io::Result<String> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    const MAX_BYTES: u64 = 256 * 1024;
+    // SAFETY: `dir` is open for the call and `name` is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` just returned `fd`, which nothing else owns.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {MAX_BYTES} bytes"),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// `<proc>/<pid>`'s descriptor table.
 pub(super) fn table(proc: &Path, pid: u32) -> Table {
     let dir = proc.join(pid.to_string());

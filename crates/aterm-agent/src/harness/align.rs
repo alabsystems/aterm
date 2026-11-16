@@ -595,9 +595,11 @@ pub fn capture_bounded_owned(
 /// [`capture_bounded_owned`] that also watches an external terminal condition, `stopped`, while
 /// the child runs unreaped with piped stdin, as a renewal watches for its browser opener's
 /// recorded failure or a hosted OAuth code to inject. Once it says so the child is ended as every
-/// other stop ends it, the output reader is cancelled and joined, and the answer is
-/// [`Ended::Stopped`]; an exit the capture observes first is answered as that exit. A panic in
-/// `stopped` becomes an error after the same end; its payload is not returned.
+/// other stop ends it, the output reader is cancelled and joined (off Unix the reader, a blocking
+/// one, is joined where the child's end closed its output within the grace a deadline gives it,
+/// and is left to end by itself otherwise), and the answer is [`Ended::Stopped`]; an exit the
+/// capture observes first is answered as that exit. A panic in `stopped` becomes an error after
+/// the same end; its payload is not returned.
 /// The callback receives only bounded input under the original deadline, not the child's
 /// wait or signal authority.
 ///
@@ -605,7 +607,6 @@ pub fn capture_bounded_owned(
 ///
 /// As [`capture_bounded_owned`], or `stopped` panicked, or the end of the child's group or its
 /// reap could not be confirmed.
-#[cfg(unix)]
 pub(super) fn capture_bounded_owned_watching(
     mut cmd: Command,
     budget: Duration,
@@ -1004,8 +1005,29 @@ fn capture_with(
             other => break other,
         }
     };
+    // A watched capture asks its watch again each REAP_CHECK while the child's output is open,
+    // as on Unix: an opener's recorded failure or a code to type ends that wait.
     #[cfg(not(unix))]
-    let waited = rx.recv_timeout(deadline.remaining().unwrap_or_default());
+    let waited = loop {
+        let remaining = deadline.remaining().unwrap_or_default();
+        if watch.is_none() {
+            break rx.recv_timeout(remaining);
+        }
+        match rx.recv_timeout(remaining.min(REAP_CHECK)) {
+            Err(mpsc::RecvTimeoutError::Timeout) if !remaining.is_zero() => {
+                let checked =
+                    check_capture_watch(&mut watch, &mut child.child, deadline, &observer);
+                if !matches!(checked, Ok(false)) {
+                    let cleanup = kill_capture_child_checked(&mut child, &observer);
+                    release_capture_reader(&mut child, &mut reader, &rx);
+                    cleanup?;
+                    checked?;
+                    return Ok(Ended::Stopped);
+                }
+            }
+            other => break other,
+        }
+    };
     let bytes = match waited {
         Ok(Ok((_, true))) => {
             let _ = join_capture_reader(&mut child, &mut reader);
@@ -1032,15 +1054,7 @@ fn capture_with(
             #[cfg(unix)]
             let _ = join_capture_reader(&mut child, &mut reader);
             #[cfg(not(unix))]
-            {
-                let _ = rx.recv_timeout(READER_CLOSE_GRACE);
-                if reader
-                    .as_ref()
-                    .is_some_and(std::thread::JoinHandle::is_finished)
-                {
-                    let _ = join_capture_reader(&mut child, &mut reader);
-                }
-            }
+            release_capture_reader(&mut child, &mut reader, &rx);
             return Err(format!(
                 "it ran past its {} ms deadline",
                 budget.as_millis()
@@ -1116,6 +1130,24 @@ fn join_capture_reader(
     }
 }
 
+/// After a non-Unix capture ended its child: the blocking reader gets [`READER_CLOSE_GRACE`] to
+/// see the output close and is joined where it did; one a descendant's copy of the output keeps
+/// reading is left to end by itself, holding nothing of the caller's.
+#[cfg(not(unix))]
+fn release_capture_reader(
+    child: &mut CaptureChild,
+    reader: &mut Option<std::thread::JoinHandle<()>>,
+    rx: &mpsc::Receiver<std::io::Result<(Vec<u8>, bool)>>,
+) {
+    let _ = rx.recv_timeout(READER_CLOSE_GRACE);
+    if reader
+        .as_ref()
+        .is_some_and(std::thread::JoinHandle::is_finished)
+    {
+        let _ = join_capture_reader(child, reader);
+    }
+}
+
 fn discard_capture_panic(payload: Box<dyn std::any::Any + Send>) {
     discard_capture_value(payload);
 }
@@ -1128,12 +1160,56 @@ fn discard_capture_value<T>(value: T) {
 
 /// Borrowed input to the actual capture child. It conveys no wait, signal or reap right.
 pub(super) struct CaptureInput<'a> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     stdin: Option<&'a mut std::process::ChildStdin>,
     deadline: Deadline<'a>,
     #[cfg(all(test, unix))]
     observer: &'a CaptureObserver,
 }
+
+#[cfg(windows)]
+impl CaptureInput<'_> {
+    /// Writes this slice through the same pipe, retaining progress under the original budget:
+    /// std opens its end of a child's stdin for overlapped I/O, so each write is started on its
+    /// own and waited on in slices that look again at `cancelled` and the budget, and a write
+    /// that either of them stops is cancelled and its end awaited before this returns
+    /// ([`input_windows::write_all`]).
+    /// # Errors
+    /// The pipe is absent, closed, unavailable or not open for overlapped writes; work is
+    /// cancelled; or the original budget expires. An error can follow partial delivery and never
+    /// proves no provider effect.
+    pub(super) fn write_all(
+        &mut self,
+        bytes: &[u8],
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle as _;
+        let deadline = self.deadline;
+        let look = || {
+            if cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "capture input cancelled",
+                ));
+            }
+            deadline
+                .remaining()
+                .map(|left| left.min(REAP_CHECK))
+                .map_err(|_| capture_pipe_deadline())
+        };
+        look()?;
+        let pipe = self
+            .stdin
+            .as_ref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+            .as_raw_handle();
+        input_windows::write_all(pipe, bytes, look)
+    }
+}
+
+#[cfg(windows)]
+#[path = "align_input_windows.rs"]
+mod input_windows;
 
 #[cfg(unix)]
 impl CaptureInput<'_> {
@@ -1230,13 +1306,13 @@ fn check_capture_watch(
         return Ok(false);
     };
     let mut input = CaptureInput {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         stdin: child.stdin.as_mut(),
         deadline,
         #[cfg(all(test, unix))]
         observer,
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = child;
     #[cfg(not(all(test, unix)))]
     let _ = observer;
@@ -1268,7 +1344,7 @@ fn capture_pipe_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn capture_pipe_deadline() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "capture pipe deadline")
 }

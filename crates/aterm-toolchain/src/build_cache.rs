@@ -3661,6 +3661,21 @@ pub fn configs_unresolved(root: &Path, tool: Tool, m: &Machine<'_>, artifacts: b
         })
 }
 
+/// [`configs_unresolved`]'s walk from `root` read for a call whose alias words this reader cannot
+/// tell, which may be any line a config's text holds: whether a config's line that is no comment
+/// spells a directory's key wherever it stands ([`Named::mentioned`]: an alias's words among
+/// them), or one this reader cannot read.
+#[must_use]
+pub fn configs_mention_dirs(root: &Path, tool: Tool, m: &Machine<'_>) -> bool {
+    config_walk(root, m)
+        .into_iter()
+        .chain(package_homes(tool, m))
+        .any(|dir| {
+            let named = config_dirs(&dir, m);
+            named.mentioned || named.unknown
+        })
+}
+
 /// [`configs_unresolved`]'s walk from `root` read for a build whose target and build directory
 /// outrank every config (`cargo-miri`'s sysroot build): whether a config names an artifact
 /// directory, into which that build copies its output, or is one this reader cannot read.
@@ -4214,7 +4229,9 @@ fn names_a_dir(s: &str) -> bool {
     s.contains("target-dir") || s.contains("build-dir") || s.contains("include") || s.contains('\\')
 }
 
-/// What `dir/config.toml` or `dir/config` says on lines that are not comments.
+/// What `dir/config.toml` or `dir/config` says: to placement ([`config_scan`]), what its lines
+/// that are not comments spell, as the shim's block reads them; to [`config_dirs`], what its
+/// `build` table names as Targo parses it, and what its lines mention.
 #[derive(Default)]
 struct Named {
     /// A config exists, so a builtin alias cannot be assumed unconfigured.
@@ -4223,6 +4240,12 @@ struct Named {
     target: bool,
     /// `build.artifact-dir`, read by [`config_dirs`] alone: placement never moves that folder.
     artifact: bool,
+    /// A line that is no comment spells a directory's key (`target-dir`, `build-dir` or
+    /// `artifact-dir`) wherever it stands, set by [`config_dirs`] alone: in the `build` table, or
+    /// in an alias's words (`build-dev = "run --target-dir target/tools …"`), another string or a
+    /// comment after a value, none of which names a directory Targo builds into. Only a call
+    /// whose alias words this reader cannot tell reads it ([`configs_mention_dirs`]).
+    mentioned: bool,
     alias_builds: bool,
     /// A line names what no line scan can read, so placement leaves the call as typed: it spells
     /// `include`, whose files Targo loads as part of the config ([`config_dirs`] reads them),
@@ -4280,6 +4303,7 @@ fn config_scan(dir: &Path, alias: Option<&str>, m: &Machine<'_>) -> Named {
                     present: true,
                     build: true,
                     target: true,
+                    mentioned: false,
                     artifact: false,
                     alias_builds: false,
                     unread: false,
@@ -4320,24 +4344,28 @@ fn config_scan(dir: &Path, alias: Option<&str>, m: &Machine<'_>) -> Named {
 /// The directories the config file in `dir` that Targo loads names as Targo loads it
 /// (`context/mod.rs`'s `get_file_path`, then `_load_file`: the legacy `config` where one stands,
 /// else `config.toml`), with the files its `include` names, an `artifact-dir` among them
-/// ([`scan_config_graph_dirs`]): [`config_scan`]'s reading of each file's lines, the files it
-/// includes read the same way, each through its links as Targo reads it ([`config_file`]), and a
-/// file whose text holds an include, an escape that can spell any character
-/// ([`spells_by_escape`]) or a multi-line string ([`holds_multiline_string`]) read as TOML as
-/// well, as TOML 1.1 ([`config_toml`], as Targo parses it), since a quoted key's escape may spell
-/// `include` or a directory's key where no line does, and a line that starts with `#` and closes
-/// a multi-line string may go on to name one: outside such a string, a line that starts with `#`
-/// is a comment. Each config file a walk finds starts its own cycle check (`load_file`'s fresh
-/// set), shared by the files it includes. A file read as TOML that this reader cannot parse, and
-/// an include it cannot follow, name both: text it cannot parse, an `include` that is no list,
-/// an entry of another type, a path that is no `.toml` or holds a glob, a brace or a control
-/// character ([`config_includes`]), one that names nothing though not optional, or a file the
-/// walk loads twice (Targo's cycle check spans it, so a file two includes name is one). So does
-/// a file the reader fails on, which it must where Targo finds one it loads (a folder, a FIFO or
-/// a device included, [`unresolved_words`]): the walk reads each file through the reader alone.
-/// Targo refuses all but the first and a FIFO's or device's, and builds nothing then. A bounded
-/// iterative walk shares the CLI graph's read-attempt, aggregate-text and pending-work limits;
-/// exceeding a limit names both.
+/// ([`scan_config_graph_dirs`]): each file, and the files it includes, read through its links as
+/// Targo reads it ([`config_file`]), and read as TOML 1.1 ([`config_toml`], as Targo parses it)
+/// for its `build` table ([`parsed_dirs`]) wherever a line that is no comment spells a
+/// directory's key (which an alias's words or a comment after a value may spell too, naming
+/// nothing: [`Named::mentioned`] keeps that a line spelled one), an include, an escape that can
+/// spell any character ([`spells_by_escape`]) or a multi-line string
+/// ([`holds_multiline_string`]), since a quoted key's escape may spell `include` or a directory's
+/// key where no line does, and a line that starts with `#` and closes a multi-line string may go
+/// on to name one: outside such a string, a line that starts with `#` is a comment, and a file
+/// none of whose other lines spells any of these names nothing. Each config file a walk finds
+/// starts its own cycle check (`load_file`'s fresh set), shared by the files it includes. Text
+/// this reader cannot parse, which Targo refuses to load, names what its lines spell where they
+/// tell (no include, escape or multi-line string). A file that holds one of those and that this
+/// reader cannot parse, and an include it cannot follow, name both: text it cannot parse, an
+/// `include` that is no list, an entry of another type, a path that is no `.toml` or holds a
+/// glob, a brace or a control character ([`config_includes`]), one that names nothing though not
+/// optional, or a file the walk loads twice (Targo's cycle check spans it, so a file two includes
+/// name is one). So does a file the reader fails on, which it must where Targo finds one it loads
+/// (a folder, a FIFO or a device included, [`unresolved_words`]): the walk reads each file through
+/// the reader alone. Targo refuses all but the first and a FIFO's or device's, and builds nothing
+/// then. A bounded iterative walk shares the CLI graph's read-attempt, aggregate-text and
+/// pending-work limits; exceeding a limit names both.
 fn config_dirs(dir: &Path, m: &Machine<'_>) -> Named {
     let mut named = Named::default();
     // Targo loads one file per folder (`get_file_path`): the legacy `config` wherever it opens,
@@ -4379,16 +4407,28 @@ fn scan_config_graph_dirs(file: &Path, m: &Machine<'_>, named: &mut Named) -> bo
             named.both();
             return true;
         }
+        // A line that spells a directory's key is a reason to parse the file, never a reading of
+        // it: Targo builds into what the `build` table names ([`parsed_dirs`]), and the line it
+        // runs reads an alias's words itself ([`targo_line`]), so an alias that names a target
+        // (`build-dev = "run --target-dir target/tools …"`) names none for another call.
         let literal = config_text_dirs(&text);
-        named.build |= literal.build;
-        named.target |= literal.target;
-        named.artifact |= literal.artifact;
-        if !literal.include && !spells_by_escape(&text) && !holds_multiline_string(&text) {
+        let mentioned = literal.build || literal.target || literal.artifact;
+        named.mentioned |= mentioned;
+        let hidden = literal.include || spells_by_escape(&text) || holds_multiline_string(&text);
+        if !mentioned && !hidden {
             continue;
         }
         let Some(config) = config_toml(&text) else {
-            named.both();
-            return true;
+            if hidden {
+                named.both();
+                return true;
+            }
+            // Text the reader cannot parse, which Targo refuses to load, whose lines tell: what
+            // they spell, as before it was parsed.
+            named.build |= literal.build;
+            named.target |= literal.target;
+            named.artifact |= literal.artifact;
+            continue;
         };
         parsed_dirs(&config, named);
         let Ok(includes) = config_includes(&config) else {

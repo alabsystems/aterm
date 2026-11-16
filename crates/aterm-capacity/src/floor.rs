@@ -260,6 +260,32 @@ pub fn lines(knobs: Knobs, total: Option<u64>, room: Option<u64>) -> Lines {
     }
 }
 
+/// CUSTODY WRITES WAIT BELOW THE EMERGENCY LINE (DC-06d, `docs/DESIGN-disk-custody-2026-11-12.md`
+/// §3.2): whether a write made only to keep orphaned work safe before it goes (a worktree's
+/// snapshot, which writes git objects; a push of its pins, which writes a pack) waits on a volume
+/// with `free` bytes and `files_free` inodes free under `lines`. It waits while the bytes read
+/// under [`Lines::emergency`], while the inodes read under [`Lines::files_emergency`], and while
+/// the bytes were not read (`None`): at zero free such a write fails, or spends what recovery
+/// has just freed, and below the line only removal of rebuildable output runs. An inode count
+/// not read holds nothing (Windows reads none). The wait ends at the first reading at or above
+/// the line: it waits for a measurement, never for a person.
+#[must_use]
+pub const fn custody_writes_wait(
+    free: Option<u64>,
+    files_free: Option<u64>,
+    lines: &Lines,
+) -> bool {
+    let bytes = match free {
+        Some(free) => free < lines.emergency,
+        None => true,
+    };
+    let files = match files_free {
+        Some(files) => files < lines.files_emergency,
+        None => false,
+    };
+    bytes || files
+}
+
 /// The floor of a volume of `total` bytes under the default knobs and no measured room: the room's least ([`room_bounds`]), which is what the window's watch holds a volume to before it has measured two days.
 #[must_use]
 pub fn default_floor(total: u64) -> u64 {

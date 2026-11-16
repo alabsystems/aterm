@@ -13,6 +13,7 @@
 //!                                 <leaf>.outbox.lock  held while those three change
 //!                                 <leaf>.history.jsonl    newest 4,096 operations
 //!                                 <leaf>.lock       held while a pass records
+//!                                 <leaf>.looking    shared by each pass from its look to its record
 //! ```
 //!
 //! The root is `~/.aterm/files`, and every caller hands it in ([`Root`]), so a test names a
@@ -144,6 +145,13 @@ impl Root {
     #[must_use]
     pub fn lock(&self, name: &Name) -> PathBuf {
         self.sidecar(name, "lock")
+    }
+
+    /// The lock each pass holds shared from its look at `name` until its record, and a
+    /// recording that changes nothing tries alone: held, another pass's look is outstanding.
+    #[must_use]
+    pub fn looking(&self, name: &Name) -> PathBuf {
+        self.sidecar(name, "looking")
     }
 
     /// The shared file whose face `path` is, by its path alone: `<root>/<set>/<leaf>.<ext>`.

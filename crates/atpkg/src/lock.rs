@@ -134,6 +134,12 @@ pub(crate) fn lock_metadata(path: &Path) -> io::Result<Flock> {
     Flock::lock(open_lock_file(path)?)
 }
 
+/// The exclusive lock of the lock file at `path` (created `0600` where it is missing, opened in
+/// the real directory at its parent), waited for up to `limit` ([`Flock::lock_within`]).
+pub(crate) fn lock_file_within(path: &Path, limit: Duration) -> io::Result<Flock> {
+    Flock::lock_within(open_lock_file(path)?, limit, path)
+}
+
 /// Exclusive lock on a file carrying a holder record ([`crate::vendor_direct::watch`]).
 pub(crate) use aterm_toolchain::record_lock::RecordLock;
 

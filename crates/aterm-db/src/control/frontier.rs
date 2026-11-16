@@ -196,10 +196,7 @@ fn read_bound(wire: &[u8]) -> Result<RecordsBound> {
     if held == 0 {
         return Err(Error::new("invalid Commons records capacity"));
     }
-    Ok(RecordsBound {
-        held,
-        crossed: wire[4] != 0,
-    })
+    Ok(RecordsBound::of(held as usize, wire[4] != 0))
 }
 
 fn own_bound(endpoint: &Endpoint) -> Result<RecordsBound> {
@@ -207,8 +204,27 @@ fn own_bound(endpoint: &Endpoint) -> Result<RecordsBound> {
     if let Some(paths) = &endpoint.paths {
         bound.crossed |= client::records_marked_crossed(paths)
             .map_err(|error| local_failure("records protocol", error))?;
+        // The custody's format mark, as its crossed mark: a log whose mark says a later format
+        // speaks no frontier protocol on any path, not only one that loads its records.
+        bound = bound.at_format(
+            client::records_marked_format(paths)
+                .map_err(|error| local_failure("records protocol", error))?,
+        );
     }
+    format_one(bound)?;
     Ok(bound)
+}
+
+/// The `ACX4`/`AFR4` bound states records and the crossed state alone, which is format 1's
+/// ([`aterm_secrets::crossing::FORMAT_ONE`]): a log past format 1 speaks no such protocol rather
+/// than state format 1 to a peer that would take its records for that.
+fn format_one(bound: RecordsBound) -> Result<()> {
+    if bound.format != aterm_secrets::crossing::FORMAT_ONE {
+        return Err(Error::new(
+            "a membership log past records format 1 speaks no atdb/5 frontier protocol",
+        ));
+    }
+    Ok(())
 }
 
 fn compatible(endpoint: &Endpoint, remote: RecordsBound) -> Result<RecordsBound> {
@@ -948,6 +964,7 @@ fn load_records(endpoint: &Endpoint) -> Result<(Records, RecordsBound)> {
     let store = client::records_now(paths).map_err(|e| local_failure("frontier records", e))?;
     let bound =
         client::records_bound(paths, &store).map_err(|e| local_failure("frontier bound", e))?;
+    format_one(bound)?;
     if let Some(log) = store.log()
         && let aterm_secrets::membership_log::Body::Genesis { root, .. } = log.genesis().body()
         && (root.network != endpoint.trust.network
@@ -1053,6 +1070,7 @@ fn send_batch(
         sent,
         received: 0,
         deferred: records.len() - sent,
+        added: 0,
     })
 }
 
@@ -1124,6 +1142,8 @@ fn receive_batch(
             sent: 0,
             received,
             deferred: count - received,
+            // The records' store does not tell held from new ([`super::Report::added`]).
+            added: 0,
         },
         count,
     ))

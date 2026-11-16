@@ -13,7 +13,6 @@ fn single_settings_tab_keeps_route_and_all_independent_states() {
         conn: Some(crate::tab_bar::TabConnRole::Both),
         closable: true,
         team: crate::tab_bar::TabTeam::NONE,
-        load: 0,
     };
     let line = format_tab_chrome(
         &["Settings".to_string()],
@@ -56,7 +55,6 @@ fn the_hover_names_the_reason_once() {
         conn: None,
         closable: true,
         team: crate::tab_bar::TabTeam::NONE,
-        load: 0,
     };
     let stop = |cause| TabStripMetadata {
         attention: crate::tab_bar::ChipLevel::Stop(cause),
@@ -96,7 +94,6 @@ fn the_hover_names_the_app_once() {
         conn: None,
         closable: true,
         team: crate::tab_bar::TabTeam::NONE,
-        load: 0,
     };
     let clauses = |title, icon| tab_help(title, None, app(icon), 0).split(" · ").count();
     assert_eq!(
@@ -126,7 +123,6 @@ fn connection_roles_state_their_direction_in_chrome_and_help() {
         conn,
         closable: true,
         team: crate::tab_bar::TabTeam::NONE,
-        load: 0,
     };
     let line = format_tab_chrome(
         &["push-src".to_string(), "push-dst".to_string()],
@@ -163,7 +159,6 @@ fn system_state_help_names_system_state_not_settings() {
             conn: None,
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
-            load: 0,
         },
         0,
     );

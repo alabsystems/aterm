@@ -62,7 +62,7 @@ pub const FAILURE_STANDS: Duration = Duration::from_secs(30);
 
 /// The most bytes of the headless start's output [`StoreVendor`] reads for its answer (the
 /// answer is one line of about 18 kB on 2.1.323).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ANSWER_MAX: usize = 1024 * 1024;
 
 /// One launch, as [`settle`] reads it.
@@ -208,7 +208,9 @@ pub trait Book {
 /// holds: a launch that is not interactive; the home directory; a folder whose exact trust key
 /// the launch's profile already records (one bounded read, the common case); a policy that
 /// trusts nothing here (`gate`, asked of the resolved folder and only now: it may cost a round
-/// trip to the window); then the headless start ([`Vendor::attest`]), believed only where the
+/// trip to the window; on Windows the safe rules hold no folder whose way runs through a
+/// directory that tells names apart by case, `case_told_on_the_way`, which they do not); then
+/// the headless start ([`Vendor::attest`]), believed only where the
 /// profile then holds the record. Only a recorded trust is booked as an approval. A step skipped
 /// because something could not be read ([`Settled::Unread`]), and a start that recorded nothing,
 /// are journaled with their reason; a policy's refusal is not.
@@ -226,7 +228,7 @@ pub fn settle(
         book.refused(folder, why);
         Settled::Unread(why)
     };
-    let Ok(cwd) = std::fs::canonicalize(launch.cwd) else {
+    let Ok(cwd) = resolved(launch.cwd) else {
         return unread(
             book,
             &launch.cwd.to_string_lossy(),
@@ -260,6 +262,14 @@ pub fn settle(
         Gate::Refuses(why) => return Settled::Gated(why),
         Gate::Unread(why) => return unread(book, folder, why),
     };
+    #[cfg(windows)]
+    if rule == approval::RULE_TRUST_DIALOG {
+        match case_told_on_the_way(&cwd) {
+            Ok(false) => {}
+            Ok(true) => return Settled::Gated(CASE_TOLD),
+            Err(why) => return unread(book, folder, why),
+        }
+    }
     let Some(build) = launch.build else {
         return unread(book, folder, "the launch's build could not be resolved");
     };
@@ -275,7 +285,7 @@ pub fn settle(
             format!(
                 "Claude Code answered that it recorded the trust, and {} holds none for {}",
                 profile.display(),
-                key.display()
+                key_spelling(&key).unwrap_or_else(|| key.display().to_string())
             ),
         ),
         Attested::Recorded { version } => {
@@ -300,8 +310,46 @@ fn is_home(cwd: &Path, launch: &Launch<'_>) -> bool {
         .map(|(_, value)| PathBuf::from(value));
     named
         .or_else(|| launch.account_home.map(Path::to_path_buf))
-        .and_then(|home| std::fs::canonicalize(home).ok())
+        .and_then(|home| resolved(&home).ok())
         .is_some_and(|home| home == cwd)
+}
+
+/// Why the safe rules trust no folder whose way runs through a directory that tells names apart
+/// by case ([`case_told_on_the_way`]).
+#[cfg(windows)]
+const CASE_TOLD: &str =
+    "a directory on the folder's way tells names apart by case, which the trust roots do not";
+
+/// Whether a directory on the way to the resolved folder `cwd` (each one a name of it is looked
+/// up in, up to its volume's root) tells names apart by case
+/// (`aterm_sysprobe::case_sensitive_dir`; WSL makes every directory so, and one made inside
+/// such a directory takes it too). The safe rules compare names folded, as Windows compares
+/// them elsewhere ([`approval::trust_folder_rule`]), so under such a directory they would hold
+/// `proj`'s sibling `PROJ` as `proj`; the folder-trust dialog refuses it the same way
+/// (`PolicyProbe::folder_leads`). `Err` where one cannot be read.
+#[cfg(windows)]
+fn case_told_on_the_way(cwd: &Path) -> Result<bool, &'static str> {
+    for dir in cwd.ancestors().skip(1) {
+        match aterm_sysprobe::case_sensitive_dir(dir) {
+            Ok(false) => {}
+            Ok(true) => return Ok(true),
+            Err(_) => {
+                return Err(
+                    "whether a directory on the folder's way tells names apart by case could not \
+                     be read",
+                );
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// `path` resolved, every link followed, and spelled as a launch's folder is: on Windows with no
+/// verbatim prefix (`C:\Users\u\proj`, not `\\?\C:\Users\u\proj`), the working folder Claude
+/// Code is started in and reads its key from (its `process.cwd()`), and the folder the headless
+/// start attests.
+fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path).map(|real| aterm_path::plain(&real).into_owned())
 }
 
 /// `rel` against `base` by its spelling alone, as `path.resolve` reads it: `.` dropped, `..`
@@ -404,20 +452,50 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// THE KEY `key` ([`trust_key`]) SPELLED AS CLAUDE CODE FILES IT in its profile's `projects`:
+/// the folder as it is spelled on unix; on Windows with no verbatim prefix and `/` for every `\`
+/// (`C:/Users//u/proj`, `//server/share/proj`), as Claude Code normalizes a folder for a key
+/// there (the profiles on a Windows host hold `C:/Users/…` keys). `None` for a key that is not
+/// UTF-8.
+#[must_use]
+pub fn key_spelling(key: &Path) -> Option<String> {
+    let plain = aterm_path::plain(key);
+    let spelled = plain.to_str()?;
+    Some(if cfg!(windows) {
+        spelled.replace('\\', "/")
+    } else {
+        spelled.to_string()
+    })
+}
+
 /// Whether the profile at `profile` records trust for exactly `key` ([`trust_key`]): a
 /// `projects` entry under that key with `hasTrustDialogAccepted: true`. A trusted folder above
 /// it is no record: Claude Code still draws the dialog under one where the folder's own
-/// settings grant permissions, and its attestation writes the exact key anyway. A key that is
-/// not ASCII is also read by the folder it names, since Claude Code may spell it in another
-/// Unicode form than the disk does.
+/// settings grant permissions, and its attestation writes the exact key anyway. On unix the
+/// entry is the key's exact spelling ([`key_spelling`]); a key that is not ASCII is also read by
+/// the folder it names, since Claude Code may spell it in another Unicode form than the disk
+/// does. On Windows an entry names the key's folder as Windows compares folders
+/// ([`aterm_path::windows_key`]: `/` and `\` alike, no verbatim prefix, names
+/// compared without case), so Claude Code's `C:/Users//u/proj` is the record of the folder
+/// `C:\Users\u\proj` however the drive or a name is cased.
 #[must_use]
 pub fn recorded(profile: &Path, key: &Path) -> bool {
     let Ok(trusted) = profile::trusted_folders(profile) else {
         return false;
     };
-    let Some(spelled) = key.to_str() else {
+    if cfg!(windows) {
+        let folder_of = |spelled: &str| aterm_path::windows_key(Path::new(spelled));
+        let Some(own) = key.to_str().and_then(folder_of) else {
+            return false;
+        };
+        return trusted
+            .iter()
+            .any(|folder| folder_of(folder).is_some_and(|folder| folder == own));
+    }
+    let Some(spelled) = key_spelling(key) else {
         return false;
     };
+    let spelled = spelled.as_str();
     trusted.iter().any(|folder| folder == spelled)
         || (!spelled.is_ascii()
             && trusted
@@ -521,15 +599,15 @@ pub fn answer_of(line: &str) -> Option<Attested> {
 pub struct StoreVendor;
 
 /// One ask of [`StoreVendor`]: the build, the folder, and the home variables it ran under.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type Ask = (PathBuf, PathBuf, String);
 
 /// The asks that recorded nothing, each with when it may be made again and why it stands.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Default)]
 struct Standing(std::collections::BTreeMap<Ask, (std::time::Instant, String)>);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Standing {
     /// Why `ask` is not made at `now`, where an earlier one still stands. Every entry whose
     /// time has come is dropped first.
@@ -545,7 +623,7 @@ impl Standing {
 }
 
 /// What this process's [`StoreVendor`] asked and was not given.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 static STANDING: std::sync::Mutex<Standing> =
     std::sync::Mutex::new(Standing(std::collections::BTreeMap::new()));
 
@@ -554,7 +632,7 @@ impl StoreVendor {
     /// earlier answer still stands for ([`Attested::Stands`]), and an answer that recorded
     /// nothing stands from `now` for [`DECLINE_STANDS`] (Claude Code's own) or
     /// [`FAILURE_STANDS`] (none given).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn attest_at(
         build: &Path,
         cwd: &Path,
@@ -597,7 +675,7 @@ impl StoreVendor {
 }
 
 impl Vendor for StoreVendor {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn attest(
         &self,
         build: &Path,
@@ -616,9 +694,9 @@ impl Vendor for StoreVendor {
         )
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn attest(&self, _: &Path, _: &Path, _: &[(String, String)], _: &str, _: Duration) -> Attested {
-        Attested::Failed("the headless start is Unix's".to_string())
+        Attested::Failed("no headless start on this platform".to_string())
     }
 }
 
@@ -638,28 +716,9 @@ fn start(
     deadline: Duration,
 ) -> Attested {
     use std::io::Write as _;
-    let Some(warm) = atpkg::vendor_direct::spec("claude").and_then(|spec| spec.warm) else {
+    let Some(mut command) = headless_command(build, cwd, env) else {
         return Attested::Failed("atpkg names no headless start for Claude Code".to_string());
     };
-    let mut command = aterm_uds::spawnfd::command(build);
-    command
-        .args(warm.argv)
-        .current_dir(cwd)
-        .env_clear()
-        .envs(env.iter().map(|(name, value)| (name, value)));
-    let table =
-        atpkg::vendor_direct::spec("claude").map(atpkg::vendor_direct::VendorSpec::shim_env);
-    let beside = atpkg::shim_env::of_store_binary(build);
-    for (name, value) in table
-        .iter()
-        .flat_map(atpkg::shim_env::ShimEnv::entries)
-        .chain(beside.entries())
-    {
-        command.env(name, value);
-    }
-    for (name, value) in warm.env {
-        command.env(name, value);
-    }
     command.setsid(true);
     let (reader, mut writer) = match aterm_uds::pipe() {
         Ok(pipe) => pipe,
@@ -719,6 +778,173 @@ fn start(
             deadline.as_millis()
         )),
         (None, Err(e)) => Attested::Failed(format!("Claude Code could not be started: {e}")),
+    }
+}
+
+/// The headless start's child, unspawned: `build` in `cwd` with atpkg's warm arguments, under the
+/// launch's own environment `env` alone, the build's shim variables and atpkg's warm variables
+/// over it. `None` where atpkg names no warm start for Claude Code.
+#[cfg(any(unix, windows))]
+fn headless_command(
+    build: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Option<aterm_uds::spawnfd::Command> {
+    let warm = atpkg::vendor_direct::spec("claude").and_then(|spec| spec.warm)?;
+    let mut command = aterm_uds::spawnfd::command(build);
+    command
+        .args(warm.argv)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)));
+    let table =
+        atpkg::vendor_direct::spec("claude").map(atpkg::vendor_direct::VendorSpec::shim_env);
+    let beside = atpkg::shim_env::of_store_binary(build);
+    for (name, value) in table
+        .iter()
+        .flat_map(atpkg::shim_env::ShimEnv::entries)
+        .chain(beside.entries())
+    {
+        command.env(name, value);
+    }
+    for (name, value) in warm.env {
+        command.env(name, value);
+    }
+    Some(command)
+}
+
+/// How long the Windows headless start waits for its job to empty once it ended the job: a
+/// bound on the cleanup's wait, not on the start.
+#[cfg(windows)]
+const JOB_END: Duration = Duration::from_secs(5);
+
+/// What the Windows headless start's watchers heard ([`start`]).
+#[cfg(windows)]
+enum Heard {
+    /// Its answer, or that it printed more than an answer.
+    Answer(Attested),
+    /// Its output ended; what it printed after the last line break, where it gave no answer.
+    Ended(Vec<u8>),
+    /// It exited.
+    Exited,
+}
+
+/// [`start`] ON WINDOWS, through the crate's Windows spawn path: the same warm start, request
+/// line and answer, the build started suspended in a kill-on-close job of its own
+/// ([`aterm_uds::deadline::spawn_in_job`]), so it and every process it starts end with that job,
+/// never by a name or a process id. Its stdin and stdout are pipes of its own and its stderr is
+/// nothing, so nothing it prints reaches this process's output; it opens no window, and where the
+/// launch has a console it is attached to it as every child of [`aterm_uds::spawnfd::command`]
+/// is, with none of its streams on it (Windows has no session of its own to give it, as
+/// `setsid` does on unix). Its output is read on a thread of its own and its exit awaited on
+/// another, each telling this one what it heard. Once the answer is read its stdin is closed and
+/// it is left to exit by itself; at its exit the job is ended (whatever it started goes with
+/// it), and at `deadline` too; an answer read before the deadline stands either way.
+#[cfg(windows)]
+fn start(
+    build: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    directory: &str,
+    deadline: Duration,
+) -> Attested {
+    use std::io::{Read as _, Write as _};
+    let until = std::time::Instant::now() + deadline;
+    let Some(mut command) = headless_command(build, cwd, env) else {
+        return Attested::Failed("atpkg names no headless start for Claude Code".to_string());
+    };
+    command
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let (mut child, job) = match aterm_uds::deadline::spawn_in_job(&mut command) {
+        Ok(started) => started,
+        Err(e) => return Attested::Failed(format!("Claude Code could not be started: {e}")),
+    };
+    let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
+    // The request is written on a thread of its own, which then holds the build's stdin open
+    // until it is told to let go (at the answer) or this side gives up on it: a line longer than
+    // the pipe holds (a long path's) waits there for a build that reads, while the deadline
+    // below keeps running, and ending the job breaks the pipe under it. A write that fails (the
+    // build gone, or its stdin shut before the line) lets go at once: the build is then read as
+    // one that ended without reading the request.
+    let (let_go, held) = std::sync::mpsc::channel::<()>();
+    let line = request_line(directory);
+    if let Some(mut stdin) = stdin {
+        std::thread::spawn(move || {
+            if stdin.write_all(line.as_bytes()).is_ok() {
+                let _ = held.recv();
+            }
+            drop(stdin);
+        });
+    }
+    let mut let_go = Some(let_go);
+    let (tell, heard) = std::sync::mpsc::channel();
+    let ended = match stdout {
+        Some(mut out) => {
+            let tell = tell.clone();
+            std::thread::spawn(move || {
+                let (mut read, mut answered, mut buf) = (Vec::new(), false, [0u8; 8192]);
+                while let Ok(n @ 1..) = out.read(&mut buf) {
+                    if answered {
+                        continue;
+                    }
+                    read.extend_from_slice(&buf[..n]);
+                    while let Some(end) = read.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = read.drain(..=end).collect();
+                        if let Some(said) = answer_of(&String::from_utf8_lossy(&line)) {
+                            answered = true;
+                            let _ = tell.send(Heard::Answer(said));
+                            break;
+                        }
+                    }
+                    if !answered && read.len() > ANSWER_MAX {
+                        answered = true;
+                        let _ = tell.send(Heard::Answer(Attested::Failed(
+                            "Claude Code printed more than an answer".to_string(),
+                        )));
+                    }
+                }
+                let _ = tell.send(Heard::Ended(if answered { Vec::new() } else { read }));
+            });
+            None
+        }
+        None => Some(Vec::new()),
+    };
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let _ = tell.send(Heard::Exited);
+    });
+    let (mut answer, mut ended, mut exited) = (None, ended, false);
+    while !(exited && ended.is_some()) {
+        match heard.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+            Ok(Heard::Answer(said)) => {
+                answer = Some(said);
+                // Its leave to finish what it was writing and go.
+                drop(let_go.take());
+            }
+            Ok(Heard::Ended(rest)) => ended = Some(rest),
+            Ok(Heard::Exited) => {
+                exited = true;
+                // Whatever it started goes with it, as its group does on unix.
+                let _ = job.end(JOB_END);
+            }
+            Err(_) => break,
+        }
+    }
+    drop(let_go);
+    if !exited {
+        let _ = job.end(JOB_END);
+    }
+    match (answer, ended) {
+        (Some(said), _) => said,
+        // It ended without a line break after its answer, or without an answer.
+        (None, Some(rest)) if exited => answer_of(&String::from_utf8_lossy(&rest))
+            .unwrap_or_else(|| Attested::Failed("Claude Code ended without answering".to_string())),
+        (None, _) => Attested::Failed(format!(
+            "Claude Code did not answer within {} ms",
+            deadline.as_millis()
+        )),
     }
 }
 

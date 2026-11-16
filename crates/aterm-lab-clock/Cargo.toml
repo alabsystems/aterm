@@ -22,6 +22,7 @@ crate-type = ["cdylib"]
 [[bin]]
 name = "lab-clock-probe"
 path = "src/bin/lab-clock-probe.rs"
+test = false
 
 [dev-dependencies]
 # The live test's package directory, probe binary and scratch, read when it runs.

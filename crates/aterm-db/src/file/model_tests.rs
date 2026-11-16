@@ -195,7 +195,7 @@ impl Walk {
             }
             "Materialize" => {
                 let before = self.tables();
-                let outcomes = self.evidence.step("Materialize", || stand.pass(true));
+                let outcomes = self.evidence.step("Materialize", || stand.pass(false));
                 assert!(outcomes.iter().all(|outcome| outcome.problem.is_none()));
                 self.authored |= i64::from(self.tables() != before);
                 let sfr = self.snapshot_frontier();

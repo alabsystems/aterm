@@ -2742,3 +2742,13 @@ fn in_the_tab_the_probe_notes_what_no_install_fixes() {
         assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
     }
 }
+
+#[test]
+fn an_existing_spotlight_scope_requires_an_explicit_password_extension() {
+    use crate::root_steps::Owed;
+    let sys = console();
+    let automatic = item(Found::Present(CC.into())).with_owed(Box::new(|_| vec![Owed::Spotlight]));
+    assert!(automatic.owed_now(&sys).is_empty());
+    let explicit = automatic.with_explicit_tab(true);
+    assert_eq!(explicit.owed_now(&sys), vec![Owed::Spotlight]);
+}

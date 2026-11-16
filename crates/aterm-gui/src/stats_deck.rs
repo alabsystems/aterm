@@ -115,7 +115,14 @@ pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usiz
     }
 }
 
-/// The complete reserved deck, including its fixed Network State rows.
+/// The fixed bands under the Deck's rows where it takes room, in device px at `scale`: the Disk
+/// Custody band ([`crate::stats_lens::disk_band`]) and Network State under it. Neither height
+/// moves with what it shows.
+pub(crate) fn bands_px(scale: f64) -> usize {
+    crate::stats_lens::disk_band::height_px(scale) + crate::network_deck::height_px(scale)
+}
+
+/// The complete reserved deck, including its fixed Disk Custody and Network State bands.
 pub(crate) fn reserved_deck_px(
     form: StatsBars,
     deck: DeckForm,
@@ -123,8 +130,8 @@ pub(crate) fn reserved_deck_px(
     cell_px: usize,
 ) -> usize {
     deck_px(form, deck, scale, cell_px)
-        + if form.takes_room() {
-            crate::network_deck::height_px(scale)
+        + if form.takes_room() && scale.is_finite() && scale > 0.0 {
+            bands_px(scale)
         } else {
             0
         }
@@ -364,7 +371,9 @@ pub(crate) struct DeckGeom {
 
 /// What a stats surface shows.
 pub(crate) struct DeckInput<'a> {
-    /// Host-published immutable observations; absent in resource-only fixtures.
+    /// Host-published immutable observations; absent in resource-only fixtures. Where it is
+    /// given (the Deck of a window that carries the System Resources band), the card's foot
+    /// holds the Disk Custody band and the Network State band under the resource rows.
     pub(crate) network: Option<&'a aterm_types::network_state::NetworkStateSnapshot>,
     /// The frame's visible place words, shared by its cache key and network paint.
     pub(crate) network_place: Option<&'a crate::network_deck::PlaceCaption>,
@@ -874,7 +883,10 @@ fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot, panes: &[u64]) 
         .map(|h| h.clamp(0.0, 1.0));
     let global = machine.or_else(|| shares.map(|s| s[0]));
     let (aterm, tab) = match res {
-        Resource::Cpu | Resource::Memory | Resource::Processes => {
+        // Published process counters can include execution from before the read span.
+        // They cannot fill a share of the machine's independently sampled busy time.
+        Resource::Cpu => (None, None),
+        Resource::Memory | Resource::Processes => {
             let a = share(&view.aterm)
                 .or_else(|| shares.filter(|_| snap.aterm.is_some()).map(|s| s[1]));
             let t = share(&view.tab).or_else(|| {
@@ -3193,16 +3205,22 @@ pub(crate) fn deck_paint_kept(
         DeckWords::new(input, &m)
     });
     let mut resource_geom = *g;
-    let network_height = input.network.map_or(0.0, |_| {
-        crate::network_deck::height_px(f64::from(g.scale)) as f32
-    });
-    resource_geom.h = (g.h - network_height).max(0.0);
+    let bands_height = input
+        .network
+        .map_or(0.0, |_| bands_px(f64::from(g.scale)) as f32);
+    resource_geom.h = (g.h - bands_height).max(0.0);
     let mut deck = Deck::new(&resource_geom, input, &m, true);
     deck.head = still.head.take();
     deck.paint(words, input.form);
     still.head = deck.head.take();
     let mut hits = deck.hits();
     if let Some(snapshot) = input.network {
+        // The Disk Custody band under the rows, then Network State under it.
+        let disk = crate::stats_lens::disk_band::paint(g, resource_geom.h, input, &m);
+        deck.p.prims.extend(disk.prims);
+        hits.extend(disk.hits);
+        let network_top =
+            resource_geom.h + crate::stats_lens::disk_band::height_px(f64::from(g.scale)) as f32;
         let mut network_inks = input.inks;
         if input.contrast {
             network_inks.hollow = network_inks.words2;
@@ -3215,7 +3233,7 @@ pub(crate) fn deck_paint_kept(
         let empty = crate::lab_deck::LabDeck::default();
         let (prims, network_hits) = crate::network_deck::paint_with_inks(
             g,
-            resource_geom.h,
+            network_top,
             snapshot,
             input.lab.unwrap_or(&empty),
             input.fleet,
@@ -4097,6 +4115,22 @@ impl crate::App {
                 }),
             });
         let mut group = stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc);
+        // The Disk Custody band's parts are read where it is drawn: the Deck of a window that
+        // carries the System Resources band, the parts its width lays.
+        if f.form == StatsBars::Deck {
+            let input = self.deck_input(&f);
+            for (name, words) in crate::stats_lens::disk_band::meters(
+                &input,
+                &deck_metrics(),
+                (f.geom.w, f.geom.scale),
+            ) {
+                group.meters.push(crate::a11y_tree::StatsMeter {
+                    name,
+                    value: None,
+                    words,
+                });
+            }
+        }
         // The Network State band's meters are read where it is drawn: in the Deck (a window
         // that carries the System Resources band) or under this window's open Network State
         // card. A window that shows the Sill draws no such band.

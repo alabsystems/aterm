@@ -33,25 +33,9 @@ fn test_fixture_and_bench_paths_are_not_counted() {
     }
 }
 
-/// The census's own source names no vendor, so it counts what §1's command counts, and the word
-/// list it reads is the ten words that command greps for.
+/// The census's own source names no vendor, so it counts what §1's command counts.
 #[test]
-fn the_census_source_names_no_vendor_and_reads_the_ten_words() {
+fn the_census_source_names_no_vendor() {
     let own = include_str!("vendor_names.rs");
     assert_eq!(own.lines().filter(|l| names_a_vendor(l)).count(), 0);
-    assert_eq!(
-        vendor_words().collect::<Vec<_>>(),
-        [
-            "claude",
-            "codex",
-            "agy",
-            "muse",
-            "kimi",
-            "grok",
-            "gemini",
-            "anthropic",
-            "openai",
-            "antigravity"
-        ]
-    );
 }

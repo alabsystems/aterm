@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS's own services' footprints, read without root, for [`aterm_vitals::services`].
+//! macOS's own services' footprints, read without root into plain process observations.
 
-pub use aterm_vitals::services::{FSEVENTSD, Member, Reading, Restart, Service};
+use aterm_process_facts::services::{Identity, Member, Reading, Service};
 
-/// What one look at a service aterm restarts found ([`look`]).
+/// What one look at a service's exact identity found ([`look`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Look {
     /// It runs: its service as read, and the machine's memory, bytes.
@@ -17,10 +17,10 @@ pub enum Look {
     Unread,
 }
 
-/// One look at `restart`'s service alone: the process of its name, uid and image, its
+/// One look at `identity`'s service alone: the process of its name, uid and image, its
 /// coalition's footprint, and the live members that footprint is of.
 #[must_use]
-pub fn look(restart: &Restart) -> Look {
+pub fn look(identity: Identity<'_>) -> Look {
     #[cfg(target_os = "macos")]
     {
         use aterm_sysprobe::coalitions;
@@ -30,10 +30,10 @@ pub fn look(restart: &Restart) -> Look {
         let mut unread = false;
         for r in records
             .iter()
-            .filter(|r| r.uid == restart.uid && r.comm == restart.name && !r.zombie)
+            .filter(|r| r.uid == identity.uid && r.comm == identity.name && !r.zombie)
         {
             match aterm_sysprobe::process_path(r.pid) {
-                Some(path) if path == std::path::Path::new(restart.path) => {
+                Some(path) if path == std::path::Path::new(identity.path) => {
                     let read = coalitions::coalition_of(r.pid).and_then(|id| {
                         let footprint = coalitions::footprint(id)?;
                         let total = aterm_sysprobe::physical_memory_mib()?.saturating_mul(1 << 20);
@@ -54,7 +54,7 @@ pub fn look(restart: &Restart) -> Look {
                             start_us: r.start_us,
                             uid: r.uid,
                             name: r.comm.clone(),
-                            path: Some(restart.path.to_owned()),
+                            path: Some(identity.path.to_owned()),
                             live: u32::try_from(live).unwrap_or(u32::MAX),
                             footprint,
                         },
@@ -73,26 +73,30 @@ pub fn look(restart: &Restart) -> Look {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = restart;
+        let _ = identity;
         Look::Unread
     }
 }
 
 /// One read of every service: the process table, each live process's resource coalition, the
-/// footprint of each coalition of system accounts alone ([`aterm_vitals::services::fold`]),
+/// footprint of each coalition of system accounts alone ([`aterm_process_facts::services::fold`]),
 /// and the memory strain (the kernel's pressure level and the swap counter); `None` where the
 /// table or the machine's memory cannot be read, and off macOS. `kernel_task` (pid 0) has no
 /// coalition to read and is left out; the kernel's own coalition is known by launchd (pid 1),
-/// whom the kernel places in it ([`aterm_vitals::services::kernel_member`]). A process of a
+/// whom the kernel places in it ([`aterm_process_facts::services::kernel_member`]). A process of a
 /// system account whose coalition did not read is one of [`Reading::unread`] (coalition 0), so
 /// one failed read of a service's process is no end of its episode.
+///
+/// `path_floor` receives the machine's memory once and chooses the minimum footprint whose
+/// lead's image is read. Off macOS it is not called, and no observations are read.
 #[must_use]
-pub fn read() -> Option<Reading> {
+pub fn read(path_floor: fn(u64) -> u64) -> Option<Reading> {
     #[cfg(target_os = "macos")]
     {
+        use aterm_process_facts::services::{kernel_member, system_uid};
         use aterm_sysprobe::coalitions;
-        use aterm_vitals::services::{kernel_member, system_uid};
         let total = aterm_sysprobe::physical_memory_mib()?.saturating_mul(1 << 20);
+        let read_paths_from = path_floor(total);
         let mut members: Vec<Member> = Vec::new();
         let mut lost: Vec<Member> = Vec::new();
         for r in aterm_sysprobe::kproc::records()?
@@ -114,11 +118,16 @@ pub fn read() -> Option<Reading> {
                 None => {}
             }
         }
-        let mut reading =
-            aterm_vitals::services::fold(&members, total, coalitions::footprint, |pid| {
+        let mut reading = aterm_process_facts::services::fold(
+            &members,
+            total,
+            read_paths_from,
+            coalitions::footprint,
+            |pid| {
                 aterm_sysprobe::process_path(pid)
                     .and_then(|p| p.into_os_string().into_string().ok())
-            });
+            },
+        );
         reading.unread.extend(lost);
         reading.unread.sort_by_key(|m| (m.coalition, m.pid));
         reading.pressure_warn = aterm_sysprobe::memory_pressure()
@@ -128,6 +137,7 @@ pub fn read() -> Option<Reading> {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = path_floor;
         None
     }
 }

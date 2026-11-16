@@ -360,7 +360,7 @@ fn a_roll_cleanup_is_not_suppressed_by_an_earlier_identical_write() {
         log.retry(session.actor(), &first).unwrap(),
         Some(receipt.id)
     );
-    let view = View::read(compiled.table, &session, &log);
+    let view = View::read(compiled.table, &session, &log).unwrap();
     let source = Cells::from([(
         key(),
         register(&[(op(1), plain("https://one.example.test"))]),
@@ -398,7 +398,9 @@ fn a_roll_cleanup_is_not_suppressed_by_an_earlier_identical_write() {
         .unwrap()
         .expect("the cleanup has its own retry receipt");
     assert_ne!(cleaned, receipt.id);
-    let providers = View::read(compiled.table, &session, &log).project(&PROVIDER);
+    let providers = View::read(compiled.table, &session, &log)
+        .unwrap()
+        .project(&PROVIDER);
     assert!(!providers.rows["anthropic"].fields["site"].conflicted());
     assert_eq!(
         providers.rows["anthropic"].get("site"),
@@ -502,8 +504,8 @@ fn first_id(lab: &Lab) -> Digest {
 /// nothing. The seal waits until the other Writer has declared the second generation, which its
 /// release pass does. NEGATIVE CONTROLS: with the seal not waiting on `waiting`, the first
 /// apply seals while b has shown no build that reads the second generation and the `staged`
-/// assertion fails; with `archived_ops` returning nothing, the owned rows are
-/// missing from the second generation and the image comparison fails; with the seal skipped,
+/// assertion fails; with `att::carried` returning nothing (run again 2026-11-15), the owned rows
+/// are missing from the second generation and the image comparison fails; with the seal skipped,
 /// `generation()` stays 1 and the reader assertion fails; with `covered` always false, the
 /// first generation's storage stays on the roller.
 #[test]
@@ -600,10 +602,11 @@ fn a_roll_restates_everything_and_releases_the_sealed_generation() {
 /// `a_roll_restates_everything_and_releases_the_sealed_generation` holds the regular scan across
 /// generations. NEGATIVE CONTROLS: with `within` always true, m2 releases right after the heal and
 /// its `NotCarried` assertion fails; with `restate` writing the late candidates alone, m1's edit is
-/// lost and the conflict assertion fails. It counts who the first roll waits on rather than naming
-/// them, writes no facts row on m2, and asserts that m1 released its first generation only at the
-/// end, not in the cut; nothing runs the regular scan on three Macs. `lab alab-roll`, whose judge
-/// read those, is gone.
+/// lost and the conflict assertion fails; with `att::carried` returning nothing (2026-11-15), m1's
+/// view holds none of the two facts rows (`left: 0`, `right: 2`). It counts who the first roll
+/// waits on rather than naming them, writes no facts row on m2, and asserts that m1 released its
+/// first generation only at the end, not in the cut; nothing runs the regular scan on three Macs.
+/// `lab alab-roll`, whose judge read those, is gone.
 #[test]
 fn a_late_edit_is_carried_before_its_mac_releases() {
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
@@ -825,10 +828,12 @@ fn archived_cell(operation: &Digest, col: &str, x: Value) -> Change {
 /// No later write over an archived row takes a carried record away or stands for another: after
 /// a roll carries a Mac's latest facts record, a Writer garbling that archived cell and archiving
 /// the Mac's older genuine record beside it leaves the latest row as it was, signer and operation
-/// included; a record that does not authenticate is no row. NEGATIVE CONTROL: with
-/// `archived_ops` honouring only each archived row's latest write, as the cells' current values
-/// do, the garbled cell hides the latest record and the older one shows, so the operation
-/// assertion fails.
+/// included; a record that does not authenticate is no row. NEGATIVE CONTROL (run again
+/// 2026-11-15): with `att::carried` honouring only each archived row's latest write, as the
+/// cells' current values do (`Resolved::read` handing it only the archived cells each operation
+/// still holds as a current candidate), the garbled cell hides the latest record and the older
+/// one shows, so the operation assertion fails (`shown.operation` held another digest than the
+/// latest record's).
 #[test]
 fn a_later_write_over_an_archived_row_neither_hides_nor_replaces_it() {
     let lab = Lab::new(&[Role::Writer]);
@@ -943,7 +948,7 @@ fn copying_roll(lab: &Lab, n: usize) {
         .unwrap()
         .unwrap();
     let old_log = Log::read_with(&session, &old, old_scope, decode).unwrap();
-    let old_view = View::read(from.table, &session, &old_log);
+    let old_view = View::read(from.table, &session, &old_log).unwrap();
     let to_descriptor = to.descriptor(trust).unwrap();
     directory.publish(&session, &to_descriptor).unwrap();
     directory.endorse(&session, &to_descriptor).unwrap();
@@ -1558,6 +1563,7 @@ fn records_of(lab: &Lab, n: usize, compiled: &Compiled) -> Vec<(Digest, String)>
         .unwrap();
     let log = Log::read_with(&session, &store, scope, decode).unwrap();
     View::read(att::REGISTRY_2.table, &session, &log)
+        .unwrap()
         .ops
         .iter()
         .map(|op| (op.id, written_text(std::slice::from_ref(&op.changes))))
@@ -1933,7 +1939,7 @@ fn copying_roll_between(lab: &Lab, n: usize, from: &att::Compiled, to: &att::Com
         .unwrap()
         .unwrap();
     let old_log = Log::read_with(&session, &old, old_scope, decode).unwrap();
-    let old_view = View::read(from.table, &session, &old_log);
+    let old_view = View::read(from.table, &session, &old_log).unwrap();
     let to_descriptor = to.descriptor(trust).unwrap();
     directory.publish(&session, &to_descriptor).unwrap();
     directory.endorse(&session, &to_descriptor).unwrap();
@@ -2547,7 +2553,7 @@ fn interrupted_roll(lab: &Lab, n: usize) {
         .unwrap()
         .unwrap();
     let old_log = Log::read_with(&session, &old, old_scope, decode).unwrap();
-    let old_view = View::read(from.table, &session, &old_log);
+    let old_view = View::read(from.table, &session, &old_log).unwrap();
     let (owed, stated) =
         history::owed(&session, from.table, from.generation, old_log, &old_view).unwrap();
     let planned = history::plan(

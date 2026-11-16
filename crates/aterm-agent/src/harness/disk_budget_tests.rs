@@ -317,6 +317,60 @@ fn the_sizing_over_a_home_counts_what_its_search_finds_on_the_volume() {
     assert_eq!(real, both);
 }
 
+/// THE SHARED DEPENDENCY STORE COUNTS IN THE REBUILDABLE TOTAL (DC-17g): the store targo fills
+/// under a home's `.cargo` (`atpkg::build_cache::shared_units::root`), which no search for build
+/// directories reaches, adds its bytes to the budget's sizing and is a holder of the survey's
+/// total (`seen`). NEGATIVE CONTROL: the same home before the store is laid counts its build
+/// directory alone, and its survey holds no holder.
+#[test]
+fn the_shared_dependency_store_counts_in_the_rebuildable_total() {
+    let tmp = Tmp::new("budget-store");
+    let home = tmp.path().join("home");
+    let a = lay_target(&home.join("a/target"));
+    let roots = discover::Roots {
+        home: Some(home.clone()),
+        claude_tmp: Some(tmp.path().join("claude-tmp")),
+        ..discover::Roots::default()
+    };
+    let later = Instant::now() + Duration::from_secs(60);
+    let bytes = |p: &Path| target::total_bytes(p).0;
+    let observed = || {
+        let mut survey = crate::harness::disk::Survey::new(0);
+        survey.home = Some(home.clone());
+        survey.volume_device = target::dev_of(&home);
+        crate::harness::disk::observe_registered_holders(&mut survey);
+        survey
+    };
+
+    // CONTROL: no store yet.
+    let without = rebuildable(&roots, discover::Budget::SHIPPED, later, &|_| true);
+    assert_eq!(without.bytes, bytes(&a));
+    assert!(observed().registered_holders.is_empty());
+
+    let store = home.join(".cargo/trust/native-dependencies-v1");
+    assert_eq!(atpkg::build_cache::shared_units::root(&home), store);
+    let unit = store.join("build/serde/0123abcd");
+    std::fs::create_dir_all(unit.join("out")).unwrap();
+    std::fs::write(unit.join(".lock"), b"").unwrap();
+    std::fs::write(unit.join("out/libserde.rlib"), vec![7u8; 64 * 1024]).unwrap();
+    assert!(bytes(&store) >= 64 * 1024);
+
+    let with = rebuildable(&roots, discover::Budget::SHIPPED, later, &|_| true);
+    assert_eq!(
+        with,
+        Rebuildable {
+            bytes: bytes(&a) + bytes(&store),
+            partial: false,
+        }
+    );
+    let survey = observed();
+    assert_eq!(survey.registered_holders.len(), 1);
+    assert_eq!(survey.registered_holders[0].path, store);
+    assert_eq!(survey.registered_holders[0].bytes, bytes(&store));
+    let seen = crate::harness::disk::report(&survey, Config::default()).seen;
+    assert_eq!(seen.bytes, bytes(&store));
+}
+
 /// A REGISTERED CACHE WHOSE REGISTRATION CHANGES WHILE IT IS SIZED IS NOT COUNTED: sized and
 /// then no longer current, its bytes are left out and the figure is a floor, as the report's
 /// holders re-check a cache after its walk. A build directory found by the search is counted
@@ -1136,6 +1190,7 @@ fn found(path: &Path, origin: discover::Origin) -> TargetDir {
         holds_source: None,
         walk_cut_short: None,
         profiles: Vec::new(),
+        stages: Vec::new(),
         device: Some(1),
         volume: None,
         probed_recent: false,
@@ -1144,6 +1199,7 @@ fn found(path: &Path, origin: discover::Origin) -> TargetDir {
         total: Some((GIB, false)),
         foreign: None,
         idle: None,
+        deps_unwalked: None,
     }
 }
 
@@ -1334,7 +1390,9 @@ fn a_budget_pass_counts_its_tiers_as_one_run() {
         let mut rep = crate::harness::disk::report(&survey, Config::default());
         rep.rows = vec![stale.clone(), whole.clone()];
         rep.budget = Some(Ask {
-            free_target: 200 * GIB,
+            admit: Admit::Budget {
+                free_target: 200 * GIB,
+            },
             eligible: BTreeSet::from([stale.path.clone(), whole.path.clone()]),
             held: Vec::new(),
         });

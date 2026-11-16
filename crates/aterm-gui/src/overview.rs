@@ -489,7 +489,7 @@ impl OverviewState {
             "{} {} \u{2014} {} on {}",
             chip.mark.glyph(),
             chip.words,
-            aterm_messages::presence::short_sid(&chip.sid),
+            crate::presence::short_sid(&chip.sid),
             chip.node,
         );
         if let Some(age_s) = chip.age_s {
@@ -1219,8 +1219,8 @@ pub(crate) fn fabric_hint_of(node: &str) -> String {
 /// a held Land session with its held line.
 #[cfg(any(test, feature = "bench-support"))]
 pub(crate) fn closing_scene() -> OverviewState {
-    let chip = |sid: &str, local_id: u64, label: &str, doing: &str, driver: &str| OverviewChip {
-        sid: SessionId::new(sid),
+    let chip = |local_id: u64, label: &str, doing: &str, driver: &str| OverviewChip {
+        sid: SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(local_id)),
         local_id,
         label: label.to_string(),
         mark: ChipMark::Decide,
@@ -1237,7 +1237,6 @@ pub(crate) fn closing_scene() -> OverviewState {
         stoppable: false,
     };
     let cruise = chip(
-        "n",
         1,
         "cruise-needs",
         "needs you: grant Screen Recording to com.aterm.aterm in System Settings \u{25b8} Privacy & \
@@ -1251,13 +1250,7 @@ pub(crate) fn closing_scene() -> OverviewState {
              still open"
                 .to_string(),
         ),
-        ..chip(
-            "l",
-            2,
-            "land-held",
-            "needs you: rotate the deploy key",
-            "land",
-        )
+        ..chip(2, "land-held", "needs you: rotate the deploy key", "land")
     };
     OverviewState::new(
         crate::WindowId(0),

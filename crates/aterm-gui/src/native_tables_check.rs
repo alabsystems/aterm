@@ -5,10 +5,10 @@
 //! §3.5): every finding `aterm db table check` and `aterm db alab check` report of the registry,
 //! each said in a person's words by the one function those verbs' `--tsv` form says it by
 //! (`aterm_db::typed::check::said`), with the way to each row it names; and under them the
-//! store's state: whether this Mac can write and why not, whether its history is complete here,
-//! its records and bytes against the store's caps, this Mac's records against its writer cap and
-//! its automatic-record quota, the refused and inert records by id, the generation, how many Macs
-//! have written, and the roll line where check asks for a roll.
+//! store's state: whether this machine can write and why not, whether its history is complete
+//! here, its records and bytes against the store's caps, this machine's records against its writer
+//! cap and its automatic-record quota, the refused and inert records by id, the generation, how
+//! many machines have written, and the roll line where check asks for a roll.
 //!
 //! Check is a view a person opens from the rail (or, under 900 px, from the table picker): it
 //! raises no alert, badge or banner, the rail shows no count of it, and its findings are counted
@@ -51,7 +51,7 @@ pub(crate) struct Found {
 /// The registry's store as one read found it, under the findings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Store {
-    /// Why this Mac cannot write the registry, where it cannot.
+    /// Why this machine cannot write the registry, where it cannot.
     pub(crate) cannot_write: Option<String>,
     /// Whether no record held here still waits on an earlier one, and how many do.
     pub(crate) complete: bool,
@@ -61,10 +61,10 @@ pub(crate) struct Store {
     pub(crate) records_cap: usize,
     pub(crate) bytes: usize,
     pub(crate) bytes_cap: usize,
-    /// This Mac's own records, and the cap on one writer's.
+    /// This machine's own records, and the cap on one writer's.
     pub(crate) mine: usize,
     pub(crate) mine_cap: usize,
-    /// This Mac's automatic records against the table's quota on them.
+    /// This machine's automatic records against the table's quota on them.
     pub(crate) quota_spent: usize,
     pub(crate) quota: usize,
     /// The records this build never projects (a newer build's, a cut-off writer's), by id.
@@ -76,7 +76,7 @@ pub(crate) struct Store {
     /// The generation in use: its number and its table's name.
     pub(crate) generation: u32,
     pub(crate) table: String,
-    /// How many Macs have written the registry.
+    /// How many machines have written the registry.
     pub(crate) writers: usize,
     /// What the roll finding says, where check asks for a roll.
     pub(crate) roll: Option<String>,
@@ -145,8 +145,8 @@ impl Store {
             (
                 "write",
                 match &self.cannot_write {
-                    None => "This Mac can write the registry".to_owned(),
-                    Some(why) => format!("This Mac cannot write the registry: {why}"),
+                    None => "This machine can write the registry".to_owned(),
+                    Some(why) => format!("This machine cannot write the registry: {why}"),
                 },
             ),
             (
@@ -182,7 +182,7 @@ impl Store {
             (
                 "mine",
                 format!(
-                    "This Mac's records: {} of {} one writer may hold",
+                    "This machine's records: {} of {} one writer may hold",
                     count_words(self.mine),
                     count_words(self.mine_cap)
                 ),
@@ -190,7 +190,7 @@ impl Store {
             (
                 "quota",
                 format!(
-                    "This Mac's automatic records: {} of its quota of {}",
+                    "This machine's automatic records: {} of its quota of {}",
                     count_words(self.quota_spent),
                     count_words(self.quota)
                 ),
@@ -207,9 +207,9 @@ impl Store {
                 match (self.inert.len(), self.inert_rows) {
                     (0, 0) => "Inert records: none".to_owned(),
                     (n, 0) => format!("Inert records: {n}: {}", ids_words(&self.inert)),
-                    (0, rows) => format!("Inert records: {rows} of the Macs' own rows"),
+                    (0, rows) => format!("Inert records: {rows} of the machines' own rows"),
                     (n, rows) => format!(
-                        "Inert records: {}: {}, and {rows} of the Macs' own rows",
+                        "Inert records: {}: {}, and {rows} of the machines' own rows",
                         n + rows,
                         ids_words(&self.inert)
                     ),
@@ -222,8 +222,8 @@ impl Store {
             (
                 "writers",
                 match self.writers {
-                    1 => "1 Mac has written it".to_owned(),
-                    n => format!("{n} Macs have written it"),
+                    1 => "1 machine has written it".to_owned(),
+                    n => format!("{n} machines have written it"),
                 },
             ),
         ];
@@ -239,8 +239,8 @@ impl Store {
 }
 
 /// The sheet of the page that holds row `pk`, the finding's own table first: a finding of one
-/// table may name a row of another (a Mac's facts and the machine they disagree with). `None`
-/// where no sheet read holds it.
+/// table may name a row of another (a machine's facts and the machine row they disagree with).
+/// `None` where no sheet read holds it.
 pub(crate) fn sheet_of(app: &TablesApp, found: &Found, pk: &str) -> Option<&'static str> {
     let holds = |name: &str| {
         app.sheet_named(name)
@@ -291,7 +291,49 @@ pub(crate) fn act(app: &mut TablesApp, view: &mut TablesViewState, key: &str) ->
     None
 }
 
-/// Where a finding stands, in words: its table's title, its rows and its columns.
+/// Each row `found` names, by the sheet that holds it and the words it is known by
+/// ([`TablesApp::row_words`]; its key where no sheet read holds it), told apart ([`apart`]).
+fn named_rows(app: &TablesApp, found: &Found) -> Vec<(Option<&'static str>, String)> {
+    let rows = found
+        .pks
+        .iter()
+        .map(|pk| {
+            let sheet = sheet_of(app, found, pk);
+            let words = sheet
+                .and_then(|name| app.row_words(name, pk))
+                .unwrap_or_else(|| pk.clone());
+            (sheet, words)
+        })
+        .collect();
+    apart(rows, &found.pks)
+}
+
+/// `rows` (each row's sheet and words, the row keyed `pks[n]` at `n`) with each one's key beside
+/// its words where another row of its sheet reads the same (two enrollments of one machine,
+/// each `m1 (<its key>)`), so a finding about two rows never reads as one.
+pub(crate) fn apart(
+    mut rows: Vec<(Option<&'static str>, String)>,
+    pks: &[String],
+) -> Vec<(Option<&'static str>, String)> {
+    let same: Vec<bool> = rows
+        .iter()
+        .enumerate()
+        .map(|(n, row)| {
+            rows.iter()
+                .enumerate()
+                .any(|(m, other)| m != n && other == row)
+        })
+        .collect();
+    for ((row, pk), same) in rows.iter_mut().zip(pks).zip(same) {
+        if same && row.1 != *pk {
+            row.1 = format!("{} ({pk})", row.1);
+        }
+    }
+    rows
+}
+
+/// Where a finding stands, in words: its table's title, its rows by their words (a row of
+/// another table with that table's title) and its columns.
 fn where_words(app: &TablesApp, found: &Found) -> String {
     let title = app
         .title_of(&found.collection)
@@ -301,7 +343,17 @@ fn where_words(app: &TablesApp, found: &Found) -> String {
         parts.push(title);
     }
     if !found.pks.is_empty() {
-        parts.push(found.pks.join(", "));
+        let rows: Vec<String> = named_rows(app, found)
+            .into_iter()
+            .map(|(sheet, words)| match sheet {
+                Some(name) if name != found.collection => match app.title_of(name) {
+                    Some(title) => format!("{words} ({title})"),
+                    None => words,
+                },
+                _ => words,
+            })
+            .collect();
+        parts.push(rows.join(", "));
     }
     if !found.columns.is_empty() {
         parts.push(found.columns.join(", "));
@@ -432,9 +484,9 @@ pub(crate) fn list(app: &TablesApp, view: &TablesViewState, width: f32, height: 
         .children(children)
 }
 
-/// The selected finding, whole: its word, what it means, where it is, each row it names with
-/// the way to it, and what else it says. Beside the list where the page is wide, below it where
-/// it is narrow.
+/// The selected finding, whole: its heading and the word `check --tsv` says it by, what it
+/// means, where it is, each row it names by its words with the way to it, and what else it says.
+/// Beside the list where the page is wide, below it where it is narrow.
 pub(crate) fn detail(app: &TablesApp, view: &TablesViewState, width: f32) -> Vec<(UiNode, f32)> {
     let inner = width - 28.0;
     let line = 22.0 * scale().max(1.0);
@@ -455,13 +507,20 @@ pub(crate) fn detail(app: &TablesApp, view: &TablesViewState, width: f32) -> Vec
         ));
         return out;
     };
+    let title = crate::native_about::wrapped(
+        "tables/pane/title",
+        &aterm_db::typed::check::headed(&found.kind),
+        inner,
+        SemanticRole::Heading,
+        StyleRef::Plain,
+    );
+    let title_h = match title.layout.height {
+        Length::Fixed(h) => h,
+        _ => line,
+    };
+    out.push((title, title_h));
     out.push((
-        fitted(
-            "tables/pane/kind",
-            &found.kind.to_uppercase(),
-            StyleRef::Note,
-            inner,
-        ),
+        fitted("tables/pane/kind", &found.kind, StyleRef::FaintNote, inner),
         line,
     ));
     let said = crate::native_about::wrapped(
@@ -516,14 +575,13 @@ pub(crate) fn detail(app: &TablesApp, view: &TablesViewState, width: f32) -> Vec
         out.push((detail, h));
     }
     let show_w = crate::native_ui::native_button_label_width("Show row") + 24.0;
-    for (m, pk) in found.pks.iter().enumerate() {
+    for (m, (sheet, words)) in named_rows(app, found).into_iter().enumerate() {
         let key = format!("{ROW}{n}/{m}");
-        let sheet = sheet_of(app, found, pk);
         let title = sheet.and_then(|name| app.title_of(name)).unwrap_or("");
         let shown = if title.is_empty() {
-            pk.clone()
+            words.clone()
         } else {
-            format!("{pk} \u{b7} {title}")
+            format!("{words} \u{b7} {title}")
         };
         out.push((
             group(format!("tables/pane/row/{m}"))
@@ -539,7 +597,7 @@ pub(crate) fn detail(app: &TablesApp, view: &TablesViewState, width: f32) -> Vec
                         &key,
                         "Show row",
                         &format!(
-                            "Show row {pk} in {}",
+                            "Show row {words} in {}",
                             if title.is_empty() { "its table" } else { title }
                         ),
                         StyleRef::Secondary,

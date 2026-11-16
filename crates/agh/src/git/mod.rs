@@ -74,6 +74,50 @@ pub fn advertised_refs(
     Ok(refs)
 }
 
+/// One ref of an advertisement: the object it names and, for an annotated tag, the object its
+/// `^{}` line names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdvertisedRef {
+    /// The full ref, or `HEAD`.
+    pub name: String,
+    /// The object the ref names: a tag object for an annotated tag.
+    pub oid: String,
+    /// What an annotated tag peels to; `None` for a branch, a lightweight tag or `HEAD`.
+    pub peeled: Option<String>,
+}
+
+/// [`advertised_refs`] as rows: each `^{}` line becomes its ref's `peeled`, never a row of its
+/// own, and an exact `reference` selects its row alone.
+/// # Errors
+/// What [`advertised_refs`] refuses, and a `^{}` line whose ref the advertisement lacks.
+pub fn advertised_ref_rows(
+    stdout: &str,
+    reference: Option<&str>,
+) -> crate::Result<Vec<AdvertisedRef>> {
+    let mut refs = advertised_refs(stdout, None)?;
+    let peeled: std::collections::BTreeMap<String, String> = refs
+        .extract_if(.., |name, _| name.ends_with("^{}"))
+        .map(|(mut name, oid)| {
+            name.truncate(name.len() - "^{}".len());
+            (name, oid)
+        })
+        .collect();
+    if peeled.keys().any(|name| !refs.contains_key(name)) {
+        return Err(crate::Error::protocol(
+            "Git ref advertisement peels a ref it does not advertise",
+        ));
+    }
+    Ok(refs
+        .into_iter()
+        .filter(|(name, _)| reference.is_none_or(|r| r == name))
+        .map(|(name, oid)| AdvertisedRef {
+            peeled: peeled.get(&name).cloned(),
+            name,
+            oid,
+        })
+        .collect())
+}
+
 /// One validation phase of an incremental native atomic ref admission.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

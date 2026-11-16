@@ -893,6 +893,181 @@ fn enrollment_after_twenty_rotations_wraps_the_admission_epochs_and_history_come
     macs.server.stop();
 }
 
+/// What a historical read answers where it does not open its basis says whether the history this
+/// Mac holds proved it cannot ([`crate::ErrorKind::HistoryUnopened`]), and a reader leaves out
+/// what is sealed under that basis only then. m10, enrolled after 20 rotations, holds no `Wrap`
+/// of an old epoch: unopened. A vault writer holding the state lock while m10 asks that epoch, or
+/// the one it holds, judges nothing: busy ([`crate::ErrorKind::VaultBusy`]), never unopened. With
+/// the handoff of the old epoch imported, it opens (CONTROL); with that handoff's cached copy
+/// damaged, the read that falls back to it did not prove anything either, so it is no longer
+/// unopened.
+///
+/// NEGATIVE CONTROLS, each failing its arm: with `roster::Access::stands_for` judging the
+/// membership by `is_current_observed(..).unwrap_or(false)` (the busy kind erased into a
+/// membership that moved, as the `is_current_through` it replaced erased it), the busy arm
+/// failed (run again 2026-11-15, once a moved membership had a kind of its own) `no handoff
+/// held; left: [Some(VaultChanged), Some(VaultChanged)] right: [Some(VaultBusy),
+/// Some(VaultBusy)]`; with `bootstrap::unopened_by_both` returning the native answer whatever
+/// the handoff's was (2026-11-14), the damaged-handoff arm failed `a handoff that does not read
+/// proves nothing: Some("historical Commons epoch is not wrapped to this device")`.
+#[test]
+fn an_epoch_not_wrapped_here_is_history_unopened_and_a_busy_vault_is_not() {
+    use crate::ErrorKind;
+    let (macs, _, _, m10, history) = enroll_after_history();
+    let old = history[4];
+    let b10 = Bootstrap::required(&m10).unwrap();
+    let trust = b10.trust();
+    let journal =
+        crate::commons::journal::Journal::open_existing(b10.journal_dir(), trust).unwrap();
+    let access = b10.access_in(&journal).unwrap().unwrap();
+    let held = *access.basis();
+    let kind =
+        |answer: crate::Result<crate::commons::roster::Historical>| answer.err().map(|e| e.kind());
+    assert_eq!(
+        kind(b10.historical(&journal, &access, old)),
+        Some(ErrorKind::HistoryUnopened),
+        "m10 holds no wrap of the old epoch"
+    );
+    assert_eq!(
+        kind(b10.historical(&journal, &access, held)),
+        None,
+        "CONTROL: m10 opens the epoch it holds"
+    );
+    let while_written = |journal: &crate::commons::journal::Journal,
+                         access: &crate::commons::roster::Access,
+                         what: &str| {
+        let writer = aterm_uds::private_file::PrivateLock::take(
+            &m10.dir,
+            ".lock",
+            std::time::Duration::ZERO,
+            "a vault writer",
+        )
+        .unwrap();
+        let answers: Vec<_> = b10
+            .historicals(journal, access, &[old, held])
+            .into_iter()
+            .map(kind)
+            .collect();
+        drop(writer);
+        assert_eq!(
+            answers,
+            [Some(ErrorKind::VaultBusy), Some(ErrorKind::VaultBusy)],
+            "{what}"
+        );
+    };
+    while_written(&journal, &access, "no handoff held");
+    drop(journal);
+
+    let journal22 = crate::commons::journal::Journal::open_existing(
+        Bootstrap::required(&macs.m22).unwrap().journal_dir(),
+        trust,
+    )
+    .unwrap();
+    let b22 = Bootstrap::required(&macs.m22).unwrap();
+    let access22 = b22.access_in(&journal22).unwrap().unwrap();
+    let handoff = b22
+        .history_handoff(&journal22, &access22, old, b10.request().unwrap().binding())
+        .unwrap();
+    drop(journal22);
+    let journal =
+        crate::commons::journal::Journal::open_existing(b10.journal_dir(), trust).unwrap();
+    let access = b10.access_in(&journal).unwrap().unwrap();
+    b10.import_history(&journal, &access, handoff.bytes())
+        .unwrap();
+    assert_eq!(
+        kind(b10.historical(&journal, &access, old)),
+        None,
+        "CONTROL: the handoff opens the old epoch"
+    );
+    while_written(&journal, &access, "the handoff held");
+
+    let cached = b10
+        .journal_dir()
+        .parent()
+        .unwrap()
+        .join("history")
+        .join(format!("{}.handoff", aterm_codec::hex::encode_lower(&old)));
+    let mut damaged = std::fs::read(&cached).unwrap();
+    *damaged.last_mut().unwrap() ^= 1;
+    std::fs::write(&cached, &damaged).unwrap();
+    let answer = b10.historical(&journal, &access, old);
+    let damage = answer.as_ref().err().map(ToString::to_string);
+    assert!(
+        !matches!(kind(answer), None | Some(ErrorKind::HistoryUnopened)),
+        "a handoff that does not read proves nothing: {damage:?}"
+    );
+    drop(journal);
+    macs.server.stop();
+}
+
+/// A historical read through an access the membership has moved past since it was observed is
+/// changed ([`crate::ErrorKind::VaultChanged`]), which a reader asks again from a fresh
+/// observation, never refused: m22 observes its access, then mints one more Commons epoch (as
+/// another Mac's rotation or a removal reaches this Mac, a record of the log and none of the
+/// table), and each historical read through the access observed before is changed, the epoch it
+/// held then included. Observed again, the access stands on the new epoch and opens both. A read
+/// for another device's identity is refused (kind `Other`) whatever the membership.
+///
+/// NEGATIVE CONTROL (2026-11-15): with `roster::Access::stands_for` answering a membership that
+/// is no longer current with `Error::new` (kind `Other`, as before this law), the moved arm
+/// failed `the membership moved under the access; left: [Some(Other)] right:
+/// [Some(VaultChanged)]`. The same mutation fails this law's aterm-db arm,
+/// `table::cutoff_tests::a_membership_that_moves_under_a_carried_read_is_busy_not_refused`.
+#[test]
+fn a_historical_read_under_a_membership_that_moved_is_changed_not_refused() {
+    use crate::ErrorKind;
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let b22 = Bootstrap::required(&macs.m22).unwrap();
+    let trust = b22.trust();
+    let journal =
+        crate::commons::journal::Journal::open_existing(b22.journal_dir(), trust).unwrap();
+    let access = b22.access_in(&journal).unwrap().unwrap();
+    assert!(access.is_log_backed(), "CONTROL: the log backs Commons");
+    let held = *access.basis();
+    let kind =
+        |answer: crate::Result<crate::commons::roster::Historical>| answer.err().map(|e| e.kind());
+    assert_eq!(
+        kind(b22.historical(&journal, &access, held)),
+        None,
+        "CONTROL: the epoch m22 holds opens"
+    );
+    let m7 = read_identity(&macs.m7).unwrap().unwrap();
+    assert_eq!(
+        kind(access.historical(&journal, &m7, held)),
+        Some(ErrorKind::Other),
+        "a read for another device's identity is refused"
+    );
+    let rotated = mint_commons_history(&macs.m22, 1);
+    assert_eq!(
+        b22.historicals(&journal, &access, &[held])
+            .into_iter()
+            .map(kind)
+            .collect::<Vec<_>>(),
+        [Some(ErrorKind::VaultChanged)],
+        "the membership moved under the access"
+    );
+    assert_eq!(
+        kind(access.historical(&journal, &m7, held)),
+        Some(ErrorKind::Other),
+        "another device's identity is refused under a moved membership too"
+    );
+    let access = b22.access_in(&journal).unwrap().unwrap();
+    assert_eq!(
+        *access.basis(),
+        rotated[0],
+        "CONTROL: observed again, the access stands on the new epoch"
+    );
+    for basis in [held, rotated[0]] {
+        assert_eq!(
+            kind(b22.historical(&journal, &access, basis)),
+            None,
+            "observed again, the access opens each epoch"
+        );
+    }
+    drop(journal);
+    macs.server.stop();
+}
+
 /// The m4 shape the other way round: X takes A's removal batch only through its `Wrap` to `r2`
 /// ([`a_prefix`]) first, and then removes `r1`. Returns the recipients X's removal rotation of
 /// `[everyone]` wraps, and the recipients.

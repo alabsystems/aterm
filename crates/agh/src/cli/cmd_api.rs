@@ -588,6 +588,10 @@ impl IntentStore for Begun<'_> {
     fn latest(&self, op: WriteOp, key: &str) -> Result<Option<IntentView>> {
         self.journal()?.latest(op, key)
     }
+
+    fn stops(&self, view: &IntentView) -> Result<bool> {
+        self.journal()?.stops(view)
+    }
 }
 
 /// `agh api` with `POST`, `PATCH`, `PUT` or `DELETE` (design §9.4, plan §7 body 8). The

@@ -12,6 +12,9 @@
 //! whole row for each writing Mac, read only. Where the Check view is open, a read also works
 //! out what `aterm db alab check` finds (`aterm_db::alab::command::checked`, each finding in
 //! the words of its `--tsv` form) and the store's state from the head's usage ([`checked`]).
+//! Each read also lists every row a reference may name and shows each reference as the words its
+//! row is known by, its key kept beside them ([`crate::native_tables::rows::targets`]), with
+//! which rows a Mac's own statement names ([`held`]) and the label each was written under.
 //! Nothing here runs on the main thread:
 //! [`crate::native_tables`]'s worker calls it.
 
@@ -27,11 +30,22 @@ use aterm_db::typed::{Collection, Column, Ty, Writer};
 use aterm_db::typed::{Face, Kind, Table};
 
 #[cfg(unix)]
+use crate::native_tables::rows::{Referrer, RowLife};
+#[cfg(unix)]
 use crate::native_tables::{
     AsOf, Author, AuthorKind, ColumnKind, Group, Observed, Schema, Sheet, SheetColumn, SheetRow,
     Shown, Since, Written, WrittenCell,
 };
 use crate::native_tables::{Snapshot, Staged, Wrote};
+
+/// The compiled table a sheet was read from, which a new row's key is derived by.
+#[cfg(unix)]
+pub(crate) type Compiled = aterm_db::att::Compiled;
+
+/// No registry is read here, so no sheet names a compiled table.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub(crate) enum Compiled {}
 
 /// One collection the rail lists: the registry's name for it, how a person is shown it, and
 /// whether it is read as each Mac's own rows.
@@ -94,9 +108,9 @@ pub(crate) fn listed(table: &Table) -> Vec<Listed> {
 }
 
 #[cfg(unix)]
-/// Columns the page leaves to later packages: the row's lifecycle (retire and restore) and the
-/// import coordinates.
-const HIDDEN: [&str; 4] = ["row", "src", "notes_src", "pk"];
+/// Columns the page does not show: the import coordinates, and the key, which the grid lays out
+/// as a column of its own and the page shows where a row is named by it ([`KEY`]).
+const HIDDEN: [&str; 3] = ["src", "notes_src", "pk"];
 
 #[cfg(unix)]
 /// An owned row's counter, which orders a Mac's own statements and says nothing to a person.
@@ -106,8 +120,13 @@ const COUNTER: &str = "n";
 /// The column of an owned sheet that names the Mac whose row it is.
 pub(crate) const MAC: &str = "~mac";
 
-/// The words of a column's header: its name in capitals, words apart.
+/// The words of a column's header: its name in capitals, words apart. The stored name `mac`
+/// (the machine a machine's own facts are of, kept in the generations that hold it) reads
+/// `MACHINE`: it names any machine running aterm.
 pub(crate) fn label_of(name: &str) -> String {
+    if name == "mac" {
+        return "MACHINE".to_owned();
+    }
     name.replace('_', " ").to_uppercase()
 }
 
@@ -140,8 +159,8 @@ fn group_of(collection: &Collection, name: &str, face: Face) -> (Group, ColumnKi
         (Face::Owner, Writer::Mine | Writer::Seed) => Group::SetByAterm,
         (face, _) => face_group(face),
     };
-    // A cells sheet shows a time as its number and a day as its date (`grid::show`), an owned
-    // sheet a time as a date too ([`stamp`]): either way their words order as their values do.
+    // A time reads as its date ([`stamp`]) and a day as its date (`grid::show`), on a cells
+    // sheet as on an owned one: their words order as their values do.
     let kind = match schema.ty {
         Ty::Int { .. } | Ty::Uint => ColumnKind::Number,
         Ty::Time | Ty::Day => ColumnKind::Time,
@@ -160,6 +179,72 @@ fn stamp(ty: &Ty, value: &aterm_json::Value) -> Option<String> {
         Ty::Day => value.as_u64().and_then(grid::day_date),
         _ => None,
     }
+}
+
+/// How a value of a cells sheet reads where its words are not the grid's: a time as its date
+/// ([`stamp`]), a plan's limits in words ([`limits_words`]). `None` where the grid's text
+/// stands.
+#[cfg(unix)]
+fn set_words(ty: &Ty, value: &aterm_json::Value) -> Option<String> {
+    stamp(ty, value).or_else(|| limits_words(ty, value))
+}
+
+/// A plan's limits (`aterm_db::alab::registry::LIMIT`) in words, each window as the rest of
+/// aterm names it and what it counts: `5-hour: 45 messages · weekly: 225 messages`, a window
+/// alone where the plan states no amount (`5-hour · weekly`, its use read in percent), and none
+/// where the plan names no window. A limit this build cannot read says its own value, and the
+/// others still read in words. `None` for any other type, or a value that is no list.
+#[cfg(unix)]
+fn limits_words(ty: &Ty, value: &aterm_json::Value) -> Option<String> {
+    let Ty::List(Ty::Struct(members), _) = ty else {
+        return None;
+    };
+    if *members != aterm_db::alab::registry::LIMIT {
+        return None;
+    }
+    let said: Vec<String> = value
+        .as_array()?
+        .iter()
+        .map(|limit| limit_words(limit).unwrap_or_else(|| limit.to_string()))
+        .collect();
+    Some(said.join(" \u{b7} "))
+}
+
+/// One limit of a plan in words ([`limits_words`]); `None` where it names no window.
+#[cfg(unix)]
+fn limit_words(limit: &aterm_json::Value) -> Option<String> {
+    let model = limit
+        .get("model")
+        .and_then(aterm_json::Value::as_str)
+        .filter(|model| !model.is_empty());
+    let window = match (limit.get("w")?.as_str()?, model) {
+        ("5h", None) => "5-hour".to_owned(),
+        ("7d", None) => "weekly".to_owned(),
+        ("7d-model", None) => "one model's weekly".to_owned(),
+        ("5h", Some(model)) => format!("{model} 5-hour"),
+        ("7d" | "7d-model", Some(model)) => format!("{model} weekly"),
+        ("day", None) => "daily".to_owned(),
+        ("month", None) => "monthly".to_owned(),
+        ("day", Some(model)) => format!("{model} daily"),
+        ("month", Some(model)) => format!("{model} monthly"),
+        (other, None) => other.to_owned(),
+        (other, Some(model)) => format!("{model} {other}"),
+    };
+    let unit = limit.get("unit").and_then(aterm_json::Value::as_str);
+    let counts = match (limit.get("nominal"), unit) {
+        (None | Some(aterm_json::Value::Null), None | Some("pct")) => return Some(window),
+        (None | Some(aterm_json::Value::Null), Some("usd-cents")) => "in dollars".to_owned(),
+        (None | Some(aterm_json::Value::Null), Some(unit)) => format!("in {unit}"),
+        (Some(nominal), unit) => match (nominal.as_u64(), unit) {
+            (Some(n), Some("pct")) => format!("{n}%"),
+            (Some(cents), Some("usd-cents")) => format!("${}.{:02}", cents / 100, cents % 100),
+            (Some(n), Some(unit)) => format!("{n} {unit}"),
+            (Some(n), None) => n.to_string(),
+            (None, Some(unit)) => format!("{nominal} {unit}"),
+            (None, None) => nominal.to_string(),
+        },
+    };
+    Some(format!("{window}: {counts}"))
 }
 
 #[cfg(unix)]
@@ -460,7 +545,12 @@ pub(crate) fn read(
         .map(|entry| (entry.operation, author(entry)))
         .collect();
     let listed = listed(table);
+    // Who names each row, by the rule a retire of it is refused by, and the cells a new row's key
+    // is derived from: both as the read found the table.
+    let referrers = aterm_db::typed::check::referrers(table, &[], &view.cells);
+    let cells = std::sync::Arc::new(view.cells.clone());
     let read = Read {
+        compiled,
         table,
         view,
         now: past.as_ref().map(|_| &head),
@@ -470,6 +560,8 @@ pub(crate) fn read(
         names: &names,
         listed: &listed,
         since: &since,
+        referrers: &referrers,
+        cells: &cells,
     };
     let mut projections = BTreeMap::new();
     for shown in listed.iter().filter(|shown| !shown.owned) {
@@ -488,7 +580,17 @@ pub(crate) fn read(
             sheet
         });
     }
+    // Each row a reference may name, and every reference shown as the words its row is known
+    // by: a link is chosen from rows and stored by key, never written by a label.
+    let targets = crate::native_tables::rows::targets(
+        &sheets,
+        |to, pk| names.words(to, pk).map(str::to_owned),
+        |to, pk| written_label(&projections, to, pk),
+        &held(table, view, &listed),
+    );
+    crate::native_tables::rows::name_references(&mut sheets, &targets);
     let check = usage.map(|usage| Box::new(checked(paths, &handle, &head, &usage, &history)));
+    let cannot_write = handle.cannot_write(&head);
     let snapshot = Snapshot {
         listed,
         sheets,
@@ -498,8 +600,67 @@ pub(crate) fn read(
             by: by_operation.get(&operation).cloned(),
         }),
         read_ms: aterm_time::unix_millis().unwrap_or(0),
+        cannot_write,
+        targets,
     };
     Ok((snapshot, whole))
+}
+
+/// The label row `pk` of collection `to` was written under, where `to` claims its labels
+/// ([`aterm_db::typed::ClaimRule::Label`]): its value as written, not the claim it reads as.
+#[cfg(unix)]
+fn written_label(projections: &Projections, to: &str, pk: &str) -> Option<String> {
+    let (collection, projection) = projections.get(to)?;
+    let column = collection
+        .columns
+        .iter()
+        .find(|c| c.claim == Some(aterm_db::typed::ClaimRule::Label))?;
+    projection
+        .rows
+        .get(pk)?
+        .fields
+        .get(column.name)?
+        .value()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Each row a Mac holds, by collection and key: the row a Mac's own statement names, read as
+/// [`Read::observed`] reads it (of each table its row names, the last of its references to that
+/// table that holds one, so a facts row's `merged_into` before its `mac`).
+#[cfg(unix)]
+fn held(
+    table: &Table,
+    view: &aterm_db::typed::View,
+    listed: &[Listed],
+) -> std::collections::BTreeSet<(&'static str, String)> {
+    let mut held = std::collections::BTreeSet::new();
+    for shown in listed.iter().filter(|shown| shown.owned) {
+        let (Some(owner), Some(read)) = (table.collection(shown.name), view.owned.get(shown.name))
+        else {
+            continue;
+        };
+        for row in read.rows.values() {
+            let mut named = std::collections::BTreeSet::new();
+            for column in owner.columns.iter().rev() {
+                let Ty::Ref(to) = column.ty else {
+                    continue;
+                };
+                if named.contains(to) {
+                    continue;
+                }
+                if let Some(pk) = row
+                    .value
+                    .get(column.name)
+                    .and_then(aterm_json::Value::as_str)
+                {
+                    named.insert(to);
+                    held.insert((to, pk.to_owned()));
+                }
+            }
+        }
+    }
+    held
 }
 
 /// What Check shows of the registry `handle` reads at `paths`, as `head` and its `usage` hold
@@ -540,11 +701,7 @@ fn checked(
             None => &entry.actor[..],
         })
         .collect();
-    let cannot_write = if aterm_secrets::commons::bootstrap::writer_here(paths) {
-        None
-    } else {
-        Some("it is not a Commons writer here".to_owned())
-    };
+    let cannot_write = handle.cannot_write(head);
     let hex = |id: &[u8; 32]| aterm_codec::hex::encode_lower(id);
     let store = Store {
         cannot_write,
@@ -585,6 +742,7 @@ fn checked(
 /// What one read of the registry holds, which each sheet is laid out from.
 #[cfg(unix)]
 struct Read<'a> {
+    compiled: &'static Compiled,
     table: &'static Table,
     view: &'a aterm_db::typed::View,
     /// The head, where `view` is a past table: what its cells hold now.
@@ -595,20 +753,15 @@ struct Read<'a> {
     names: &'a aterm_db::alab::registry::Names,
     listed: &'a [Listed],
     since: &'a [aterm_db::att::CellDiff],
+    /// The live rows that name each row, by collection and key
+    /// ([`aterm_db::typed::check::referrers`]).
+    referrers: &'a BTreeMap<(&'static str, String), Vec<(&'static str, String)>>,
+    cells: &'a std::sync::Arc<aterm_db::typed::cell::Cells>,
 }
 
 /// The cells collections' projections, by name.
 #[cfg(unix)]
 type Projections = BTreeMap<&'static str, (&'static Collection, aterm_db::typed::cell::Projection)>;
-
-/// The column of `collection` a reference in `column` names, where it names a row of one.
-#[cfg(unix)]
-fn reference(collection: &Collection, column: &str) -> Option<&'static str> {
-    collection.column(column).and_then(|c| match c.ty {
-        Ty::Ref(target) => Some(target),
-        _ => None,
-    })
-}
 
 #[cfg(unix)]
 impl Read<'_> {
@@ -630,9 +783,9 @@ impl Read<'_> {
     }
 
     /// An owned collection as each Mac states it: one row for each writing Mac, under a first
-    /// column naming that Mac, every cell read only. A reference reads as the words its row is
-    /// known by ([`aterm_db::alab::registry::Names`]); each cell's writer is the row's Mac, and
-    /// when it saw what it states is the row's own `at`.
+    /// column naming that Mac, every cell read only. A reference holds its row's key, and its
+    /// history reads as the words its row is known by ([`aterm_db::alab::registry::Names`]);
+    /// each cell's writer is the row's Mac, and when it saw what it states is the row's own `at`.
     fn owned_sheet(&self, shown: &Listed, collection: &'static Collection) -> Sheet {
         let read = self.view.owned.get(collection.name);
         // Each Mac's row is keyed by the Mac that states it.
@@ -691,17 +844,22 @@ impl Read<'_> {
                 },
             );
             for column in collection.columns.iter().filter(|c| c.name != COUNTER) {
-                let value = row.value.get(column.name);
+                // A reference holds its row's key here; the read then says its row's words
+                // ([`crate::native_tables::rows::name_references`]).
+                let text = row
+                    .value
+                    .get(column.name)
+                    .filter(|v| !v.is_null())
+                    .map(|value| {
+                        stamp(&column.ty, value).unwrap_or_else(|| grid::show(&column.ty, value))
+                    })
+                    .unwrap_or_default();
                 cells.insert(
                     column.name.to_owned(),
                     Shown {
-                        text: text_of(column, value),
+                        text,
                         by: Some(by.clone()),
                         seen_ms,
-                        names: match (target(&column.ty), value.and_then(|v| v.as_str())) {
-                            (Some(to), Some(pk)) => self.names.words(to, pk).map(str::to_owned),
-                            _ => None,
-                        },
                         ..Shown::default()
                     },
                 );
@@ -769,6 +927,8 @@ impl Read<'_> {
                 rows: Vec::new(),
             },
             schema: None,
+            life: None,
+            referrers: BTreeMap::new(),
         }
     }
 
@@ -880,12 +1040,13 @@ impl Read<'_> {
                 let (group, kind, owners) = group_of(collection, name, shown.face);
                 let schema = collection.column(name);
                 // The one rule for an edit: the owner's column, which the grid does not hold
-                // read only.
+                // read only. A row's lifecycle is not typed: the pane retires, ends and restores
+                // it, after naming what still names the row.
                 Some(SheetColumn {
                     name: name.to_owned(),
                     label: label_of(name),
                     group,
-                    editable: !read_only && owners,
+                    editable: !read_only && owners && name != aterm_db::typed::LIFECYCLE,
                     kind,
                     links: schema.and_then(|c| target(&c.ty)).map(str::to_owned),
                     compiled: schema,
@@ -969,13 +1130,11 @@ impl Read<'_> {
             KEY.to_owned()
         });
         let mut rows = Vec::new();
+        // Every row, whatever its lifecycle: the page's lifecycle filter picks which it shows.
         for (pk, seen) in &base.rows {
             let Some(row) = projection.rows.get(pk) else {
                 continue;
             };
-            if !row.live() {
-                continue;
-            }
             let mut cells = BTreeMap::new();
             if key == KEY {
                 cells.insert(
@@ -1050,19 +1209,22 @@ impl Read<'_> {
                             .max_by_key(|a| a.at_ms)
                             .cloned()
                     });
-                // The words a one-row reference is known by, which the page says beside it.
-                let names = reference(collection, &column.name).and_then(|to| {
-                    let [one] = &candidates[..] else {
-                        return None;
-                    };
-                    self.names
-                        .words(to, one.value.x.as_str()?)
-                        .map(str::to_owned)
-                });
+                // A value reads in words (a time as its date, a plan's limits), whoever writes
+                // it; a cell the page edits keeps the grid's text as what it holds.
+                let words = schema
+                    .zip(candidates.first())
+                    .filter(|_| candidates.len() == 1)
+                    .and_then(|(schema, candidate)| set_words(&schema.ty, &candidate.value.x));
+                let holds = words
+                    .as_ref()
+                    .filter(|_| column.editable)
+                    .map(|_| seen.shown.clone());
                 cells.insert(
                     column.name.clone(),
                     Shown {
-                        text: if values.is_empty() {
+                        text: if let Some(words) = words {
+                            words
+                        } else if values.is_empty() {
                             seen.shown.clone()
                         } else {
                             let mut texts: Vec<&str> =
@@ -1078,7 +1240,8 @@ impl Read<'_> {
                         values,
                         raw: seen.raw,
                         seen_ms: None,
-                        names,
+                        refers: None,
+                        holds,
                     },
                 );
             }
@@ -1109,9 +1272,9 @@ impl Read<'_> {
                             format!("\u{2212} {elem}")
                         }
                     }
-                    (Some(cell), None) => {
+                    (Some(cell), None) => set_words(&schema.ty, &cell.x).unwrap_or_else(|| {
                         shown_value(collection.name, schema, key.pk, Some(&cell.x))
-                    }
+                    }),
                     (None, _) => String::new(),
                 };
                 changed.push(WrittenCell {
@@ -1128,6 +1291,22 @@ impl Read<'_> {
                 });
             }
         }
+        let life = self.life(collection, &base);
+        let referrers = self
+            .referrers
+            .range((name, String::new())..)
+            .take_while(|((of, _), _)| *of == name)
+            .map(|((_, pk), by)| {
+                let by = by
+                    .iter()
+                    .map(|(sheet, pk)| Referrer {
+                        sheet,
+                        pk: pk.clone(),
+                    })
+                    .collect();
+                (pk.clone(), by)
+            })
+            .collect();
         // In a past table, a sealed number changed since reads as the grid at Now shows it:
         // opened as the head's cells open here. One that does not open leaves the read not
         // whole, as a number of the table shown does.
@@ -1151,11 +1330,44 @@ impl Read<'_> {
             observed: self.observed(name, collection),
             base,
             schema: Some(Schema {
-                table: self.table,
+                compiled: self.compiled,
                 collection,
+                cells: self.cells.clone(),
             }),
+            life,
+            referrers,
         };
         Ok((sheet, whole && whole_now))
+    }
+
+    /// How rows of `collection`, laid out as `base` is, are added, retired, ended and restored:
+    /// its lifecycle as the grid writes it ([`grid::lifecycle`]); whether a new row is born here
+    /// or who adds one ([`aterm_db::alab::registry::born_elsewhere`]); the columns a new row is
+    /// typed into, every one the grid does not hold read only; and those of them only a verb
+    /// sets, with that verb ([`aterm_db::alab::registry::set_by`]). `None` where it has no
+    /// lifecycle.
+    fn life(&self, collection: &'static Collection, base: &Base) -> Option<RowLife> {
+        let lifecycle = grid::lifecycle(self.table, collection)?;
+        let mut born_columns = Vec::new();
+        let mut set_by = Vec::new();
+        for header in &base.header {
+            let name = header.trim_start_matches(grid::READ_ONLY);
+            if collection.column(name).is_none() || name == aterm_db::typed::LIFECYCLE {
+                continue;
+            }
+            if !header.starts_with(grid::READ_ONLY) {
+                born_columns.push(name.to_owned());
+            } else if let Some(verb) = aterm_db::alab::registry::set_by(collection.name, name) {
+                set_by.push((name.to_owned(), verb));
+            }
+        }
+        Some(RowLife {
+            words: lifecycle.words,
+            ends: lifecycle.ends,
+            born_elsewhere: aterm_db::alab::registry::born_elsewhere(collection.name),
+            born_columns,
+            set_by,
+        })
     }
 }
 
@@ -1231,75 +1443,155 @@ fn since_then(
     found
 }
 
-#[cfg(unix)]
-/// The grid text of `base` with each staged cell's text in place of what it showed.
-pub(crate) fn staged_text(base: &Base, staged: &BTreeMap<(String, String), String>) -> String {
-    let mut edited = base.clone();
-    for (pk, seen) in &mut edited.rows {
-        for (column, cell) in seen.iter_mut() {
-            if let Some(text) = staged.get(&(pk.clone(), column.clone())) {
-                cell.shown.clone_from(text);
-            }
-        }
-    }
-    grid::render(&edited)
-}
-
 /// Each of `problems` a save of `base`'s grid found, at the row and column it names, with its rule:
 /// the page shows the rule at the cell, so a rule's own `<collection>.<column>: ` is not said
-/// again.
+/// again. A problem of a new row is placed at the key the page gave it, `born`'s in the order
+/// the grid text holds them ([`grid::staged_text`]).
 #[cfg(unix)]
-fn placed(base: &Base, problems: Vec<grid::Problem>) -> Vec<((String, String), String)> {
+fn placed(
+    base: &Base,
+    born: &[String],
+    problems: Vec<grid::Problem>,
+) -> Vec<((String, String), String)> {
     problems
         .into_iter()
         .map(|problem| {
-            let pk = problem
-                .record
-                .checked_sub(1)
-                .and_then(|i| base.rows.get(i))
-                .map(|(pk, _)| pk.clone())
-                .unwrap_or_default();
-            let column = base
+            let record = grid::RecordOf::of(base, problem.record);
+            let pk = match record {
+                grid::RecordOf::Header => String::new(),
+                grid::RecordOf::Row(pk) => pk.to_owned(),
+                grid::RecordOf::Born(n) => born.get(n).cloned().unwrap_or_default(),
+            };
+            let mut column = base
                 .header
                 .get(problem.column)
                 .map(|h| h.trim_start_matches(grid::READ_ONLY).to_owned())
                 .unwrap_or_default();
             let said = format!("{}.{column}: ", base.collection);
-            let rule = problem
+            let mut rule = problem
                 .rule
                 .strip_prefix(&said)
                 .map_or(problem.rule.clone(), str::to_owned);
+            // What stops a new row's key is said at the cell of the column the rule names (its
+            // key is made from a column left empty, `preference.account: …`), else at the cell
+            // that says the row is new (a row the table holds already).
+            if matches!(record, grid::RecordOf::Born(_)) && column == grid::PK {
+                let named = base
+                    .header
+                    .iter()
+                    .map(|h| h.trim_start_matches(grid::READ_ONLY))
+                    .find_map(|c| {
+                        let rest = problem
+                            .rule
+                            .strip_prefix(&format!("{}.{c}: ", base.collection))?;
+                        Some((c, rest))
+                    });
+                match named {
+                    Some((c, rest)) => {
+                        c.clone_into(&mut column);
+                        rest.clone_into(&mut rule);
+                    }
+                    None => {
+                        aterm_db::typed::LIFECYCLE.clone_into(&mut column);
+                        if let Some(rest) = rule.strip_prefix(&format!("{}: ", base.collection)) {
+                            rule = rest.to_owned();
+                        }
+                    }
+                }
+            }
             ((pk, column), rule)
         })
         .collect()
 }
 
-/// What the save would refuse of `staged` (by row and column) on `sheet`, by row and column with
-/// its rule: the save's own reading of the staged grid ([`grid::plan`], as
-/// [`aterm_db::att::Handle::save`] reads it), run as each cell is staged, so a value the save
-/// cannot take shows refused before Write. What only the store can judge (the table's rules
-/// against the rows it holds, another writer's value since) is still the Write's to find. A
-/// staged cell is never a new row, so no row is born here.
+/// `staged` (by row and column) split into the cells of `base`'s rows and the new rows, each
+/// new row's key ([`crate::native_tables::rows::NEW`]) with its cells by column, in key order.
 #[cfg(unix)]
-pub(crate) fn refusals(
-    sheet: &Sheet,
+fn born_of(
     staged: &BTreeMap<(String, String), String>,
-) -> BTreeMap<(String, String), String> {
-    let Some(schema) = sheet.schema else {
-        return BTreeMap::new();
+) -> (
+    BTreeMap<(String, String), String>,
+    Vec<(String, BTreeMap<String, String>)>,
+) {
+    let mut cells = BTreeMap::new();
+    let mut born: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    for ((pk, column), text) in staged {
+        if !crate::native_tables::rows::is_new(pk) {
+            cells.insert((pk.clone(), column.clone()), text.clone());
+            continue;
+        }
+        match born.iter_mut().find(|(key, _)| key == pk) {
+            Some((_, row)) => {
+                row.insert(column.clone(), text.clone());
+            }
+            None => born.push((pk.clone(), BTreeMap::from([(column.clone(), text.clone())]))),
+        }
+    }
+    (cells, born)
+}
+
+/// The grid text a save of `base` reads for `cells` and the new rows `born`, and the new rows'
+/// keys in the order it holds them.
+#[cfg(unix)]
+fn text_of(
+    base: &Base,
+    cells: &BTreeMap<(String, String), String>,
+    born: &[(String, BTreeMap<String, String>)],
+) -> (String, Vec<String>) {
+    let rows: Vec<BTreeMap<String, String>> = born.iter().map(|(_, row)| row.clone()).collect();
+    (
+        grid::staged_text(base, cells, &rows),
+        born.iter().map(|(key, _)| key.clone()).collect(),
+    )
+}
+
+/// What the save's own reading of a staged grid found ([`refusals`]).
+#[derive(Debug, Default)]
+pub(crate) struct Reading {
+    /// What it would refuse, by row and column, with the rule.
+    pub(crate) refused: std::collections::BTreeMap<(String, String), String>,
+    /// Each new row's key as the save would derive it from its cells now, by the key the page
+    /// gives it ([`crate::native_tables::rows::NEW`]): where nothing refuses the grid.
+    pub(crate) keys: std::collections::BTreeMap<String, String>,
+}
+
+/// What the save would refuse of `staged` (by row and column) on `sheet`, by row and column with
+/// its rule, and the key each new row would be born under: the save's own reading of the staged
+/// grid ([`grid::plan`], as [`aterm_db::att::Handle::save`] reads it), run as each cell is
+/// staged, so a value the save cannot take shows refused before Write. A new row's key is
+/// derived as the save derives it ([`aterm_db::att::Compiled::born`]), from the table as the read
+/// found it. What only the store can judge (the table's rules against the rows it holds, another
+/// writer's value since) is still the Write's to find.
+#[cfg(unix)]
+pub(crate) fn refusals(sheet: &Sheet, staged: &BTreeMap<(String, String), String>) -> Reading {
+    let Some(schema) = &sheet.schema else {
+        return Reading::default();
     };
-    let unborn = |_: &Collection, _: &BTreeMap<String, aterm_json::Value>| {
-        Err(std::io::Error::other("the page stages no new row").into())
+    let born = |collection: &Collection, values: &BTreeMap<String, aterm_json::Value>| {
+        schema.compiled.born(collection, values, &schema.cells)
     };
+    let (cells, new) = born_of(staged);
+    let (text, keys) = text_of(&sheet.base, &cells, &new);
     match grid::plan(
-        schema.table,
+        schema.compiled.table,
         schema.collection,
         &sheet.base,
-        &staged_text(&sheet.base, staged),
-        &unborn,
+        &text,
+        &born,
     ) {
-        Ok(_) => BTreeMap::new(),
-        Err(problems) => placed(&sheet.base, problems).into_iter().collect(),
+        // A key made at random as the row is written (a phone's) is not this one.
+        Ok(_) if aterm_db::alab::registry::born_at_random(schema.collection.name) => Reading {
+            refused: BTreeMap::new(),
+            keys: BTreeMap::new(),
+        },
+        Ok(plan) => Reading {
+            refused: BTreeMap::new(),
+            keys: keys.into_iter().zip(plan.born).collect(),
+        },
+        Err(problems) => Reading {
+            refused: placed(&sheet.base, &keys, problems).into_iter().collect(),
+            keys: BTreeMap::new(),
+        },
     }
 }
 
@@ -1308,11 +1600,11 @@ pub(crate) fn refusals(
 pub(crate) fn refusals(
     _: &crate::native_tables::Sheet,
     _: &std::collections::BTreeMap<(String, String), String>,
-) -> std::collections::BTreeMap<(String, String), String> {
-    std::collections::BTreeMap::new()
+) -> Reading {
+    Reading::default()
 }
 
-/// Write each collection's staged cells, each collection in one save.
+/// Write each collection's staged cells and new rows, each collection in one save.
 ///
 /// # Errors
 /// A save could not reach the registry (no Commons writer, an incomplete history here, a busy
@@ -1322,12 +1614,13 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
     use aterm_db::att::{Handle, REGISTRY, Saved};
     let handle = Handle::at(paths.clone(), &REGISTRY);
     let mut wrote = Wrote::default();
-    for Staged { base, cells } in staged {
+    for Staged { base, cells, born } in staged {
+        let (text, keys) = text_of(&base, &cells, &born);
         // A table that cannot be saved is named and the rest are still written.
         let saved = handle
             .compiled()
             .collection(&base.collection)
-            .and_then(|collection| handle.save(collection, &base, &staged_text(&base, &cells)));
+            .and_then(|collection| handle.save(collection, &base, &text));
         let saved = match saved {
             Ok(saved) => saved,
             Err(why) => {
@@ -1338,8 +1631,15 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
             }
         };
         match saved {
-            Saved::Written { applied, .. } => {
+            Saved::Written { plan, applied } => {
                 wrote.cells += applied.cells;
+                wrote.added += applied.born.len();
+                // The plan holds a key for each new row, in the order the grid text holds them.
+                wrote.born.extend(
+                    keys.iter()
+                        .zip(&plan.born)
+                        .map(|(new, pk)| (base.collection.clone(), new.clone(), pk.clone())),
+                );
                 wrote.kept.extend(
                     applied
                         .stale
@@ -1348,7 +1648,7 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
                 );
             }
             Saved::Problems(problems) => {
-                for ((pk, column), rule) in placed(&base, problems) {
+                for ((pk, column), rule) in placed(&base, &keys, problems) {
                     wrote
                         .refused
                         .push((base.collection.clone(), pk, column, rule));
@@ -1431,3 +1731,7 @@ pub(crate) fn read(_: &Paths, _: Option<[u8; 32]>, _: bool) -> Result<(Snapshot,
 pub(crate) fn write(_: &Paths, _: Vec<Staged>) -> Result<Wrote, String> {
     Err("the registry is kept on macOS and Linux".into())
 }
+
+#[cfg(all(test, unix))]
+#[path = "tables_store_tests.rs"]
+mod tests;

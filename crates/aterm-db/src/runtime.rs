@@ -514,7 +514,11 @@ impl Network {
     fn observed(&self, transport: &mut transport::Transport) {
         if let Some(attachment) = &self.isolated {
             let rounds = transport.take_finished_rounds();
-            attachment.observe(transport.application_observations(), rounds);
+            attachment.observe(
+                transport.application_observations(),
+                rounds,
+                transport.rounds_in_flight(),
+            );
         }
     }
 }
@@ -1159,7 +1163,7 @@ impl Runtime {
                 // try at serving comes to: `[commons]` off, no membership and an unfinished
                 // succession are states a reader needs recorded, and in none of them does
                 // this thread serve. It rests while another process owns Commons.
-                let elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let elsewhere = Arc::new(crate::alab::upkeep::Elsewhere::default());
                 let _files = files.and_then(|cadence| {
                     crate::alab::upkeep::Materializer::start(
                         paths.clone(),
@@ -1171,10 +1175,7 @@ impl Runtime {
                 let mut window_claim = None;
                 let mut previous = None;
                 let mut report = |status: Status| {
-                    elsewhere.store(
-                        status == Status::Waiting,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    elsewhere.set(status == Status::Waiting);
                     if previous.as_ref() != Some(&status) {
                         observe(status.clone());
                         previous = Some(status);
@@ -1633,6 +1634,7 @@ fn serve_selected(
         transport.watching(moved::Moves::start(
             paths,
             bootstrap.journal_dir(),
+            config,
             bootstrap.trust(),
             transport.doorbell(),
         ));

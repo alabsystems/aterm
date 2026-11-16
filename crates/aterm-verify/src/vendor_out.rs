@@ -4,40 +4,47 @@
 //! `verify vendor-out --into <dir> [--check]`: byte-identical copies of the crates another
 //! repository builds from aterm's sources ([`CRATES`]), written under `<dir>/vendor/`.
 //!
-//! Each crate is read from the folder aterm's root `[workspace.dependencies]` points it at (where
-//! every member that inherits it builds it from), else `crates/<crate>`; its copy is
+//! The screen reader and agent name table are projections. alab-policy comes from the receiving
+//! repository's independent whole tagged copy at `vendor/alab-harness`, never a flattened relay.
+//! Each projected crate is read from the folder aterm's root `[workspace.dependencies]` points
+//! it at (where every member that inherits it builds it from), else `crates/<crate>`; its copy is
 //! `vendor/<crate>/`:
 //! - the files its library's build reads with debug assertions on and without `cfg(test)`, byte
 //!   for byte: each module file it compiles and each file an `include_str!` or `include_bytes!`
 //!   there embeds, as the census reader follows them ([`crate::own_tests::closure`]), so no
 //!   `*_tests.rs` file and nothing only a test reads;
 //! - a `Cargo.toml` that builds it alone: the workspace keys it inherits spelled out, the
-//!   workspace's lints inlined, each dependency a path to another copy, and the library its one
-//!   target, whose tests and doctests stay beside the files they read: in aterm, or for a vendored
+//!   workspace's lints inlined, each dependency a path to another projection or canonical
+//!   alab-policy, and the library its one target, whose tests and doctests stay beside the files
+//!   they read: in aterm, or for a vendored
 //!   crate in the repository aterm vendors it from. Its workspace is
 //!   the one cargo builds it in, the nearest `[workspace]` manifest at or above its folder:
 //!   aterm's root for a member, and for a crate aterm vendors from another repository (under a
 //!   folder the root excludes) that repository's own root, whose version and lints are its own.
 //!
-//! A crate whose build depends on a crate outside the set is refused, as is one whose manifest
-//! says something this writer does not carry over (a build script, features, a registry or git
-//! dependency) and one whose build reads a file outside its own folder.
+//! A crate whose build depends on a crate outside the set and canonical alab-policy is refused,
+//! as is one whose manifest says something this writer does not carry over (a build script,
+//! features, a registry or git dependency) and one whose build reads a file outside its own folder.
 //!
-//! `vendor/VENDORED` lists every other file under `vendor/` as `<fnv1a64> <path>` (the FNV-1a 64
+//! `vendor/VENDORED` lists the projections under `vendor/` as `<fnv1a64> <path>` (the FNV-1a 64
 //! digest of its bytes in 16 lowercase hex digits, then its path from `vendor/`), in path order,
 //! and carries an [`aterm_seal`] line of itself: the receiving repository's check finds a hand
-//! edit of a copy, or of the list, without aterm.
+//! edit of a copy, or of the list, without aterm. The canonical subtree and its adjacent pin
+//! are separately owned: the target's index and working files must hold that pin before either
+//! a check or a write, and neither a prior seal nor new output may claim their paths. Source
+//! and target pins are independent; upstream's `tools/check-pin` checks each tag's identity.
 //!
 //! Writing replaces whatever is at a path it writes, and removes a file under `vendor/` only where
 //! the sealed list there names it, as one an earlier run wrote; any other file it would not write
-//! (a stray) stops the run before anything changes. `--check` writes nothing and names each file
-//! under `vendor/` that differs from what a write would leave, is missing, is extra or is a stray.
+//! (a stray), outside the validated canonical owner, stops the run before anything changes.
+//! `--check` writes nothing and names each projection file that differs from what a write would
+//! leave, is missing, is extra or is a stray.
 //! The aterm commit a copy is made from belongs in the receiving repository's commit message,
 //! never in a file here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use aterm_seal as seal;
 use aterm_toml::{Table, Value};
@@ -45,10 +52,13 @@ use aterm_toml::{Table, Value};
 use crate::exit;
 use crate::own_tests;
 
-/// The crates vendor-out copies, for claude-code-alab to build from: the turn-end readers
-/// (alab-policy, relayed from the alab-harness tag aterm carries pinned in `vendor/alab-harness`),
-/// the screen reader and the agent name table it names agents by.
-pub const CRATES: [&str; 3] = ["alab-policy", "aterm-agent-names", "aterm-phase"];
+/// The projections vendor-out copies: the screen reader and its agent name table.
+pub const CRATES: [&str; 2] = ["aterm-agent-names", "aterm-phase"];
+
+const CANONICAL: &str = "alab-harness";
+const CANONICAL_DIR: &str = "vendor/alab-harness";
+const CANONICAL_PIN: &str = "vendor/alab-harness.pin";
+const POLICY: &str = "alab-policy";
 
 /// The folder of `--into` the copies go in.
 pub const VENDOR: &str = "vendor";
@@ -62,20 +72,27 @@ const GENERATOR: &str = "targo --unverified verify vendor-out";
 /// `verify vendor-out`'s usage.
 pub const USAGE: &str = "targo --unverified verify vendor-out --into <dir> [--check]
 
-Write byte-identical copies of alab-policy, aterm-agent-names and aterm-phase into
+Write byte-identical projections of aterm-agent-names and aterm-phase into
 <dir>/vendor/<crate>/ for another repository to build from. Each crate is read where
-aterm's workspace points it: alab-policy from vendor/alab-harness, the alab-harness
-tag aterm carries pinned by tree id (change it in alab-harness and repin), the others
-from crates/. Nothing is read until each pinned copy holds to its pin (the index holds
+aterm's workspace points it. The receiving repository must already carry its own
+whole tagged vendor/alab-harness plus vendor/alab-harness.pin, from alab-harness's
+tools/pin. alab-policy dependencies point into that copy; no flattened policy is
+written. Source and target pins may differ. Both check their index and working files;
+alab-harness's tools/check-pin separately checks each pin against its upstream tag.
+Nothing is read until each source pinned copy holds to its pin (the index holds
 the pinned tree and nothing under it is unstaged, untracked or ignored; else exit 1,
-without git exit 3). The copy holds the files each library's build reads with debug
+without git exit 3). The target pin must hold before checking or writing projections.
+The copy holds the files each library's build reads with debug
 assertions on (no test file, nothing only a test reads), a standalone Cargo.toml
 (the version, edition and lints of the workspace it builds in spelled out, path
-dependencies between the copies, no tests), and vendor/VENDORED, each file's FNV-1a
+dependencies between projections or into canonical alab-policy, no tests), and
+vendor/VENDORED, each projected file's FNV-1a
 64 digest, sealed. A crate
-that depends on one outside the set is refused. A write replaces each file at a path
+that depends on one outside these owners is refused. Neither old seals nor new
+output may claim the canonical subtree or pin. A write replaces each file at a path
 it writes, whoever made it, and removes a file it no longer writes only where the
-sealed list there names it; any other file under vendor/ (a stray) stops the write
+sealed list there names it (including obsolete flattened alab-policy files). Any
+other file outside the validated canonical owner (a stray) stops the write
 before anything changes.
 
   --check   write nothing; name each file that differs, is missing, is extra (a
@@ -181,26 +198,38 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
             return code;
         }
     };
-    let shown = into.join(VENDOR);
+    let target = match Target::checked(&into) {
+        Ok(target) => target,
+        Err((code, line)) => {
+            eprintln!("verify vendor-out: {line}");
+            return code;
+        }
+    };
+    let shown = &target.vendor;
     if check {
-        let found = match drift(&shown, &want) {
+        let found = match drift(&target, &want) {
             Ok(found) => found,
-            Err(why) => {
-                eprintln!("verify vendor-out: COULD NOT RUN — {why}");
-                return exit::COULD_NOT_RUN;
+            Err((code, why)) => {
+                let label = if code == exit::COULD_NOT_RUN {
+                    "COULD NOT RUN"
+                } else {
+                    "REFUSED"
+                };
+                eprintln!("verify vendor-out: {label} — {why}");
+                return code;
             }
         };
         for item in &found {
             println!("{} {VENDOR}/{}", item.word(), item.path());
         }
-        println!("{}", verdict(&shown, &found, want.len()));
+        println!("{}", verdict(shown, &found, want.len()));
         if found.is_empty() {
             exit::PASS
         } else {
             exit::FAILED
         }
     } else {
-        match write(&shown, &want) {
+        match write(&target, &want) {
             Ok(changed) => {
                 println!(
                     "verify vendor-out: {} holds {} files ({} written, {} removed)",
@@ -211,9 +240,14 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
                 );
                 exit::PASS
             }
-            Err(why) => {
-                eprintln!("verify vendor-out: REFUSED — {why}");
-                exit::FAILED
+            Err((code, why)) => {
+                let label = if code == exit::COULD_NOT_RUN {
+                    "COULD NOT RUN"
+                } else {
+                    "REFUSED"
+                };
+                eprintln!("verify vendor-out: {label} — {why}");
+                code
             }
         }
     }
@@ -258,8 +292,8 @@ pub fn verdict(shown: &Path, found: &[Drift], files: usize) -> String {
 /// What vendor-out copies from the checkout at `root`: [`vendored`] of `crates`, once every copy
 /// aterm vendors pinned by tree id holds to its pin ([`aterm_forge::tree_pins`]: the index holds
 /// the pinned tree and the working copy changes nothing under it). vendor-out reads the working
-/// files and runs before verify's own pin check, so without this a hand edit of
-/// `vendor/alab-harness` would be relayed to the receiving repository as the pinned tag.
+/// files and runs before verify's own pin check, so it applies the same source dependency
+/// validation before projecting crates that compile against those dependencies.
 ///
 /// # Errors
 /// The exit code and line [`run`] stops with: a pin that does not hold (refused, `[OB-1]`), git
@@ -294,6 +328,13 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// # Errors
 /// A crate this writer refuses (the module's rules), or a file that does not read.
 pub fn vendored(root: &Path, crates: &[&str]) -> Result<Copy, String> {
+    if crates.contains(&POLICY) {
+        return Err(
+            "alab-policy is owned by the receiving repository's canonical \
+                    vendor/alab-harness pin, never a flattened projection"
+                .to_string(),
+        );
+    }
     let top = toml_table(root, "Cargo.toml")?;
     let mut copy = Copy::new();
     for &name in crates {
@@ -714,10 +755,10 @@ fn standalone(
 
 /// The copy's spelling of the dependency `dep` of `name` (`spec`, under its own workspace's
 /// `shared` `[workspace]` where it says `workspace = true`): a path to the copy of a crate in
-/// `set`.
+/// `set`, or canonical alab-policy in the receiving repository's independent pin.
 ///
 /// # Errors
-/// It is no crate of `set`, or no path dependency: a copy depends only on copies beside it.
+/// It is neither a crate of `set` nor canonical alab-policy, or no path dependency.
 fn dependency(
     name: &str,
     dep: &str,
@@ -727,8 +768,8 @@ fn dependency(
 ) -> Result<String, String> {
     let outside = |package: &str| {
         Err(format!(
-            "{name} depends on {package}, which is not one of the crates vendored with it ({}): \
-             a copy builds only from the copies beside it",
+            "{name} depends on {package}, which is neither a projected crate ({}) nor canonical \
+             alab-policy: a projection builds only from these owners",
             set.join(", ")
         ))
     };
@@ -772,10 +813,17 @@ fn dependency(
         Some(Value::String(package)) => package.as_str(),
         Some(_) => return Err(format!("{name}'s dependency {dep} names no package")),
     };
-    if merged.get("path").is_none() || !set.contains(&package) {
+    if merged.get("path").and_then(Value::as_str).is_none()
+        || !(set.contains(&package) || package == POLICY)
+    {
         return outside(package);
     }
-    let mut out = format!("{{ path = {}", quoted(&format!("../{package}")));
+    let path = if package == POLICY {
+        format!("../{CANONICAL}/crates/{POLICY}")
+    } else {
+        format!("../{package}")
+    };
+    let mut out = format!("{{ path = {}", quoted(&path));
     if package != dep {
         let _ = write!(out, ", package = {}", quoted(package));
     }
@@ -863,8 +911,8 @@ fn key(name: &str) -> String {
 fn manifest_text(copy: &Copy) -> Result<String, String> {
     let mut text = seal::line("#", GENERATOR);
     text.push_str(
-        "\n# One line per file under this folder: the FNV-1a 64 digest of its bytes, then its \
-         path from here.\n",
+        "\n# One line per projected file: its FNV-1a 64 digest, then its path from here.\n\
+         # alab-harness/ and alab-harness.pin are separately owned by their canonical tree pin.\n",
     );
     for (path, bytes) in copy {
         if path.contains(['\n', '\r']) {
@@ -873,6 +921,52 @@ fn manifest_text(copy: &Copy) -> Result<String, String> {
         let _ = writeln!(text, "{:016x} {path}", aterm_hash::fnv1a_64(bytes));
     }
     seal::stamp(&text)
+}
+
+/// A destination whose independently owned canonical copy has been checked. Only this checked
+/// target reaches the projection reader/writer; neither operation touches the canonical owner.
+struct Target {
+    vendor: PathBuf,
+}
+
+impl Target {
+    fn checked(root: &Path) -> Result<Self, (i32, String)> {
+        match aterm_forge::tree_pin(root, CANONICAL_DIR, CANONICAL_PIN) {
+            Ok(_) => Ok(Self {
+                vendor: root.join(VENDOR),
+            }),
+            Err(aterm_forge::TreePinError::Fail(why)) => Err((
+                exit::FAILED,
+                format!("REFUSED — target [OB-1] {why}; nothing was copied"),
+            )),
+            Err(aterm_forge::TreePinError::CouldNotRun(why)) => Err((
+                exit::COULD_NOT_RUN,
+                format!("COULD NOT RUN — target [OB-1] {why}"),
+            )),
+        }
+    }
+}
+
+/// Whether a vendor-relative path names either canonical-owned artifact, after resolving dots.
+fn protected(path: &str) -> bool {
+    inside(path).is_some_and(|path| {
+        path == CANONICAL || path.starts_with("alab-harness/") || path == "alab-harness.pin"
+    })
+}
+
+fn disjoint<'a>(paths: impl IntoIterator<Item = &'a String>) -> Result<(), (i32, String)> {
+    for path in paths {
+        if protected(path) {
+            return Err((
+                exit::FAILED,
+                format!(
+                    "projection ownership overlaps canonical vendor/{path}: neither output nor \
+                     a sealed {MANIFEST} may claim the canonical subtree or pin"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The paths a sealed [`MANIFEST`] in `vendor` lists (itself among them): the files an earlier
@@ -896,7 +990,8 @@ fn written_before(vendor: &Path) -> BTreeSet<String> {
 ///
 /// # Errors
 /// A folder that does not list.
-fn entries(vendor: &Path) -> Result<BTreeMap<String, bool>, String> {
+fn entries(target: &Target) -> Result<BTreeMap<String, bool>, String> {
+    let vendor = &target.vendor;
     let mut found = BTreeMap::new();
     if std::fs::symlink_metadata(vendor).is_err() {
         return Ok(found);
@@ -909,6 +1004,9 @@ fn entries(vendor: &Path) -> Result<BTreeMap<String, bool>, String> {
             let entry = entry.map_err(|e| format!("{}: {e}", folder.display()))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = format!("{prefix}{name}");
+            if protected(&path) {
+                continue;
+            }
             let kind = entry
                 .file_type()
                 .map_err(|e| format!("{}: {e}", entry.path().display()))?;
@@ -922,14 +1020,17 @@ fn entries(vendor: &Path) -> Result<BTreeMap<String, bool>, String> {
     Ok(found)
 }
 
-/// Each file under `vendor` that differs from `want`, is missing from it, is extra (the sealed
-/// [`MANIFEST`] there names it) or is a stray (none names it), in path order.
+/// Each projection file under the checked `target` that differs from `want`, is missing from it,
+/// is extra (the sealed [`MANIFEST`] there names it) or is a stray (none names it), in path order.
 ///
 /// # Errors
-/// A folder or file under `vendor` that does not read.
-pub fn drift(vendor: &Path, want: &Copy) -> Result<Vec<Drift>, String> {
-    let have = entries(vendor)?;
+/// Overlapping canonical ownership, or a folder or file that does not read.
+fn drift(target: &Target, want: &Copy) -> Result<Vec<Drift>, (i32, String)> {
+    let vendor = &target.vendor;
     let ours = written_before(vendor);
+    disjoint(want.keys())?;
+    disjoint(&ours)?;
+    let have = entries(target).map_err(|why| (exit::COULD_NOT_RUN, why))?;
     let mut found = Vec::new();
     for (path, bytes) in want {
         match have.get(path) {
@@ -937,7 +1038,7 @@ pub fn drift(vendor: &Path, want: &Copy) -> Result<Vec<Drift>, String> {
             Some(false) => found.push(Drift::Differs(path.clone())),
             Some(true) => {
                 let now = crate::read_regular(vendor.join(path))
-                    .map_err(|e| format!("{VENDOR}/{path}: {e}"))?;
+                    .map_err(|e| (exit::COULD_NOT_RUN, format!("{VENDOR}/{path}: {e}")))?;
                 if now != *bytes {
                     found.push(Drift::Differs(path.clone()));
                 }
@@ -968,16 +1069,17 @@ pub struct Written {
     pub removed: usize,
 }
 
-/// Make `vendor` hold exactly `want`: remove the files an earlier run wrote that `want` does not
-/// hold ([`Drift::Extra`]), then write each file that is missing or differs, replacing whatever
-/// is at that path.
+/// Make the checked target's projections hold exactly `want`: remove the files an earlier run
+/// wrote that `want` does not hold ([`Drift::Extra`]), then write each file that is missing or
+/// differs, replacing whatever is at that path. Canonical artifacts are never changed.
 ///
 /// # Errors
 /// A [`Drift::Stray`], a file under `vendor` that `want` does not hold and the sealed list there
 /// does not name, with nothing changed; or a write or removal that failed, which leaves the copy
 /// part written.
-pub fn write(vendor: &Path, want: &Copy) -> Result<Written, String> {
-    let found = drift(vendor, want)?;
+fn write(target: &Target, want: &Copy) -> Result<Written, (i32, String)> {
+    let vendor = &target.vendor;
+    let found = drift(target, want)?;
     let strangers: Vec<&str> = found
         .iter()
         .filter_map(|item| match item {
@@ -986,11 +1088,14 @@ pub fn write(vendor: &Path, want: &Copy) -> Result<Written, String> {
         })
         .collect();
     if !strangers.is_empty() {
-        return Err(format!(
-            "{} holds {} that no earlier run wrote (the sealed {MANIFEST} there names none of \
+        return Err((
+            exit::FAILED,
+            format!(
+                "{} holds {} that no earlier run wrote (the sealed {MANIFEST} there names none of \
              them); move them out of {VENDOR}/ or remove them, then rerun. Nothing was written",
-            vendor.display(),
-            strangers.join(", ")
+                vendor.display(),
+                strangers.join(", ")
+            ),
         ));
     }
     let mut changed = Written {
@@ -1000,7 +1105,8 @@ pub fn write(vendor: &Path, want: &Copy) -> Result<Written, String> {
     for item in &found {
         if let Drift::Extra(path) = item {
             let at = vendor.join(path);
-            std::fs::remove_file(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+            std::fs::remove_file(&at)
+                .map_err(|e| (exit::FAILED, format!("{}: {e}", at.display())))?;
             changed.removed += 1;
             let mut folder = at.parent();
             while let Some(dir) = folder.filter(|dir| *dir != vendor) {
@@ -1017,13 +1123,15 @@ pub fn write(vendor: &Path, want: &Copy) -> Result<Written, String> {
         };
         let at = vendor.join(path);
         if let Some(dir) = at.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| (exit::FAILED, format!("{}: {e}", dir.display())))?;
         }
         if matches!(std::fs::symlink_metadata(&at), Ok(meta) if !meta.is_file()) {
-            std::fs::remove_file(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+            std::fs::remove_file(&at)
+                .map_err(|e| (exit::FAILED, format!("{}: {e}", at.display())))?;
         }
         aterm_uds::atomic_file::write_flushed(&at, &want[path], 0o644, None)
-            .map_err(|e| format!("{}: {e}", at.display()))?;
+            .map_err(|e| (exit::FAILED, format!("{}: {e}", at.display())))?;
         changed.written += 1;
     }
     Ok(changed)

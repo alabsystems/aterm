@@ -26,7 +26,7 @@ const SURVEY_ENTRY_AFTER: Duration = Horizon::SUPERVISOR_RESTARTS.duration();
 thread_local! {
     /// How often the digest announced a change (the menu-bar item and Settings follow): a test
     /// seam, since a headless App has neither.
-    static DIGEST_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static DIGEST_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Deferred exception entry waiting until its ripening horizon (`due`) to be raised.
@@ -44,9 +44,12 @@ const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 /// Settle window (`10m`) before the resume family hands its full state to the digest.
 pub(crate) const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 
-/// `host_noted` keys recording low-disk digest entries ([`HostNote::DiskLow`], [`HostNote::DiskLowCleanupOff`]).
+/// `host_noted` keys recording a low-disk episode's record ([`HostNote::DiskLow`]) and its
+/// cleanup-off form's ([`HostNote::DiskLowCleanupOff`]).
 const DISK_NOTED: &str = "disk";
 const DISK_CLEANUP_OFF_NOTED: &str = "disk:cleanup-off";
+/// `host_noted` key recording a disk-full episode's record ([`HostNote::DiskFull`]).
+const DISK_FULL_NOTED: &str = "disk-full";
 
 /// The `host_noted` marks of the usage tap's line ([`HostNote::UsageTap`]): one per tab whose tap
 /// stands silent, and the day it was last raised.
@@ -355,11 +358,8 @@ impl App {
         use crate::message_reporters::{
             occupancy_hold_entry, occupancy_hold_key, occupancy_ready_idle_entry,
         };
-        let registered = self
-            .store
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_sid(&aterm_session::SessionId::new(sid))
+        let registered = aterm_session::SessionId::parse(sid)
+            .and_then(|sid| self.local_session_of(&sid))
             .is_some();
         if !registered {
             // The host's note can already be queued when its tab is retired.
@@ -455,7 +455,7 @@ impl App {
             .chain(
                 told.unread
                     .iter()
-                    .map(aterm_vitals::services::Member::episode),
+                    .map(aterm_process_facts::services::Member::episode),
             )
             .map(|episode| message_reporters::service_memory_alert_key(&episode))
             .collect();
@@ -638,12 +638,8 @@ impl App {
     pub(crate) fn note_harness_host(&mut self, note: HostNote) {
         match note {
             HostNote::RestoredOver { sid } => {
-                let local = self
-                    .store
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .by_sid(&aterm_session::SessionId::new(&sid))
-                    .map(|handle| handle.local_id);
+                let local = aterm_session::SessionId::parse(&sid)
+                    .and_then(|sid| self.local_session_of(&sid));
                 if let Some(local) = local {
                     self.restored_agent_over(local);
                 }
@@ -707,37 +703,30 @@ impl App {
                 free_gib,
                 floor_gib,
                 hogs,
-                asked,
             } => {
+                // A record of the episode, not a line asking anyone to act: the watch's own
+                // passes go on by themselves.
                 if self.host_noted.insert(DISK_NOTED.to_string()) {
                     self.record_message(message_reporters::disk_low_record(
                         free_gib, floor_gib, &hogs,
                     ));
                 }
                 self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
-                self.except(&message_reporters::disk_low_entry(
-                    free_gib,
-                    floor_gib,
-                    &hogs,
-                    asked.as_deref(),
-                ));
+                self.except_end(message_reporters::RETIRED_DISK_LOW_KEY);
             }
             HostNote::DiskLowCleanupOff {
                 free_gib,
                 floor_gib,
-                asked,
             } => {
                 if self.host_noted.insert(DISK_CLEANUP_OFF_NOTED.to_string()) {
                     self.record_message(message_reporters::disk_low_cleanup_off_record(
                         free_gib, floor_gib,
                     ));
                 }
-                self.except_end(message_reporters::DISK_LOW_KEY);
-                let entry = message_reporters::disk_low_cleanup_off_entry(free_gib, floor_gib);
-                self.except(&match asked {
-                    Some(asked) => entry.more(asked),
-                    None => entry,
-                });
+                self.except_end(message_reporters::RETIRED_DISK_LOW_KEY);
+                // A record, not a line: the settings line already asks for the fix
+                // (`disk_settings_entry`); one an earlier build raised beside it ends.
+                self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
             }
             HostNote::DiskPlenty => {
                 // Both, whichever this process held: `|` is not `||`.
@@ -746,109 +735,41 @@ impl App {
                 {
                     aterm_log::info!("harness disk watch: space is back above the floor");
                 }
-                self.except_clear(message_reporters::DISK_LOW_KEY);
                 self.except_clear(message_reporters::DISK_LOW_CLEANUP_OFF_KEY);
+                self.except_clear(message_reporters::RETIRED_DISK_LOW_KEY);
+                self.except_clear(message_reporters::RETIRED_DISK_FREED_KEY);
             }
             HostNote::DiskSettingsOff { notes } => {
                 self.except(&message_reporters::disk_settings_entry(&notes));
             }
             HostNote::DiskFreed { bytes, went } => {
-                self.except(&message_reporters::disk_freed_entry(bytes, &went));
+                self.record_message(message_reporters::disk_freed_record(bytes, &went));
+                self.except_clear(message_reporters::RETIRED_DISK_FREED_KEY);
             }
             HostNote::DiskFull {
                 free,
                 freed,
                 hogs,
                 cause,
-                thresholds,
-                asked,
             } => {
-                let full = message_reporters::disk_full(free, freed, &hogs, cause, &thresholds);
-                self.post_message(match asked {
-                    Some(asked) => full.line(asked),
-                    None => full,
-                });
+                // One record an episode, not an alert: nothing on the glass asks anyone to act,
+                // and the watch's own passes go on.
+                if self.host_noted.insert(DISK_FULL_NOTED.to_string()) {
+                    self.record_message(message_reporters::disk_full_record(
+                        free, freed, &hogs, cause,
+                    ));
+                }
             }
             HostNote::DiskFullOver => {
+                if self.host_noted.remove(DISK_FULL_NOTED) {
+                    aterm_log::info!("harness disk watch: the disk is out of its emergency");
+                }
+                // A standing disk-full alert a build before this one posted ends with it.
                 self.messages.resolve_key_prefix(
                     message_reporters::DISK_FULL_KEY,
                     aterm_messages::Outcome::Ok,
                     Instant::now(),
                 );
-                aterm_log::info!("harness disk watch: the disk is out of its emergency");
-            }
-            HostNote::DiskFilling {
-                needed,
-                projected_only,
-                free,
-                floor,
-                rate_bps,
-                eta_s,
-                said,
-            } => {
-                if needed {
-                    self.post_message(message_reporters::disk_filling(
-                        free,
-                        floor,
-                        rate_bps,
-                        eta_s,
-                        said.as_deref(),
-                    ));
-                } else {
-                    // An agent can act again: the alert goes, unresolved, as nothing came of it.
-                    self.messages
-                        .withdraw_key_prefix(message_reporters::DISK_FILLING_KEY, Instant::now());
-                }
-                if projected_only {
-                    self.except(&message_reporters::disk_filling_entry(
-                        free,
-                        floor,
-                        rate_bps,
-                        eta_s,
-                        said.as_deref(),
-                    ));
-                } else {
-                    self.except_end(message_reporters::DISK_FILLING_ENTRY_KEY);
-                }
-            }
-            HostNote::DiskFillingOver => {
-                self.messages.resolve_key_prefix(
-                    message_reporters::DISK_FILLING_KEY,
-                    aterm_messages::Outcome::Ok,
-                    Instant::now(),
-                );
-                let _ = self.messages.end_standing_quiet(
-                    message_reporters::DISK_FILLING_KEY,
-                    wall_stamp_now(),
-                    Instant::now(),
-                );
-                self.except_end(message_reporters::DISK_FILLING_ENTRY_KEY);
-            }
-            HostNote::DiskWorker { task, folder } => self.start_disk_worker(task, &folder),
-            HostNote::DiskWorkerExpired { sid } => self.disk_worker_expired(&sid),
-            HostNote::DiskWorkerOver {
-                sid,
-                volume,
-                why,
-                rose,
-                target_met,
-                removed,
-                report,
-            } => {
-                let place = sid
-                    .as_deref()
-                    .map_or_else(String::new, |sid| self.upgrade_place(sid));
-                self.record_message(message_reporters::disk_worker_over_record(
-                    sid.as_deref().unwrap_or(&volume),
-                    &place,
-                    &message_reporters::DiskWorkerEnd {
-                        why: &why,
-                        rose,
-                        target_met,
-                        removed,
-                        report: &report,
-                    },
-                ));
             }
             HostNote::CreditClaim { sid, offer } => self.start_credit_claim(&sid, offer),
             HostNote::CreditClaimNotReady { why } => self.credit_claim_not_ready(&why),
@@ -896,7 +817,9 @@ impl App {
                 // why of one the held deadline judges at any verdict (a point the loop's own
                 // tries are spent at, `held_judges_exception`), so a lead's `await task` hears
                 // the stall; one the loop recovers from, or another told in its place, clears it.
-                if let Some(session) = self.local_session_of(&aterm_session::SessionId::new(&sid)) {
+                if let Some(session) = aterm_session::SessionId::parse(&sid)
+                    .and_then(|sid| self.local_session_of(&sid))
+                {
                     self.show_stopped(
                         session,
                         standing.as_ref().and_then(|e| e.held),

@@ -396,6 +396,50 @@ impl Log {
     pub(crate) fn retained_ids(&self) -> impl Iterator<Item = &Digest> {
         self.records.keys()
     }
+    /// A digest of how this replica judges each retained record now: the judgments that can
+    /// move while the records do not (a payload key this Mac comes to hold, a membership change
+    /// that makes a cutoff count), in record-id order. With the retained ids (which commit to
+    /// each authenticated record, so to everything decoded from it) it fixes what a projection
+    /// of the log reads: the shared files' projection key (`file::materialize`).
+    pub(crate) fn judgment(&self) -> [u8; 32] {
+        let mut sha = aterm_digest::Sha256::new();
+        sha.update(b"aterm/db/log/judgment/1\0");
+        sha.update((self.records.len() as u64).to_le_bytes());
+        for (id, (operation, _command)) in &self.records {
+            // Every field takes a position: a new one does not compile until it does.
+            let Operation {
+                // Fixed by the id, or derived from the record's bytes and the judgments below.
+                header: _,
+                roster: _,
+                epoch: _,
+                authored_ms: _,
+                request: _,
+                reverts: _,
+                duplicate_of: _,
+                // This replica's first retention: no projection reads it.
+                receipt: _,
+                available,
+                catalog_eligible,
+                eligible,
+                refusal,
+            } = operation;
+            sha.update(id);
+            sha.update([
+                u8::from(*available),
+                u8::from(*catalog_eligible),
+                u8::from(*eligible),
+            ]);
+            match refusal {
+                None => sha.update([0]),
+                Some(why) => {
+                    sha.update([1]);
+                    sha.update((why.len() as u64).to_le_bytes());
+                    sha.update(why.as_bytes());
+                }
+            }
+        }
+        sha.finalize()
+    }
     pub(crate) fn history_complete(&self) -> bool {
         self.revert_refusals.is_empty()
             && self.opaque_authors.is_empty()

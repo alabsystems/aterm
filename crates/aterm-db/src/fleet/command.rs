@@ -14,9 +14,10 @@
 //! A cell nobody read prints `?` (JSON `null`), never 0; a login address prints as it is.
 
 use super::fold::{FleetTables, Inputs, Source, SourceState, Sources, fold};
-use super::rows::{self, Cell, Row, Schema};
+use super::rows;
 use crate::alab::{LabRead, Registry, journal};
-use crate::typed::{Ty, grid};
+use crate::relation::{Cell, Schema, kept};
+use crate::typed::grid;
 use crate::{Error, Result};
 use aterm_json::{Value, json};
 use aterm_types::network_state::NetworkStateSnapshot;
@@ -106,71 +107,6 @@ fn parse(words: &[String]) -> Result<Args> {
         return Err(Error::new("a table prints as either --tsv or --json"));
     }
     Ok(args)
-}
-
-/// One cell as a table shows it: `?` for a cell nobody read, nothing for one known empty, and
-/// a value as the registry's grid shows a value of its type.
-pub fn shown(ty: &Ty, cell: &Cell) -> String {
-    match cell {
-        Cell::Unread => "?".to_owned(),
-        Cell::Empty => String::new(),
-        Cell::Value(value) => grid::show(ty, value),
-    }
-}
-
-/// One cell as JSON: `null` for a cell with no value, a value of its column's type as it is, and
-/// one that fails its type or the guards (another writer's build stored it) as the grid gives a
-/// raw value ([`grid::raw_shown`]), so the JSON shows nothing [`shown`] withholds.
-fn cell_json(ty: &Ty, cell: &Cell) -> Value {
-    match cell {
-        Cell::Value(value) if !crate::typed::cell::admissible(ty, value) => grid::raw_shown(value),
-        other => other.json(),
-    }
-}
-
-/// Whether a row's cell reads as `text`: its shown text, or for a list cell any item's (for a
-/// list of records, any member of any item).
-fn cell_matches(ty: &Ty, cell: &Cell, text: &str) -> bool {
-    let text = text.trim();
-    if shown(ty, cell) == text {
-        return true;
-    }
-    let (Ty::List(inner, _), Cell::Value(Value::Array(items))) = (ty, cell) else {
-        return false;
-    };
-    items.iter().any(|item| match item {
-        Value::Object(members) => members.values().any(|member| match member {
-            Value::String(word) => word == text,
-            other => other.to_string() == text,
-        }),
-        other => grid::show(inner, other) == text,
-    })
-}
-
-/// The rows of `rows` every filter keeps, as cells.
-///
-/// # Errors
-/// A filter names no column of the relation.
-fn kept<R: Row>(rows: &[R], filters: &[grid::Where]) -> Result<Vec<Vec<Cell>>> {
-    let schema = R::SCHEMA;
-    let filters: Vec<(usize, &str)> = filters
-        .iter()
-        .map(|filter| {
-            schema
-                .position(&filter.column)
-                .map(|at| (at, filter.text.as_str()))
-                .ok_or_else(|| Error::new(&format!("{}: no such column to filter by", schema.name)))
-        })
-        .collect::<Result<_>>()?;
-    Ok(rows
-        .iter()
-        .map(Row::cells)
-        .filter(|cells| {
-            filters
-                .iter()
-                .all(|(at, text)| cell_matches(&schema.columns[*at].column.ty, &cells[*at], text))
-        })
-        .collect())
 }
 
 /// One TSV line: a tab or a control character in a cell prints as a space.
@@ -270,7 +206,7 @@ pub fn print(
                     text,
                     "{}:{}",
                     Value::String(col.column.name.to_owned()),
-                    cell_json(&col.column.ty, cell)
+                    cell.json(&col.column.ty)
                 );
             }
             text.push('}');
@@ -288,7 +224,7 @@ pub fn print(
                     .columns
                     .iter()
                     .zip(cells)
-                    .map(|(col, cell)| shown(&col.column.ty, cell)),
+                    .map(|(col, cell)| cell.shown(&col.column.ty)),
             );
         }
     }

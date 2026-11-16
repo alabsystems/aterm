@@ -529,6 +529,7 @@ fn held_desk(exited: Option<u64>) -> RestoreManifest {
         text: "Carried Mono".to_string(),
     }];
     RestoreManifest::new(vec![WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,
@@ -750,6 +751,7 @@ fn a_layout_naming_a_session_in_two_windows_is_placed_whole() {
 fn sample() -> RestoreManifest {
     RestoreManifest::new(vec![
         WindowLayout {
+            dock: None,
             rows: 24,
             cols: 80,
             active_tab: 1,
@@ -775,6 +777,7 @@ fn sample() -> RestoreManifest {
             restored_tabs: Vec::new(),
         },
         WindowLayout {
+            dock: None,
             rows: 40,
             cols: 132,
             active_tab: 0,
@@ -796,6 +799,7 @@ fn sample() -> RestoreManifest {
 
 fn mixed_sample(uri: &str) -> RestoreManifest {
     RestoreManifest::new(vec![WindowLayout {
+        dock: None,
         rows: 32,
         cols: 110,
         active_tab: 0,
@@ -1230,6 +1234,7 @@ fn a_layout_past_the_caps_keeps_every_window_it_can() {
 
 fn shells_window(shells: std::ops::Range<u64>) -> WindowLayout {
     WindowLayout {
+        dock: None,
         rows: 30,
         cols: 100,
         active_tab: 0,
@@ -2019,6 +2024,7 @@ fn a_leaf_names_its_logs_epoch_and_the_layout_says_the_largest() {
 #[test]
 fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
     let window = |sid: Option<String>, lineage: Option<String>| WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

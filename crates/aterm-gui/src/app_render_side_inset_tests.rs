@@ -21,7 +21,7 @@ pub(crate) fn assert_pet_pointer_picture_agreement() {
                 app.split_active_stub_tab(WID);
             }
             feed(&app, b"\x1b[6;12H$ cat");
-            app.set_side_inset_cells(WID, inset);
+            app.set_side_inset_for_test(WID, inset);
             let frame =
                 app.window_frame_px_for(WID, app.windows[&WID].rows, app.windows[&WID].cols);
             app.windows.get_mut(&WID).unwrap().win_px = Some(frame);
@@ -69,7 +69,7 @@ fn side_inset_cpu_partial_damage_refreshes_a_leading_chrome_band() {
     feed(&app, b"\x1b[?25lchrome");
     app.redraw_window(WID);
     let bare = app.frame_px(app.windows[&WID].rows, app.windows[&WID].cols);
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     app.windows.get_mut(&WID).unwrap().win_px = Some(bare);
     let bleed = |color| {
         Some(aterm_render::ChromeBleed {
@@ -118,7 +118,7 @@ fn side_inset_cpu_partial_damage_refreshes_a_leading_chrome_band() {
     );
 }
 
-fn recorded_virtual() -> (App, std::path::PathBuf, (usize, usize)) {
+fn recorded_virtual() -> (App, aterm_tempfile::TempDir, (usize, usize)) {
     let mut app = App::headless_for_test();
     feed(&app, b"\x1b]11;#102030\x07\x1b[?25lrecorded inset");
     let font_px = app.windows[&WID].metrics.font_px;
@@ -134,7 +134,7 @@ fn recorded_virtual() -> (App, std::path::PathBuf, (usize, usize)) {
         .capture_leaf_snapshot_seqs = capture.leaves.iter().map(|l| l.snapshot_seq).collect();
     app.windows.get_mut(&WID).unwrap().capture_leaf_content_seqs =
         capture.leaves.iter().map(|l| l.content_seq).collect();
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     assert!(app.windows[&WID].win_px.is_none());
     let bare = app.frame_px(
         app.windows[&WID].rows + app.chrome_rows(WID),
@@ -162,12 +162,12 @@ fn recorded_virtual() -> (App, std::path::PathBuf, (usize, usize)) {
         )
         .unwrap();
     app.windows.get_mut(&WID).unwrap().present = Some(PresentTarget::Virtual { window_gpu });
-    let root = std::env::temp_dir().join(".ubd").join(format!(
-        "dk1-recorded-{}-{}.noindex",
-        std::process::id(),
-        crate::metrics::now_us()
-    ));
-    crate::control_auth::ensure_private_dir(&root).unwrap();
+    let root = aterm_tempfile::Builder::new()
+        .prefix("dk1-recorded-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    crate::control_auth::ensure_private_dir(root.path()).unwrap();
     let (reply, _) = std::sync::mpsc::channel();
     app.video_rec = Some(crate::VideoRec {
         window: WID,
@@ -182,7 +182,7 @@ fn recorded_virtual() -> (App, std::path::PathBuf, (usize, usize)) {
         mode: crate::VideoMode::OffscreenPresentReal,
         next_frame: None,
         presented: None,
-        dir: crate::control_auth::confine_video_dir(&root).unwrap(),
+        dir: crate::control_auth::confine_video_dir(root.path()).unwrap(),
         handoff: None,
         cancel: crate::VideoCancellation::new(),
         reply,
@@ -259,7 +259,15 @@ fn side_inset_recorded_virtual_images_cut_the_frame_in_both_capture_routes() {
         );
     }
     app.video_rec.take();
-    std::fs::remove_dir_all(root).unwrap();
+    drop(app);
+    // On Windows this process keeps handles under `root` open without delete sharing until it
+    // exits: the instance lease (`control_auth::hold_current_instance_lease`) and, that let go,
+    // still one on the instance's own folder, `video\p<pid>-…` (ATERM-KI-1115-58210), so the
+    // folder cannot go before then and is left in `%TEMP%\.ubd`; elsewhere it goes now.
+    let removed = std::fs::remove_dir_all(root.keep());
+    if cfg!(not(windows)) {
+        removed.unwrap();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -296,7 +304,8 @@ fn side_inset_virtual_overlay_uses_the_window_inset_and_the_headless_surface() {
         .unwrap();
     assert_eq!((destination.w, destination.h), expected);
     app.video_rec.take();
-    std::fs::remove_dir_all(root).unwrap();
+    drop(app);
+    std::fs::remove_dir_all(root.keep()).unwrap();
 }
 
 fn virtual_surface(app: &mut App) -> aterm_gpu::video_tap::CapturedFrame {

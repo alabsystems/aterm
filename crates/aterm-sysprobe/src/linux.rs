@@ -361,6 +361,93 @@ pub fn os_pretty_name(os_release: &str) -> Option<String> {
     })
 }
 
+/// The most characters of a chip's name ([`chip_name`]): the registry's `chip` column.
+pub const CHIP_NAME_MAX: usize = 32;
+
+/// The chip `/proc/cpuinfo` names: its first `model name` (x86), less the trademark marks, the
+/// clock its vendor writes after an `@`, the graphics an APU's name adds after ` w/ ` or
+/// ` with `, and a closing `Processor` or `CPU` (`AMD Ryzen 9 7950X 16-Core Processor` reads `AMD
+/// Ryzen 9 7950X 16-Core`, `AMD Ryzen 7 7840U w/ Radeon 780M Graphics` reads `AMD Ryzen 7
+/// 7840U`). What is still longer than the registry's column ([`CHIP_NAME_MAX`]) loses its
+/// leading words, the vendor and family the model number at its end implies (`AMD Ryzen
+/// Threadripper PRO 5995WX 64-Cores` reads `Threadripper PRO 5995WX 64-Cores`). An ARM board's
+/// `Model` line names the board and a 32-bit ARM kernel's `model name` (`ARMv7 Processor rev 3
+/// (v7l)`) the architecture, not the chip, so each is none.
+#[must_use]
+pub fn chip_name(cpuinfo: &str) -> Option<String> {
+    let named = cpuinfo.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "model name").then_some(value)
+    })?;
+    if named.trim_start().starts_with("ARMv") {
+        return None;
+    }
+    let named = named.split('@').next().unwrap_or_default();
+    let named = [" w/ ", " with "]
+        .iter()
+        .fold(named, |n, graphics| n.split(graphics).next().unwrap_or(n));
+    let mut words: Vec<&str> = named
+        .split_whitespace()
+        .map(|word| {
+            ["(R)", "(r)", "(TM)", "(tm)"]
+                .iter()
+                .fold(word, |w, mark| w.strip_suffix(mark).unwrap_or(w))
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    while words
+        .last()
+        .is_some_and(|last| matches!(*last, "Processor" | "CPU"))
+    {
+        words.pop();
+    }
+    let mut chip = words.join(" ");
+    while chip.len() > CHIP_NAME_MAX {
+        let (_, rest) = chip.split_once(' ')?;
+        chip = rest.to_owned();
+    }
+    (!chip.is_empty()).then_some(chip)
+}
+
+/// `/etc/machine-id`'s identity, lower-cased: 32 hex digits on its first line. None for the
+/// empty file or `uninitialized` an image ships before its first boot, and for an all-zero id.
+#[must_use]
+pub fn machine_id(text: &str) -> Option<String> {
+    let id = text.lines().next()?.trim();
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && id.bytes().any(|b| b != b'0'))
+        .then(|| id.to_ascii_lowercase())
+}
+
+/// `/etc/hostname`'s static host name, the one its owner set (`hostname(5)`: the first line
+/// that is neither empty nor a `#` comment), as its first label: `hostnamectl set-hostname
+/// m31.lab.example.com` names the machine `m31`, the single label a Mac's local host name is.
+/// None for `localhost`, the name nobody gave, which would name every unset machine alike.
+#[must_use]
+pub fn static_hostname(text: &str) -> Option<String> {
+    let name = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+    let label = name.split('.').next().unwrap_or_default();
+    (!label.is_empty() && !label.eq_ignore_ascii_case("localhost")).then(|| label.to_owned())
+}
+
+/// `/etc/machine-info`'s `PRETTY_HOSTNAME`, unquoted: the free-form name an owner gives a Linux
+/// machine, as a Mac's computer name.
+#[must_use]
+pub fn pretty_hostname(machine_info: &str) -> Option<String> {
+    machine_info.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("PRETTY_HOSTNAME=")?.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value)
+            .trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
 /// The most bytes of `/proc/net/dev` one [`links_under_into`] takes: room for about 500 interfaces.
 pub const NET_DEV_CAP: usize = 64 * 1024;
 
@@ -1491,6 +1578,110 @@ impl Root {
             cpu: self.read("proc/cpuinfo", cpu_model).flatten(),
             os: self.read("etc/os-release", os_pretty_name).flatten(),
         }
+    }
+
+    /// The machine's model as its firmware names it: the DMI table's `product_name`, else the
+    /// device tree's `model` (an ARM board without SMBIOS), each as written, a code included, as
+    /// a Mac's `hw.model` is one. A placeholder ([`crate::machine_type::is_placeholder`]:
+    /// `To Be Filled By O.E.M.`, `System Product Name`) names no model, so it falls to the next.
+    #[must_use]
+    pub fn product_model(&self) -> Option<String> {
+        let named = |text: Option<String>| {
+            let text = text?;
+            let first = text.split('\0').next().unwrap_or_default().trim();
+            (!crate::machine_type::is_placeholder(first)).then(|| first.to_owned())
+        };
+        named(self.text("sys/class/dmi/id/product_name"))
+            .or_else(|| named(self.text("proc/device-tree/model")))
+    }
+
+    /// The chip `/proc/cpuinfo` names ([`chip_name`]).
+    #[must_use]
+    pub fn chip(&self) -> Option<String> {
+        self.read("proc/cpuinfo", chip_name).flatten()
+    }
+
+    /// The physical cores of the performance levels and of the efficiency level of
+    /// [`Self::cpu_layout`]: a machine of one level states all of them as performance cores and
+    /// no efficiency level. A core is counted once however many threads it runs: the logical
+    /// cores its `topology/core_cpus_list` (else `thread_siblings_list`) names are one. Only the
+    /// online cores are counted: the kernel takes an offline core's `topology` away, so with SMT
+    /// off (`nosmt`, `smt/control`) each sibling thread would count as a core of its own.
+    #[must_use]
+    pub fn core_counts(&self) -> (Option<u64>, Option<u64>) {
+        let online = self.online();
+        let physical = |logical: &[u16]| {
+            let cores: std::collections::BTreeSet<u16> = logical
+                .iter()
+                .filter(|id| online.as_ref().is_none_or(|online| online.contains(id)))
+                .map(|&id| {
+                    ["core_cpus_list", "thread_siblings_list"]
+                        .iter()
+                        .find_map(|file| {
+                            self.read(
+                                &format!("sys/devices/system/cpu/cpu{id}/topology/{file}"),
+                                cpulist,
+                            )
+                            .flatten()
+                        })
+                        .and_then(|siblings| siblings.into_iter().min())
+                        .unwrap_or(id)
+                })
+                .collect();
+            cores.len() as u64
+        };
+        let layout = self.cpu_layout();
+        if layout.clusters.len() < 2 {
+            let all: Vec<u16> = layout
+                .clusters
+                .iter()
+                .flat_map(|cluster| cluster.logical.iter().copied())
+                .collect();
+            return ((!all.is_empty()).then(|| physical(&all)), None);
+        }
+        let (mut performance, mut efficiency) = (0, 0);
+        for cluster in &layout.clusters {
+            if cluster.name.eq_ignore_ascii_case("efficiency") {
+                efficiency += physical(&cluster.logical);
+            } else {
+                performance += physical(&cluster.logical);
+            }
+        }
+        (Some(performance), Some(efficiency))
+    }
+
+    /// `/proc/meminfo`'s `MemTotal`, KiB ([`mem_total_kib`]).
+    #[must_use]
+    pub fn mem_total_kib(&self) -> Option<u64> {
+        self.read("proc/meminfo", mem_total_kib).flatten()
+    }
+
+    /// The size in bytes of the volume the root directory itself is on: `/`'s on the machine.
+    #[must_use]
+    pub fn volume_bytes(&self) -> Option<u64> {
+        crate::volume(&self.base).map(|volume| volume.total)
+    }
+
+    /// The names the machine's owner gave it: `/etc/machine-info`'s pretty host name
+    /// ([`pretty_hostname`]) and `/etc/hostname`'s static one ([`static_hostname`]), as a Mac's
+    /// computer and local host names. The kernel's running host name is not one, since DHCP can
+    /// supply it.
+    #[must_use]
+    pub fn owner_host_names(&self) -> Vec<String> {
+        [
+            self.read("etc/machine-info", pretty_hostname).flatten(),
+            self.read("etc/hostname", static_hostname).flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// `/etc/machine-id` ([`machine_id`]): the machine's identity, which a reinstall changes. It
+    /// is identity, never stated: a caller keeps it in its process, as a Mac's IOPlatformUUID.
+    #[must_use]
+    pub fn machine_id(&self) -> Option<String> {
+        self.read("etc/machine-id", machine_id).flatten()
     }
 
     /// The present cores (`/sys/devices/system/cpu/present`).

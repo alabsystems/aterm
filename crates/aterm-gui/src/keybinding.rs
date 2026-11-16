@@ -220,6 +220,7 @@ pub(crate) const MENU_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+shift+g", "Find Previous"),
     ("cmd+ctrl+f", "Enter Full Screen"),
     ("cmd+ctrl+o", "Overview…"),
+    ("cmd+alt+o", "Show Navigator"),
     ("cmd+shift+j", "Next That Needs You"),
     ("cmd+shift+p", "Command Palette…"),
     ("cmd+shift+r", "Rewind Pane"),

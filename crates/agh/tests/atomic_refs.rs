@@ -4,6 +4,8 @@
 
 //! Atomic ref updates across the real client, journal and loopback service.
 
+use std::time::Duration;
+
 use agh::github::refs::{AtomicRefBatch, RefUpdate};
 use agh::journal::IntentStore as _;
 use agh::policy::{RouteRequest, RouteTarget};
@@ -239,7 +241,11 @@ fn graphql_errors_override_even_the_matching_acknowledgement_and_never_leak_thei
 }
 
 #[test]
-fn an_unacknowledged_mutation_is_unknown_never_retried_and_blocks_other_batches() {
+/// An unanswered batch is never retried, and its intent stops every atomic batch, its own
+/// resend included, for agh's window: the time it is given to land late. Then the next batch
+/// begins and closes it (`Journal::closable`): each batch is a compare-and-swap on its refs'
+/// exact old ids.
+fn an_unacknowledged_mutation_is_unknown_never_retried_and_stops_batches_for_its_window() {
     for (label, fault) in [
         ("lost", Fault::LandThenClose),
         (
@@ -283,14 +289,43 @@ fn an_unacknowledged_mutation_is_unknown_never_retried_and_blocks_other_batches(
         };
         assert_eq!(error.side_effect, SideEffect::Unknown, "{label}");
         assert_eq!(w.posts(), 1, "{label}");
+        let error = w
+            .run(&batch())
+            .expect_err("the open intent stops a resend of its own batch");
+        // A batch that landed meets its own compare-and-swap first: the guard reads find
+        // every ref moved, before the journal is asked.
+        let stopped = if label == "lost" {
+            Kind::Conflict
+        } else {
+            Kind::OutcomeUnknown
+        };
+        assert_eq!(error.kind, stopped, "{label}");
+        assert_eq!(w.posts(), 1, "{label}");
+        assert_eq!(w.journal.open().expect("journal").len(), 1, "{label}");
         let other =
             AtomicRefBatch::new(vec![update("refs/attest/another", ZERO, NEXT)]).expect("batch");
         let error = w
             .run(&other)
-            .expect_err("the open intent blocks another batch");
+            .expect_err("inside its window the open intent stops another batch");
         assert_eq!(error.kind, Kind::OutcomeUnknown, "{label}");
         assert_eq!(w.posts(), 1, "{label}");
-        assert_eq!(w.journal.open().expect("journal").len(), 1);
+        w.gh.fx()
+            .sleep(agh::git::GRANT_MAX)
+            .expect("the simulated clock");
+        let error = w
+            .run(&other)
+            .expect_err("the whole-second retirement fence never shortens the window");
+        assert_eq!(error.kind, Kind::OutcomeUnknown, "{label}");
+        assert_eq!(w.posts(), 1, "{label}");
+        w.gh.fx()
+            .sleep(Duration::from_secs(1))
+            .expect("the simulated clock");
+        assert!(
+            matches!(w.run(&other).expect("outcome"), Outcome::Done(_)),
+            "past its window another batch begins: {label}"
+        );
+        assert_eq!(w.posts(), 2, "{label}");
+        assert!(w.journal.open().expect("journal").is_empty(), "{label}");
     }
 }
 

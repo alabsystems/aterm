@@ -20,8 +20,9 @@
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use aterm_process_facts::services::Reading;
 use aterm_vitals::services::{
-    HOLD_MS, Judge, Reading, Seen, Size, Told, followed_from, restart_of,
+    HOLD_MS, Judge, SWAP_SPAN_MS, Seen, Size, Told, followed_from, restart_of,
 };
 
 use crate::harness_host::{DISK_TICK, HostNote};
@@ -41,6 +42,11 @@ pub(crate) const SERVICES_CALM: Duration = Duration::from_mins(5);
 // A calm rest delays a service's first reading past its bar by at most the rest, and the judge
 // dates its hold from that reading: the delay stays within half the hold.
 const _: () = assert!(2 * SERVICES_CALM.as_secs() * 1000 <= HOLD_MS);
+
+// The judge measures swap over at least SWAP_SPAN_MS whatever rings the watch early, and a
+// followed service is read once a DISK_TICK, which is that span: a reading at the watch's own pace
+// ends one span, and only a reading a ring brought sooner carries the last span's verdict.
+const _: () = assert!(DISK_TICK.as_millis() == SWAP_SPAN_MS as u128);
 
 /// What the watch knows: the judge, what the window last heard, and the account.
 #[derive(Debug, Default)]
@@ -119,7 +125,7 @@ fn signature(told: &Told) -> Vec<String> {
         .chain(
             told.unread
                 .iter()
-                .map(aterm_vitals::services::Member::episode)
+                .map(aterm_process_facts::services::Member::episode)
                 .filter(|e| followed.contains(e))
                 .map(|e| format!("{e}:unread")),
         )
@@ -216,12 +222,16 @@ pub(crate) fn filed() -> Vec<String> {
 /// a service (one read at or past [`followed_from`], told or not, or unread since it was), while
 /// memory is pressed, and before a first reading; [`SERVICES_CALM`] otherwise.
 ///
-/// A move of the kernel's pressure level rings the rest short ([`BELL`]); swap traffic does not.
-/// The judge's swap rate spans the gap between two readings, so a burst within a calm rest is
-/// spread over [`SERVICES_CALM`] and can read under its bar where a minute's gap would read it
+/// A move of the kernel's pressure level, a wake or a step of the wall clock rings the rest short
+/// ([`BELL`]); swap traffic does not. Whatever ends the rest, the judge measures swap over a span
+/// of at least [`SWAP_SPAN_MS`], which is [`DISK_TICK`]: a reading sooner than that after the
+/// span's start tells the last span's verdict ([`Judge::absorb`]), so a few megabytes paged in
+/// the seconds after a wake count over that span, not over those seconds. A calm rest spreads a
+/// burst over [`SERVICES_CALM`], where it can read under its bar that a minute's span would read
 /// pressed. That changes no alert: the window reads `pressed` only for a service told past the
 /// huge bar (`App::service_memory`), and a told service was followed for the judge's hold at a
-/// [`DISK_TICK`] a reading, so each reading it is told on measures its swap over that minute.
+/// [`DISK_TICK`] a reading, so each span its readings measure runs from a minute to about two,
+/// however soon a ring brings a reading.
 pub(crate) fn next_read(board: &Board) -> Duration {
     match board.judge.told() {
         Some(told) if told.services.is_empty() && !told.pressed => SERVICES_CALM,
@@ -240,7 +250,9 @@ pub(crate) fn next_read(board: &Board) -> Duration {
 /// answers no, which a read now could only turn into a restart for a service no alert names (an
 /// alert stands only on a reading that follows its service).
 pub(crate) fn holds(service: &str) -> bool {
-    holds_in(board(), service, aterm_uds::services::read)
+    holds_in(board(), service, || {
+        aterm_uds::services::read(followed_from)
+    })
 }
 
 /// [`holds`] over `board`, `read` taking a reading now where the watch has read nothing; the
@@ -451,7 +463,7 @@ pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
                 || aterm_update_core::FileLock::acquire(&lock).ok(),
                 || {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let reading = aterm_uds::services::read();
+                        let reading = aterm_uds::services::read(followed_from);
                         let mut board = board().lock().unwrap_or_else(PoisonError::into_inner);
                         let owed = step(&mut board, now_ms(), reading.as_ref());
                         (owed, next_read(&board))

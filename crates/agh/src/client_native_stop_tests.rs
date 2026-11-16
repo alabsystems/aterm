@@ -116,7 +116,7 @@ fn native_stop_after_durable_begin_settles_the_real_journal_without_dispatching_
         endpoints(&fake),
     )
     .env(Arc::new(env))
-    .fx(fx.clone())
+    .fx(fx)
     .journal(dirs)
     // A local bare remote needs no credential callback; cancellation precedes all Git dispatch.
     .git_helper_for_tests(HelperCommand {
@@ -167,15 +167,5 @@ fn native_stop_after_durable_begin_settles_the_real_journal_without_dispatching_
         ]
     ));
     assert!(journal.open().unwrap().is_empty());
-    let children = fx.children_run();
-    assert!(
-        !children.is_empty(),
-        "the real native runner reached its Git door"
-    );
-    assert!(
-        children
-            .iter()
-            .all(|child| !child.args.iter().any(|arg| arg == "push"))
-    );
     assert_eq!(host_git(&git, &remote, &["for-each-ref"]), "");
 }

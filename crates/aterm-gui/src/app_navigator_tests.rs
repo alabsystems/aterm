@@ -1164,14 +1164,27 @@ fn middle_of(app: &App, view: ViewId, key: &str) -> (f64, f64) {
     )
 }
 
-/// A CHANGE A VIEW LISTS OFF ITS SCREEN LEAVES THE FRAME THE POINTER PRESSES: the row's pixels
-/// are not on the glass, so the view keeps its revision, `inspect` reads the new title before any
-/// frame, and the one frame it asks for rasters one pixel and moves none. After it the frame on
-/// glass still routes the pointer: a press and release on a row goes to its session.
-#[test]
-fn a_change_off_screen_keeps_the_frame_the_pointer_presses() {
-    use aterm_window::event::{ElementState, MouseButton};
+/// The frames window [`WID`] asked its OS window for.
+fn redraws(app: &App) -> u32 {
+    app.windows[&WID].redraw_requests_for_test.get()
+}
 
+/// What the compile `view`'s raster was painted from says of `session`'s row: the page on glass.
+fn drawn_label(app: &App, view: ViewId, session: u64) -> String {
+    raster(app, view)
+        .compiled
+        .semantic(&crate::native_ui::UiKey::new(format!(
+            "navigator/row/{session}"
+        )))
+        .expect("the row's node")
+        .label
+        .clone()
+}
+
+/// A navigator tab over 41 sessions, framed, its reads settled, with the selected row (the
+/// last) in its room and the first row scrolled off its screen: the app, the view, the first and
+/// last sessions, and the clock it was published at.
+fn a_list_past_its_first_row() -> (App, ViewId, u64, u64, Instant) {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut app = App::headless_for_test();
     let first = active_session(&app, WID).expect("the first tab");
@@ -1204,6 +1217,257 @@ fn a_change_off_screen_keeps_the_frame_the_pointer_presses() {
         app.retained_native_pointer_artifact(WID, view).is_some(),
         "PRECONDITION: the frame on glass routes the pointer"
     );
+    (app, view, first, last, now)
+}
+
+/// A CHANGE A VIEW LISTS OFF ITS SCREEN ASKS FOR NO FRAME: no pixel or target of the row is on
+/// the glass, so the view keeps its revision and its paint, asks its window for nothing, and a
+/// frame that comes for another cause compiles nothing for it. The list took the change:
+/// `inspect` reads the row as it is now, the frame on glass still routes the pointer, and the row
+/// reads the change once it is scrolled onto the screen. CONTROL: the same change to a row on
+/// the screen asks for exactly one frame, which compiles the page once.
+#[test]
+fn a_change_off_screen_asks_for_no_frame() {
+    let (mut app, view, first, last, now) = a_list_past_its_first_row();
+    let at = |s: u64| now + Duration::from_secs(s);
+    assert_eq!(
+        app.write_session_title_pin(first, "ledger").ok(),
+        Some(true)
+    );
+    app.navigator_mark_row(first);
+    let (shown, painted, asked) = (
+        presentation_revision(&app, view),
+        paint_serial(&app, view),
+        redraws(&app),
+    );
+    let compiles = crate::app_native::native_ui_compile_count();
+    app.publish_navigators(at(5));
+    assert_eq!(
+        row_of(&app, first).expect("listed").title,
+        "ledger",
+        "NEGATIVE CONTROL: the list took the change"
+    );
+    assert_eq!(redraws(&app), asked, "no frame asked for");
+    assert_eq!(paint_serial(&app, view), painted, "no paint asked for");
+    assert_eq!(
+        app.windows[&WID].leaf_render_cache[&view].native_damage,
+        None
+    );
+    assert_eq!(
+        presentation_revision(&app, view),
+        shown,
+        "the view's revision stays: the raster on glass is still its page"
+    );
+    assert!(app.commit_glassless_native_frame(WID));
+    assert_eq!(
+        crate::app_native::native_ui_compile_count(),
+        compiles,
+        "a frame that comes for another cause compiles nothing for it"
+    );
+    assert!(
+        !drawn_label(&app, view, first).contains("ledger"),
+        "the page on glass is the one it was"
+    );
+    assert!(
+        app.retained_native_pointer_artifact(WID, view).is_some(),
+        "the frame on glass routes the pointer"
+    );
+    let _ = middle_of(&app, view, &format!("navigator/row/{last}"));
+    assert!(
+        inspect_text(&mut app, view)
+            .iter()
+            .any(|line| line.contains("ledger")),
+        "inspect reads the row as it is now"
+    );
+
+    // Scrolled onto the screen, the row is drawn from the list as published.
+    app.dispatch_native_event(WID, crate::native_app::AppEvent::ScrollLines(-1000))
+        .expect("a wheel on the list");
+    app.navigator_view_moved();
+    app.publish_navigators(at(6));
+    assert!(app.commit_glassless_native_frame(WID));
+    assert!(
+        app.navigator_row_span(view, first).is_some(),
+        "PRECONDITION: the first row is on the screen"
+    );
+    assert!(
+        drawn_label(&app, view, first).contains("ledger"),
+        "the row reads the change: {}",
+        drawn_label(&app, view, first)
+    );
+
+    // CONTROL: the same change to a row on the screen.
+    assert_eq!(
+        app.write_session_title_pin(first, "journal").ok(),
+        Some(true)
+    );
+    app.navigator_mark_row(first);
+    let (painted, asked) = (paint_serial(&app, view), redraws(&app));
+    let compiles = crate::app_native::native_ui_compile_count();
+    app.publish_navigators(at(7));
+    assert_eq!(redraws(&app), asked + 1, "CONTROL: one frame asked for");
+    assert_ne!(paint_serial(&app, view), painted, "CONTROL: and a paint");
+    assert!(app.commit_glassless_native_frame(WID));
+    assert_eq!(
+        crate::app_native::native_ui_compile_count(),
+        compiles + 1,
+        "CONTROL: which compiles the page once"
+    );
+    assert!(drawn_label(&app, view, first).contains("journal"));
+}
+
+/// A CHANGE A VIEW LISTS OFF ITS SCREEN, WITH NO CLIENT READING THE WINDOW, KEEPS THE FRAME THE
+/// POINTER PRESSES: it asks for no frame, and while the page's nodes stand behind its model a
+/// press is dispatched through the page compiled as it stands (`App::note_native_nodes_behind`).
+/// The frame on glass still routes the pointer: hover lights the row under it, and a press and
+/// release on the row goes to its session.
+#[test]
+fn a_change_off_screen_keeps_the_frame_the_pointer_presses() {
+    use aterm_window::event::{ElementState, MouseButton};
+
+    let (mut app, view, first, last, now) = a_list_past_its_first_row();
+    assert_eq!(
+        app.write_session_title_pin(first, "ledger").ok(),
+        Some(true)
+    );
+    app.navigator_mark_row(first);
+    let asked = redraws(&app);
+    app.publish_navigators(now + Duration::from_secs(5));
+    assert_eq!(redraws(&app), asked, "PRECONDITION: no frame asked for");
+
+    let key = format!("navigator/row/{last}");
+    let (x, y) = middle_of(&app, view, &key);
+    app.on_cursor_moved(WID, x, y);
+    assert_eq!(
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().hovered.as_ref())
+            .map(crate::native_ui::UiKey::as_str),
+        Some(key.as_str()),
+        "the pointer lights the row it is over"
+    );
+    assert!(
+        app.windows[&WID].leaf_render_cache[&view].native_nodes_behind,
+        "PRECONDITION: the page's nodes stand behind its model at the press"
+    );
+    assert_eq!(active_session(&app, WID), None, "PRECONDITION");
+    app.on_mouse_input(WID, ElementState::Pressed, MouseButton::Left);
+    app.on_mouse_input(WID, ElementState::Released, MouseButton::Left);
+    assert_eq!(
+        active_session(&app, WID),
+        Some(last),
+        "the first click on a row goes to its session"
+    );
+}
+
+/// A SNAPSHOT'S TEXT READS A ROW CHANGED OFF THE LIST'S SCREEN AS IT IS NOW, as `inspect` does:
+/// the change asked for no frame, so the compile glass shows still says the row's old words, and
+/// a sidecar read from it would contradict `inspect` until the list's next raster. NEGATIVE
+/// CONTROL: the compile glass shows does not read the change.
+#[test]
+fn a_snapshots_text_reads_a_row_changed_off_screen() {
+    let (mut app, view, first, _last, now) = a_list_past_its_first_row();
+    let text = |app: &App| {
+        app.snapshot_visible_text(
+            WID,
+            app.active_visible_content_route(WID).expect("a route"),
+            &app.active_visible_leaf_plan(WID).expect("a plan"),
+            &app.windows[&WID].input_scratch,
+            usize::from(app.tab_strip_rows),
+            usize::from(app.windows[&WID].cols),
+        )
+    };
+    let row = format!("text key=\"navigator/row/{first}\"");
+    let before = text(&app);
+    assert!(
+        before.contains(&row) && !before.contains("ledger"),
+        "PRECONDITION: the snapshot lists the row off the screen: {before}"
+    );
+
+    assert_eq!(
+        app.write_session_title_pin(first, "ledger").ok(),
+        Some(true)
+    );
+    app.navigator_mark_row(first);
+    app.publish_navigators(now + Duration::from_secs(5));
+    assert!(
+        !drawn_label(&app, view, first).contains("ledger"),
+        "NEGATIVE CONTROL: the page on glass is the one it was"
+    );
+    let after = text(&app);
+    assert!(
+        after
+            .lines()
+            .any(|line| line.contains(&row) && line.contains("ledger")),
+        "the snapshot reads the row as it is now: {after}"
+    );
+}
+
+/// A CLIENT THAT BEGINS READING A WINDOW HEARS ITS ROWS AS THEY ARE: a change off the list's
+/// screen made while no client read the tree asked for no frame, so the client's arrival owes
+/// the least frame, and the tree it is sent reads the change. NEGATIVE CONTROL: the frame on
+/// glass did not.
+#[cfg(a11y_tree)]
+#[test]
+fn a_client_that_begins_reading_hears_a_row_changed_off_screen() {
+    let (mut app, view, first, _last, now) = a_list_past_its_first_row();
+    assert_eq!(
+        app.write_session_title_pin(first, "ledger").ok(),
+        Some(true)
+    );
+    app.navigator_mark_row(first);
+    let asked = redraws(&app);
+    app.publish_navigators(now + Duration::from_secs(5));
+    assert_eq!(
+        redraws(&app),
+        asked,
+        "PRECONDITION: no frame asked for while no client reads"
+    );
+    assert!(
+        !drawn_label(&app, view, first).contains("ledger"),
+        "NEGATIVE CONTROL: the page on glass is the one it was"
+    );
+
+    let winit_id = aterm_window::window::WindowId::from(1u64);
+    app.winit_to_window.insert(winit_id, WID);
+    app.windows
+        .get_mut(&WID)
+        .expect("the window")
+        .a11y_sent
+        .clear();
+    app.on_accessibility_event(crate::a11y_adapter::Event {
+        window_id: winit_id,
+        window_event: crate::a11y_adapter::WindowEvent::InitialTreeRequested,
+    });
+    assert_eq!(
+        app.windows[&WID].leaf_render_cache[&view].native_damage,
+        Some(crate::app_native::TREE_ONLY),
+        "the least frame is owed"
+    );
+    assert_eq!(redraws(&app), asked + 1, "and asked for");
+    let sent = &app.windows[&WID].a11y_sent;
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0]
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label().is_some_and(|label| label.contains("ledger"))),
+        "the tree the client is sent reads the change"
+    );
+}
+
+/// A CHANGE A VIEW LISTS OFF ITS SCREEN, WITH A CLIENT READING THE WINDOW'S TREE, IS TOLD BY THE
+/// LEAST FRAME AND LEAVES THE FRAME THE POINTER PRESSES: the row's pixels are not on the glass, so
+/// the view keeps its revision, `inspect` reads the new title before any frame, and the one frame
+/// it asks for rasters one pixel and moves none. After it the frame on glass still routes the
+/// pointer: a press and release on a row goes to its session.
+#[cfg(a11y_tree)]
+#[test]
+fn a_change_off_screen_tells_a_reading_client_and_keeps_the_frame_the_pointer_presses() {
+    use aterm_window::event::{ElementState, MouseButton};
+
+    let (mut app, view, first, last, now) = a_list_past_its_first_row();
+    app.windows.get_mut(&WID).expect("the window").a11y_active = true;
     let shown = presentation_revision(&app, view);
     let (wholes, pixels) = (
         raster(&app, view).full_rasters,
@@ -1215,7 +1479,9 @@ fn a_change_off_screen_keeps_the_frame_the_pointer_presses() {
         Some(true)
     );
     app.navigator_mark_row(first);
+    let asked = redraws(&app);
     app.publish_navigators(now + Duration::from_secs(5));
+    assert_eq!(redraws(&app), asked + 1, "one frame asked for");
     assert_eq!(
         presentation_revision(&app, view),
         shown,
@@ -1272,8 +1538,8 @@ fn a_change_off_screen_keeps_the_frame_the_pointer_presses() {
 }
 
 /// A CHANGE A VIEW DOES NOT LIST ASKS IT FOR NOTHING: a session under a closed row is no node of
-/// the page, which compiles as it did. No revision, no paint, no compile. NEGATIVE CONTROL: the
-/// list did take the change.
+/// the page, which compiles as it did. No frame asked for, no revision, no paint, and a frame that
+/// comes for another cause compiles nothing. NEGATIVE CONTROL: the list did take the change.
 #[test]
 fn a_change_under_a_closed_row_asks_the_view_for_nothing() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
@@ -1302,18 +1568,28 @@ fn a_change_under_a_closed_row_asks_the_view_for_nothing() {
     app.publish_navigators(now + Duration::from_secs(4));
     paint(&mut app);
     let (shown, painted) = (presentation_revision(&app, view), paint_serial(&app, view));
-    let compiles = crate::app_native::native_ui_compile_count();
 
     mark(&mut app, worker, TaskState::Done, Some(from_lead));
+    let asked = redraws(&app);
+    let compiles = crate::app_native::native_ui_compile_count();
     app.publish_navigators(now + Duration::from_secs(5));
+    let asked_after = redraws(&app);
     assert_eq!(
         row_of(&app, worker).expect("listed").word,
         Word::Quiet,
         "NEGATIVE CONTROL: the list took the change"
     );
+    // The count is read across a frame: with none between, a change that owed the page a
+    // compile would leave it where it was.
+    paint(&mut app);
+    assert_eq!(
+        crate::app_native::native_ui_compile_count(),
+        compiles,
+        "the frame after it compiles nothing"
+    );
+    assert_eq!(asked_after, asked, "no frame asked for");
     assert_eq!(presentation_revision(&app, view), shown);
     assert_eq!(paint_serial(&app, view), painted, "no paint asked for");
-    assert_eq!(crate::app_native::native_ui_compile_count(), compiles);
 }
 
 /// A MARK FOR A SESSION NO TAB HOLDS BUILDS NOTHING: no row, no arrangement, no new list.
@@ -1783,6 +2059,240 @@ fn with_tab_status_off_a_shells_command_reads_working_by_its_own_word() {
     assert_eq!(word(&app), Word::Idle, "back at its prompt");
 }
 
+/// WITH TAB STATUS OFF AN AGENT BETWEEN TURNS READS `quiet` BY ITS OWN WORD: its shell says a
+/// command runs for as long as the agent lives, and the agent's own report (OSC 7501) says its
+/// turn ended, which arrives as output and marks the row. NEGATIVE CONTROL: its next turn reads
+/// `working`, and once it leaves (`state=clear`) the row reads its shell's word again.
+#[test]
+fn with_tab_status_off_an_agent_waiting_reads_quiet_by_its_own_word() {
+    let now = Instant::now();
+    let (mut app, shell) = shell_at_its_prompt_by_its_own_word(now);
+    let word = |app: &App| row_of(app, shell).expect("listed").word;
+    let at = |s: u64| now + Duration::from_secs(s);
+    feed(&mut app, shell, b"claude\r\n\x1b]133;C\x1b\\", at(1));
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=working:app=claude-code\x1b\\",
+        at(2),
+    );
+    app.publish_navigators(at(2));
+    assert_eq!(
+        word(&app),
+        Word::Working,
+        "PRECONDITION: a turn in progress"
+    );
+
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=idle:app=claude-code\x1b\\",
+        at(3),
+    );
+    assert!(
+        app.pool.get(shell).expect("the shell").ctx.job_feed.runs(),
+        "PRECONDITION: its shell still says the agent runs"
+    );
+    assert!(
+        app.session_status.status(shell).is_none(),
+        "PRECONDITION: nothing observes the session"
+    );
+    app.publish_navigators(at(3));
+    assert_eq!(
+        word(&app),
+        Word::Quiet,
+        "its turn ended: at rest, though its process lives"
+    );
+
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=working:app=claude-code\x1b\\",
+        at(4),
+    );
+    app.publish_navigators(at(4));
+    assert_eq!(word(&app), Word::Working, "NEGATIVE CONTROL: its next turn");
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=clear\x1b\\\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\",
+        at(5),
+    );
+    app.publish_navigators(at(5));
+    assert_eq!(
+        word(&app),
+        Word::Idle,
+        "the agent left: its shell at its prompt"
+    );
+}
+
+/// WITH TAB STATUS OFF AN AGENT MID-TURN READS `working` BY ITS OWN WORD, in a shell that says
+/// nothing of itself (no OSC 133 marks): the agent's report is the fact, and it marks the row.
+/// NEGATIVE CONTROL: the same session before the agent reports reads `idle`.
+#[test]
+fn with_tab_status_off_an_agent_mid_turn_reads_working_by_its_own_word() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = App::headless_for_test();
+    let shell = active_session(&app, WID).expect("the first tab");
+    app.config.tab_status = Some(false);
+    app.reconfigure_session_status();
+    assert_eq!(app.open_navigator(false), Ok(false));
+    let now = Instant::now();
+    feed(&mut app, shell, b"$ claude\r\n", now);
+    app.publish_navigators(now);
+    let word = |app: &App| row_of(app, shell).expect("listed").word;
+    assert_eq!(
+        word(&app),
+        Word::Idle,
+        "NEGATIVE CONTROL: no word of its own"
+    );
+    assert!(
+        !app.pool.get(shell).expect("the shell").ctx.job_feed.runs(),
+        "PRECONDITION: its shell says nothing of a command"
+    );
+
+    let turn = now + Duration::from_secs(1);
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=working:app=claude-code\x1b\\",
+        turn,
+    );
+    app.publish_navigators(turn);
+    assert_eq!(
+        word(&app),
+        Word::Working,
+        "a turn in progress, by the agent's own word"
+    );
+}
+
+/// WITH TAB STATUS OFF AN AGENT THAT REPORTS UNDER ITS OWN APP WORD READS BY IT: Kimi Code and
+/// Muse Code name themselves (`app=kimi-code`, `app=muse`), and the engine keeps such a report
+/// apart from the known programs' (`ProgramStateReport::other`). Between its turns the row reads
+/// `quiet`, though its shell says it runs. NEGATIVE CONTROL: its turn reads `working`, and once it
+/// leaves with no `clear`, its shell's prompt takes the report down and the row reads `idle`.
+#[test]
+fn with_tab_status_off_an_agent_under_its_own_app_word_reads_quiet_by_it() {
+    let now = Instant::now();
+    let (mut app, shell) = shell_at_its_prompt_by_its_own_word(now);
+    let word = |app: &App| row_of(app, shell).expect("listed").word;
+    let at = |s: u64| now + Duration::from_secs(s);
+    feed(&mut app, shell, b"kimi\r\n\x1b]133;C\x1b\\", at(1));
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=working:app=kimi-code\x1b\\",
+        at(2),
+    );
+    app.publish_navigators(at(2));
+    assert_eq!(
+        word(&app),
+        Word::Working,
+        "NEGATIVE CONTROL: a turn in progress"
+    );
+
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=idle:app=kimi-code\x1b\\",
+        at(3),
+    );
+    let live = app.pool.get(shell).expect("the shell");
+    let report = crate::term_lock(&live.term).program_state();
+    assert!(
+        report.state.is_none() && report.other.state.is_some(),
+        "PRECONDITION: the engine holds the report apart from the known programs': {report:?}"
+    );
+    assert!(
+        live.ctx.job_feed.runs(),
+        "PRECONDITION: its shell still says the agent runs"
+    );
+    assert!(
+        app.session_status.status(shell).is_none(),
+        "PRECONDITION: nothing observes the session"
+    );
+    app.publish_navigators(at(3));
+    assert_eq!(
+        word(&app),
+        Word::Quiet,
+        "its turn ended: at rest, though its process lives"
+    );
+
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\",
+        at(4),
+    );
+    app.publish_navigators(at(4));
+    assert_eq!(
+        word(&app),
+        Word::Idle,
+        "NEGATIVE CONTROL: the agent left: its shell at its prompt"
+    );
+}
+
+/// WITH TAB STATUS OFF A REPORT AN AGENT LEFT STANDING IS NO WORD AT ITS SHELL'S PROMPT: an agent
+/// killed mid-turn writes no `clear`, and the engine keeps a known program's report standing
+/// under the shell. Where the host names no front group (Windows, and this headless reader) or a
+/// handoff carried the report, the engine cannot tell the shell from the agent; the shell's own
+/// marks can: at its prompt no program is in front of it, and the row reads `idle`. NEGATIVE
+/// CONTROL: once its shell runs a command again (a stopped agent's `fg`), the report is that
+/// program's word again.
+#[test]
+fn with_tab_status_off_a_report_left_standing_is_no_word_at_the_shells_prompt() {
+    let now = Instant::now();
+    let (mut app, shell) = shell_at_its_prompt_by_its_own_word(now);
+    let word = |app: &App| row_of(app, shell).expect("listed").word;
+    let at = |s: u64| now + Duration::from_secs(s);
+    feed(&mut app, shell, b"claude\r\n\x1b]133;C\x1b\\", at(1));
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]7501;state=working:app=claude-code\x1b\\",
+        at(2),
+    );
+    app.publish_navigators(at(2));
+    assert_eq!(
+        word(&app),
+        Word::Working,
+        "PRECONDITION: a turn in progress"
+    );
+
+    feed(
+        &mut app,
+        shell,
+        b"\x1b]133;D;137\x1b\\\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\",
+        at(3),
+    );
+    let live = app.pool.get(shell).expect("the shell");
+    assert!(
+        crate::term_lock(&live.term)
+            .program_state()
+            .sign()
+            .is_some(),
+        "PRECONDITION: the killed agent's report stands as the engine's run sign"
+    );
+    assert!(
+        !live.ctx.job_feed.runs(),
+        "PRECONDITION: its shell says nothing runs"
+    );
+    app.publish_navigators(at(3));
+    assert_eq!(
+        word(&app),
+        Word::Idle,
+        "the shell at its prompt: no program in front of it"
+    );
+
+    feed(&mut app, shell, b"fg\r\n\x1b]133;C\x1b\\", at(4));
+    app.publish_navigators(at(4));
+    assert_eq!(
+        word(&app),
+        Word::Working,
+        "NEGATIVE CONTROL: its shell runs a program again, whose report stands"
+    );
+}
+
 /// TURNING TAB STATUS ON OR OFF MARKS THE ROWS: what it observed of a shell is not kept once it
 /// is off, where each row reads the shell's own word. NEGATIVE CONTROL: on, the row read
 /// `working` for a command the shell's reader never fed.
@@ -1978,5 +2488,33 @@ fn a_covered_view_that_drew_a_frame_reads_each_later_change() {
     assert!(
         says(&mut app, "journal"),
         "inspect reads the row as it is now, not the page of the covered frame"
+    );
+}
+
+#[test]
+fn a_delivered_machine_title_updates_the_page_once_without_a_poll() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut app = App::headless_for_test();
+    app.open_navigator(false).expect("the list");
+    let now = Instant::now();
+    app.publish_navigators(now);
+    app.navigator_title_ready("m42 Lark".into());
+    app.publish_navigators(now + Duration::from_secs(1));
+    assert_eq!(app.navigator_tree().unwrap().machine, "m42 Lark");
+    let tree = app.navigator_tree().unwrap();
+    let work = app.navigator_work();
+    let wake = app.navigator_wake();
+    app.navigator_title_ready("m42 Lark".into());
+    app.publish_navigators(now + Duration::from_secs(1));
+    assert!(Arc::ptr_eq(&tree, &app.navigator_tree().unwrap()));
+    assert_eq!(
+        app.navigator_work(),
+        work,
+        "an unchanged title publishes nothing"
+    );
+    assert_eq!(
+        app.navigator_wake(),
+        wake,
+        "title delivery adds no polling deadline"
     );
 }

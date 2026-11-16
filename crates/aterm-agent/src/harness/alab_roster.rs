@@ -1827,7 +1827,7 @@ pub fn test_publish_source_roster(
                 fleet: None,
             },
             false,
-            Some(source),
+            (Some(source), accounts::Admits::EveryPlan),
         )
         .map_err(SyncError::into_message)
 }

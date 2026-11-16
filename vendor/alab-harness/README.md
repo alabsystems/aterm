@@ -27,6 +27,9 @@ real aterm on 2026-11-13. It keeps kimi-alab's rule that an aterm which
 answered the handshake but answers a later read late is busy, not gone. Only
 lateness is busy: an unreadable reply, or an event subscription aterm refuses,
 ends a launch unclaimed, as claude-code-alab's client did.
+An unavailable endpoint or interrupted transport is retried on the normal reclaim
+clock, without adoption grace or a prior claim. Invalid input, malformed replies
+and refused connection admission remain permanent refusals.
 
 - `wire`: finding the session (`Locator`, from the variables the config names),
   the socket and its token. The direct connection (`Connection`) is
@@ -54,7 +57,10 @@ ends a launch unclaimed, as claude-code-alab's client did.
   its own readings (`judge_own_move`, under a `Warrant`).
 - `kernel`: a child's kernel start time as aterm checks `child=`
   (`kernel::start_us`, `ChildProcess::of`): exact on macOS, within about one
-  second on Linux.
+  second on Linux. The separate `NativeChild` identity for C3 keeps exact
+  kernel units: microseconds on macOS, raw start ticks on Linux/Android.
+  `NativeChild::from_native` accepts an already observed tuple; `NativeChild::of`
+  reads it. Neither identity grants process or input authority.
 - `link`: the claim sequence and the `Link` state machine. The sequence is
   policy, roster (contract 3 only), claim at the chosen contract, then
   reading the proof and every granted scope word back from `status`, then
@@ -78,6 +84,20 @@ ends a launch unclaimed, as claude-code-alab's client did.
   (Decision 33). A harness image that took over a running child from an
   earlier image of itself (a re-exec that kept the child, `reexec`) starts
   with `Link::adopt_with` (Decision 14).
+  From v0.9.0 a caller can explicitly declare C3 child tracking with
+  `Config::with_c3_child_tracking`. It calls `Link::before_spawn` before each
+  fresh attempt, supplies `NativeObservation` after spawn, and calls
+  `Link::child_ended` only after consuming its current original wait handle's
+  terminal event. An unknown or different observation never retires a known
+  child. Proof-only hosts retain the exact child across reconnect without a
+  generation. Start-capable hosts acknowledge a pending generation under one
+  original 500-ms deadline for high-water sync, begin, proof and at most one
+  same-generation retry; failure closes both C3 connections. Metadata ACKs and
+  pending proofs do not withdraw cached host holds. `tick_native_with` samples
+  lazily, at most once for due reclaim or pending completion, so steady held
+  polls add no native read. Tracking defaults off and changes no C4 timestamp,
+  stream or re-exec contract. It does not establish hosted Claude adoption or
+  real-vendor qualification.
   From v0.4.0 a contract-4 grant opens the session stream (Decisions 22 to
   28, 30 and 31): `stream @<sid> v=1` on the claim's connection, which
   carries records from its `OK`, a second request connection for every

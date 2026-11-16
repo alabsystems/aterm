@@ -14,11 +14,6 @@ use std::ffi::OsString;
 use std::ops::ControlFlow;
 use std::process::ExitCode;
 
-// The proofs of the mesh kernels this binary ships: a build of it checks them (Cargo.toml).
-use aterm_mesh_core_islands as _;
-use aterm_mesh_core_islands_no_lost_edit as _;
-use aterm_mesh_core_islands_p1 as _;
-
 mod build_facts;
 mod lab_window;
 
@@ -45,7 +40,8 @@ mod setup_resume;
 mod setup_take_up;
 #[cfg(target_os = "macos")]
 mod subscriber_scheduling;
-#[cfg(test)]
+// Read only by the unix-only `alab_journal` and `shared_login::repository_catalog` tests.
+#[cfg(all(test, unix))]
 mod test_log;
 #[cfg(target_os = "macos")]
 mod withheld_preferences;
@@ -1427,6 +1423,11 @@ fn front_door_main(
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
         start_linux_session_trial(build);
+        // Linux's resume-cancelled timer needs no acknowledgement. A macOS session registers no
+        // power client: stopped by Ctrl-Z or a debugger it could not acknowledge a will-sleep, and
+        // each sleep of the Mac would wait 30 s for it, so its check reads its clocks every 5 s.
+        #[cfg(target_os = "linux")]
+        let _ = aterm_update::hear_wakes();
         aterm_update::spawn_background_check_with_settings(
             build,
             std::sync::Arc::new(aterm_gui::configured_update_settings),

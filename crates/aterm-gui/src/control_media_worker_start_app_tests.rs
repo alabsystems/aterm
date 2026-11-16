@@ -45,7 +45,9 @@ fn seeded(sid: &str) -> (TaskSeed, PathBuf) {
         crate::task_launch::WORKER_AUTOPILOT,
         aterm_phase::Program::Claude,
     ));
-    let path = seed.write_for(&SessionId::new(sid)).expect("written");
+    let path = seed
+        .write_for(&SessionId::parse(sid).expect("a session id"))
+        .expect("written");
     (seed, path)
 }
 
@@ -167,7 +169,7 @@ fn a_spawn_over_a_fleet_drive_names_the_driving_mac_as_its_managers() {
         host: "beta".to_string(),
     };
     let managed = || TaskOrder {
-        caller: Some(SessionId::new("s-0123456789abcdef0123")),
+        caller: Some(SessionId::parse("s-0123456789abcdef0123").expect("a legacy tab id")),
         ..worker().order
     };
     assert_eq!(
@@ -715,7 +717,7 @@ fn a_worker_that_cannot_start_is_closed_again_and_leaves_no_task_file() {
         app.push_stub_tab(wid, crate::stub_session(1));
         app.push_stub_tab(wid, crate::stub_session(2));
 
-        let ghost = "s-0123dead";
+        let ghost = "t0123dead00";
         let (seed, path) = seeded(ghost);
         assert_eq!(
             app.ready_worker(ghost, worker(), seed).err().as_deref(),
@@ -760,7 +762,9 @@ fn a_worker_that_cannot_start_is_closed_again_and_leaves_no_task_file() {
         let sid = sid_of(&app, 3);
         let requested = worker();
         let seed = requested.seed();
-        let task = seed.write_for(&SessionId::new(sid.as_str())).unwrap();
+        let task = seed
+            .write_for(&SessionId::parse(&sid).expect("a session id"))
+            .unwrap();
         let pending = app.ready_worker(&sid, requested, seed).unwrap();
         assert!(task.exists(), "the task file precedes the launcher");
         let prompt = {
@@ -840,7 +844,9 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
             let start = WorkerStart { order, ..worker() };
             let sid = sid_of(&app, local);
             let seed = start.seed();
-            let path = seed.write_for(&SessionId::new(&sid)).expect("written");
+            let path = seed
+                .write_for(&SessionId::parse(&sid).expect("a session id"))
+                .expect("written");
             assert_eq!(
                 std::fs::read(&path).expect("the task file"),
                 task_text(b"the task", Some(crate::task_record::FROM_CTL), word, agent),
@@ -1636,7 +1642,7 @@ fn a_worker_of_a_pinned_session_starts_unpinned() {
         );
         let sid = sid_of(&app, 2);
         let mut ask = worker();
-        ask.order.caller = Some(SessionId::new(sid_of(&app, 1)));
+        ask.order.caller = Some(SessionId::parse(&sid_of(&app, 1)).expect("a session id"));
         ask.caller = Some(1);
         let seed = ask.seed();
         let pending = app.ready_worker(&sid, ask, seed).expect("a worker");

@@ -1056,7 +1056,7 @@ mod mac {
     fn set_mode(paths: &Paths, mode: Mode) -> Result<(), String> {
         let file = paths.state_file();
         state::save(&file, mode).map_err(|e| format!("{}: {e}", file.display()))?;
-        crate::notify::post_changed();
+        crate::notify::post_changed(paths);
         if mode == Mode::Off {
             turned_off(paths);
         }
@@ -1135,7 +1135,7 @@ mod mac {
             if let Err(e) = state::save_lid(&file, on) {
                 return fail(format!("{}: {e}", file.display()));
             }
-            crate::notify::post_changed();
+            crate::notify::post_changed(&paths);
         }
         answer(&super::lid_line(state::load_lid(&file)))
     }

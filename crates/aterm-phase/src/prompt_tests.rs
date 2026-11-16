@@ -2588,6 +2588,96 @@ fn a_wrapped_trust_path_is_read_whole() {
     }
 }
 
+/// THE TRUST DIALOG'S FOLDER IS READ AS CLAUDE CODE ON WINDOWS DRAWS ITS WORKING FOLDER TOO: a
+/// drive's (`C:\Users\…`, `C:/…`) or a share's (`\\server\share\…`), whole when it wraps, and
+/// left out of the dialog's prose as a `/` folder is. CONTROL: a row a drive letter only begins
+/// (`C: drive`, `C:proj`, a lone `\`) opens no folder, and the dialog's other rows read as before.
+#[test]
+fn a_windows_trust_path_is_read_as_claude_code_draws_it() {
+    for (path, cut) in [
+        (r"C:\Users\Andrew Yates\proj", 12),
+        ("D:/work/proj", 4),
+        (r"\\server\share\team\proj", 15),
+    ] {
+        for wrapped in [false, true] {
+            let r: Vec<String> = screen(TRUST)
+                .into_iter()
+                .flat_map(|row| {
+                    if !row.trim().starts_with("/private/") {
+                        vec![row]
+                    } else if wrapped {
+                        vec![format!(" {}", &path[..cut]), format!(" {}", &path[cut..])]
+                    } else {
+                        vec![format!(" {path}")]
+                    }
+                })
+                .collect();
+            let p = parse_prompt_v2(&r).expect("the dialog");
+            assert_eq!(p.kind, PromptKind::Trust);
+            assert_eq!(p.path.as_deref(), Some(path), "wrapped: {wrapped}");
+            assert_eq!(p.command, path);
+            assert!(!p.description.contains(&path[cut..]), "{}", p.description);
+            assert_eq!(p.options[1].role, Role::Trust);
+        }
+    }
+    for not in [
+        "C: drive is full",
+        "C:proj",
+        r"\ alone",
+        r"\\\x",
+        "Quick safety check",
+    ] {
+        assert!(!opens_folder(not), "{not}");
+    }
+    for folder in ["/private/tmp/w", "~/proj", r"c:\w", "Z:/w", r"\\srv\share"] {
+        assert!(opens_folder(folder), "{folder}");
+    }
+}
+
+/// ONLY THE TRUST DIALOG LEAVES A WINDOWS FOLDER OUT OF ITS PROSE: in any other box read by its
+/// prose (here the MCP server dialog) a paragraph that begins `C:\`, `C:/` or `\\` (a drive
+/// folder named in prose, an escaped `\\n`) stays in the description whole, on every platform.
+/// CONTROL: a paragraph that begins with a `/` path is left out of that box's prose, as before.
+#[test]
+fn only_the_trust_dialog_leaves_a_windows_folder_out_of_its_prose() {
+    let with = |first: &str| -> Vec<String> {
+        screen(MCP_SERVER_ONE)
+            .into_iter()
+            .flat_map(|row| {
+                if row.trim().starts_with("MCP servers may execute code") {
+                    vec![
+                        format!("  {first}"),
+                        "  names this server for you".to_string(),
+                    ]
+                } else {
+                    vec![row]
+                }
+            })
+            .collect()
+    };
+    for first in [
+        r"C:\Users\u\proj\.mcp.json is the file that",
+        "C:/Users//u/proj/.mcp.json is the file that",
+        r"\\n in its name is an escape that",
+    ] {
+        let p = parse_prompt_v2(&with(first)).expect("the dialog");
+        assert_eq!(p.kind, PromptKind::McpServer);
+        assert!(
+            p.description
+                .starts_with(&format!("{first} names this server for you")),
+            "{first}: {}",
+            p.description
+        );
+    }
+    let p = parse_prompt_v2(&with("/Users//u/proj/.mcp.json is the file that")).expect("the dialog");
+    assert_eq!(p.kind, PromptKind::McpServer);
+    assert!(
+        !p.description.contains("names this server"),
+        "CONTROL: a `/` path's paragraph: {}",
+        p.description
+    );
+}
+
 #[test]
 fn option_rows_need_a_number_a_dot_and_a_space() {
     assert_eq!(option_row(" ❯ 1. Yes", ARROW), Some((1, "Yes".to_string())));

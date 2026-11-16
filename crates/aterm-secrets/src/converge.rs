@@ -237,14 +237,17 @@ impl RunnerRetry {
 }
 
 /// When the vault's subscriber starts a runner: as it starts, after each pass that applied a
-/// version, after the first healthy pass that follows failed ones (the vault came back, or this
-/// Mac came back to it: `docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2), and after any other
-/// healthy pass once this Mac's routes moved or [`RECHECK_MS`] passed (or the clock went back)
-/// since the last start. One runner at a time: a start that comes due while the last one runs,
-/// waiting for the lock another pass holds included, is owed to the round after its end, so a
-/// version applied during a pass is never left to the next recheck. An unfinished or failed
-/// runner retries on a bounded backoff; every time here is elapsed milliseconds on the
-/// subscriber's monotonic clock.
+/// version which moved something a runner reads ([`SyncOutcome::Applied`]'s `moved`: a version
+/// that carried only other Macs' news starts none), after a round that took a pass another
+/// program's apply left owed in the vault's state (`client::converge_inputs`), after the first
+/// healthy pass that follows failed ones (the vault came back, or this Mac came back to it:
+/// `docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2), and after any other healthy pass once this
+/// Mac's routes moved or [`RECHECK_MS`] passed (or the clock went back) since the last start. One
+/// runner at a time: a start that comes due while the last one runs, waiting for the lock
+/// another pass holds included, is owed to the round after its end, so a version that moved
+/// something during a pass is never left to the next recheck. An unfinished or failed runner
+/// retries on a bounded backoff; every time here is elapsed milliseconds on the subscriber's
+/// monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
     /// The last refresh boundary's local start and remaining wait. A shared
@@ -421,7 +424,7 @@ impl Due {
         routes: Routes,
         last: Last,
     ) -> bool {
-        let applied = matches!(outcome, SyncOutcome::Applied { .. });
+        let applied = matches!(outcome, SyncOutcome::Applied { moved: true, .. });
         let back = std::mem::take(&mut self.failing);
         if applied {
             self.because(Causes::APPLIED);
@@ -447,7 +450,7 @@ impl Due {
         last: Last,
     ) -> bool {
         self.failed();
-        let applied = matches!(outcome, SyncOutcome::Applied { .. });
+        let applied = matches!(outcome, SyncOutcome::Applied { moved: true, .. });
         if applied {
             self.because(Causes::APPLIED);
         }

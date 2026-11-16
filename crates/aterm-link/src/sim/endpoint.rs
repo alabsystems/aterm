@@ -57,6 +57,10 @@ pub(crate) struct Row {
     pub(crate) handled: bool,
     /// The record its row answers (`re=`), for an answer or an `expired`.
     pub(crate) re: Option<u64>,
+    /// That record is one of the log the endpoint was last told, as [`FetchRead::ask_on_log`]:
+    /// a log replaced since below it gives its offset to another record. A row whose own
+    /// record a replacement gave up while keeping that one still answers it.
+    pub(crate) re_on_log: bool,
     /// The broadcast topic it came on (`topic=`), for a broadcast.
     pub(crate) topic: Option<String>,
 }
@@ -121,6 +125,9 @@ pub(crate) struct Session {
     /// Each answer or `expired` the session read by a fetch, which leaves no row: the laws
     /// that ask what a session was handed read these beside its rows.
     pub(crate) read_by_fetch: Vec<FetchRead>,
+    /// What each whole record the session read by a fetch was read past, until the world takes
+    /// them ([`Endpoint::take_read_past`]).
+    read_past: Vec<ReadPast>,
     /// The broadcast topics it follows (`topic add <t> since=<s>`), each with its `since=`,
     /// as `topic ls` names them.
     pub(crate) topics: BTreeMap<String, String>,
@@ -132,6 +139,16 @@ pub(crate) struct Session {
 /// record of the session's lane the broker held there the moment the bridge answered
 /// ([`super::bus::Broker::at`]: the bridge reads nothing between its read and its answer).
 pub(crate) type Fetched = (u64, String, Option<super::bus::At>);
+
+/// A whole record a session read by a fetch, and the own records of its lane below it then
+/// ([`Session::read_past`]): the broker's copy of each, held or cut, by subject and body, and
+/// the log's head, at and past which a record landed after the read.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadPast {
+    pub(crate) off: u64,
+    pub(crate) head: u64,
+    pub(crate) below: Vec<(String, Vec<u8>)>,
+}
 
 /// An answer or `expired` a session read by a fetch ([`Session::read_by_fetch`]).
 #[derive(Clone, Debug)]
@@ -175,6 +192,7 @@ impl Session {
             fetches: Vec::new(),
             fetched: Vec::new(),
             read_by_fetch: Vec::new(),
+            read_past: Vec::new(),
             topics: BTreeMap::new(),
             seen_id: 0,
         }
@@ -196,6 +214,7 @@ impl Session {
         let kept = |off: u64| off < fork;
         for r in &mut self.rows {
             r.on_log &= kept(r.off);
+            r.re_on_log &= r.re.is_none_or(kept);
         }
         for r in &mut self.read_by_fetch {
             r.ask_on_log &= kept(r.re);
@@ -690,6 +709,19 @@ impl Endpoint {
 
     /// Every fetch answer the bridge gave since the last take, with its session's sid, of the
     /// live sessions and the ones that left.
+    /// Every session's [`Session::read_past`] since the last take, by sid.
+    pub(crate) fn take_read_past(&self) -> Vec<(String, ReadPast)> {
+        let mut s = lock(&self.state);
+        let EpState { sessions, gone, .. } = &mut *s;
+        let mut out = Vec::new();
+        for session in sessions.values_mut().chain(gone.iter_mut()) {
+            for read in std::mem::take(&mut session.read_past) {
+                out.push((session.sid.clone(), read));
+            }
+        }
+        out
+    }
+
     pub(crate) fn take_fetched(&self) -> Vec<(String, Fetched)> {
         let mut s = lock(&self.state);
         let EpState { sessions, gone, .. } = &mut *s;
@@ -1044,16 +1076,47 @@ impl EpState {
                 .find_map(|t| t.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
         };
         let dedup = self.rules.dedup;
-        let held = field("fetched")
-            .and_then(crate::parse_uint::<u64>)
+        let lane = format!(
+            "/f/{}/in/{}/{sid}/",
+            super::world::FLEET,
+            super::world::NODE
+        );
+        let fetched_at = field("fetched").and_then(crate::parse_uint::<u64>);
+        let held = fetched_at
             .zip(self.world.as_ref())
-            .and_then(|(off, world)| {
-                let lane = format!(
-                    "/f/{}/in/{}/{sid}/",
-                    super::world::FLEET,
-                    super::world::NODE
-                );
-                world.broker.at(off, &lane)
+            .and_then(|(off, world)| world.broker.at(off, &lane));
+        // The own records of the lane below a record read whole, held or cut, as the broker
+        // has them the moment the bridge answered; one with a copy above the read already comes
+        // after it, and is no record read past.
+        let own = format!("{lane}{}/", super::world::NODE);
+        let past = fetched_at
+            .filter(|_| {
+                toks.iter()
+                    .find(|t| !t.starts_with("fetched="))
+                    .is_some_and(|t| t.starts_with("from="))
+            })
+            .filter(|_| field("more").is_none() && field("at").is_none())
+            .zip(self.world.as_ref())
+            .map(|(off, world)| {
+                let records = world.broker.records();
+                let above: Vec<(&String, &Vec<u8>)> = records
+                    .iter()
+                    .filter(|(at, ..)| *at > off)
+                    .map(|(_, subject, body, _)| (subject, body))
+                    .collect();
+                ReadPast {
+                    off,
+                    head: world.broker.offsets_of(&lane).2,
+                    below: records
+                        .iter()
+                        .filter(|(at, subject, body, _)| {
+                            *at < off
+                                && subject.starts_with(&own)
+                                && !above.contains(&(subject, body))
+                        })
+                        .map(|(_, subject, body, _)| (subject.clone(), body.clone()))
+                        .collect(),
+                }
             });
         let Some(session) = self.session_by_sid(sid) else {
             return "ERR no such session\n".to_string();
@@ -1099,6 +1162,7 @@ impl EpState {
                 });
             }
             session.fetched.push((off, answer.join(" "), held));
+            session.read_past.extend(past);
             return "OK\n".to_string();
         }
         let Some(off) = field("off").and_then(crate::parse_uint::<u64>) else {
@@ -1125,6 +1189,7 @@ impl EpState {
             text,
             handled: false,
             re: field("re").and_then(crate::parse_uint),
+            re_on_log: true,
             topic: field("topic").map(str::to_string),
         });
         session.dedup.insert(off);

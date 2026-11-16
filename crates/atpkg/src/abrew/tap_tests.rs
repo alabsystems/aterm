@@ -635,7 +635,7 @@ fn git_redirect_parsing_and_refusal_match_brew() {
 fn resource_stanzas_parse_in_file_order() {
     let text = "class Py < Formula\n  resource \"wheel\" do\n    url \"https://files.pythonhosted.org/packages/a/wheel-0.45.0.tar.gz\"\n    sha256 \"x\"\n  end\n\n  on_linux do\n    resource \"linonly\" do\n      url \"https://example.com/linonly-1.0.tar.gz\"\n    end\n  end\n\n  resource \"packaging\" do\n    url \"https://files.pythonhosted.org/packages/b/packaging-26.3.tar.gz\"\n    version \"26.3\"\n  end\nend\n";
     let got = parse_resource_stanzas(text).unwrap();
-    let names: Vec<&str> = got.iter().map(|(n, _, _, _)| n.as_str()).collect();
+    let names: Vec<&str> = got.iter().map(|(n, ..)| n.as_str()).collect();
     if cfg!(target_os = "linux") {
         assert_eq!(names, ["wheel", "linonly", "packaging"]);
     } else {
@@ -656,6 +656,20 @@ fn resource_stanzas_parse_in_file_order() {
     assert_eq!(
         parse_resource_stanzas("class A < Formula\nend\n").unwrap(),
         Vec::new()
+    );
+    // r409: a git resource's `tag:` spec (same-line and
+    // continuation forms) is captured, and a `:test`
+    // resource header parses like any other.
+    let text = "class G < Formula\n  resource \"sub\" do\n    url \"https://github.com/x/sub.git\",\n      tag: \"v1.2.3\",\n      revision: \"abc\"\n  end\n  resource \"data\", :test do\n    url \"https://example.com/data.wasm\"\n  end\nend\n";
+    let got = parse_resource_stanzas(text).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].3.as_deref(), Some("v1.2.3"));
+    assert_eq!(got[1].3, None);
+    assert!(
+        parse_resource_stanzas(
+            "  resource \"a\" do\n    url \"https://x/a.git\", tag: \"#{v}\"\n  end\n"
+        )
+        .is_none()
     );
 }
 
@@ -712,14 +726,14 @@ fn resource_livecheck_block_parses() {
         got[0].1,
         "https://files.pythonhosted.org/packages/a/wheel-0.45.0.tar.gz"
     );
-    let spec = got[0].3.as_ref().expect("resource livecheck parsed");
+    let spec = got[0].4.as_ref().expect("resource livecheck parsed");
     assert_eq!(
         spec.url,
         Some(LivecheckUrl::Literal(
             "https://files.pythonhosted.org/packages/c/flit_core-9.9.tar.gz".into()
         ))
     );
-    let spec = got[1].3.as_ref().expect("parent ref parsed");
+    let spec = got[1].4.as_ref().expect("parent ref parsed");
     assert_eq!(spec.formula_ref.as_deref(), Some(":parent"));
     // A livecheck block the package parser refuses (an unknown
     // statement) refuses the file.

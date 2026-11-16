@@ -7523,7 +7523,7 @@ fn the_host_is_asked_for_the_sessions_sighting_with_the_accounts_off() {
 }
 
 /// The host is told each turn break the loop decides, whether or not it wants a step there:
-/// the window's worker makes the disk ask's seat-rule finding there (`disk-free@v1`), so a host
+/// the window's worker makes its look at the session's work there, so a host
 /// that owes nothing is told as often as one that steps, and never mid-turn. It is told once per
 /// decision: the finding reads the session's records, and the wait's later looks at the same
 /// point, every 5 to 20 s for as long as the session rests, would find the same.
@@ -7604,9 +7604,8 @@ fn the_host_is_told_each_turn_break_whether_or_not_it_wants_a_step_there() {
 /// A turn break at a sign-in wall (`wall:auth`) is a lasting withhold of the loop's: nothing the
 /// host would type there goes until a person signs in again. The host is told so as the loop
 /// decides the break, whether or not it wants a step there, once, and told it is over at the
-/// next break with none (signed in again with no turn between), so the window's seat rule
-/// (`disk-free@v1`) holds the session out of its seats meanwhile rather than electing a session
-/// whose line could not go.
+/// next break with none (signed in again with no turn between), so a host holds the session
+/// out of what it offers meanwhile rather than choosing a session whose line could not go.
 #[test]
 fn the_host_is_told_a_sign_in_wall_holds_the_session_at_its_turn_break() {
     let full = SuperviseOpts {
@@ -7646,7 +7645,7 @@ fn the_host_is_told_a_sign_in_wall_holds_the_session_at_its_turn_break() {
 /// A wall's lasting withhold is told over at the session's next live read, as it works past it
 /// ([`IdleHost::lasting_hold`]). A later break at the same wall is told again: the loop's record
 /// of what it told goes with the host's, or the session, back at its wall after a retry, would be
-/// seated by the window's seat rule (`disk-free@v1`) and elected at a break its line could not go.
+/// offered a line at a break where it could not go.
 #[test]
 fn a_wall_the_session_worked_past_and_came_back_to_is_told_again() {
     let full = SuperviseOpts {
@@ -7689,8 +7688,8 @@ fn a_wall_the_session_worked_past_and_came_back_to_is_told_again() {
 /// that told a sign-in wall and ended at it (its body restarted, or the agent relaunched in the
 /// tab) leaves the host holding the session, and the next loop for the tab, signed in again, tells
 /// it over at its first decided break. Before, a loop told only changes from what it had told
-/// itself, so the host held the session at a sign-in long gone for as long as the tab lived
-/// (`disk-free@v1` waited on it). NEGATIVE CONTROL: a next loop still at the wall tells it again.
+/// itself, so the host held the session at a sign-in long gone for as long as the tab lived.
+/// NEGATIVE CONTROL: a next loop still at the wall tells it again.
 #[test]
 fn a_new_loop_tells_over_the_wall_a_loop_before_it_told() {
     let full = SuperviseOpts {

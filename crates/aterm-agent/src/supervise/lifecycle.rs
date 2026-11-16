@@ -172,6 +172,19 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Autopilot `off` (the session's `autopilot` word, else `[harness] autopilot = "off"`; [`Session::autopilot`]): park as on a hold ([`Self::park_on_hold`]), with nothing pressed, typed or escalated, no host step, no probe and no point reported, until the word changes.
+    ///
+    /// A HOST THAT ANSWERS THE WORD WAKES THE PARK ONLY FOR WHAT IT WAITS FOR (ATERM-KI-1108-2):
+    /// its waits carry the session's word, which such a host answers the moment it is switched, so
+    /// the park waits whole there ([`OFF_REST`], to its deadline or the switch's settle) and a
+    /// timeout with no switch to settle reads no word: the claim is given back and the table's word
+    /// is fixed for the run, so nothing else could have moved. Elsewhere (a host that refused the
+    /// token, an older one that takes it and never answers it, a session whose `meta` keeps no
+    /// word) it steps [`OFF_STEP`] and reads the word at each step. Until the host has answered,
+    /// each step asks it ([`Self::park_proving`]). The idle wait after a moved screen stays an
+    /// [`OFF_STEP`] at most, so a program busy in the tab never holds it for the park's whole step,
+    /// and on a host that answers it is followed by no read either: the seq and idle waits carried
+    /// the word, and the next wait carries it again, which such a host answers at its arm where the
+    /// word moved in between.
     pub(super) fn park_while_off(
         &mut self,
         seq: u64,
@@ -190,14 +203,23 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(());
             }
             let now = self.fx.mono();
-            let step = deadline.saturating_duration_since(now).min(OFF_STEP);
+            let heard = self.word_heard();
+            let longest = if heard { OFF_REST } else { OFF_STEP };
+            let step = deadline.saturating_duration_since(now).min(longest);
             let step = self
                 .word_at
                 .map_or(step, |at| step.min(at.saturating_duration_since(now)));
+            let past = seq.to_string();
+            let cond = ["seq", past.as_str()];
             let waited = if step.is_zero() {
                 Wait::TimedOut
+            } else if heard {
+                self.park(&cond, step, true)?
             } else {
-                self.park(&["seq", &seq.to_string()], step, true)?
+                match self.park_proving(&cond, step)? {
+                    Some(waited) => waited,
+                    None => continue,
+                }
             };
             match waited {
                 Wait::Word(word) => {
@@ -205,7 +227,8 @@ impl<C: Ctl> Session<'_, C> {
                     continue;
                 }
                 Wait::Latched => {
-                    if let Wait::Word(word) = self.park(&["idle", IDLE_MS], step, true)? {
+                    let idle = step.min(OFF_STEP);
+                    if let Wait::Word(word) = self.park(&["idle", IDLE_MS], idle, true)? {
                         self.word_moved(seq, word, review);
                     }
                     let screen = self.screen()?;
@@ -218,7 +241,11 @@ impl<C: Ctl> Session<'_, C> {
                         }
                     }
                     seq = screen.seq;
+                    if self.word_at.is_none() && self.word_heard() {
+                        continue;
+                    }
                 }
+                Wait::TimedOut if self.word_at.is_none() && self.word_heard() => continue,
                 Wait::TimedOut => {}
                 Wait::Unsupported => {
                     return Err(Fail::Hard(
@@ -244,6 +271,41 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(());
             }
         }
+    }
+
+    /// Whether the Off park's waits carry the session's word to a host that wakes them on a switch
+    /// of it ([`Caps::word_answered`]), so a wait that timed out leaves the word as it was.
+    fn word_heard(&self) -> bool {
+        self.caps.word_answered
+            && self.caps.await_autopilot == Some(true)
+            && self.autopilot.latch().is_some()
+    }
+
+    /// A wait of the Off park ([`Self::park_while_off`]) on a host that has not yet answered the
+    /// session's word ([`Caps::word_answered`]): it carries a word other than the stored one, which
+    /// a host that wakes its waits on the word answers at once (`OK autopilot <stored>`), and an
+    /// older host, reading only the arguments it knows, waits out as it always did. `None` where
+    /// the answer names the stored word: the host answers, and nothing moved. A switch to the very
+    /// word this wait carries, made before it arms, is no answer: the wait runs its [`OFF_STEP`]
+    /// out and the read after it unparks, at most that late, as every park step was.
+    fn park_proving(&mut self, cond: &[&str], step: Duration) -> Result<Option<Wait>, Fail> {
+        let Some(kept) = self
+            .autopilot
+            .latch()
+            .filter(|_| self.caps.await_autopilot != Some(false))
+        else {
+            return self.park(cond, step, true).map(Some);
+        };
+        let other = if kept == Autopilot::Cruise.word() {
+            Autopilot::Off
+        } else {
+            Autopilot::Cruise
+        };
+        let token = format!("autopilot={}", other.word());
+        Ok(match self.wait_on(cond, step, Some(&token))?.0 {
+            Wait::Word(read) if read.map_or("-", Autopilot::word) == kept => None,
+            waited => Some(waited),
+        })
     }
 
     /// AUTOPILOT OFF STANDS ON THE SESSION: what the park ends is over ([`TurnEndState::park_off`]), and the ledger says so ([`approvals::RULE_OFF_STOOD`]) for a loop that follows, which takes up its books as this one holds them after the park (`Session::seed_from_ledger`). An Off no person set keeps the hold, and Land's rest on a need ([`TurnEndState::park_off_held`], [`approvals::OFF_STOOD_HELD`], [`approvals::OFF_STOOD_RESTING`]): only the person's own switch lifts one.
@@ -457,6 +519,11 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The in-GUI host's loop: the engine's watching loop (one flushed line per approval and per review point, [`Lines`]), under `opts` (normally [`SuperviseOpts::hosted`]), until `stop` is set.
+    ///
+    /// A stop is read before each request; one raised while a wait is under way is the host's to
+    /// cut through the `Ctl`'s interrupter ([`Ctl::interrupter`]), which it calls with the stop:
+    /// an Off park's wait on a host that answers the word lasts up to `OFF_REST` (600 s), so a
+    /// `Ctl` that gives none ends such a run that long after its stop.
     pub fn run_hosted(
         &mut self,
         opts: &SuperviseOpts,

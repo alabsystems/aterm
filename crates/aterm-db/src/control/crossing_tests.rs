@@ -66,6 +66,57 @@ fn a_responder_rechecks_crossing_after_admission_before_its_hello() {
     }
 }
 
+/// A responder whose custody's format mark names a later format, stored before its admission or
+/// after it, writes no hello: no database protocol states that format, so none is spoken, and the
+/// mark is read as the crossed mark is, before any record is loaded.
+///
+/// NEGATIVE CONTROL: with `require_legacy_records` reading the crossed mark alone (as first
+/// built), the responder wrote its hello (`marked before`).
+#[test]
+fn vault_fence_a_responder_past_format_one_writes_no_hello() {
+    let lab = Lab::new();
+    for after_admission in [false, true] {
+        let paths = custody(&lab, &format!("format-{after_admission}"), false);
+        let mark = paths.records_file().with_extension("format");
+        let store = move || {
+            aterm_secrets::fsx::write_atomic(&mark, b"aterm-secrets records format 2\n", 0o600)
+                .unwrap();
+        };
+        if !after_admission {
+            store();
+        }
+        let endpoint = lab.endpoint(1).with_membership_paths(paths);
+        let peer = lab.endpoint(0);
+        let proof = NodeProof {
+            node: peer.identity.node().into(),
+            key: peer.identity.key(),
+        };
+        let mut input = Vec::new();
+        send_frame(&mut input, &peer.hello).unwrap();
+        let mut stream = Script {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        let mut repair = Repair::default();
+        let mut late = after_admission.then_some(store);
+        let _ = observe_peer_cache(
+            move |stage| {
+                if matches!(stage, PeerCacheStage::Acquired(Side::Responder))
+                    && let Some(store) = late.take()
+                {
+                    store();
+                }
+            },
+            || endpoint.connected(&mut stream, Some(&proof), Side::Responder, &mut repair),
+        );
+        assert!(
+            stream.output.is_empty(),
+            "marked {}",
+            if after_admission { "after" } else { "before" }
+        );
+    }
+}
+
 #[test]
 fn cached_membership_disk_stops_serving_after_the_durable_mark() {
     use aterm_secrets::membership_log::Entrant;

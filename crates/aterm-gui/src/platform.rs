@@ -127,10 +127,6 @@ pub(crate) trait AppRt {
     }
 
     /// Open `url` with the system's handler.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
     fn open_url(&self, _url: &str) -> bool {
         false
     }
@@ -563,15 +559,15 @@ impl AppRt for AppRtMacOS {
         glance: &crate::status_item::Glance,
     ) -> Option<crate::status_item::StatusItemHandle> {
         let mut handle = crate::status_item::install(proxy, glance)?;
-        // `aterm fleet access` and another window's lock post this once the stored level
-        // changed: the App reads the file again.
+        // `aterm fleet access` and another window's lock post this once the level stored under
+        // the state home this window reads changed: the App reads the file again. A post for
+        // another home has another name and wakes nothing here.
         let wake = proxy.clone();
-        handle.keep_access_watch(aterm_macos_ui::darwin_notify::Observer::register(
-            aterm_agent::fleet_access::CHANGED,
-            move || {
+        handle.keep_access_watch(crate::control::fleet_access_changed().and_then(|name| {
+            aterm_macos_ui::darwin_notify::Observer::register(&name, move || {
                 let _ = wake.send_event(Wake::FleetAccessChanged);
-            },
-        ));
+            })
+        }));
         Some(handle)
     }
 

@@ -412,6 +412,53 @@ fn clt_landing_a_manual_shell_defers_when_an_installer_started_since_the_press()
     assert!(drain(&read).is_empty(), "the command was submitted once");
 }
 
+#[test]
+fn the_page_shares_one_installer_read_between_mac_setup_and_repository_wait() {
+    fn counted_idle() -> Reading {
+        INSTALL_EXTERNAL_PROBES.with(|count| count.set(count.get() + 1));
+        idle()
+    }
+    let (mut app, _) = page();
+    TOOLS_PRESENT.with(|present| present.set(false));
+    app.workstation_setup.developer_tools_shim = crate::clt_shim::Shim::at(
+        std::path::PathBuf::from("/nonexistent/aterm-test-clt-shim"),
+        tools_present,
+    );
+    let mut status = tools_missing(&mut app);
+    // A worker snapshot may predate the window finding its tools missing.
+    status.tools_owed = false;
+    app.workstation_setup.developer_tools_probe = Some(external_installer_running);
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    app.publish_system_state(status);
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    let shown = app.system_state_host.latest_status();
+    assert!(shown.tools_owed);
+    assert_eq!(shown.mac_setup, Some(ToolsInstall::Installing));
+    assert_eq!(shown.developer_tools, shown.mac_setup);
+
+    app.workstation_setup.developer_tools_probe = Some(counted_idle);
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    app.republish_system_state_developer_tools();
+    // The comparison's idle read is reused by the publication it triggers.
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    let shown = app.system_state_host.latest_status();
+    assert_ne!(shown.mac_setup, Some(ToolsInstall::Installing));
+    assert_eq!(shown.developer_tools, shown.mac_setup);
+
+    TOOLS_PRESENT.with(|present| present.set(true));
+    app.republish_system_state_developer_tools();
+    assert!(!app.system_state_host.latest_status().tools_owed);
+    TOOLS_PRESENT.with(|present| present.set(false));
+    app.workstation_setup.developer_tools_probe = Some(external_installer_running);
+    INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
+    app.republish_system_state_developer_tools();
+    assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
+    let shown = app.system_state_host.latest_status();
+    assert!(shown.tools_owed, "the new wait is read before its step");
+    assert_eq!(shown.mac_setup, Some(ToolsInstall::Installing));
+    assert_eq!(shown.developer_tools, shown.mac_setup);
+}
+
 /// A key typed while the shell starts defers the landing: the tab would take the next keys,
 /// and those were meant for System State. Once the keys are quiet again, it lands once.
 #[test]

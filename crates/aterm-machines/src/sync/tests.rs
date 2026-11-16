@@ -7,6 +7,7 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+mod fleet_retry;
 mod repository_prerequisites;
 
 /// A base item of `class` that plans one change, reads right once applied, and counts each
@@ -2506,7 +2507,13 @@ fn the_lanes_own_ids_are_its_kinds_rows_and_no_others() {
         aterm_secrets::converge::RepositoryWork::Refresh,
         None,
     );
-    let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
+    let ids: Vec<String> = items
+        .local
+        .iter()
+        .chain(&items.repositories)
+        .chain(&items.publication)
+        .map(|item| item.id())
+        .collect();
     let (own, others): (Vec<&String>, Vec<&String>) = ids.iter().partition(|id| own_item(id));
     assert_eq!(own.len(), Kind::ALL.len(), "{ids:?}");
     assert_eq!(others, ["sync.repository-prerequisites"], "{ids:?}");
@@ -3373,11 +3380,11 @@ fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() 
     }
 }
 
-/// A fleet join is tried once per pass, at once, whatever ended it: a join that did not land
-/// (an unreachable or busy issuer included) ends its row, and with it the pass's hold on the
-/// converge lock, for the starter's runner retry to try again. No pass waits on the issuer.
+/// A fleet join is tried at once: a join that did not land
+/// (an unreachable or busy issuer included) ends its row. A pass with no long repository work
+/// finishes for its starter's retry; repository acquisition is still allowed to progress.
 #[test]
-fn a_fleet_join_is_tried_once_per_pass_and_a_failed_one_ends_its_row() {
+fn a_fleet_join_starts_at_once_and_its_failure_does_not_withhold_cloning() {
     for trigger in [
         Trigger::Init,
         Trigger::Subscriber,
@@ -3402,11 +3409,6 @@ fn a_fleet_join_is_tried_once_per_pass_and_a_failed_one_ends_its_row() {
         assert_eq!(
             fleet.why.as_deref(),
             Some(format!("{why}; the next pass tries again").as_str())
-        );
-        assert_eq!(
-            ports.applies().iter().filter(|&&k| k == "fleet").count(),
-            1,
-            "a failed join is the starter's to retry, never the pass's"
         );
         // The rows after it still run: a fleet that did not land holds no clone back.
         assert_ne!(row(&pass.rows, CLONE).outcome, Outcome::Unknown);

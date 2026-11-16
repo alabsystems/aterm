@@ -820,13 +820,23 @@ pub(super) fn write_oauth_code(path: PathBuf, code: &str) -> Result<(), &'static
     .map_err(|_| "the hosted OAuth authorization code could not be retained")
 }
 
-/// Take a hosted code once, removing it before the waiting CLI reads it from its own stdin.
-#[cfg(unix)]
+/// Take a hosted code once, removing it before the waiting CLI reads it from its own stdin. A
+/// link at `path` is never followed: on Unix its open fails, and on Windows it opens as itself
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`) and so is no regular file.
 pub(super) fn take_oauth_code(path: PathBuf) -> Result<Option<String>, &'static str> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
-    use std::os::unix::fs::OpenOptionsExt as _;
-    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = match opts.open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -860,12 +870,10 @@ pub fn read_outcome(path: &Path) -> Option<Met> {
 
 /// An opener's explicit terminal failure, which alone stops its still-running provider: what it
 /// met, where it recorded that.
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TerminalFailure(pub Option<Met>);
 
 /// Only an explicit terminal record can stop its still-running provider.
-#[cfg(unix)]
 pub(super) fn read_terminal_outcome(path: &Path) -> Option<TerminalFailure> {
     match read_outcome_record(path)? {
         (OutcomePhase::Failed, met) => Some(TerminalFailure(met)),
@@ -880,10 +888,18 @@ const OUTCOME_MAX: u64 = 512;
 fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
+    // A link at `path` is never followed, as [`take_oauth_code`] takes a code: on Unix its open
+    // fails, and on Windows it opens as itself and so is no regular file.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = opts.open(path).ok()?;
     let meta = file.metadata().ok()?;

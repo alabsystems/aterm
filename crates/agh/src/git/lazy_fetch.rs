@@ -64,11 +64,12 @@ impl NoLazyFetch {
     /// git could not be asked: a run did not start, finish or exit normally, the scratch folder
     /// its question needs could not be made, a setup step failed, its trace was unavailable or
     /// incomplete, or the local-fetch control did not establish the observation
-    /// ([`guarded_read`]).
+    /// ([`guarded_read`]). Run failures retain the runner's explanation and identify the
+    /// probe phase.
     pub fn of(git: &dyn Git) -> Result<Option<Self>, String> {
         let flag = git
             .run(&[OsStr::new(OPTION), OsStr::new("--version")], &[])
-            .map_err(|_| "cannot ask Git whether it takes --no-lazy-fetch")?;
+            .map_err(|why| format!("cannot ask Git whether it takes --no-lazy-fetch: {why}"))?;
         if flag.status.is_none() {
             return Err(format!(
                 "cannot ask Git whether it takes --no-lazy-fetch: {}",
@@ -212,7 +213,7 @@ pub fn guarded_read(git: &dyn Git, guard: NoLazyFetch) -> Result<GuardedRead, St
     let scratch: &Path = (*held).as_ref();
     let promisor = scratch.join("promisor.git");
     let partial = scratch.join("partial.git");
-    let run = |args: &[&OsStr], env: &[(&str, &str)]| -> Result<Ran, String> {
+    let run = |step: &str, args: &[&OsStr], env: &[(&str, &str)]| -> Result<Ran, String> {
         let args: Vec<&OsStr> = NO_SIDE_RUNS
             .into_iter()
             .map(OsStr::new)
@@ -226,10 +227,11 @@ pub fn guarded_read(git: &dyn Git, guard: NoLazyFetch) -> Result<GuardedRead, St
         .into_iter()
         .chain(env.iter().copied())
         .collect();
-        git.run(&args, &env).map_err(|_| WHY.to_owned())
+        git.run(&args, &env)
+            .map_err(|why| format!("{WHY}: git {step} did not run to completion ({why})"))
     };
     let set_up = |step: &str, args: &[&OsStr]| -> Result<Ran, String> {
-        let ran = run(args, &[])?;
+        let ran = run(step, args, &[])?;
         if ran.success() {
             Ok(ran)
         } else {
@@ -279,6 +281,11 @@ pub fn guarded_read(git: &dyn Git, guard: NoLazyFetch) -> Result<GuardedRead, St
         args.extend(words(&["cat-file", "-t"]));
         args.push(OsStr::new(object));
         let ran = run(
+            if protected {
+                "cat-file (protected read)"
+            } else {
+                "cat-file (control read)"
+            },
             &args,
             &[
                 ("GIT_NO_LAZY_FETCH", if protected { "1" } else { "0" }),
@@ -331,3 +338,7 @@ pub fn guarded_read(git: &dyn Git, guard: NoLazyFetch) -> Result<GuardedRead, St
         no_fetch: true,
     })
 }
+
+#[cfg(test)]
+#[path = "lazy_fetch_tests.rs"]
+mod tests;

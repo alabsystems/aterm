@@ -432,16 +432,42 @@ impl Access {
         self.is_current_observed_in(journal, look).unwrap_or(false)
     }
 
-    /// [`Self::is_current_in`] where `look` is given, and otherwise [`Self::is_current`].
-    fn is_current_through(
+    /// Whether this is the current local membership of `identity`, for a historical read: judged
+    /// through `look` where given ([`Self::is_current_observed_in`]), and otherwise on its own
+    /// call ([`Self::is_current_observed`]). A membership that moved since this access was
+    /// observed (a rotation, a join or a removal another Mac's record brought) is
+    /// [`crate::ErrorKind::VaultChanged`], as a store read batch's fences call the same answer
+    /// a changed snapshot: a reader observes the membership again and asks again, and a
+    /// historical read that met the move is never read as refused.
+    ///
+    /// # Errors
+    /// `identity` is another device's than this membership's local seat (a refusal, kind
+    /// [`crate::ErrorKind::Other`]); a vault writer holds the state lock
+    /// ([`crate::ErrorKind::VaultBusy`], kept as it is, so a historical read that met it stays
+    /// busy); or this observation is no longer current ([`crate::ErrorKind::VaultChanged`]).
+    fn stands_for(
         &self,
         journal: &Journal,
+        identity: &Identity,
         look: Option<&crate::client::VaultLook<'_>>,
-    ) -> bool {
-        look.map_or_else(
-            || self.is_current(journal),
-            |look| self.is_current_in(journal, look),
-        )
+    ) -> Result<()> {
+        if self.local().binding.recipient() != identity.recipient() {
+            return Err(Error::new(
+                "historical access requires the local membership of this device",
+            ));
+        }
+        let current = match look {
+            Some(look) => self.is_current_observed_in(journal, look)?,
+            None => self.is_current_observed(journal)?,
+        };
+        if !current {
+            return Err(Error::of_kind(
+                crate::ErrorKind::VaultChanged,
+                "the local membership moved since this access was observed: historical access \
+                 needs it observed again",
+            ));
+        }
+        Ok(())
     }
 
     /// [`Self::is_current_observed`] through `look`: judged under the look's shared observation of
@@ -533,10 +559,12 @@ impl Access {
     /// Lend `read` one check of the current local membership, one read of the log and one lease
     /// of its complete history, which every historical read of a batch shares: `None` where this
     /// observation is not log-backed, and an error where this is not the current local
-    /// membership, or the log is unavailable or one of its complete records cannot be leased. A
-    /// repair round reads a batch (`aterm-db`'s `Session::history_needs`), and when each basis
-    /// checked, read and leased again that was 30% of a quiet round's CPU over 4,805 records
-    /// (`docs/measured/commons-long-log-rounds-2026-11-07.md`).
+    /// membership (a vault writer holding the state lock while that is judged is
+    /// [`crate::ErrorKind::VaultBusy`], and a membership that moved since this access was
+    /// observed [`crate::ErrorKind::VaultChanged`]: [`Self::stands_for`]), or the log is
+    /// unavailable or one of its complete records cannot be leased. A repair round reads a batch (`aterm-db`'s `Session::history_needs`),
+    /// and when each basis checked, read and leased again that was 30% of a quiet round's CPU over
+    /// 4,805 records (`docs/measured/commons-long-log-rounds-2026-11-07.md`).
     pub(super) fn with_log_history<R>(
         &self,
         journal: &Journal,
@@ -563,12 +591,8 @@ impl Access {
         let Some(paths) = &self.log_paths else {
             return read(Ok(None));
         };
-        if !self.is_current_through(journal, look)
-            || self.local().binding.recipient() != identity.recipient()
-        {
-            return read(Err(Error::new(
-                "historical access requires the current local membership",
-            )));
+        if let Err(stood) = self.stands_for(journal, identity, look) {
+            return read(Err(stood));
         }
         let trusted = match look.and_then(|look| look.held_at(paths)) {
             Some(under) => crate::client::trusted_commons_log_under(paths, self.trust, under),
@@ -593,18 +617,15 @@ impl Access {
     }
 
     // The public path checks current local membership before it leases this immutable history.
+    // The answer for a basis the lease holds is kept for every later lease of the same held
+    // records ([`KeptHistory`]); a basis it does not hold is answered from the lease alone.
     fn historical_from_lease(
         &self,
         identity: &Identity,
         basis: [u8; 32],
         lease: &crate::membership_log::history::HistoryLease<'_>,
     ) -> Result<Option<Historical>> {
-        use crate::membership_log::history::{Generation, RecordState};
-        type HistoricalCacheKey = (Trust, [u8; 32], Generation, [u8; 32]);
-        type HistoricalCacheVal = Option<(u64, Vec<Member>, Zeroizing<[u8; 32]>)>;
-        static HISTORICAL_CACHE: std::sync::Mutex<
-            std::collections::VecDeque<(HistoricalCacheKey, HistoricalCacheVal)>,
-        > = std::sync::Mutex::new(std::collections::VecDeque::new());
+        use crate::membership_log::history::RecordState;
 
         #[cfg(any(test, debug_assertions))]
         KEY_CACHE_ASKS.with(|asks| asks.set(asks.get() + 1));
@@ -612,56 +633,38 @@ impl Access {
             return Ok(None);
         };
         let epoch = match lease.record(&basis)? {
-            RecordState::Complete(epoch) => Some(epoch),
-            RecordState::Pending => {
-                return Err(Error::new("historical Commons epoch is not complete"));
-            }
-            RecordState::Absent => None,
+            RecordState::Complete(epoch) => epoch,
+            RecordState::Pending => return Err(pending_epoch()),
+            RecordState::Absent => return Ok(None),
         };
-        let cache_key = (
-            self.trust,
-            identity.recipient().0,
-            lease.generation(),
-            basis,
-        );
-        if let Ok(cache) = HISTORICAL_CACHE.lock()
-            && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
+        let recipient = identity.recipient().0;
+        if let Some(cached) = KeptHistory::answer(self.trust, recipient, lease.generation(), basis)
         {
-            return Ok(cached
-                .as_ref()
-                .map(|(generation, members, key_bytes)| Historical {
-                    trust: self.trust,
-                    head: self.head,
-                    basis: self.basis,
-                    source: basis,
-                    generation: *generation,
-                    members: members.clone(),
-                    key: SecretBytes::from(key_bytes.as_slice()),
-                    log_paths: Some(paths.clone()),
-                    log_heads_digest: self.log_heads_digest,
-                    local_recipient: Some(self.local().binding.recipient()),
-                }));
+            return Ok(cached.map(|(generation, members, key_bytes)| Historical {
+                trust: self.trust,
+                head: self.head,
+                basis: self.basis,
+                source: basis,
+                generation,
+                members,
+                key: SecretBytes::from(key_bytes.as_slice()),
+                log_paths: Some(paths.clone()),
+                log_heads_digest: self.log_heads_digest,
+                local_recipient: Some(self.local().binding.recipient()),
+            }));
         }
-        let opened = match epoch.as_ref() {
-            Some(epoch) => open_from_lease(identity, epoch, lease)?,
-            None => None,
-        };
-        let Some((generation, bindings, key)) = opened else {
-            if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
-                if cache.len() >= 16 {
-                    cache.pop_front();
-                }
-                cache.push_back((cache_key, None));
-            }
+        let Some((generation, bindings, key)) = open_from_lease(identity, &epoch, lease)? else {
+            KeptHistory::keep(self.trust, recipient, lease.generation(), basis, None);
             return Ok(None);
         };
         let members = self.log_writers(bindings);
-        if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
-            if cache.len() >= 16 {
-                cache.pop_front();
-            }
-            cache.push_back((cache_key, Some((generation, members.clone(), key.clone()))));
-        }
+        KeptHistory::keep(
+            self.trust,
+            recipient,
+            lease.generation(),
+            basis,
+            Some((generation, members.clone(), key.clone())),
+        );
         Ok(Some(Historical {
             trust: self.trust,
             head: self.head,
@@ -681,8 +684,7 @@ impl Access {
     /// key unwrapped again ([`HistoryLease::opened`]), and a key unwrapped to answer is neither kept
     /// nor given. A repair round asks whether this Mac holds each epoch of its history, sixteen a
     /// round on each side (`aterm-db`'s `Session::history_needs`): unwrapping each again took 7.7%
-    /// of a quiet round over a log of 9,605 records, and keeping each pushed the keys a table's
-    /// reads take out of the sixteen kept (2026-11-09).
+    /// of a quiet round over a log of 9,605 records (2026-11-09).
     ///
     /// [`HistoryLease::opened`]: crate::membership_log::history::HistoryLease::opened
     ///
@@ -701,9 +703,7 @@ impl Access {
         }
         let epoch = match lease.record(&basis)? {
             RecordState::Complete(epoch) => epoch,
-            RecordState::Pending => {
-                return Err(Error::new("historical Commons epoch is not complete"));
-            }
+            RecordState::Pending => return Err(pending_epoch()),
             RecordState::Absent => return Ok(false),
         };
         if lease.opened(&epoch, identity)? {
@@ -840,6 +840,14 @@ impl Access {
     /// [`Self::historical`], its membership check judged through `look` where given
     /// ([`Self::is_current_in`]): a table-repair read batch's fallback to the control journal for
     /// a basis the log does not open (`Bootstrap::historicals_in`).
+    ///
+    /// # Errors
+    /// A vault writer holds the state lock while the membership is judged
+    /// ([`crate::ErrorKind::VaultBusy`]); the membership moved since this access was observed
+    /// ([`crate::ErrorKind::VaultChanged`]); `identity` is another device's; the control
+    /// journal does not hold `basis` on its selected history or holds it sealed to other devices
+    /// ([`crate::ErrorKind::HistoryUnopened`]); or the journal or the roster it holds fails any
+    /// other check.
     pub fn historical_in(
         &self,
         journal: &Journal,
@@ -847,13 +855,7 @@ impl Access {
         basis: [u8; 32],
         look: Option<&crate::client::VaultLook<'_>>,
     ) -> Result<Historical> {
-        if !self.is_current_through(journal, look)
-            || self.local().binding.recipient() != identity.recipient()
-        {
-            return Err(Error::new(
-                "historical access requires the current local membership",
-            ));
-        }
+        self.stands_for(journal, identity, look)?;
         let snapshot = if self.is_log_backed() {
             journal.retained_historical(basis, identity)?
         } else {
@@ -874,6 +876,13 @@ impl Access {
         })
     }
 
+    /// The control-journal roster `basis`, opened with `key`, a history handoff's, under its
+    /// payload's `file_key`.
+    ///
+    /// # Errors
+    /// As [`Self::stands_for`] (another device's `identity`, a busy vault, a membership that
+    /// moved since this access was observed); or the journal does not hold `basis` under
+    /// `file_key`, its roster does not decode, or its evidence does not stand with `key`.
     pub(crate) fn historical_with_key(
         &self,
         journal: &Journal,
@@ -882,11 +891,7 @@ impl Access {
         file_key: &[u8; 16],
         key: &[u8; 32],
     ) -> Result<Historical> {
-        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
-            return Err(Error::new(
-                "history handoff requires current local membership",
-            ));
-        }
+        self.stands_for(journal, identity, None)?;
         let snapshot = if self.is_log_backed() {
             journal.retained_historical_with_key(basis, file_key)?
         } else {
@@ -909,6 +914,101 @@ impl Access {
     }
 }
 
+/// What [`Access::historical_from_lease`] answered for one trust and one device's recipient under
+/// one held log: the [`Generation`] of the held records it read them under, and for each of those
+/// records it was asked of as a basis, that epoch's generation, the members of its writers and its
+/// key, or `None` where the log names no Commons writers of it.
+///
+/// It keeps every answer under the current held log, so a pass that reads a table's historical
+/// rosters again under the same records unwraps no key again, however many epochs they name. An
+/// answer read under another generation of the same trust's and recipient's log drops every
+/// answer kept under the one before: a log that holds another record has another generation, and
+/// a lease asks only under its own. What it keeps for one trust and recipient is therefore at
+/// most an answer for each record of one held log. Another trust's or recipient's answers stay:
+/// a rule across them would let one vault's reads drop another's, as a test process reads a
+/// vault for each of its tests at once.
+///
+/// [`Generation`]: crate::membership_log::history::Generation
+struct KeptHistory {
+    trust: Trust,
+    recipient: [u8; 32],
+    generation: crate::membership_log::history::Generation,
+    answers: std::collections::BTreeMap<[u8; 32], KeptAnswer>,
+}
+
+/// One answer [`KeptHistory`] keeps: an epoch's generation, the members of its writers and its
+/// key, or `None` where the log names no Commons writers of it.
+type KeptAnswer = Option<(u64, Vec<Member>, Zeroizing<[u8; 32]>)>;
+
+/// Every [`KeptHistory`] this process holds, one for each trust and recipient it answered for.
+static HISTORICAL_CACHE: std::sync::Mutex<Vec<KeptHistory>> = std::sync::Mutex::new(Vec::new());
+
+impl KeptHistory {
+    /// The answer kept for `basis` under `generation` of `trust`'s and `recipient`'s log, if one
+    /// is: none while another generation's answers are kept for them, or where the cache's lock
+    /// is poisoned.
+    fn answer(
+        trust: Trust,
+        recipient: [u8; 32],
+        generation: crate::membership_log::history::Generation,
+        basis: [u8; 32],
+    ) -> Option<KeptAnswer> {
+        let kept = HISTORICAL_CACHE.lock().ok()?;
+        kept.iter()
+            .find(|held| {
+                held.trust == trust && held.recipient == recipient && held.generation == generation
+            })?
+            .answers
+            .get(&basis)
+            .cloned()
+    }
+
+    /// Keep `answer` for `basis` under `generation` of `trust`'s and `recipient`'s log, first
+    /// dropping every answer kept for them under another generation. Where the cache's lock is
+    /// poisoned it keeps nothing.
+    fn keep(
+        trust: Trust,
+        recipient: [u8; 32],
+        generation: crate::membership_log::history::Generation,
+        basis: [u8; 32],
+        answer: KeptAnswer,
+    ) {
+        let Ok(mut kept) = HISTORICAL_CACHE.lock() else {
+            return;
+        };
+        match kept
+            .iter_mut()
+            .find(|held| held.trust == trust && held.recipient == recipient)
+        {
+            Some(held) => {
+                if held.generation != generation {
+                    held.answers.clear();
+                    held.generation = generation;
+                }
+                held.answers.insert(basis, answer);
+            }
+            None => kept.push(Self {
+                trust,
+                recipient,
+                generation,
+                answers: std::collections::BTreeMap::from([(basis, answer)]),
+            }),
+        }
+    }
+
+    /// How many answers are kept for `trust` and `recipient`, under every generation of their log
+    /// they were read under.
+    #[cfg(test)]
+    fn kept(trust: Trust, recipient: [u8; 32]) -> usize {
+        HISTORICAL_CACHE.lock().map_or(0, |kept| {
+            kept.iter()
+                .filter(|held| held.trust == trust && held.recipient == recipient)
+                .map(|held| held.answers.len())
+                .sum()
+        })
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     /// The calls of [`Access::historical_from_lease`], which asks the kept historical keys, made
@@ -926,6 +1026,15 @@ pub fn test_kept_key_asks() -> usize {
     KEY_CACHE_ASKS.with(std::cell::Cell::get)
 }
 
+/// The answer for a log-era epoch the held log holds only pending its parents: no key of it opens
+/// under this history ([`crate::ErrorKind::HistoryUnopened`]), until record intake brings them.
+fn pending_epoch() -> Error {
+    Error::of_kind(
+        crate::ErrorKind::HistoryUnopened,
+        "historical Commons epoch is not complete",
+    )
+}
+
 /// What [`open_from_lease`] unwraps of an epoch: its generation, the bindings of its writers and
 /// its key.
 type OpenedEpoch = (u64, Vec<Binding>, Zeroizing<[u8; 32]>);
@@ -937,7 +1046,8 @@ type OpenedEpoch = (u64, Vec<Binding>, Zeroizing<[u8; 32]>);
 /// [`HistoryLease::note_opened`]: crate::membership_log::history::HistoryLease::note_opened
 ///
 /// # Errors
-/// The epoch belongs to another history, or its key is not wrapped to `identity` or does not open.
+/// The epoch belongs to another history, or its key does not open; a key the log does not wrap
+/// to `identity` is [`crate::ErrorKind::HistoryUnopened`].
 fn open_from_lease(
     identity: &Identity,
     epoch: &crate::membership_log::history::RecordLease<'_>,
@@ -947,7 +1057,8 @@ fn open_from_lease(
         return Ok(None);
     };
     let Some(key) = lease.unwrap_commons_epoch(epoch, identity)? else {
-        return Err(Error::new(
+        return Err(Error::of_kind(
+            crate::ErrorKind::HistoryUnopened,
             "historical Commons epoch is not wrapped to this device",
         ));
     };
@@ -994,9 +1105,7 @@ impl LogHistory<'_> {
         let lease = self.lease;
         let epoch = match lease.record(&source)? {
             RecordState::Complete(epoch) => epoch,
-            RecordState::Pending => {
-                return Err(Error::new("historical Commons epoch is not complete"));
-            }
+            RecordState::Pending => return Err(pending_epoch()),
             RecordState::Absent => return Ok(None),
         };
         let Some((generation, bindings)) = lease.historical_commons_writers(&epoch)? else {

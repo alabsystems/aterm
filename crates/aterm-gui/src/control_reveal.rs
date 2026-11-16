@@ -335,7 +335,7 @@ fn served(store: &Store, bridge: bool, rest: &str, procs: &dyn Procs) -> String 
 /// `reveal` says `spawned`.
 pub(crate) fn mark_ctl_spawned(store: &Store, sid: &str) {
     let store = store.read().unwrap_or_else(PoisonError::into_inner);
-    if let Some(handle) = store.by_sid(&aterm_session::SessionId::new(sid)) {
+    if let Some(handle) = aterm_session::SessionId::parse(sid).and_then(|sid| store.by_sid(&sid)) {
         handle.ctx.spawn_mark.ctl();
     }
 }

@@ -53,6 +53,7 @@ pub mod network;
 #[cfg(unix)]
 pub mod network_state;
 pub mod publish;
+pub mod relation;
 #[cfg(unix)]
 pub mod replica;
 #[cfg(unix)]

@@ -1297,7 +1297,7 @@ const fn gerund(stage: Stage) -> &'static str {
 }
 
 /// The `SetupLedger` and `SetupKeptKey` actions the setup run does not perform, named where the
-/// whole-source closure (aterm-models' `spec_xref_closure`) collects them: the environment's
+/// whole-source closure (aterm-spec-closure's `spec_xref_closure`) collects them: the environment's
 /// crash, quit and reboot, and the models' `Buggy=1` mutants, which the conformance test's
 /// negative control replays. A waiver in the test module would compile into that test alone,
 /// never into the closure.

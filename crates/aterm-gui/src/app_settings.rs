@@ -1785,6 +1785,9 @@ impl App {
                         adapter.listened(window);
                     }
                 }
+                // A page whose off-screen nodes fell behind the model while nobody read them
+                // owes the client the frame that compiles them.
+                self.owe_client_native_nodes(wid);
                 self.push_a11y_tree(wid);
             }
             AkWindowEvent::ActionRequested(req) => self.on_accessibility_action(wid, req),

@@ -18,6 +18,7 @@ description = "The Linux lane's guest agent: a static, std-only binary that runs
 [[bin]]
 name = "aterm-vz-agent"
 path = "src/main.rs"
+test = false
 
 # Nothing in `aterm` depends on the agent, so `verify cells` reaches its Linux
 # code only through this key: the linux-arm cell lints it with the clippy.toml

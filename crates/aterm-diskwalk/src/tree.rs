@@ -129,7 +129,8 @@ pub struct HugeDir {
 }
 
 impl HugeDir {
-    /// The line `sys disk` prints and the exceptions entry carries.
+    /// The folder's fact in one line: its count, the line it passed and what that count costs.
+    /// It states the fact and no instruction: nothing in it asks anyone to remove anything.
     #[must_use]
     pub fn sentence(&self) -> String {
         let kind = if self.warning { "warning" } else { "note" };
@@ -139,8 +140,7 @@ impl HugeDir {
         if self.executables {
             format!(
                 "{kind}: {path} has {n} entries (line {line}): a binary launched from it makes \
-                 tccd read the whole directory when it opens its WindowServer connection; remove \
-                 old build outputs there (targo clean, or delete entries older than a few days)"
+                 tccd read the whole directory when it opens its WindowServer connection"
             )
         } else {
             format!(

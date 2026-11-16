@@ -922,6 +922,7 @@ fn a_tap_reading_fills_the_windows_of_the_json() {
         ctx_left: None,
         dur_us: 0,
         row: None,
+        route: None,
     };
     let mut a = live_account();
     a.add_reading(&reading, 1_012);
@@ -963,6 +964,7 @@ fn week_only_reading() -> crate::harness::tap::Reading {
         ctx_left: None,
         dur_us: 0,
         row: None,
+        route: None,
     }
 }
 
@@ -1208,6 +1210,7 @@ fn the_usage_line_says_100_only_for_a_reading_of_100() {
         pid: Some("68537".to_owned()),
         login: None,
         home: None,
+        route: None,
     };
     let now = 1_793_473_703;
     let line_of = |reading: &crate::harness::tap::Reading, week_x10: u32| {

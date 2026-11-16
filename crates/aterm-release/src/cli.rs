@@ -621,6 +621,16 @@ USAGE
                            obligations/<package>.ndjson), against the current
                            credit epoch. Exit 0 holds, 1 below the epoch's floor
                            or a record refused, 2 no readable credit epoch
+  targo --unverified ship trust log <crate|name@version> [--target-root DIR]
+                           prints the log the lane kept of that library's check
+                           (logs/<name@version>.log.zst under the target root a
+                           run with that --target-root uses), decompressed; a
+                           running check's log as far as it is stored. Past its
+                           cap a stored log holds only the lines the judge reads
+                           and the output's last 256 KiB, and ends saying how
+                           much it left out. Exit 0 printed, 1 no log, 2 logs of
+                           more than one version (name one), or a logs folder
+                           or log that could not be read
   targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            finish or withdraw the cut of a machine that died
@@ -756,7 +766,8 @@ pub enum Cmd {
     Inputs {
         recheck: bool,
     },
-    /// `trust run|judge`: the Trust lane and the judge of its stored facts ([`crate::trust_facts`]).
+    /// `trust run|reduce|judge|credit|log`: the Trust lane, its report reducer, the judge of its
+    /// stored facts, the proved (calculus) counter and the lane's logs ([`crate::trust_facts`]).
     Trust(crate::trust_facts::TrustCmd),
     /// `site`: alab.systems brought to a release ([`crate::site`]), which parses its flags.
     Site(Vec<String>),

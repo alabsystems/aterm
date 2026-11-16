@@ -245,28 +245,19 @@ fn a_relative_cache_keeps_its_absolute_original_after_staging_through_a_symlink(
     assert!(stage.join("program").is_file());
 }
 
-/// One exact image exercises every automatic cache route. No image or ancestor is
-/// renamed or removed until its child has echoed a line from inside that actual image.
+/// One mapped file inside the tree holds it through every automatic cache route. The test
+/// process maps the file itself, so the production kernel reader sees a holder under the tree's
+/// path with no child to exec: the kernel reports a mapping by its file's current path, which
+/// follows the tree through each staged rename. That the same reader finds a running executable
+/// by its path is aterm-uds' to prove (`holders_paths_tests.rs`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn a_running_cache_image_keeps_whole_registered_tooling_and_resumed_stages() {
-    use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes, kill_within};
-    use aterm_uds::spawnfd::{Child, Stdio};
+fn a_mapped_cache_file_keeps_whole_registered_tooling_and_resumed_stages() {
+    use std::os::fd::AsFd as _;
     use std::time::{Duration, SystemTime};
 
-    struct Running {
-        child: Child,
-        stdin: Option<std::process::ChildStdin>,
-    }
-    impl Drop for Running {
-        fn drop(&mut self) {
-            kill_within(&mut self.child, Duration::from_secs(60));
-        }
-    }
-
-    let directory = aterm_tempfile::tempdir().unwrap().keep();
-    let mut custody = KeptUntilRan::new(directory);
-    let home = custody.path().canonicalize().unwrap().join("home");
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let home = directory.path().canonicalize().unwrap().join("home");
     let owner = home.join("workspace");
     // Private whatever the umask: a registered target is laid only through folders no
     // group or other user can write, from the home down.
@@ -288,26 +279,30 @@ fn a_running_cache_image_keeps_whole_registered_tooling_and_resumed_stages() {
     assert!(super::super::registered::create_checked(&home, &leaf, &owner).unwrap());
     let tooling = leaf.join("debug/deps/tooling.noindex");
     let row = tooling.join("fish-7");
-    let image = row.join("bin/cat");
+    let image = row.join("bin/mapped");
     std::fs::create_dir_all(image.parent().unwrap()).unwrap();
     std::fs::write(leaf.join("debug/.cargo-lock"), b"").unwrap();
-    ad_hoc_copy(Path::new("/bin/cat"), &image);
-    let child = aterm_uds::spawnfd::command(&image)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut running = Running { child, stdin: None };
-    running.stdin = Some(cat_echoes(&mut running.child));
-    custody.ran();
-    let pid = running.child.id();
+    std::fs::write(&image, vec![0x71; aterm_uds::shm::PAGE]).unwrap();
+    let file = std::fs::File::open(&image).unwrap();
+    // SAFETY: this private file has exactly PAGE bytes and nothing writes, resizes or removes
+    // it while the region lives: every route below is asserted to keep it, and the region is
+    // dropped before the one reclaim that may remove it.
+    let region =
+        unsafe { aterm_uds::shm::Region::map_readonly(file.as_fd(), aterm_uds::shm::PAGE) }
+            .unwrap();
+    drop(file);
+    let mut byte = [0];
+    region.read_into(0, &mut byte).unwrap();
+    assert_eq!(byte, [0x71]);
+    let me = std::process::id();
 
-    // Use the real production kernel reader, scoped to this proven fixture child so
-    // unrelated processes outside the test do not determine its expected verdict.
+    // Use the real production kernel reader, which ignores this process's own descriptors
+    // but not its mappings, scoped to this process so unrelated processes outside the test
+    // do not determine its expected verdict.
     let processes = |dirs: &[PathBuf], skip: &[u32]| {
         let mut scan = live(dirs, skip)?;
-        scan.users.retain(|user| user.pid == pid);
-        scan.unreadable.retain(|(user, _)| *user == pid);
+        scan.users.retain(|user| user.pid == me);
+        scan.unreadable.retain(|(user, _)| *user == me);
         Ok(scan)
     };
     let fence = Fence::new(&processes);
@@ -359,7 +354,7 @@ fn a_running_cache_image_keeps_whole_registered_tooling_and_resumed_stages() {
     if row.is_dir() {
         std::fs::rename(&row, &tool_stage).unwrap();
         let tools = super::super::tooling::reclaim_on(&tooling, now, &mut |_, _| true, &fence);
-        held.push(tools.is_empty() && tool_stage.join("bin/cat").is_file());
+        held.push(tools.is_empty() && tool_stage.join("bin/mapped").is_file());
     } else {
         held.push(false);
     }
@@ -387,18 +382,13 @@ fn a_running_cache_image_keeps_whole_registered_tooling_and_resumed_stages() {
     } else {
         held.push(false);
     }
-    kill_within(&mut running.child, Duration::from_secs(60));
-    assert!(
-        running.child.try_wait().unwrap().is_some(),
-        "the proven child was reaped"
-    );
-    drop(running);
+    drop(region);
     assert!(
         held.iter().all(|kept| *kept),
-        "a live exact image must retain every route: {held:?}"
+        "a mapped file must retain every route: {held:?}"
     );
 
-    // The same identity-bound pending payload goes after its only holder exits.
+    // The same identity-bound pending payload goes once its only holder unmaps it.
     let removed = super::super::registered::reclaim_on(
         &home,
         now + 2 * day,

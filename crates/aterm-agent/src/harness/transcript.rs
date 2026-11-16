@@ -207,6 +207,7 @@ const CONVERSATION: Shape = Shape::Object(&[
     (
         "message",
         Shape::Object(&[
+            ("id", Shape::Scalar),
             ("model", Shape::Scalar),
             ("stop_reason", Shape::Scalar),
             ("content", CONTENT),

@@ -276,6 +276,203 @@ fn private_lock_excludes_a_second_holder() {
     let _again = PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap();
 }
 
+#[test]
+fn an_existing_lock_probe_creates_neither_file_nor_directory() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing").join("state");
+    assert!(
+        PrivateLock::take_existing(&missing, ".lock", Duration::ZERO, BUSY)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!root.path().join("missing").exists());
+
+    let dir = dir_in(root.path(), "state", 0o700);
+    assert!(
+        PrivateLock::take_existing(&dir, ".lock", Duration::ZERO, BUSY)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    assert_eq!(mode_of(&dir), 0o700);
+}
+
+#[test]
+fn a_private_lock_creates_0600_without_changing_existing_files() {
+    use std::os::unix::fs::FileExt as _;
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    assert_eq!(
+        PrivateLock::take_private(&missing, ".lock", Duration::ZERO, BUSY)
+            .err()
+            .expect("the directory is never created")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(!missing.exists());
+    let dir = dir_in(root.path(), "state", 0o700);
+    let held = PrivateLock::take_private(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+    assert_eq!(mode_of(&dir.join(".lock")), 0o600);
+    assert_eq!(held.file().metadata().unwrap().len(), 0);
+    let refused = PrivateLock::take_private(&dir, ".lock", Duration::ZERO, BUSY)
+        .err()
+        .expect("the strict creating API excludes another holder too");
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(refused.to_string(), BUSY);
+    held.file().write_all_at(b"kept", 0).unwrap();
+    drop(held);
+    let _again = PrivateLock::take_private(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+    assert_eq!(std::fs::read(dir.join(".lock")).unwrap(), b"kept");
+    assert_eq!(mode_of(&dir.join(".lock")), 0o600);
+}
+
+#[test]
+fn an_existing_lock_keeps_its_file_and_excludes_until_release() {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    file_in(&dir, ".lock", b"before", 0o600);
+    let before = std::fs::metadata(dir.join(".lock")).unwrap();
+    let held = PrivateLock::take_existing(&dir, ".lock", Duration::MAX, BUSY)
+        .unwrap()
+        .expect("the existing free lock is taken");
+    let mut file = held.file();
+    let opened = file.metadata().unwrap();
+    assert_eq!((opened.dev(), opened.ino()), (before.dev(), before.ino()));
+    let mut bytes = [0; 6];
+    file.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"before");
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(b"after").unwrap();
+    file.set_len(5).unwrap();
+    assert_eq!(std::fs::read(dir.join(".lock")).unwrap(), b"after");
+    let refused = PrivateLock::take_existing(&dir, ".lock", Duration::ZERO, BUSY)
+        .err()
+        .expect("the held lock excludes another probe");
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(refused.to_string(), BUSY);
+    drop(held);
+
+    let again = PrivateLock::take_existing(&dir, ".lock", Duration::ZERO, BUSY)
+        .unwrap()
+        .expect("the same lock is free after its holder drops");
+    assert_eq!(again.file().metadata().unwrap().ino(), before.ino());
+    assert_eq!(std::fs::read(dir.join(".lock")).unwrap(), b"after");
+}
+
+#[test]
+fn an_existing_lock_refuses_unsafe_entries_without_changing_them() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    file_in(&dir, "real", b"kept", 0o600);
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+    let outside = root.path().join("outside");
+    std::os::unix::fs::symlink(&outside, dir.join("dangling")).unwrap();
+    file_in(&dir, "loose", b"loose", 0o644);
+    std::fs::hard_link(dir.join("real"), dir.join("another-link")).unwrap();
+    dir_in(&dir, "directory", 0o700);
+    let fifo = dir.join("fifo");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+
+    for name in [
+        "link",
+        "dangling",
+        "loose",
+        "real",
+        "another-link",
+        "directory",
+        "fifo",
+    ] {
+        assert!(
+            PrivateLock::take_private(&dir, name, Duration::ZERO, BUSY).is_err(),
+            "{name} is refused before creating or modifying its file"
+        );
+        assert!(
+            PrivateLock::take_existing(&dir, name, Duration::ZERO, BUSY).is_err(),
+            "{name} is not a private regular file with one link"
+        );
+    }
+    assert!(!outside.exists());
+    assert_eq!(std::fs::read(dir.join("real")).unwrap(), b"kept");
+    assert_eq!(std::fs::read(dir.join("loose")).unwrap(), b"loose");
+    assert_eq!(mode_of(&dir.join("loose")), 0o644);
+    assert!(
+        std::fs::symlink_metadata(dir.join("link"))
+            .unwrap()
+            .is_symlink()
+    );
+
+    let open = dir_in(root.path(), "open", 0o755);
+    file_in(&open, ".lock", b"kept", 0o600);
+    assert!(PrivateLock::take_existing(&open, ".lock", Duration::ZERO, BUSY).is_err());
+    assert!(PrivateLock::take_existing(&open, "missing", Duration::ZERO, BUSY).is_err());
+    assert!(PrivateLock::take_private(&open, ".lock", Duration::ZERO, BUSY).is_err());
+    assert!(PrivateLock::take_private(&open, "missing", Duration::ZERO, BUSY).is_err());
+    assert_eq!(mode_of(&open), 0o755);
+    assert!(!open.join("missing").exists());
+    let linked_dir = root.path().join("linked-dir");
+    std::os::unix::fs::symlink(&dir, &linked_dir).unwrap();
+    assert!(PrivateLock::take_existing(&linked_dir, "loose", Duration::ZERO, BUSY).is_err());
+    assert!(PrivateLock::take_private(&linked_dir, "loose", Duration::ZERO, BUSY).is_err());
+}
+
+#[test]
+fn an_existing_lock_rejects_escaping_names_and_threads_that_take_nothing() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    let absolute = root.path().join("absolute.lock");
+    for name in [
+        "sub/x.lock",
+        "../beside.lock",
+        "..",
+        ".",
+        "",
+        absolute.to_str().unwrap(),
+    ] {
+        assert_eq!(
+            PrivateLock::take_private(&dir, name, Duration::ZERO, BUSY)
+                .err()
+                .expect("an escaping name is refused by the creating API too")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            PrivateLock::take_existing(&dir, name, Duration::ZERO, BUSY)
+                .err()
+                .expect("an escaping name is refused")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    assert!(!absolute.exists());
+    assert!(!root.path().join("beside.lock").exists());
+
+    file_in(&dir, ".lock", b"", 0o600);
+    let refused = crate::file_lock::takes_nothing(|| {
+        PrivateLock::take_existing(&dir, ".lock", Duration::ZERO, BUSY)
+    })
+    .err()
+    .expect("the thread's no-lock rule still applies");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    let refused = crate::file_lock::takes_nothing(|| {
+        PrivateLock::take_private(&dir, ".lock", Duration::ZERO, BUSY)
+    })
+    .err()
+    .expect("the strict creating API obeys the thread's no-lock rule too");
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        PrivateLock::take_existing(&dir, ".lock", Duration::ZERO, BUSY)
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// A symlink at the lock's name is refused, and so is a FIFO, whose open returns at
 /// once (`O_NONBLOCK`).
 #[test]
@@ -426,6 +623,12 @@ fn files_made_under_a_narrow_umask_are_exactly_0600() {
         drop(
             PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY)
                 .expect("the second take"),
+        );
+        drop(PrivateLock::take_private(&dir, ".private-lock", Duration::ZERO, BUSY).unwrap());
+        assert_eq!(mode_of(&dir.join(".private-lock")), 0o600);
+        drop(
+            PrivateLock::take_private(&dir, ".private-lock", Duration::ZERO, BUSY)
+                .expect("the second strict take"),
         );
         // An existing file is opened as it stands: never chmodded.
         file_in(&dir, "narrow", b"x", 0o400);

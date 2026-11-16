@@ -111,9 +111,9 @@
 //! never answered on its re-ask with such a record's restart; a record that still carries a native
 //! move is carried, to complete it, and the restart asked over it defers (`wait:native-carried`)
 //! until a re-ask finds the move gone and supersedes it. The model has no such word.
-//! The host types into the agent (`HostTypes`: its carry-on, the disk ask) only into
+//! The host types into the agent (`HostTypes`: its carry-on) only into
 //! a composer that reads empty (the carry-on's `wait:draft`,
-//! `relaunch::continuation_composer_empty`; the disk ask's `disk_ask::HeldBy::Draft`), so never
+//! `relaunch::continuation_composer_empty`), so never
 //! onto a line drawn there. `ProgramEnds` is
 //! the program's own end (a crash, an exit), which may come at any state where no ask awaits the
 //! host's answer (`asked = 0`; a restart deferred and standing, `restart` 3, included): the loop's

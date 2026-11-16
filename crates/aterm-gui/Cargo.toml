@@ -37,6 +37,7 @@ bench = false
 [[bin]]
 name = "aterm-redraw-conformance"
 path = "src/bin/aterm-redraw-conformance.rs"
+test = false
 
 # The Claude Code footer's per-frame pass, timed: a measurement, not a
 # gate, so it is a bench, not an #[ignore]d test in every test build. It drives
@@ -260,6 +261,7 @@ dev-seams = [
 ]
 
 [dependencies]
+aterm-path = { workspace = true }
 # The turn-end readers and their texts (needs, the read-only command classifier, the press
 # guard, the words the policy types), which the server reads and shows.
 alab-policy = { workspace = true }
@@ -272,7 +274,7 @@ aterm-repository-progress = { workspace = true }
 aterm-core = { workspace = true, features = ["serde"] }
 # The anchor attributes' registry (std-only): this crate's own
 # `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]` anchors expand in
-# every test and debug build, so aterm-models' closure gate sees them; release strips them.
+# every test and debug build, so aterm-spec-closure's closure gate sees them; release strips them.
 aterm-spec-anchor = { workspace = true }
 # The selection/block control verbs + the shared response-framing primitives,
 # hosted here through `control_host::GuiHost`'s `SessionHost` impl.
@@ -344,6 +346,7 @@ aterm-messages = { workspace = true }
 # those readers lives in that crate, so the host adds none.
 aterm-sysprobe = { workspace = true }
 aterm-vitals = { workspace = true }
+aterm-process-facts = { workspace = true }
 # The per-action telemetry row and its local log (Continuum TM-0): `telemetry_host`
 # writes a row for each command, agent call and spawn this window sees, from
 # readings it already takes, and answers the `telemetry` verb. Workspace crate.
@@ -519,7 +522,6 @@ aterm-models-gui = { workspace = true }
 aterm-models-harness = { workspace = true }
 aterm-models-misc = { workspace = true }
 aterm-models-native = { workspace = true }
-aterm-models-release = { workspace = true }
 aterm-models-render = { workspace = true }
 aterm-models-session = { workspace = true }
 aterm-models-swarm = { workspace = true }
@@ -660,11 +662,6 @@ workspace = true
 name = "jumplist_acceptance"
 harness = false
 test = false
-
-# Pure production chunk classifier and its original oracle, without a GUI host.
-[[bench]]
-name = "job_chunk_cost"
-harness = false
 
 # Native session-counter validation, including index construction, without a GUI host.
 [[bench]]

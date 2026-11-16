@@ -596,10 +596,10 @@ Run aterm's checks in place, alone or in any combination.
   verify glue <in.wasm> <out-dir>
                                   a wasm module's ES module glue (`verify glue --help`)
   verify vendor-out --into <dir> [--check]
-                                  sealed copies of alab-policy (aterm's pinned
-                                  copy, vendor/alab-harness), aterm-phase and
-                                  aterm-agent-names in <dir>/vendor for another
-                                  repository to build (`verify vendor-out --help`)
+                                  sealed aterm-phase and aterm-agent-names
+                                  projections beside <dir>'s independently pinned
+                                  vendor/alab-harness; policy dependencies use
+                                  that pin (`verify vendor-out --help`)
   verify provision [--linux] [--check] [ROW...]
                                   the tools this checkout pins (fish, bash
                                   5.3, pwsh, binaryen, the browsers, rustup's

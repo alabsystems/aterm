@@ -175,6 +175,7 @@ const fn next(kind: crate::ErrorKind) -> Next {
         | Kind::VaultBusy
         | Kind::VaultChanged
         | Kind::MembershipHistoryUnavailable
+        | Kind::HistoryUnopened
         | Kind::TimedOut
         | Kind::JoinQueueIncomplete
         | Kind::NotStored

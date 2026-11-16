@@ -501,3 +501,173 @@ fn a_share_only_replaces_its_own_earlier_cutoff() {
         "the stale one is replaced"
     );
 }
+
+/// Who removed a writer decides which cutoffs of it count ([`Session::removers_of`]), so a
+/// membership log that does not read refuses the read: it is no answer that nobody removed
+/// anybody. CONTROL: read with the log, m2's operation past m0's cutoff is withheld.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `removers_of` taking a log that did not read for no log
+/// (`read.ok().flatten()`), the read succeeded and counted the cut writer's later operation:
+/// `a membership log that did not read refuses the read: ["m2-before", "m2-after"]`.
+#[test]
+fn a_membership_log_that_does_not_read_refuses_the_table_read() {
+    let table = table();
+    table.write(2, b"m2-before");
+    table.remove_m2();
+    table.write(2, b"m2-after");
+    let control = table.read();
+    assert!(
+        !control.contains(&b"m2-after".to_vec()),
+        "CONTROL: past the cutoff: {control:?}"
+    );
+    REMOVERS_LOG_FAILS.set(true);
+    let read = (|| {
+        let b0 = table.lab.bootstrap(0);
+        let session = Session::observe(&b0)?;
+        Store::open(&session, &table.dirs[0], table.scope)?.catalog(&session)
+    })();
+    REMOVERS_LOG_FAILS.set(false);
+    let refused = read
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| String::from_utf8_lossy(record.payload()).into_owned())
+                .collect::<Vec<_>>()
+        })
+        .expect_err("a membership log that did not read refuses the read");
+    assert!(
+        refused.to_string().contains("membership log did not read"),
+        "{refused}"
+    );
+}
+
+/// A writer that is no member now keeps the operations it sealed under a roster whose grant
+/// seated it ([`Session::historical_writer_in`]), and where that grant does not read, the read
+/// refuses: a history that did not read is no answer that the writer held no seat. The table is
+/// read by a session that did not open its store, as a store kept across sessions is, so the
+/// grant is asked of the history afresh. CONTROL: read so, m2's operation from before its
+/// removal (which signed no cutoff) stands.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `historical_writer_in` answering `Ok(false)` for every
+/// grant that did not read, the read succeeded without m2's operation: `a grant that did not read
+/// refuses the read: ["m0-before"]`.
+#[test]
+fn a_historical_grant_that_does_not_read_refuses_the_table_read() {
+    let table = table();
+    table.write(0, b"m0-before");
+    table.write(2, b"m2-before");
+    let roster = {
+        let b2 = table.lab.bootstrap(2);
+        let session = Session::open(&b2).unwrap();
+        let store = Store::open(&session, &table.dirs[2], table.scope).unwrap();
+        let evidence = store.metadata_evidence(&session).unwrap();
+        assert_eq!(evidence.len(), 1, "m2's replica holds its own operation");
+        let wire = store
+            .wire(&session, &evidence[0].header.id)
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        envelope_roster(&wire).unwrap()
+    };
+    client::remove_member_in_log(&table.lab.paths[0], table.actor(2)).unwrap();
+    let b0 = table.lab.bootstrap(0);
+    let opener = Session::observe(&b0).unwrap();
+    let store = Store::open(&opener, &table.dirs[0], table.scope).unwrap();
+    let read = || -> Result<Vec<Vec<u8>>> {
+        let reader = Session::observe(&b0)?;
+        Ok(store
+            .catalog(&reader)?
+            .into_iter()
+            .map(|record| record.payload().to_vec())
+            .collect())
+    };
+    let control = read().unwrap();
+    assert!(
+        control.contains(&b"m2-before".to_vec()),
+        "CONTROL: the removed writer's operation stands through its grant: {control:?}"
+    );
+    HISTORICAL_FAILS.with_borrow_mut(|fails| fails.insert(roster));
+    let refused = read();
+    HISTORICAL_FAILS.with_borrow_mut(std::collections::BTreeSet::clear);
+    let refused = refused
+        .map(|read| {
+            read.iter()
+                .map(|payload| String::from_utf8_lossy(payload).into_owned())
+                .collect::<Vec<_>>()
+        })
+        .expect_err("a grant that did not read refuses the read");
+    assert!(
+        refused
+            .to_string()
+            .contains("historical grant did not read"),
+        "{refused}"
+    );
+}
+
+/// A membership that moves after a session observed it and before the session reads a record a
+/// roll carried makes that read busy, which a reader observes again, never a refusal: the
+/// carried batch asks the held history for the rosters the session has not opened before its
+/// read batch's opening fence ([`Session::authenticate_carried`]), so the move meets the
+/// historical read's own check of the membership first (`roster::Access::stands_for`), and a
+/// refusal there would hold the shared files `custody` until the next minute pass where a busy
+/// one is followed by a pass 10 s later (`alab::upkeep`'s busy follow-up), and would refuse a
+/// mesh record a busy one queues for retry. m2's record is sealed under the roster before m2's
+/// removal; m0 observes the roster after it, then removes m1. CONTROL: a session that observed
+/// the membership as it stands, before and after the move, authenticates the record.
+///
+/// NEGATIVE CONTROL (2026-11-15): with `roster::Access::stands_for` answering a membership that
+/// is no longer current with `Error::new` (kind `Other`, as before this law), the read under the
+/// moved membership was not busy: the `is_busy` assertion failed with `historical access
+/// requires the current local membership`.
+#[test]
+fn a_membership_that_moves_under_a_carried_read_is_busy_not_refused() {
+    let table = table();
+    table.write(2, b"m2-before");
+    let wire = {
+        let b2 = table.lab.bootstrap(2);
+        let session = Session::open(&b2).unwrap();
+        let store = Store::open(&session, &table.dirs[2], table.scope).unwrap();
+        let evidence = store.metadata_evidence(&session).unwrap();
+        assert_eq!(evidence.len(), 1, "m2's replica holds its own operation");
+        store
+            .wire(&session, &evidence[0].header.id)
+            .unwrap()
+            .unwrap()
+            .to_vec()
+    };
+    let (m1, m2) = (table.actor(1), table.actor(2));
+    client::remove_member_in_log(&table.lab.paths[0], m2).unwrap();
+    let b0 = table.lab.bootstrap(0);
+    let authenticates = |session: &Session<'_>| {
+        matches!(
+            session
+                .authenticate_carried(table.scope, &[wire.as_slice()])
+                .unwrap()
+                .as_slice(),
+            [Carried::Record(_)]
+        )
+    };
+    assert!(
+        authenticates(&Session::observe(&b0).unwrap()),
+        "CONTROL: the roster m2's record names opens for m0"
+    );
+    let observed = Session::observe(&b0).unwrap();
+    assert!(
+        !observed
+            .history
+            .borrow()
+            .contains_key(&envelope_roster(&wire).unwrap()),
+        "CONTROL: the session has not opened the record's roster"
+    );
+    client::remove_member_in_log(&table.lab.paths[0], m1).unwrap();
+    let moved = observed
+        .authenticate_carried(table.scope, &[wire.as_slice()])
+        .err()
+        .expect("a membership that moved under the session answers nothing");
+    assert!(moved.is_busy(), "{moved}");
+    drop(observed);
+    assert!(
+        authenticates(&Session::observe(&b0).unwrap()),
+        "CONTROL: observed again, the record authenticates"
+    );
+}

@@ -30,13 +30,22 @@ fn unread(rings: &Receiver<()>) -> usize {
     rings.try_iter().count()
 }
 
+/// A bell of the test's own, started as a serving lane starts the process's before any park arms
+/// it.
+#[track_caller]
+fn started() -> Bell {
+    let bell = Bell::new();
+    assert!(bell.start(), "the hang-up bell starts on this platform");
+    bell
+}
+
 /// A CLOSE RINGS, and a stream already hung up when armed rings at once; the predicate a woken
 /// park asks agrees with the ring.
 /// NEGATIVE CONTROL: with the queue's wait hearing no hang-up, neither ring comes within the hang
 /// detector.
 #[test]
 fn a_peer_that_closes_rings_its_arm() {
-    let bell = Bell::new();
+    let bell = started();
     let (near, far) = CtlStream::pair().expect("pair");
     let (tx, rx) = ring();
     let armed = bell.arm(&near, tx).expect("arm");
@@ -59,7 +68,7 @@ fn a_peer_that_closes_rings_its_arm() {
 /// as it is armed (its socket is writable), and A's count is 1.
 #[test]
 fn a_write_side_shutdown_never_rings_where_a_close_does() {
-    let bell = Bell::new();
+    let bell = started();
     let (a, a_peer) = CtlStream::pair().expect("pair");
     let (b, b_peer) = CtlStream::pair().expect("pair");
     let (a_tx, a_rx) = ring();
@@ -84,7 +93,7 @@ fn a_write_side_shutdown_never_rings_where_a_close_does() {
 /// shows the descriptor armed, and rings the dropped arm's channel at the close.
 #[test]
 fn an_arm_dropped_before_the_close_never_rings() {
-    let bell = Bell::new();
+    let bell = started();
     let (near, far) = CtlStream::pair().expect("pair");
     let (tx, rx) = ring();
     let armed = bell.arm(&near, tx).expect("arm");
@@ -111,7 +120,7 @@ fn an_arm_dropped_before_the_close_never_rings() {
 /// is refused.
 #[test]
 fn a_number_reused_after_a_drop_rings_its_new_arm() {
-    let bell = Bell::new();
+    let bell = started();
     let (reused, old_peer) = CtlStream::pair().expect("pair");
     let (old_tx, old_rx) = ring();
     drop(bell.arm(&reused, old_tx).expect("arm the old socket"));
@@ -148,7 +157,7 @@ fn a_number_reused_after_a_drop_rings_its_new_arm() {
 /// `EPOLLONESHOT`) reports A at every wait, and A has rung again by B's ring.
 #[test]
 fn a_hung_up_arm_rings_once() {
-    let bell = Bell::new();
+    let bell = started();
     let (a, a_peer) = CtlStream::pair().expect("pair");
     let (a_tx, a_rx) = ring();
     let _a_armed = bell.arm(&a, a_tx).expect("arm A");
@@ -168,7 +177,7 @@ fn a_hung_up_arm_rings_once() {
 /// NEGATIVE CONTROL: an end that leaves the bell marked live arms the later stream.
 #[test]
 fn a_bell_whose_thread_ended_rings_its_arms_and_arms_no_more() {
-    let bell = Bell::new();
+    let bell = started();
     let (near, _far) = CtlStream::pair().expect("pair");
     let (tx, rx) = ring();
     let armed = bell.arm(&near, tx).expect("arm");
@@ -182,4 +191,45 @@ fn a_bell_whose_thread_ended_rings_its_arms_and_arms_no_more() {
         "an ended bell arms nothing"
     );
     drop(armed);
+}
+
+/// AN ARM NEVER STARTS ITS BELL, SO IT NEVER WAITS FOR A SPAWN IN FLIGHT: a park arms under the
+/// lock of the state it guards (a session's Inbox), and a start opens its kernel queue under the
+/// spawn lock, which on macOS waits for every spawn in flight (seconds under load, for good while
+/// `syspolicyd` is stuck). With a spawn held in flight on the test's thread, an arm of a started
+/// bell answers Ok and an arm of a bell never started answers Err, both within the hang
+/// detector, and the bell never started still arms nothing after the spawn ends.
+/// NEGATIVE CONTROL: an arm that starts its bell at the first arm (the lazy start) arms the bell
+/// never started; on macOS it first waits for the held spawn, past the hang detector.
+#[test]
+fn an_arm_never_starts_its_bell_nor_waits_for_a_spawn_in_flight() {
+    let live = started();
+    let unstarted = Bell::new();
+    let (a, _a_peer) = CtlStream::pair().expect("pair");
+    let (b, _b_peer) = CtlStream::pair().expect("pair");
+    let (tx, _rx) = ring();
+    let (answer_tx, answer) = sync_channel(1);
+    std::thread::scope(|scope| {
+        let in_flight = crate::spawn_lock::spawning();
+        scope.spawn(|| {
+            let armed = (
+                live.arm(&a, tx.clone()).is_ok(),
+                unstarted.arm(&b, tx.clone()).is_ok(),
+            );
+            let _ = answer_tx.send(armed);
+        });
+        let armed = answer
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the arms answer while a spawn is in flight");
+        drop(in_flight);
+        assert_eq!(
+            armed,
+            (true, false),
+            "a started bell arms; one never started arms nothing"
+        );
+    });
+    assert!(
+        unstarted.arm(&b, tx).is_err(),
+        "an arm left the bell never started unstarted"
+    );
 }

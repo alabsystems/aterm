@@ -5382,6 +5382,131 @@ fn an_own_record_held_for_the_drain_keeps_the_link_and_the_other_lanes() {
     }
 }
 
+/// **A RETRY SETTLES AT THE LANDING THE BRIDGE HOLDS UNHANDED** (ATERM-KI-1115-149). An own
+/// note to `tb000000000` landed and aterm answered its `outbox sent` with `ERR busy`, so its
+/// entry stands; the live tail read the note, which the bridge holds unhanded, in hand (`held`
+/// and `replay`) or queued in the mailbox, not yet taken (`queued`). Retention then gives the
+/// note's bus copy up. The drain's retry reads nothing back at the post's pin: held in hand, it
+/// settles at the copy the bridge holds; queued, it publishes nothing and holds the sender
+/// until the loop has taken the copy, and the next retry settles there. `replay`: the link
+/// drops on the same log first, and the re-attach's replay leaves the entry standing at the
+/// copy held in hand, neither reading it back nor publishing it, for the attach's drain to
+/// settle there. Nothing is published again, the post is retired at the note's offset, and
+/// `tb000000000` is handed the note once. NEGATIVE CONTROL
+/// (`Mutant::RetryPastAnUnhandedLanding`): the retry, or the replay, publishes the note again
+/// past the cut, as every build before this one did, and `tb000000000` is handed both copies.
+#[cfg(unix)]
+#[test]
+fn a_retry_settles_at_the_landing_the_bridge_holds_unhanded() {
+    use crate::sim::world::Mutant;
+    for arm in ["held", "queued", "replay"] {
+        for control in [false, true] {
+            let case = format!("{arm} control={control}");
+            let queued = arm == "queued";
+            let (lane, mut bridge) =
+                FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
+            if control {
+                bridge.fx = crate::fx::Fx::os_without(Mutant::RetryPastAnUnhandedLanding);
+            }
+            let (a, broker, _server) = serve_log(&lane, &format!("unhanded-{arm}-{control}"));
+            bridge.cfg.broker = a.clone();
+            assert!(bridge.attach_broker(), "{case}: the attach");
+            let note = an_own_note_aterm_keeps_queued(&lane, &mut bridge);
+            let face = bridge
+                .state
+                .post_pin("ta000000000", 1)
+                .unwrap()
+                .and_then(|pin| pin.identity)
+                .expect("the post's pin names its subject")
+                .subject;
+            aterm_spec::wait::until_within(
+                aterm_spec::wait::MUST_HAPPEN,
+                "the live tail to queue the note",
+                || bridge.mailbox.inbox_queued_at(note).map(|_| ()),
+            );
+            if !queued {
+                assert!(
+                    offer_live_record(&mut bridge, note),
+                    "{case}: the live tail reached the note"
+                );
+                assert!(
+                    bridge.mailbox.inbox_queued_at(note).is_none(),
+                    "{case}: the bridge holds the note in hand, not queued"
+                );
+            }
+            let (mut writer, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
+            writer.publish(92, 1, "/f/f/x/padding", b"v=1").unwrap();
+            // The state-carrying cut, as aterm's rules cut: a plain one is refused by the
+            // presence will the attach left pending below the note.
+            broker.retain_before_carrying_state(note + 1).unwrap();
+            let on_bus = |writer: &mut transport::Conn| -> Vec<u64> {
+                let ((rows, _), _) = transport::fetch_kept(writer, 0, &face, 8).unwrap();
+                rows.iter().map(|(off, ..)| *off).collect()
+            };
+            assert!(
+                on_bus(&mut writer).is_empty(),
+                "{case}: retention gave the note's bus copy up"
+            );
+
+            lane.refuse_retirements(false);
+            if arm == "replay" {
+                // The link drops on the same log with the note held in hand past the cut: the
+                // re-attach's replay meets its entry, and the attach's drain retries the post.
+                // aterm takes the post it retires out of its outbox, so the drain below lists
+                // nothing and hands only what the bridge holds.
+                bridge.close_subscriptions();
+                bridge.conn = None;
+                lane.retire_from_outbox();
+                assert!(
+                    bridge.attach_broker(),
+                    "{case}: the re-attach on the same log"
+                );
+            }
+            bridge.drain_outbox();
+            if queued && !control {
+                assert!(
+                    !bridge.state.in_flight().unwrap().is_empty() && on_bus(&mut writer).is_empty(),
+                    "{case}: the retry waits for the queued copy, publishing nothing"
+                );
+                assert!(
+                    offer_live_record(&mut bridge, note),
+                    "{case}: the loop takes the queued note"
+                );
+                bridge.drain_outbox();
+            }
+            assert!(
+                bridge.state.in_flight().unwrap().is_empty(),
+                "{case}: the drain's retry ended the entry"
+            );
+            let again = on_bus(&mut writer);
+            assert_eq!(
+                again.len(),
+                usize::from(control),
+                "{case}: published again past the cut only under the control: {again:?}"
+            );
+            if let Some(&copy) = again.first() {
+                assert!(
+                    offer_live_record(&mut bridge, copy),
+                    "{case}: the live tail reached the copy published again"
+                );
+            }
+            assert_eq!(
+                retired_at(&retirements(&lane), "ta000000000", 1),
+                Some(again.first().copied().unwrap_or(note)),
+                "{case}: retired where the copy tb000000000 is handed first landed"
+            );
+            let mut want: BTreeSet<String> = [format!("off={note}")].into();
+            want.extend(again.iter().map(|off| format!("off={off}")));
+            assert_eq!(
+                notes_delivered(&lane, "once"),
+                want,
+                "{case}: the note once, or both copies under the control"
+            );
+            bridge.close_subscriptions();
+        }
+    }
+}
+
 /// **WHAT THE BRIDGE HOLDS IN HAND IS BOUNDED, AND PAST IT THE LINK DROPS** (ATERM-KI-1111-3):
 /// a held own note and its session's later mail behind it fill [`HELD_OWN_RECORDS_MAX`]; the
 /// next record of that lane is not held, and the link is said down and dropped, as every
@@ -6488,8 +6613,8 @@ fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once()
     for (hold, at) in [
         (true, None),
         (false, None),
-        (true, Some(0)),
-        (false, Some(0)),
+        (true, Some(Head::From(0))),
+        (false, Some(Head::From(0))),
     ] {
         let case = format!("hold={hold} at={at:?}");
         let sessions = [(1, "ta000000000"), (2, "tb000000000")];
@@ -6665,7 +6790,7 @@ fn a_record_held_below_its_subjects_oldest_is_read_back_and_not_published_again(
             subject,
             body: bytes,
             log: first.conn.as_ref().and_then(|c| c.seen_log_identity()),
-            at: Some(0),
+            at: Some(Head::From(0)),
         })
         .unwrap();
     first.close_subscriptions();
@@ -6889,7 +7014,7 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
             subject: subject.clone(),
             body: bytes.clone(),
             log,
-            at: Some(at),
+            at: Some(Head::From(at)),
         };
         first.state.set_in_flight(&entry(&pin, on_bus)).unwrap();
         lane.refuse_retirements(false);
@@ -6914,7 +7039,7 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
         let next = PublishPin {
             seq: first.next_seq().unwrap(),
             owner: Some(2),
-            at: Some(on_bus + 1),
+            at: Some(Head::From(on_bus + 1)),
             ..pin.clone()
         };
         first.state.set_post_pin("ta000000000", 2, &next).unwrap();
@@ -6996,22 +7121,18 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
 /// left unreadable (rot, or another build's format: astream's `logid::settle` meets
 /// `Prior::Unreadable` and mints a fresh id) or gone (`Prior::Absent`, which derives one from the
 /// records kept); the broker opens again with every record kept, under another id at generation 0
-/// told with an empty lineage, as it opens an empty log. The next attach meets that log at the
-/// head it reads (`state::Met`), which the bus-log witness names, and the replay (an entry in
-/// flight: `Bridge::read_back_from`) or the drain's retry at the pin (a pin alone:
-/// `StateDir::publication_offset_resets`) reads the post back from there, finds none, and
-/// publishes the second `ok`: `s-b` is handed `ok` twice, and each post retires where it landed.
-/// NEGATIVE CONTROL (`Mutant::ReadBackFromTheLogsStart`, ATERM-KI-1111-4's rule): read back from
-/// 0, the post is settled on the first `ok`'s record and never published, and aterm is told it
-/// landed there.
+/// told with an empty lineage, as it opens an empty log. The replay (an entry in flight:
+/// `Bridge::read_back_from`) or the drain's retry at the pin (a pin alone:
+/// `StateDir::publication_offset_resets`) reads the post back from anywhere
+/// (`Bridge::found_anywhere`, ATERM-KI-1114-1414): the first `ok`'s record holds its words under
+/// the first post's sequence, so it is passed, none is found, and the second `ok` is published:
+/// `s-b` is handed `ok` twice, and each post retires where it landed. NEGATIVE CONTROL
+/// (`Mutant::ReadBackAnywhereByWords`, as ATERM-KI-1111-4's rule read from 0): a row of its words
+/// is taken whatever its origin, the post is settled on the first `ok`'s record and never
+/// published, and aterm is told it landed there.
 #[cfg(unix)]
 #[test]
 fn a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_the_same_words() {
-    #[derive(Clone, Copy, Debug)]
-    enum Sidecar {
-        Unreadable,
-        Gone,
-    }
     for (sidecar, journaled, control) in [
         (Sidecar::Unreadable, true, false),
         (Sidecar::Gone, true, false),
@@ -7048,7 +7169,7 @@ fn a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_
             original: None,
             original_off: None,
             owner: Some(2),
-            at: Some(head),
+            at: Some(Head::From(head)),
         };
         first.state.set_post_pin("ta000000000", 2, &next).unwrap();
         if journaled {
@@ -7059,7 +7180,7 @@ fn a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_
                     subject: subject.clone(),
                     body: bytes.clone(),
                     log: was,
-                    at: Some(head),
+                    at: Some(Head::From(head)),
                 })
                 .unwrap();
         }
@@ -7094,7 +7215,7 @@ fn a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_
         bridge.cfg.broker = a;
         if control {
             bridge.fx =
-                crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadBackFromTheLogsStart);
+                crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadBackAnywhereByWords);
         }
         second.retire_from_outbox();
         *second.outbox.lock().unwrap() = Some(post(2));
@@ -7165,18 +7286,371 @@ fn a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_
     }
 }
 
+/// How the identity sidecar of a log astream reopens keeping its records went
+/// ([`reminted_with_a_carried_attempt`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Sidecar {
+    Unreadable,
+    Gone,
+}
+
+/// What [`reminted_with_a_carried_attempt`] left: the offsets of post 1's and post 2's records,
+/// every copy of their words on the bus, where aterm was told post 2 landed, whether its pin
+/// stands, and how many times `tb000000000` was handed post 2's record.
+#[cfg(unix)]
+struct CarriedRemint {
+    first: u64,
+    attempt: u64,
+    copies: Vec<u64>,
+    retired: Option<u64>,
+    pinned: bool,
+    handed: usize,
+}
+
+/// `ta000000000` posts `ok` to `tb000000000` twice, on its own lane. Post 1 lands and retires;
+/// post 2 lands while aterm answers its `outbox sent` with `ERR busy`, so it stays queued at its
+/// pin, its entry in flight (`journaled`; else dropped, the pin alone), and the bridge stops.
+/// The broker stops, the log's identity sidecar rots or goes (astream's `logid::settle` meets
+/// `Prior::Unreadable` or `Prior::Absent`), and it opens again keeping every record, under
+/// another id at generation 0 told with an empty lineage; a cut then carries both records below
+/// the base, dropping their dedup keys, and the rules set next take their lane whole from the
+/// base alone, so the lane's oldest lies above them ([`carry_below_the_lanes_oldest`]). The
+/// bridge attaches again, a fresh process on the same state directory, under `mutant` where one
+/// is named, and drains. `older`: the first bridge publishes under that producer, as an older
+/// node key of this Mac's would, not the one the second bridge's node derives.
+#[cfg(unix)]
+fn reminted_with_a_carried_attempt(
+    arm: &str,
+    sidecar: Sidecar,
+    journaled: bool,
+    mutant: Option<crate::sim::world::Mutant>,
+    older: Option<u64>,
+) -> CarriedRemint {
+    let sessions = [(1, "ta000000000"), (2, "tb000000000")];
+    let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+    if let Some(producer) = older {
+        first.producer_id = producer;
+    }
+    let state = first.state.root().to_path_buf();
+    let (a, broker, server) = serve_log(&lane, "carried-remint");
+    first.cfg.broker = a.clone();
+    assert!(first.attach_broker(), "{arm}: the first attach");
+    let post =
+        |id: u64| format!("post sid=ta000000000 id={id} to=@tb000000000 kind=note len=2\nok");
+    lane.retire_from_outbox();
+    *lane.outbox.lock().unwrap() = Some(post(1));
+    first.drain_outbox();
+    assert_eq!(
+        first.state.post_pin("ta000000000", 1).unwrap(),
+        None,
+        "{arm}: post 1 retired"
+    );
+    lane.refuse_retirements(true);
+    *lane.outbox.lock().unwrap() = Some(post(2));
+    first.drain_outbox();
+    let pin = first
+        .state
+        .post_pin("ta000000000", 2)
+        .unwrap()
+        .expect("post 2's pin stays while aterm keeps it queued");
+    let face = pin.identity.as_ref().unwrap().subject.clone();
+    let (rows, _) = first.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+    let on_bus: Vec<u64> = rows.iter().map(|(off, ..)| *off).collect();
+    let [first_ok, attempt] =
+        <[u64; 2]>::try_from(on_bus).expect("post 1 and post 2 on the bus, each once");
+    let was = first.conn.as_ref().and_then(|c| c.seen_log_identity());
+    if !journaled {
+        first.drop_in_flight(pin.seq);
+    }
+    assert_eq!(
+        first.state.in_flight().unwrap().len(),
+        usize::from(journaled),
+        "{arm}: post 2's entry stands only where journaled"
+    );
+    first.close_subscriptions();
+    drop(first);
+
+    drop(server);
+    drop(broker);
+    let path = lane.dir.path().join("carried-remint.log");
+    let id = astream_broker::identity_path(&path);
+    match sidecar {
+        Sidecar::Unreadable => std::fs::write(&id, b"not an identity").unwrap(),
+        Sidecar::Gone => std::fs::remove_file(&id).unwrap(),
+    }
+    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let broker = loop {
+        match crate::test_broker(&path) {
+            Ok(broker) => break broker,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("{arm}: the log did not open again: {e}"),
+        }
+    };
+    broker.set_retention_interval(Duration::from_secs(3600));
+    broker
+        .set_retention(lanes_whole_from_the_base(true))
+        .unwrap();
+    let _ = std::fs::remove_file(&a);
+    let _server = broker.serve(std::path::Path::new(&a)).unwrap();
+    let (mut writer, _) = transport::connect(&a, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    writer.publish(92, 1, "/f/f/x/padding", b"v=1").unwrap();
+    let (_, (_, head)) = writer.fetch(0, "/f/>", 0).unwrap();
+    carry_below_the_lanes_oldest(&broker, &face, head);
+    let on_bus = |writer: &mut Conn| -> Vec<u64> {
+        let ((rows, _), _) = transport::fetch_told_kept(writer, 0, &face, 8).unwrap();
+        rows.iter().map(|(off, ..)| *off).collect()
+    };
+    assert_eq!(
+        on_bus(&mut writer),
+        vec![first_ok, attempt],
+        "{arm}: PRECONDITION: the cut carried both records below the lane's oldest"
+    );
+
+    let (second, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+    bridge.cfg.broker = a;
+    if let Some(mutant) = mutant {
+        bridge.fx = crate::fx::Fx::os_without(mutant);
+    }
+    second.retire_from_outbox();
+    *second.outbox.lock().unwrap() = Some(post(2));
+    assert!(
+        bridge.attach_broker(),
+        "{arm}: the attach to the reminted log"
+    );
+    let now = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
+    assert!(
+        was.zip(now)
+            .is_some_and(|(was, now)| was.id != now.id && now.generation == 0),
+        "{arm}: the broker gave the log another id: {was:?} -> {now:?}"
+    );
+    assert!(
+        bridge
+            .state
+            .log_witness()
+            .and_then(|witness| witness.met)
+            .is_some_and(|met| met.head > attempt),
+        "{arm}: PRECONDITION: the attach met the log above post 2's record"
+    );
+    bridge.drain_outbox();
+    let copies = on_bus(&mut writer);
+    let retired = retired_at(&retirements(&second), "ta000000000", 2);
+    let pinned = bridge.state.post_pin("ta000000000", 2).unwrap().is_some();
+    let handed = second
+        .deliveries()
+        .iter()
+        .filter(|l| {
+            l.starts_with("deliver tb000000000 ")
+                && l.split_whitespace().any(|w| w == format!("off={attempt}"))
+        })
+        .count();
+    bridge.close_subscriptions();
+    CarriedRemint {
+        first: first_ok,
+        attempt,
+        copies,
+        retired,
+        pinned,
+        handed,
+    }
+}
+
+/// **A LOG REMINTED KEEPING A CARRIED ATTEMPT SETTLES IT WHERE IT LANDED**
+/// (ATERM-KI-1114-1414), on a real broker ([`reminted_with_a_carried_attempt`]): the attach
+/// meets the log above both records, and the replay (an entry in flight) or the drain's retry at
+/// the pin (a pin alone) reads post 2 back from anywhere (`Bridge::found_anywhere`), told below
+/// the lane's oldest on a reader that asks each record's origin: post 1's record holds its words
+/// under post 1's sequence and is passed, post 2's under its own from this node's producer, so
+/// post 2 is settled there, never published again, aterm is told it landed there, and
+/// `tb000000000` is handed it once, though it lies below the forged-self floor the attach set.
+/// NEGATIVE CONTROLS: `Mutant::ReadBackFromTheAttachHead` (the rule from critic review F1 to
+/// this one), read back from the head the attach met the log at, above both, finds nothing, and
+/// the retry, its key gone with the cut, lands a third copy, where aterm is told post 2 landed;
+/// `Mutant::ReadBackAnywhereByWords` (no origin, as ATERM-KI-1111-4's read from 0) settles post
+/// 2 on post 1's record.
+#[cfg(unix)]
+#[test]
+fn a_log_reminted_keeping_a_carried_attempt_settles_it_where_it_landed() {
+    use crate::sim::world::Mutant;
+    for (sidecar, journaled, control) in [
+        (Sidecar::Unreadable, true, None),
+        (Sidecar::Gone, true, None),
+        (Sidecar::Unreadable, false, None),
+        (Sidecar::Gone, false, None),
+        (
+            Sidecar::Unreadable,
+            true,
+            Some(Mutant::ReadBackFromTheAttachHead),
+        ),
+        (
+            Sidecar::Gone,
+            false,
+            Some(Mutant::ReadBackFromTheAttachHead),
+        ),
+        (
+            Sidecar::Unreadable,
+            true,
+            Some(Mutant::ReadBackAnywhereByWords),
+        ),
+        (
+            Sidecar::Unreadable,
+            false,
+            Some(Mutant::ReadBackAnywhereByWords),
+        ),
+    ] {
+        let arm = format!("{sidecar:?} journaled={journaled} control={control:?}");
+        let got = reminted_with_a_carried_attempt(&arm, sidecar, journaled, control, None);
+        assert!(!got.pinned, "{arm}: post 2 retired");
+        match control {
+            Some(Mutant::ReadBackFromTheAttachHead) => {
+                assert_eq!(
+                    got.copies.len(),
+                    3,
+                    "CONTROL {arm}: a third copy beside the carried two: {:?}",
+                    got.copies
+                );
+                assert_eq!(
+                    got.retired,
+                    got.copies.last().copied(),
+                    "CONTROL {arm}: retired at the third copy"
+                );
+            }
+            Some(_) => {
+                assert_eq!(
+                    got.copies,
+                    vec![got.first, got.attempt],
+                    "CONTROL {arm}: nothing published again"
+                );
+                assert_eq!(
+                    got.retired,
+                    Some(got.first),
+                    "CONTROL {arm}: post 2 settled on post 1's record"
+                );
+            }
+            None => {
+                assert_eq!(
+                    got.copies,
+                    vec![got.first, got.attempt],
+                    "{arm}: each post on the bus once, never published again"
+                );
+                assert_eq!(
+                    got.retired,
+                    Some(got.attempt),
+                    "{arm}: post 2 retired where it landed"
+                );
+                assert_eq!(got.handed, 1, "{arm}: tb000000000 handed post 2 once");
+            }
+        }
+    }
+}
+
+/// **A READ BACK FROM ANYWHERE WHOSE ORIGIN THE BROKER CANNOT SAY HOLDS ITS POST**
+/// (ATERM-KI-1114-1414, case 6 of `Bridge::unverified_publication`): as
+/// [`a_log_reminted_keeping_a_carried_attempt_settles_it_where_it_landed`], but the broker
+/// stamps no origin (`ANYWHERE_UNSTAMPED`), so the records hold post 2's words and nothing says
+/// whose they are: post 2 is neither settled nor published, its pin stands and aterm is told
+/// nothing, by the replay (`journaled`) and by the drain's retry. Its record, the replay's entry
+/// for it dropped as an unverifiable answer's is, may be handed once. NEGATIVE CONTROL
+/// (`Mutant::AnywhereUntoldPublishes`): the undecided read answers that none landed, and the
+/// retry lands a third copy.
+#[cfg(unix)]
+#[test]
+fn an_anywhere_read_whose_origin_the_broker_cannot_say_holds_its_post() {
+    use crate::sim::world::Mutant;
+    for (journaled, control) in [(true, false), (false, false), (true, true), (false, true)] {
+        let arm = format!("journaled={journaled} control={control}");
+        crate::bridge::ANYWHERE_UNSTAMPED.with(|on| on.set(true));
+        let got = reminted_with_a_carried_attempt(
+            &arm,
+            Sidecar::Unreadable,
+            journaled,
+            control.then_some(Mutant::AnywhereUntoldPublishes),
+            None,
+        );
+        crate::bridge::ANYWHERE_UNSTAMPED.with(|on| on.set(false));
+        if control {
+            assert_eq!(
+                got.copies.len(),
+                3,
+                "CONTROL {arm}: published again beside the carried copies: {:?}",
+                got.copies
+            );
+            assert_eq!(got.retired, got.copies.last().copied(), "CONTROL {arm}");
+        } else {
+            assert_eq!(
+                got.copies,
+                vec![got.first, got.attempt],
+                "{arm}: nothing published again"
+            );
+            assert_eq!(got.retired, None, "{arm}: aterm told nothing");
+            assert!(got.pinned, "{arm}: post 2 stays queued at its pin");
+            assert!(
+                got.handed <= 1,
+                "{arm}: post 2's record handed at most once"
+            );
+        }
+    }
+}
+
+/// **A READ BACK FROM ANYWHERE HOLDS A POST WHOSE RECORD STANDS UNDER A PRODUCER NO HAND-OFF
+/// PLACES** (ATERM-KI-1114-1414, case 6 of `Bridge::unverified_publication`): as
+/// [`a_log_reminted_keeping_a_carried_attempt_settles_it_where_it_landed`], but post 2's attempt
+/// was published under the producer of a node key this Mac held before, and the mesh's
+/// hand-off, which would name that node, does not read (`HANDOFF_UNREAD`): the record holds post
+/// 2's words at its sequence and nothing says it is not this Mac's, so post 2 is neither settled
+/// nor published, its pin stands and aterm is told nothing, by the replay (`journaled`) and by
+/// the drain's retry. NEGATIVE CONTROL (`Mutant::AnywherePassesAnUnplacedProducer`): the record
+/// is passed as another writer's, and the retry lands a third copy.
+#[cfg(unix)]
+#[test]
+fn an_anywhere_read_holds_a_post_whose_record_no_handoff_places() {
+    use crate::sim::world::Mutant;
+    let older = astream_cap::producer_id_of("an-older-node-key");
+    for (journaled, control) in [(true, false), (false, false), (true, true), (false, true)] {
+        let arm = format!("journaled={journaled} control={control}");
+        crate::bridge::HANDOFF_UNREAD.with(|on| on.set(true));
+        let got = reminted_with_a_carried_attempt(
+            &arm,
+            Sidecar::Unreadable,
+            journaled,
+            control.then_some(Mutant::AnywherePassesAnUnplacedProducer),
+            Some(older),
+        );
+        crate::bridge::HANDOFF_UNREAD.with(|on| on.set(false));
+        if control {
+            assert_eq!(
+                got.copies.len(),
+                3,
+                "CONTROL {arm}: published again beside the carried copies: {:?}",
+                got.copies
+            );
+            assert_eq!(got.retired, got.copies.last().copied(), "CONTROL {arm}");
+        } else {
+            assert_eq!(
+                got.copies,
+                vec![got.first, got.attempt],
+                "{arm}: nothing published again"
+            );
+            assert_eq!(got.retired, None, "{arm}: aterm told nothing");
+            assert!(got.pinned, "{arm}: post 2 stays queued at its pin");
+        }
+    }
+}
+
 /// **AN ATTACH THAT RE-BASES ONTO ANOTHER LOG HAS WHERE IT MET THAT LOG ON THE MEDIA BEFORE ITS
 /// REPLAY PUBLISHES THERE** (critic review F1, `Bridge::save_log_witness`): every copy a replay
 /// published on a log since the node met it lies at or above the head it met the log at
-/// (`state::Met`), the floor a read back of a post kept on an earlier log starts at
-/// (`Met::floor`). `s-a`'s second post is in flight on log A when the bridge, its state dir now
+/// (`state::Met`), the floor a keyed re-post's read back of a head kept on an earlier log
+/// starts at (`Met::floor`), and every read back's under `Mutant::ReadBackFromTheAttachHead`. `s-a`'s second post is in flight on log A when the bridge, its state dir now
 /// on a simulated device with every file as it stood on the media, attaches to log B, which
 /// continues none of A: the attach re-bases its witness onto B, met at B's head, and its replay
 /// publishes the post there. Whatever image a power cut then leaves of the state dir, the next
 /// bridge's attach to B stands met at or below that copy. NEGATIVE CONTROL
 /// (`Mutant::RebaseWitnessUnflushed`, every build before critic review F1): the re-base written
 /// as any other witness is, some cut brings back A's witness, and the next attach meets B again
-/// at its head, above the copy, where a read back of that post no longer finds it.
+/// at its head, above the copy, where a keyed re-post's read back no longer finds it.
 #[cfg(unix)]
 #[test]
 fn a_rebase_onto_another_log_stays_met_below_the_replays_copy_through_a_power_cut() {
@@ -7214,7 +7688,7 @@ fn a_rebase_onto_another_log_stays_met_below_the_replays_copy_through_a_power_cu
                 original: None,
                 original_off: None,
                 owner: Some(2),
-                at: Some(on_a + 1),
+                at: Some(Head::From(on_a + 1)),
             };
             first.state.set_post_pin("ta000000000", 2, &pin).unwrap();
             first
@@ -7224,7 +7698,7 @@ fn a_rebase_onto_another_log_stays_met_below_the_replays_copy_through_a_power_cu
                     subject: subject.clone(),
                     body,
                     log: was,
-                    at: Some(on_a + 1),
+                    at: Some(Head::From(on_a + 1)),
                 })
                 .unwrap();
 
@@ -7649,7 +8123,7 @@ fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() 
                     subject: face.clone(),
                     body: encoded,
                     log: bridge.conn.as_ref().and_then(|c| c.seen_log_identity()),
-                    at: Some(head_of(&bridge)),
+                    at: Some(Head::From(head_of(&bridge))),
                 })
                 .unwrap();
             queue(2, "again");
@@ -7757,7 +8231,7 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
                 subject: face.clone(),
                 body: encoded.clone(),
                 log,
-                at: Some(head_of(&bridge)),
+                at: Some(Head::From(head_of(&bridge))),
             })
             .unwrap();
         let (own, deduped) = bridge.publish_at(pin.seq, &face, &encoded).unwrap();
@@ -11585,7 +12059,7 @@ fn an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork(
                 subject: subject.clone(),
                 body: body.clone(),
                 log: Some(old),
-                at: Some(10),
+                at: Some(Head::From(10)),
             })
             .unwrap();
         std::fs::OpenOptions::new()
@@ -16494,7 +16968,7 @@ fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> Repla
         subject: lane_of.clone(),
         body,
         log,
-        at: Some(head),
+        at: Some(Head::From(head)),
     };
     // ta000000000's post 1, in flight under a pin another writer's record answers.
     a_legacy_pin_another_writer_answers(&mut bridge, &lane_of);
@@ -16511,7 +16985,7 @@ fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> Repla
             original: None,
             original_off: None,
             owner: Some(id),
-            at: Some(head),
+            at: Some(Head::From(head)),
         };
         bridge.unsent = None;
         bridge.state.set_post_pin(sid, id, &pin).unwrap();
@@ -16638,7 +17112,7 @@ fn journal_entry(bridge: &Bridge, pin: &PublishPin, subject: &str, body: &[u8], 
             subject: subject.to_string(),
             body: body.to_vec(),
             log,
-            at: Some(head),
+            at: Some(Head::From(head)),
         })
         .unwrap();
 }
@@ -16653,7 +17127,7 @@ fn fresh_pin(bridge: &mut Bridge, subject: &str, body: &[u8], head: u64) -> Publ
         original: None,
         original_off: None,
         owner: None,
-        at: Some(head),
+        at: Some(Head::From(head)),
     };
     bridge.unsent = None;
     pin
@@ -23004,7 +23478,7 @@ fn a_reworded_receipt(fx: crate::fx::Fx, landed: bool) -> RewordedReceipt {
         original: None,
         original_off: None,
         owner: None,
-        at: Some(head_of(&bridge)),
+        at: Some(Head::From(head_of(&bridge))),
     };
     let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
     bridge
@@ -23103,7 +23577,7 @@ fn a_reworded_retry_is_deduped_against_a_first_attempt_that_commits_late() {
         original: None,
         original_off: None,
         owner: None,
-        at: Some(head_of(&bridge)),
+        at: Some(Head::From(head_of(&bridge))),
     };
     bridge.unsent = None;
     let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
@@ -23266,8 +23740,8 @@ fn a_keys_own_post_rebuilt_from_its_keys_pin_is_pinned_in_the_words_it_sends() {
 /// review, `state::ACK_HEADS`): a build before the heads neither moves nor clears the head
 /// file, so after a downgrade and an upgrade the file can name another pin's head, or an
 /// offset of a log since replaced. The head kept beside receipt 1's pin is read back for that
-/// pin on the log it was written on, and on another log from that log's start at most (a move
-/// an older build made past it, [`Bridge::read_back_from`]); once an older build pinned the
+/// pin on the log it was written on, and on another log anywhere, by its words and its origin
+/// (a move an older build made past it, [`Bridge::read_back_from`]); once an older build pinned the
 /// receipt again at another sequence (its `acks/` file rewritten, the head left), the head
 /// names none.
 #[cfg(unix)]
@@ -23282,7 +23756,7 @@ fn a_receipts_head_is_read_only_for_its_own_pin() {
         original: None,
         original_off: None,
         owner: None,
-        at: Some(40),
+        at: Some(Head::From(40)),
     };
     let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
     bridge
@@ -23294,7 +23768,7 @@ fn a_receipts_head_is_read_only_for_its_own_pin() {
             .receipt_pin_now("th0st000000", 1)
             .unwrap()
             .map(|pin| pin.at),
-        Some(Some(40)),
+        Some(Some(Head::From(40))),
         "its own pin, on its own log"
     );
     let another = astream_broker::LogIdentity {
@@ -23310,9 +23784,10 @@ fn a_receipts_head_is_read_only_for_its_own_pin() {
         .receipt_pin_now("th0st000000", 1)
         .unwrap()
         .map(|pin| pin.at);
-    assert!(
-        matches!(elsewhere, Some(None | Some(0))),
-        "a head of another log is not an offset of this one: {elsewhere:?}"
+    assert_eq!(
+        elsewhere,
+        Some(Some(Head::Anywhere)),
+        "a head of another log is not an offset of this one"
     );
     std::fs::write(
         std::path::Path::new(&bridge.cfg.state_dir).join("acks/th0st000000.1"),
@@ -23366,7 +23841,7 @@ fn reworded_past_a_cut(fx: crate::fx::Fx) -> PastACut {
         original: None,
         original_off: None,
         owner: None,
-        at: Some(head_of(&bridge)),
+        at: Some(Head::From(head_of(&bridge))),
     };
     bridge.unsent = None;
     let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
@@ -23488,7 +23963,7 @@ fn a_same_words_keyed_repost_does_not_own_its_originals_replay() {
         .unwrap();
     bridge.claim(off, winner.seq);
     bridge.awaiting_drain.insert(winner.seq, (off, true));
-    for at in [Some(off + 1), None] {
+    for at in [Some(Head::From(off + 1)), None] {
         let repost = PublishPin {
             via_key: true,
             at,
@@ -23497,7 +23972,7 @@ fn a_same_words_keyed_repost_does_not_own_its_originals_replay() {
         };
         assert_eq!(
             bridge.keyed_repost_landed(&repost, false, true).unwrap(),
-            Some((off, true)),
+            Some(PinLanding::Winner(off)),
             "the replay belongs to the original, even with identical words and head {at:?}"
         );
     }

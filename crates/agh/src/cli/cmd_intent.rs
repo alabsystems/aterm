@@ -101,12 +101,14 @@ mod unix {
         for slug in &slugs {
             let journal = Journal::open(&dirs, slug, &ctx.fx)?;
             let (records, end) = journal.read()?;
-            items.extend(
-                journal::views(&records)
-                    .iter()
-                    .filter(|view| view.open || !only_open)
-                    .map(document),
-            );
+            // A damaged journal's begin closes nothing (it refuses), so none reads closable.
+            let judged = !matches!(end, JournalEnd::Fault { .. });
+            for view in journal::views(&records)
+                .iter()
+                .filter(|view| view.open || !only_open)
+            {
+                items.push(document(view, judged && journal.closable(view)?));
+            }
             if let JournalEnd::Fault { at, why } = &end {
                 receipt.complete = false;
                 return Ok(Outcome {
@@ -134,7 +136,8 @@ mod unix {
         let (slug, id) = repo_and_id(inv)?;
         let journal = Journal::open(&dirs, &slug, &ctx.fx)?;
         let view = held(&journal, &slug, &id)?;
-        Ok(object(inv, &slug, &view))
+        let closable = journal.closable(&view)?;
+        Ok(object(inv, &slug, &view, closable))
     }
 
     /// `intent retract`.
@@ -152,7 +155,7 @@ mod unix {
         let journal = Journal::open(&dirs, &slug, &ctx.fx)?;
         journal.retract(&id)?;
         let view = held(&journal, &slug, &id)?;
-        Ok(object(inv, &slug, &view))
+        Ok(object(inv, &slug, &view, false))
     }
 
     /// agh's state directory, which every journal lives under.
@@ -205,21 +208,22 @@ mod unix {
     }
 
     /// One intent's document as the answer.
-    fn object(inv: &Invocation, slug: &Slug, view: &IntentView) -> Outcome {
+    fn object(inv: &Invocation, slug: &Slug, view: &IntentView, closable: bool) -> Outcome {
         let mut receipt = Receipt::new(&inv.verb_name());
         receipt.repo = Some(slug.key());
         Outcome {
             answer: Answer::Object {
                 noun: Noun::Intent,
-                value: document(view),
+                value: document(view, closable),
             },
             receipt,
         }
     }
 
-    /// The intent document (plan §8, body 12): thirteen sorted keys. The fingerprint and the
-    /// body digest are not printed.
-    pub(super) fn document(view: &IntentView) -> Value {
+    /// The intent document (plan §8, body 12): fourteen sorted keys. The fingerprint and the
+    /// body digest are not printed. `closable` is `Journal::closable`: the next atomic write
+    /// closes this open intent rather than stopping on it.
+    pub(super) fn document(view: &IntentView, closable: bool) -> Value {
         let intent = &view.intent;
         let settled = view.settled.as_ref().map(|settled| match settled {
             Settled::Created { .. } => "created",
@@ -239,6 +243,7 @@ mod unix {
             .collect();
         let mut doc = Map::new();
         doc.insert("at_secs".into(), Value::from(intent.at_secs));
+        doc.insert("closable".into(), Value::from(closable));
         doc.insert("grant".into(), Value::from(intent.grant.clone()));
         doc.insert("id".into(), Value::from(intent.id.as_str()));
         doc.insert("identity".into(), Value::from(intent.identity.as_str()));

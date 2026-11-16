@@ -19,7 +19,8 @@ pub struct Causes(u32);
 impl Causes {
     /// The subscriber started.
     pub const START: Self = Self(1 << 0);
-    /// A vault round applied a version.
+    /// A vault round applied a version that moved something a runner reads
+    /// (`SyncOutcome::Applied`'s `moved`), or found the pass such an apply left owed.
     pub const APPLIED: Self = Self(1 << 1);
     /// The first healthy vault round after failed ones.
     pub const RECOVERED: Self = Self(1 << 2);

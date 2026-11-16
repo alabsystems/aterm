@@ -713,7 +713,8 @@ fn drain_roster(
     }
     let mark = |sid: &str| {
         let deferred = watched.is_some_and(|w| {
-            g.by_sid(&aterm_session::SessionId::new(sid))
+            aterm_session::SessionId::parse(sid)
+                .and_then(|sid| g.by_sid(&sid))
                 .is_some_and(|h| !w(h.local_id))
         });
         if deferred { " watch=deferred" } else { "" }
@@ -1918,7 +1919,7 @@ fn pick_adoptions(
         Some(low) if adopt_seq.saturating_add(1) >= low => g
             .roster_since(*adopt_seq)
             .filter(|r| r.change == crate::session_store::RosterChange::Created)
-            .filter_map(|r| g.by_sid(&aterm_session::SessionId::new(&r.sid)))
+            .filter_map(|r| g.by_sid(&aterm_session::SessionId::parse(&r.sid)?))
             .filter(|h| unwatched(h))
             .map(carve)
             .collect(),

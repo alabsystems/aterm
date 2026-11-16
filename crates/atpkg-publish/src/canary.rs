@@ -20,9 +20,12 @@ use crate::quad::{self, VerifiedQuad};
 pub const RECEIPT: &str = "train-receipt.toml";
 /// Signature over the exact receipt bytes.
 pub const SIGNATURE: &str = "train-receipt.toml.sig";
-/// Command line.
+/// Command line. A canary judges exactly the consumers named, and none when none is named.
 pub const SYNOPSIS: &str =
     "canary trust=<N> --out DIR [--consumer NAME=CHECKOUT]… [--stage-receipt]";
+
+/// The line a receipt with no consumer row starts with: a TOML comment inside the signed bytes.
+pub const NO_CONSUMER: &str = "# no consumer named: this canary judged install integrity only";
 
 /// One consumer's observation, never an index gate.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -74,7 +77,8 @@ pub struct Receipt {
     pub installed_unix: i64,
     /// Installations actually run.
     pub installed: Vec<Installed>,
-    /// Consumer keys, including unavailable consumers.
+    /// The key of each consumer named, including unavailable ones; empty when none was named
+    /// (the receipt then starts with [`NO_CONSUMER`]).
     pub consumers: Vec<ConsumerReport>,
 }
 
@@ -418,19 +422,41 @@ pub fn install(
             "canary source changed during execution; no receipt signed",
         ));
     }
-    let text = aterm_toml::to_string(&receipt).map_err(|e| Error::refused(e.to_string()))?;
+    let mut text = aterm_toml::to_string(&receipt).map_err(|e| Error::refused(e.to_string()))?;
+    if receipt.consumers.is_empty() {
+        // A comment, inside the signed bytes, so a reader of any schema-1 receipt (whose
+        // fields deny unknown names) reads it as it reads every other receipt.
+        text.insert_str(0, &format!("{NO_CONSUMER}\n"));
+    }
     crate::lane::report::write_atomic(&out.join(RECEIPT), &text)?;
     signer.key.sign_file(&out.join(RECEIPT))?;
     check_receipt(ctx, quad, out, build)?;
     Ok(receipt)
 }
 
-/// Install the staged pack, or stage an existing signed receipt without moving the index.
-/// The current head's roster authorizes a new build without pinning it first.
+/// What `canary` was asked to do: the build, where its evidence goes, the consumers it judges
+/// (exactly those named with `--consumer`, none when none is named) and whether it only
+/// stages an existing receipt.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    /// The Trust build.
+    pub build: u64,
+    /// The fresh output folder.
+    pub out: PathBuf,
+    /// Each consumer named with `--consumer NAME=CHECKOUT`.
+    pub consumers: BTreeMap<String, PathBuf>,
+    /// `--stage-receipt`.
+    pub stage_existing: bool,
+}
+
+/// Read `canary`'s arguments. A consumer is judged only where it is named: no checkout is
+/// filled in from the home folder, so a canary never runs a consumer's acceptance inside a
+/// shared `~/<repo>` checkout another session owns.
 ///
 /// # Errors
-/// Download, verification, install, signing or staging fails.
-pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
+/// A usage error: an unknown argument, a `--consumer` that is not `NAME=CHECKOUT`, a missing
+/// `trust=<N>` or `--out`, or `--stage-receipt` with a consumer.
+pub fn parse(args: &[String]) -> Result<Request> {
     let mut build = None;
     let mut out = None;
     let mut consumers = BTreeMap::new();
@@ -460,22 +486,38 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     }
     let build = build.ok_or_else(|| Error::usage(SYNOPSIS))?;
     let out = out.ok_or_else(|| Error::usage(SYNOPSIS))?;
+    if stage_existing && !consumers.is_empty() {
+        return Err(Error::usage(
+            "--stage-receipt stages existing evidence; it takes no --consumer",
+        ));
+    }
+    Ok(Request {
+        build,
+        out,
+        consumers,
+        stage_existing,
+    })
+}
+
+/// Install the staged pack, or stage an existing signed receipt without moving the index.
+/// The current head's roster authorizes a new build without pinning it first. Consumers are
+/// judged only where named ([`parse`]); with none named the receipt says so ([`NO_CONSUMER`]).
+///
+/// # Errors
+/// Download, verification, install, signing or staging fails.
+pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
+    let Request {
+        build,
+        out,
+        consumers,
+        stage_existing,
+    } = parse(args)?;
     if stage_existing {
-        if !consumers.is_empty() {
-            return Err(Error::usage(
-                "--stage-receipt stages existing evidence; it takes no --consumer",
-            ));
-        }
         stage_receipt(ctx, &out, build)?;
         Log::echo("atpkg-publish canary").say(format!(
             "staged verified canary evidence for Trust {build}; index unchanged"
         ));
         return Ok(());
-    }
-    for name in ["aterm", "ay", "ty", "clean"] {
-        consumers
-            .entry(name.to_string())
-            .or_insert_with(|| ctx.home.join(name));
     }
     let scratch = Scratch::new("train-canary")?;
     let (_, head) = quad::fetch_head(ctx, &ctx.index_slug(), &scratch.path().join("head"))?;
@@ -505,6 +547,12 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         receipt.installed.len(),
         out.join(RECEIPT).display()
     ));
+    if receipt.consumers.is_empty() {
+        log.say(
+            "no consumer named: judge one with --consumer NAME=<owned clone>, or move its lock \
+             with `atpkg-publish adopt trust=<N> --repo <owned clone>`",
+        );
+    }
     for report in receipt.consumers {
         log.say(format!(
             "{}: {} — {}",

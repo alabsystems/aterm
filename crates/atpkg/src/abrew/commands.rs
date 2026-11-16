@@ -16733,6 +16733,22 @@ mod livecheck {
             .is_ok_and(|t| t.lines().any(|l| l == leaf))
     }
 
+    /// Whether a resolved formula record came from the
+    /// API (its `full_name` is the bare leaf, as the API
+    /// emits for core, or a homebrew/core qualification)
+    /// rather than a tap file (always qualified
+    /// `user/tap/name`). The API-vs-file agreement gate
+    /// keys on this: brew livecheck reads the file, so
+    /// a record whose API version or URL disagrees with
+    /// the checked-out tap file delegates instead of
+    /// reporting the API's current (r413; the previous
+    /// derivation read API records as file-backed and
+    /// the gate never fired).
+    fn formula_from_api(f: &Formula) -> bool {
+        !foreign_qualified(&f.full_name)
+            && (f.full_name == f.name || f.full_name.starts_with("homebrew/core/"))
+    }
+
     fn pkg_from_formula(
         prefix: &Prefix,
         _api: &Api,
@@ -16740,9 +16756,7 @@ mod livecheck {
         f: Formula,
         for_installed: bool,
     ) -> Pkg {
-        let from_api = !foreign_qualified(&f.full_name)
-            && f.full_name.starts_with("homebrew/core/")
-            || f.full_name == format!("homebrew/core/{}", f.name);
+        let from_api = formula_from_api(&f);
         let qualified = foreign_qualified(&f.full_name).then_some(f.full_name.as_str());
         let (tap_name, tap_dir) = record_tap(prefix, false, qualified);
         let full = if f.full_name.is_empty() {
@@ -17108,6 +17122,9 @@ mod livecheck {
         /// The prefix ends in a lazy quantifier, so split
         /// search prefers the shortest prefix (Ruby order).
         lazy_prefix: bool,
+        /// Group 1's body ends in a lazy quantifier, so
+        /// split search prefers the shortest group.
+        lazy_group: bool,
         has_group: bool,
     }
 
@@ -17162,13 +17179,14 @@ mod livecheck {
             g.push_str(&format!(r"\A(?:{body_part})\z"));
             g
         };
-        let (group1, group1_full, pre_full, post_full, lazy_prefix, has_group) =
+        let (group1, group1_full, pre_full, post_full, lazy_prefix, lazy_group, has_group) =
             match first_capture(body) {
                 Some((prefix, sub, suffix, quantified)) => {
                     if quantified {
                         return Err(Outside);
                     }
                     let lazy = ["*?", "+?", "??", "}?"].iter().any(|e| prefix.ends_with(e));
+                    let group_lazy = ["*?", "+?", "??", "}?"].iter().any(|e| sub.ends_with(e));
                     (
                         Some(compile(&flag_prefix(&sub))?),
                         Some(compile(&anchored(&sub))?),
@@ -17183,10 +17201,11 @@ mod livecheck {
                             Some(compile(&anchored(&suffix))?)
                         },
                         lazy,
+                        group_lazy,
                         true,
                     )
                 }
-                None => (None, None, None, None, false, false),
+                None => (None, None, None, None, false, false, false),
             };
         Ok(LcRegex {
             src: pattern.to_string(),
@@ -17197,6 +17216,7 @@ mod livecheck {
             pre_full,
             post_full,
             lazy_prefix,
+            lazy_group,
             has_group,
         })
     }
@@ -17296,10 +17316,17 @@ mod livecheck {
             }
             // Candidate group ends: every char boundary the
             // group could end at (its own find picks only
-            // one), longest first.
+            // one).
             let mut ends: Vec<usize> = rest.char_indices().map(|(i, _)| i).collect();
             ends.push(rest.len());
-            ends.reverse();
+            // Ruby tries the shortest group first for a
+            // lazy group body, the longest for a greedy
+            // one (an optional `/?` after a lazy `(.*?)`
+            // belongs to the suffix, not the capture —
+            // Hackage's derived regex, r418).
+            if !re.lazy_group {
+                ends.reverse();
+            }
             for j in ends {
                 if j == 0 {
                     continue;
@@ -17353,6 +17380,7 @@ mod livecheck {
 
     #[derive(Clone, Copy, PartialEq)]
     enum Strat {
+        Apache,
         Git,
         GithubLatest,
         GithubReleases,
@@ -17361,6 +17389,16 @@ mod livecheck {
         HeaderMatch,
         Sparkle,
         Pypi,
+        Sourceforge,
+        Npm,
+        Gnome,
+        Xorg,
+        Cpan,
+        CrateStrategy,
+        Hackage,
+        RubyGems,
+        Launchpad,
+        Bitbucket,
         Json,
         Xml,
         Yaml,
@@ -17527,331 +17565,455 @@ mod livecheck {
         None
     }
 
-    /// A URL's file-name stem: basename without query or
-    /// archive suffixes.
-    fn file_stem(url: &str) -> String {
-        let base = url.split(['?', '#']).next().unwrap_or_default();
-        let mut name = base.rsplit('/').next().unwrap_or_default().to_string();
-        const EXTS: &[&str] = &[
-            ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".whl", ".zip",
-            ".crate", ".tar", ".gz", ".bz2", ".xz", ".7z", ".gem", ".jar",
-        ];
-        loop {
-            let lower = name.to_lowercase();
-            let Some(ext) = EXTS.iter().find(|e| lower.ends_with(**e)) else {
-                break;
-            };
-            name.truncate(name.len() - ext.len());
-        }
-        name
-    }
-
-    /// The strict subset of the oracle's version detection
-    /// pinned by probing its reported currents (r389, r403):
-    /// an underscore-joined digit group (`boost_1_87_0`)
-    /// when no dotted core exists; else the LAST dotted core
-    /// `v?<digits>(.<digits>)+`, possibly letter-prefixed
-    /// inside its token (`foo1.2`, `ver1.2`), with an
-    /// attached suffix (`1.0rc1`, `3.0a`, but not `9.4p1`),
-    /// `.RELEASE`/`.GA` kept, `.Final` cut, then prerelease
-    /// chunks (`-beta.3`, `_alpha`), then one numeric chunk
-    /// and/or a run of flavor chunks (`-linux`, `-src`, any
-    /// all-alphabetic chunk, `x64`/`win64`/`i386`) — a flavor
-    /// tail (with any numeric chunk before it) is excluded
-    /// from the version. `+metadata` survives only on a
-    /// prerelease-bearing detection. A core whose tail does
-    /// not fit falls through to the plainer rules, as the
-    /// oracle's cascade does (`_amd64` -> `64`). Stems mixing
-    /// an underscore digit group with a dotted core delegate
-    /// (their interaction is unpinned). Without a dotted
-    /// core: a plain `v?<digits>` token, else the last
-    /// token's trailing digits (`r16`, `foo128`, and — as
-    /// the oracle also reports — `9.4p1`).
-    fn detect_stem_version(stem: &str) -> Option<(usize, String)> {
-        if let Some((head, _)) = stem.split_once('+') {
-            let (idx, ver, had_prerelease) = detect_stem_inner(head)?;
-            return had_prerelease.then_some((idx, ver));
-        }
-        detect_stem_inner(stem).map(|(idx, ver, _)| (idx, ver))
-    }
-
-    fn detect_stem_inner(stem: &str) -> Option<(usize, String, bool)> {
-        // Tokens with byte spans: (start, text).
-        let mut toks: Vec<(usize, &str)> = Vec::new();
-        let mut start = 0usize;
-        for (i, c) in stem.char_indices() {
-            if c == '-' || c == '_' {
-                toks.push((start, &stem[start..i]));
-                start = i + 1;
+    /// A resource's current version, detected from its
+    /// URL exactly as the oracle does (r408): a faithful
+    /// port of Homebrew `Version.parse` over its 26
+    /// ordered `VERSION_PARSERS` (version.rb, brew
+    /// 7.0.13) — URL-decode, brew `Pathname#stem`
+    /// semantics for the stem parsers (bottle/archive
+    /// extnames, the not-an-extension rule), the
+    /// SourceForge/no-extension `process_spec`
+    /// branches, and the whole-spec URL parsers.
+    /// `aterm_regex` has no captures, so each parser is
+    /// a whole-match pattern plus a deterministic
+    /// extractor for its group 1. Scored 15,123/15,123
+    /// against the oracle's own `Version.parse` on
+    /// every distinct `url` in homebrew-core (corpus
+    /// method in the r408 commit message); this
+    /// replaces the r389/r403 heuristic cascade, whose
+    /// agreement on resource URLs measured 94.3%.
+    /// Empty detection is `None` (the oracle's NULL).
+    fn version_parse(url: &str) -> Option<String> {
+        let spec = version_url_decode(url);
+        let stem = version_stem_process(&spec);
+        for parser in version_parsers() {
+            let text: &str = if parser.url { &spec } else { &stem };
+            if let Ok(Some(m)) = parser.re.try_find(text) {
+                let v = (parser.extract)(m.as_str());
+                if !v.is_empty() {
+                    return Some(v);
+                }
             }
         }
-        toks.push((start, &stem[start..]));
+        None
+    }
 
-        // Parse a dotted core inside one token: optional
-        // letter prefix (a leading `v` included), then
-        // digits(.digits)+, then an attached suffix —
-        // letters+digits (not a lone `p` run), `.RELEASE`/
-        // `.GA` (kept), or `.Final` (cut) — consuming the
-        // token to its end. Returns the core's byte offset
-        // within the token and where the version ends
-        // inside it (before a cut `.Final`).
-        let parse_core = |tok: &str| -> Option<(usize, usize)> {
-            let bytes = tok.as_bytes();
-            // Candidate starts: every digit position whose
-            // preceding bytes are all ASCII letters.
-            for at in 0..bytes.len() {
-                if !bytes[at].is_ascii_digit() {
-                    continue;
-                }
-                if !bytes[..at].iter().all(|b| b.is_ascii_alphabetic()) {
-                    continue;
-                }
-                let mut i = at;
-                let mut dots = 0usize;
-                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                    if bytes[i] == b'.' {
-                        // A dot needs digits on both sides.
-                        if i == at || !bytes[i - 1].is_ascii_digit() {
-                            break;
+    struct VersionParser {
+        url: bool,
+        re: aterm_regex::Regex,
+        extract: fn(&str) -> String,
+    }
+
+    fn version_parsers() -> &'static [VersionParser] {
+        const N: &str = "[0-9]+(?:\\.[0-9]+)*";
+        const ND: &str = "[0-9]+(?:\\.[0-9]+)+";
+        const MP: &str = "[0-9]+(?:\\.[0-9]+){1,2}";
+        const CS: &str = "[._-](?i:bin|dist|stable|src|sources?|final|full)";
+        const PR: &str = "[._-]?(?i:alpha|beta|pre|rc)\\.?[0-9]{0,2}";
+        static PARSERS: std::sync::OnceLock<Vec<VersionParser>> = std::sync::OnceLock::new();
+        PARSERS.get_or_init(|| {
+            let p = |url: bool, pat: String, extract: fn(&str) -> String| VersionParser {
+                url,
+                re: aterm_regex::Regex::new(&pat).expect("static version parser pattern"),
+                extract,
+            };
+            vec![
+                p(
+                    false,
+                    "(?:^|[._-]?)v?[0-9]{4}-[0-9]{2}-[0-9]{2}".into(),
+                    |m| m[m.len() - 10..].to_string(),
+                ),
+                p(
+                    true,
+                    "github\\.com/.+/(?:zip|tar)ball/(?:v|[A-Za-z0-9_]+-)?(?:[0-9]+[._-])+[0-9]*$"
+                        .into(),
+                    |m| {
+                        let tail = m.rsplit("ball/").next().unwrap_or(m);
+                        let fits = |s: &str| {
+                            let b = s.as_bytes();
+                            let mut i = 0;
+                            let mut groups = 0;
+                            while i < b.len() {
+                                let d0 = i;
+                                while i < b.len() && b[i].is_ascii_digit() {
+                                    i += 1;
+                                }
+                                if i == d0 {
+                                    return false;
+                                }
+                                if i < b.len() && matches!(b[i], b'.' | b'_' | b'-') {
+                                    groups += 1;
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            groups >= 1 && i == b.len()
+                        };
+                        if let Some(rest) = tail.strip_prefix('v')
+                            && fits(rest)
+                        {
+                            return rest.to_string();
                         }
-                        dots += 1;
+                        for (i, c) in tail.char_indices().rev() {
+                            if c == '-' {
+                                let (w, rest) = (&tail[..i], &tail[i + 1..]);
+                                if !w.is_empty()
+                                    && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                                    && fits(rest)
+                                {
+                                    return rest.to_string();
+                                }
+                            }
+                        }
+                        tail.to_string()
+                    },
+                ),
+                p(
+                    true,
+                    format!("github\\.com/.+/releases/download/(?:[rvV]_?)?{ND}/"),
+                    |m| {
+                        let seg = m
+                            .rsplit("download/")
+                            .next()
+                            .unwrap_or(m)
+                            .trim_end_matches('/');
+                        strip_version_prefix(seg, true).unwrap_or_else(|| seg.to_string())
+                    },
+                ),
+                p(true, "[_-][Rr][0-9]+[AaBb][0-9]*(?:-[0-9]+)?".into(), |m| {
+                    m[1..].to_string()
+                }),
+                p(false, "(?:[0-9]+_)+[0-9]+$".into(), |m| m.replace('_', ".")),
+                p(
+                    false,
+                    format!("[_-]{ND}-(?:p|P|rc|RC)?[0-9]+(?:{CS})?$"),
+                    |m| strip_content_suffix(&m[1..]).to_string(),
+                ),
+                p(false, format!("^v?{ND}(?:-{N})+"), |m| {
+                    m.strip_prefix('v').unwrap_or(m).to_string()
+                }),
+                p(true, format!("[-v]{N}$"), |m| m[1..].to_string()),
+                p(false, "-[0-9]+-[0-9]+".into(), |m| m[1..].to_string()),
+                p(false, format!("-{N}$"), |m| m[1..].to_string()),
+                p(false, format!("-{N}(?:.post[0-9]+)?$"), |m| {
+                    m[1..].to_string()
+                }),
+                p(false, format!("-{N}(?:[abc]|rc|RC)[0-9]*$"), |m| {
+                    m[1..].to_string()
+                }),
+                p(false, format!("-{N}-(?:alpha|beta|rc)[0-9]*$"), |m| {
+                    m[1..].to_string()
+                }),
+                p(false, format!("-{MP}-w(?:in)?(?:32|64)$"), |m| {
+                    for suf in ["-win32", "-win64", "-w32", "-w64"] {
+                        if let Some(h) = m.strip_suffix(suf) {
+                            return h[1..].to_string();
+                        }
                     }
+                    m.to_string()
+                }),
+                p(false, format!("\\.{MP}\\+opam$"), |m| {
+                    m[1..m.len() - 5].to_string()
+                }),
+                p(
+                    false,
+                    format!("[_-]{MP}(?:-[0-9]+)?[._-](?:i[36]86|x86|x64(?:[_-](?:32|64))?)$"),
+                    |m| {
+                        let body = &m[1..];
+                        for arch in [
+                            "x64-64", "x64_64", "x64-32", "x64_32", "i386", "i686", "x86", "x64",
+                        ] {
+                            if let Some(h) = body.strip_suffix(arch)
+                                && h.len() > 1
+                                && matches!(h.as_bytes().last(), Some(b'.' | b'_' | b'-'))
+                            {
+                                return h[..h.len() - 1].to_string();
+                            }
+                        }
+                        body.to_string()
+                    },
+                ),
+                p(false, format!("[-.vV]?{ND}{PR}"), |m| {
+                    cut_version_prefix_char(m)
+                }),
+                p(false, format!("{N}$"), |m| m.to_string()),
+                p(false, format!("[-vV]{ND}[abc]?{CS}$"), |m| {
+                    strip_content_suffix(&m[1..]).to_string()
+                }),
+                p(false, format!("-{ND}-"), |m| m[1..m.len() - 1].to_string()),
+                p(false, format!("_{N}[abc]?\\.orig$"), |m| {
+                    m[1..m.len() - 5].to_string()
+                }),
+                p(false, "-v?[0-9][^-]+".into(), |m| {
+                    let i = m.bytes().position(|b| b.is_ascii_digit()).unwrap_or(0);
+                    m[i..].to_string()
+                }),
+                p(false, "_v?[0-9][^_]+".into(), |m| {
+                    let i = m.bytes().position(|b| b.is_ascii_digit()).unwrap_or(0);
+                    m[i..].to_string()
+                }),
+                p(
+                    true,
+                    "/(?:[rvV]_?)?[0-9]+\\.[0-9]+(?:\\.[0-9]+){0,2}".into(),
+                    |m| {
+                        let seg = &m[1..];
+                        strip_version_prefix(seg, false).unwrap_or_else(|| seg.to_string())
+                    },
+                ),
+                p(false, "\\.v[0-9]+[a-z]?".into(), |m| m[2..].to_string()),
+                p(true, format!("[-.vV]?{ND}(?:{PR})?"), |m| {
+                    cut_version_prefix_char(m)
+                }),
+            ]
+        })
+    }
+
+    /// The `[rvV]_?` prefix of parsers 3 and 24, tried
+    /// in the regex's preference order (present before
+    /// absent). With `whole`, the remainder must be
+    /// exactly a dotted-numeric version; otherwise its
+    /// `\d+\.\d+(\.\d+){0,2}` prefix is taken.
+    fn strip_version_prefix(seg: &str, whole: bool) -> Option<String> {
+        for strip in [2usize, 1, 0] {
+            if seg.len() < strip {
+                continue;
+            }
+            let (pre, rest) = seg.split_at(strip.min(seg.len()));
+            let pre_ok = match strip {
+                0 => true,
+                1 => matches!(pre, "r" | "v" | "V"),
+                _ => {
+                    let b = pre.as_bytes();
+                    b.len() > 1 && matches!(b[0], b'r' | b'v' | b'V') && b[1] == b'_'
+                }
+            };
+            if !pre_ok {
+                continue;
+            }
+            if whole {
+                if is_dotted_numeric(rest) {
+                    return Some(rest.to_string());
+                }
+                continue;
+            }
+            let b = rest.as_bytes();
+            let mut i = 0;
+            let mut groups = 0;
+            let mut ok = true;
+            while i < b.len() {
+                let d0 = i;
+                while i < b.len() && b[i].is_ascii_digit() {
                     i += 1;
                 }
-                // Trailing dot does not count.
-                if i > at && bytes[i - 1] == b'.' {
-                    i -= 1;
-                    dots -= 1;
+                if i == d0 {
+                    ok = false;
+                    break;
                 }
-                if dots == 0 {
-                    continue;
+                groups += 1;
+                if groups >= 4 {
+                    break;
                 }
-                let rest = &tok[i..];
-                // The oracle's post-release parser
-                // (`-(NUMERIC_WITH_OPTIONAL_DOTS(?:.post\d+)?)$`):
-                // a `.post<digits>` tail (lowercase `post`,
-                // digits to the token end) is part of the
-                // version (`2.9.0.post0`), as read from its
-                // version.rb and probed (r407).
-                let post_ok = rest
-                    .strip_prefix(".post")
-                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
-                let ok = if post_ok {
-                    true
-                } else if rest.is_empty() || rest == ".RELEASE" || rest == ".GA" {
-                    true
-                } else if rest.eq_ignore_ascii_case(".final") {
-                    return Some((at, i));
+                if i < b.len() && b[i] == b'.' && i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                    i += 1;
                 } else {
-                    // Attached suffix: [a-zA-Z]+<digits>* to
-                    // the token end, letter run not just `p`.
-                    let run_len = rest.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
-                    run_len > 0
-                        && &rest[..run_len] != "p"
-                        && rest[run_len..].bytes().all(|b| b.is_ascii_digit())
-                };
-                if ok {
-                    return Some((at, tok.len()));
+                    break;
                 }
             }
-            None
-        };
+            if ok && groups >= 2 {
+                return Some(rest[..i].to_string());
+            }
+        }
+        None
+    }
 
-        // Extension chunks after the core token.
-        let prerelease_chunk = |tok: &str| -> bool {
-            const WORDS: &[&str] = &["alpha", "beta", "rc", "pre", "preview", "a", "b", "m", "ea"];
-            let (head, tail) = match tok.split_once('.') {
-                Some((h, t)) => (h, Some(t)),
-                None => (tok, None),
-            };
-            if let Some(t) = tail
-                && !(t.bytes().all(|b| b.is_ascii_digit()) && !t.is_empty())
-            {
+    fn is_dotted_numeric(s: &str) -> bool {
+        let mut groups = 0;
+        for part in s.split('.') {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
                 return false;
             }
-            let word: String = head
-                .chars()
-                .take_while(|c| c.is_ascii_alphabetic())
-                .collect::<String>()
-                .to_lowercase();
-            WORDS.contains(&word.as_str()) && head[word.len()..].bytes().all(|b| b.is_ascii_digit())
-        };
-
-        // A flavor chunk: any all-alphabetic chunk, plus
-        // the probed digit-bearing arch words.
-        let flavor_chunk = |tok: &str| -> bool {
-            !tok.is_empty()
-                && (tok.bytes().all(|b| b.is_ascii_alphabetic())
-                    || matches!(tok, "x64" | "win64" | "i386"))
-        };
-
-        // The last underscore-joined digit group
-        // (`\d+(_\d+)+`) in the stem, as (byte start,
-        // dotted text).
-        let bytes = stem.as_bytes();
-        let mut digit_group: Option<(usize, String)> = None;
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i].is_ascii_digit() {
-                let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                let mut end = i;
-                let mut joined = false;
-                while end < bytes.len()
-                    && bytes[end] == b'_'
-                    && end + 1 < bytes.len()
-                    && bytes[end + 1].is_ascii_digit()
-                {
-                    joined = true;
-                    end += 1;
-                    while end < bytes.len() && bytes[end].is_ascii_digit() {
-                        end += 1;
-                    }
-                }
-                if joined {
-                    digit_group = Some((start, stem[start..end].replace('_', ".")));
-                }
-                i = end;
-            } else {
-                i += 1;
-            }
+            groups += 1;
         }
-        let has_dotted = toks.iter().any(|&(_, tok)| parse_core(tok).is_some());
-        if let Some((start, ver)) = &digit_group {
-            if has_dotted {
-                // Their interaction is unpinned; delegate.
-                return None;
-            }
-            let idx = toks
-                .iter()
-                .position(|&(s, t)| *start >= s && *start < s + t.len())
-                .unwrap_or(0);
-            return Some((idx, ver.clone(), false));
-        }
-
-        // Dotted cores, last first; a core whose tail does
-        // not fit falls through to earlier cores and then
-        // the plain rules below.
-        for (idx, &(tok_start, tok)) in toks.iter().enumerate().rev() {
-            let Some((at, tok_end)) = parse_core(tok) else {
-                continue;
-            };
-            // A cut `.Final` ends the version inside the
-            // token; chunks after it cannot be represented.
-            if tok_end < tok.len() && idx + 1 < toks.len() {
-                continue;
-            }
-            let core_abs = tok_start + at;
-            let mut version_end = tok_start + tok_end;
-            let mut had_prerelease = false;
-            let mut j = idx + 1;
-            while j < toks.len() && prerelease_chunk(toks[j].1) {
-                version_end = toks[j].0 + toks[j].1.len();
-                had_prerelease = true;
-                j += 1;
-            }
-            // One `post<digits>` chunk after the core (and
-            // any prerelease chunks) extends the version
-            // (`1.2-post3`, `1.2_post3`; the oracle's
-            // any-char separator before `post`, r407). It
-            // is not a prerelease.
-            if j < toks.len()
-                && toks[j]
-                    .1
-                    .strip_prefix("post")
-                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-            {
-                version_end = toks[j].0 + toks[j].1.len();
-                j += 1;
-            }
-            let mut numeric = false;
-            if j < toks.len()
-                && !toks[j].1.is_empty()
-                && toks[j].1.bytes().all(|b| b.is_ascii_digit())
-            {
-                numeric = true;
-                j += 1;
-            }
-            let flavor_start = j;
-            while j < toks.len() && flavor_chunk(toks[j].1) {
-                j += 1;
-            }
-            if j != toks.len() {
-                continue;
-            }
-            let end = if j > flavor_start {
-                version_end
-            } else if numeric {
-                stem.len()
-            } else {
-                version_end
-            };
-            return Some((idx, stem[core_abs..end].to_string(), had_prerelease));
-        }
-
-        // No dotted core: a plain version-shaped token,
-        // else the last token's trailing digit run.
-        for (i, &(_, tok)) in toks.iter().enumerate() {
-            let t = tok.strip_prefix('v').unwrap_or(tok);
-            if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
-                return Some((i, t.to_string(), false));
-            }
-        }
-        let (last_idx, &(_, last)) = toks.iter().enumerate().next_back()?;
-        let digits: String = last
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        if !digits.is_empty() && digits.len() < last.len() {
-            return Some((last_idx, digits, false));
-        }
-        None
+        groups >= 2
     }
 
-    /// A resource's current version from its URL: the
-    /// file-name detection, else the nearest path segment
-    /// walking left from the file name that detects
-    /// (`.../OSS-v2.10.0/build.tar.gz` -> 2.10.0, as the
-    /// oracle reports for influxdb@2's ui-assets).
-    fn url_version_token(url: &str) -> Option<String> {
-        // Wheel file names are `{dist}-{version}-...` with
-        // the version as the second `-` component.
-        let file = url
-            .split(['?', '#'])
-            .next()
-            .unwrap_or_default()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default();
-        if file.to_lowercase().ends_with(".whl") {
-            let stem = file_stem(url);
-            if let Some(v) = stem.split('-').nth(1)
-                && let Some((_, ver)) = detect_stem_version(v)
+    fn strip_content_suffix(s: &str) -> &str {
+        const WORDS: &[&str] = &[
+            "sources", "source", "stable", "dist", "final", "full", "bin", "src",
+        ];
+        for w in WORDS {
+            if s.len() > w.len() + 1 {
+                let (head, tail) = s.split_at(s.len() - w.len());
+                if tail.eq_ignore_ascii_case(w)
+                    && matches!(head.as_bytes().last(), Some(b'.' | b'_' | b'-'))
+                {
+                    return &head[..head.len() - 1];
+                }
+            }
+        }
+        s
+    }
+
+    fn cut_version_prefix_char(m: &str) -> String {
+        let b = m.as_bytes();
+        if b.len() > 1 && matches!(b[0], b'-' | b'.' | b'v' | b'V') && b[1].is_ascii_digit() {
+            m[1..].to_string()
+        } else {
+            m.to_string()
+        }
+    }
+
+    /// `URI.decode_www_form_component` for URL specs.
+    fn version_url_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < bytes.len() => {
+                    let h = (bytes[i + 1] as char).to_digit(16);
+                    let l = (bytes[i + 2] as char).to_digit(16);
+                    if let (Some(h), Some(l)) = (h, l) {
+                        out.push((h * 16 + l) as u8);
+                        i += 2;
+                    } else {
+                        out.push(bytes[i]);
+                    }
+                }
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// `StemParser.process_spec`: SourceForge download
+    /// URLs take the parent directory's stem; a spec
+    /// ending in a dot plus non-letters takes the whole
+    /// basename; otherwise the brew stem.
+    fn version_stem_process(spec: &str) -> String {
+        let sf = (spec.contains("sourceforge.net/") || spec.contains("sf.net/"))
+            && spec.ends_with("/download");
+        if sf {
+            return version_path_stem(version_path_dirname(spec));
+        }
+        let noext = {
+            let bytes = spec.as_bytes();
+            let mut i = bytes.len();
+            while i > 0 && !bytes[i - 1].is_ascii_alphabetic() {
+                i -= 1;
+            }
+            bytes[i..]
+                .iter()
+                .enumerate()
+                .any(|(j, &b)| b == b'.' && j + 1 < bytes[i..].len())
+        };
+        if noext {
+            return version_path_basename(spec).to_string();
+        }
+        version_path_stem(spec)
+    }
+
+    fn version_path_basename(p: &str) -> &str {
+        let p = p.trim_end_matches('/');
+        if p.is_empty() {
+            return "/";
+        }
+        p.rsplit('/').next().unwrap_or(p)
+    }
+
+    fn version_path_dirname(p: &str) -> &str {
+        let p = p.trim_end_matches('/');
+        match p.rfind('/') {
+            Some(0) => "/",
+            Some(i) => &p[..i],
+            None => ".",
+        }
+    }
+
+    fn version_path_stem(p: &str) -> String {
+        let base = version_path_basename(p);
+        let ext = version_extname(base);
+        base[..base.len() - ext.len()].to_string()
+    }
+
+    /// Homebrew `Pathname#extname`: bottle extension,
+    /// archive double extension, "" when the would-be
+    /// extension is a version number, else the last
+    /// dot segment.
+    fn version_extname(base: &str) -> String {
+        if base.ends_with(".tar.gz")
+            && let Some(pos) = base.find(".bottle.")
+        {
+            let tag = &base[..pos];
+            let after = &base[pos + 8..];
+            let tag_ok = tag.rsplit('.').next().is_some_and(|t| {
+                !t.is_empty()
+                    && t.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            });
+            let after_ok = after == "tar.gz"
+                || after
+                    .strip_suffix(".tar.gz")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if tag_ok
+                && after_ok
+                && let Some(start) = tag.rfind('.')
             {
-                return Some(ver);
-            }
-            return None;
-        }
-        if let Some((_, v)) = detect_stem_version(&file_stem(url)) {
-            return Some(v);
-        }
-        let base = url.split(['?', '#']).next().unwrap_or_default();
-        let after = base.split("://").nth(1).unwrap_or(base);
-        let mut segs: Vec<&str> = after.split('/').collect();
-        segs.reverse();
-        // Skip the file name (segment 0) and the host (last).
-        for seg in segs.iter().skip(1).take(segs.len().saturating_sub(2)) {
-            if let Some((_, v)) = detect_stem_version(seg) {
-                return Some(v);
+                return base[start..].to_string();
             }
         }
-        None
+        for a in ["tar", "cpio", "pax"] {
+            for b in ["gz", "bz2", "lz", "xz", "zst", "Z"] {
+                let ext = format!(".{a}.{b}");
+                if base.ends_with(&ext) {
+                    return ext;
+                }
+            }
+        }
+        if !base.ends_with(".7z") && version_like_ending(base) {
+            return String::new();
+        }
+        match base.rfind('.') {
+            Some(i) if i > 0 => base[i..].to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// The oracle's `\b\d+\.\d+[^.]*\Z` ending.
+    fn version_like_ending(base: &str) -> bool {
+        let bytes = base.as_bytes();
+        for start in 0..bytes.len() {
+            if !bytes[start].is_ascii_digit() {
+                continue;
+            }
+            let boundary = start == 0
+                || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+            if !boundary {
+                continue;
+            }
+            let mut i = start;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b'.' {
+                continue;
+            }
+            i += 1;
+            let d0 = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == d0 {
+                continue;
+            }
+            if bytes[i..].iter().all(|&b| b != b'.') {
+                return true;
+            }
+        }
+        false
     }
 
     /// The PyPI project a `files.pythonhosted.org` URL
@@ -17890,6 +18052,38 @@ mod livecheck {
         Some(name.replace("%20", "-").replace('_', "-"))
     }
 
+    /// The npm package a `registry.npmjs.org` URL
+    /// belongs to (the oracle Npm strategy's
+    /// `URL_MATCH_REGEX` in livecheck/strategy/npm.rb):
+    /// the non-greedy span up to the first `/-/`,
+    /// scoped names included.
+    fn npm_package(url: &str) -> Option<String> {
+        if url_host(url) != "registry.npmjs.org" {
+            return None;
+        }
+        let path = url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, p)| p)?;
+        let at = path.find("/-/")?;
+        let package = &path[..at];
+        (!package.is_empty()).then(|| package.to_string())
+    }
+
+    /// `URI.encode_www_form_component` for the derived
+    /// npm API URL.
+    fn form_encode_component(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
     /// Hosts of the priority-5 URL-pinned strategies abrew
     /// does not run: brew would pick one of them over
     /// PageMatch, so such URLs are outside the subset.
@@ -17911,26 +18105,7 @@ mod livecheck {
             || h == "archive.apache.org"
             || h == "dlcdn.apache.org"
             || h == "downloads.apache.org"
-            || h == "bitbucket.org"
-            || h == "cpan.metacpan.org"
-            || h == "www.cpan.org"
-            || h == "static.crates.io"
-            || h == "download.gnome.org"
-            || h == "downloads.haskell.org"
-            || h == "hackage.haskell.org"
-            || h == "launchpad.net"
-            || h.ends_with(".launchpad.net")
-            || h == "registry.npmjs.org"
             || h == "files.pythonhosted.org"
-            || h == "sourceforge.net"
-            || h.ends_with(".sourceforge.net")
-            || h == "sf.net"
-            || h.ends_with(".sf.net")
-            || h == "x.org"
-            || h.ends_with(".x.org")
-            || h == "freedesktop.org"
-            || h.ends_with(".freedesktop.org")
-            || h == "archive.mesa3d.org"
     }
 
     struct RunPlan {
@@ -17951,6 +18126,9 @@ mod livecheck {
         /// The option was the `:browser` symbol (debug renders
         /// it as a symbol, literals as quoted strings).
         ua_symbol: bool,
+        /// Gnome's old-scheme unstable filter applies
+        /// (derived regex, no explicit spec regex).
+        gnome_filter: bool,
         /// The `:json` block shape, for `Strat::Json`.
         json: Option<super::super::formula::JsonBlock>,
         /// The `:xml` block shape, for `Strat::Xml`.
@@ -17976,6 +18154,7 @@ mod livecheck {
 
     fn strat_name(s: Strat) -> &'static str {
         match s {
+            Strat::Apache => "Apache",
             Strat::Git => "Git",
             Strat::GithubLatest => "GithubLatest",
             Strat::GithubReleases => "GithubReleases",
@@ -17984,11 +18163,1144 @@ mod livecheck {
             Strat::HeaderMatch => "HeaderMatch",
             Strat::Sparkle => "Sparkle",
             Strat::Pypi => "Pypi",
+            Strat::Sourceforge => "Sourceforge",
+            Strat::Npm => "Npm",
+            Strat::Gnome => "Gnome",
+            Strat::Xorg => "Xorg",
+            Strat::Cpan => "Cpan",
+            Strat::CrateStrategy => "Crate",
+            Strat::Hackage => "Hackage",
+            Strat::RubyGems => "RubyGems",
+            Strat::Launchpad => "Launchpad",
+            Strat::Bitbucket => "Bitbucket",
             Strat::Json => "Json",
             Strat::Xml => "Xml",
             Strat::Yaml => "Yaml",
             Strat::ExtractPlist => "ExtractPlist",
         }
+    }
+
+    /// Brew's Apache strategy inputs for `url`
+    /// (`URL_MATCH_REGEX` + `generate_input_values` in
+    /// livecheck/strategy/apache.rb): the archive
+    /// listing URL and the *pattern* of its derived
+    /// regex. None when the URL does not match.
+    fn apache_values(url: &str) -> Option<(String, String)> {
+        let after_scheme = ["https://", "http://"].iter().find_map(|sch| {
+            url.to_ascii_lowercase()
+                .starts_with(sch)
+                .then(|| &url[sch.len()..])
+        })?;
+        let lower = after_scheme.to_ascii_lowercase();
+        // Remainder candidates after the host alternation
+        // (greedy .+ before path=/filename=, so the last
+        // such assignment first, optional slash first).
+        let mut remainders: Vec<&str> = Vec::new();
+        if let Some(dyn_rest) = lower
+            .starts_with("www.apache.org/dyn/")
+            .then(|| &after_scheme["www.apache.org/dyn/".len()..])
+        {
+            let dyn_lower = dyn_rest.to_ascii_lowercase();
+            let mut positions: Vec<usize> = Vec::new();
+            for key in ["path=", "filename="] {
+                let mut at = 0;
+                while let Some(rel) = dyn_lower[at..].find(key) {
+                    // `.+` before the key needs a char.
+                    if at + rel > 0 {
+                        positions.push(at + rel + key.len());
+                    }
+                    at += rel + 1;
+                }
+            }
+            positions.sort_unstable_by(|a, b| b.cmp(a));
+            for pos in positions {
+                let rem = &dyn_rest[pos..];
+                if let Some(stripped) = rem.strip_prefix('/') {
+                    remainders.push(stripped);
+                }
+                remainders.push(rem);
+            }
+        } else if let Some(r) = lower
+            .starts_with("archive.apache.org/dist/")
+            .then(|| &after_scheme["archive.apache.org/dist/".len()..])
+        {
+            remainders.push(r);
+        } else if let Some(r) = lower
+            .starts_with("dlcdn.apache.org/")
+            .then(|| &after_scheme["dlcdn.apache.org/".len()..])
+        {
+            remainders.push(r);
+        } else if let Some(r) = lower
+            .starts_with("downloads.apache.org/")
+            .then(|| &after_scheme["downloads.apache.org/".len()..])
+        {
+            remainders.push(r);
+        }
+        for rem in remainders {
+            if let Some(values) = apache_match_remainder(rem) {
+                return Some(values);
+            }
+        }
+        None
+    }
+
+    /// The `(path, prefix, suffix)` captures of the
+    /// Apache URL regex against the post-host remainder,
+    /// yielding the (listing URL, derived-regex pattern)
+    /// pair. Leftmost-lazy `path`, lazy `prefix`, then
+    /// `v?\d+(\.\d+)+`, then `/` or the rest of the
+    /// segment as `suffix`.
+    fn apache_match_remainder(rem: &str) -> Option<(String, String)> {
+        let bytes = rem.as_bytes();
+        for slash in 1..bytes.len() {
+            if bytes[slash] != b'/' {
+                continue;
+            }
+            let path = &rem[..slash];
+            let tail = &rem[slash + 1..];
+            let mut plen = 0usize;
+            loop {
+                if plen > tail.len() || tail[..plen].contains('/') {
+                    break;
+                }
+                let rest = &tail[plen..];
+                // `v?` prefers to participate.
+                let after_v = [true, false].into_iter().find_map(|take_v| {
+                    if take_v {
+                        rest.strip_prefix(['v', 'V'])
+                    } else {
+                        Some(rest)
+                    }
+                });
+                for digits_from in [after_v, Some(rest)].into_iter().flatten() {
+                    // \d+(\.\d+)+ greedy.
+                    let b = digits_from.as_bytes();
+                    let mut i = 0;
+                    let mut groups = 0usize;
+                    while i < b.len() {
+                        let d0 = i;
+                        while i < b.len() && b[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        if i == d0 {
+                            break;
+                        }
+                        groups += 1;
+                        if i < b.len()
+                            && b[i] == b'.'
+                            && i + 1 < b.len()
+                            && b[i + 1].is_ascii_digit()
+                        {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if groups < 2 {
+                        continue;
+                    }
+                    let after = &digits_from[i..];
+                    let suffix: &str = if after.starts_with('/') {
+                        "/"
+                    } else {
+                        after.split('/').next().unwrap_or("")
+                    };
+                    let prefix = &tail[..plen];
+                    let listing = format!("https://archive.apache.org/dist/{path}/");
+                    let suffix_t = apache_tarball_t(suffix);
+                    let pattern = format!(
+                        "href=[\"']?{}v?(\\d+(?:\\.\\d+)+){}",
+                        ruby_regex_escape(prefix),
+                        ruby_regex_escape(&suffix_t)
+                    );
+                    return Some((listing, pattern));
+                }
+                plen += 1;
+            }
+        }
+        None
+    }
+
+    /// The Apache suffix rewrite: a trailing tarball
+    /// extension (brew's `TARBALL_EXTENSION_REGEX`)
+    /// collapses to `.t`.
+    fn apache_tarball_t(suffix: &str) -> String {
+        const TAILS: &[&str] = &[
+            ".tar.bz2",
+            ".tar.lzma",
+            ".tar.lzo",
+            ".tar.zst",
+            ".tar.gz",
+            ".tar.lz",
+            ".tar.xz",
+            ".tar.z",
+            ".tlzma",
+            ".tar",
+            ".tbz2",
+            ".tbz",
+            ".tb2",
+            ".tz2",
+            ".taz",
+            ".tgz",
+            ".tlz",
+            ".txz",
+            ".tzst",
+            ".tz",
+            ".taz",
+        ];
+        let lower = suffix.to_ascii_lowercase();
+        for tail in TAILS {
+            if lower.ends_with(tail) {
+                return format!("{}.t", &suffix[..suffix.len() - tail.len()]);
+            }
+        }
+        suffix.to_string()
+    }
+
+    /// Ruby `Regexp.escape` (with brew's `\-` unescaping)
+    /// for derived-regex literals.
+    fn ruby_regex_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | '#' | '$' | '&' | '*' | '+'
+                | '.' | '?' | '[' | '\\' | ']' | '^' | '{' | '|' | '}' | '(' | ')' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Every end position at which `v?\d+(?:\.\d+)+`
+    /// (case-insensitive) matches a prefix of `rest`,
+    /// longest first (the oracle's greedy order).
+    fn dotted_version_ends(rest: &str) -> Vec<usize> {
+        let b = rest.as_bytes();
+        let mut pos = 0;
+        if pos < b.len() && (b[pos] == b'v' || b[pos] == b'V') {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < b.len() && b[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if pos == start {
+            return Vec::new();
+        }
+        let mut ends = Vec::new();
+        loop {
+            if pos >= b.len() || b[pos] != b'.' {
+                break;
+            }
+            let d0 = pos + 1;
+            let mut d = d0;
+            while d < b.len() && b[d].is_ascii_digit() {
+                d += 1;
+            }
+            if d == d0 {
+                break;
+            }
+            for take in 1..=(d - d0) {
+                ends.push(d0 + take);
+            }
+            pos = d;
+        }
+        ends.sort_unstable_by(|a, c| c.cmp(a));
+        ends
+    }
+
+    /// The (prefix, suffix) split of a Bitbucket
+    /// filename around its dotted version (the oracle
+    /// `URL_MATCH_REGEX` filename part): the lazy
+    /// prefix ending in `_` or `-` is tried shortest
+    /// first, absent last; the suffix is the rest of
+    /// the segment and must be non-empty.
+    fn bitbucket_filename(file: &str) -> Option<(String, String)> {
+        let b = file.as_bytes();
+        let mut starts: Vec<usize> = (2..=b.len())
+            .filter(|&p| b[p - 1] == b'_' || b[p - 1] == b'-')
+            .collect();
+        starts.push(0);
+        for p in starts {
+            let rest = &file[p..];
+            for e in dotted_version_ends(rest) {
+                let suffix = &rest[e..];
+                if !suffix.is_empty() {
+                    return Some((file[..p].to_string(), suffix.to_string()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Brew's Bitbucket strategy inputs for `url`
+    /// (`URL_MATCH_REGEX` + `generate_input_values` in
+    /// livecheck/strategy/bitbucket.rb): the generated
+    /// downloads-page URL, regex pattern and flags.
+    /// `/get/` archives check the tags tab; the
+    /// oracle's `dl_type == "get"` comparison is
+    /// case-sensitive even though its regex is not.
+    fn bitbucket_values(url: &str) -> Option<(String, String, &'static str)> {
+        let after_scheme = ["https://", "http://"].iter().find_map(|sch| {
+            url.to_ascii_lowercase()
+                .starts_with(sch)
+                .then(|| &url[sch.len()..])
+        })?;
+        let (host, path) = after_scheme.split_once('/')?;
+        if !host.eq_ignore_ascii_case("bitbucket.org") {
+            return None;
+        }
+        let segs: Vec<&str> = path.split('/').collect();
+        for i in 1..segs.len().saturating_sub(1) {
+            let dl = segs[i];
+            if !dl.eq_ignore_ascii_case("get") && !dl.eq_ignore_ascii_case("downloads") {
+                continue;
+            }
+            let repo = segs[..i].join("/");
+            if repo.is_empty() {
+                continue;
+            }
+            let Some((prefix, suffix)) = bitbucket_filename(segs[i + 1]) else {
+                continue;
+            };
+            let regex_prefix = ruby_regex_escape(&prefix);
+            return Some(if dl == "get" {
+                (
+                    format!("https://bitbucket.org/{repo}/downloads/?tab=tags&iframe=true&spa=0"),
+                    format!(
+                        "<td[^>]*?class=\"name\"[^>]*?>\\s*{regex_prefix}v?(\\d+(?:\\.\\d+)+)\\s*?<"
+                    ),
+                    "im",
+                )
+            } else {
+                let regex_suffix = ruby_regex_escape(&apache_tarball_t(&suffix));
+                (
+                    format!("https://bitbucket.org/{repo}/downloads/?iframe=true&spa=0"),
+                    format!("href=.*?{regex_prefix}v?(\\d+(?:\\.\\d+)+){regex_suffix}"),
+                    "i",
+                )
+            });
+        }
+        None
+    }
+
+    /// Brew's Bitbucket downloads URL + effective
+    /// regex (a provided regex wins).
+    fn bitbucket_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        values: &(String, String, &'static str),
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(&values.1, values.2)?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Bitbucket,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(values.0.clone()),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// Brew's Apache listing URL + effective regex.
+    fn apache_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        values: &(String, String),
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(&values.1, "i")?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Apache,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(values.0.clone()),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// Brew's Sourceforge strategy inputs for `url`
+    /// (`URL_MATCH_REGEX` + `generate_input_values` in
+    /// livecheck/strategy/sourceforge.rb): the project
+    /// RSS URL (None when the URL already is the feed)
+    /// and the derived-regex pattern. None when the
+    /// URL does not match — including bare project
+    /// homepages like `https://matio.sourceforge.net/`,
+    /// which brew deliberately falls through from
+    /// (the r412 corpus: 683 of 900 sourceforge-ish tap
+    /// URLs match; the rest stay PageMatch territory).
+    fn sourceforge_values(url: &str) -> Option<(Option<String>, String)> {
+        let after_scheme = ["https://", "http://"].iter().find_map(|sch| {
+            url.to_ascii_lowercase()
+                .starts_with(sch)
+                .then(|| &url[sch.len()..])
+        })?;
+        let (host, path) = match after_scheme.split_once('/') {
+            Some((h, p)) => (h, format!("/{p}")),
+            None => (after_scheme, String::new()),
+        };
+        let host_l = host.to_ascii_lowercase();
+        let host_ok = ["sourceforge.net", "sf.net"].iter().any(|domain| {
+            host_l == *domain
+                || host_l
+                    .strip_suffix(domain)
+                    .is_some_and(|pre| pre.len() > 1 && pre.ends_with('.'))
+        });
+        if !host_ok {
+            return None;
+        }
+        fn seg<'a>(rest: &'a str) -> Option<(&'a str, &'a str)> {
+            let name = rest.split('/').next().filter(|n| !n.is_empty())?;
+            Some((name, &rest[name.len()..]))
+        }
+        let path_l = path.to_ascii_lowercase();
+        let project: &str = if let Some(rest) = path_l
+            .strip_prefix("/projects/")
+            .or_else(|| path_l.strip_prefix("/project/"))
+        {
+            let rest = &path[path.len() - rest.len()..];
+            let (name, tail) = seg(rest)?;
+            if !tail.starts_with('/') {
+                // Falls to the generic segment below.
+                match path.strip_prefix('/') {
+                    Some(r) => seg(r)?.0,
+                    None => return None,
+                }
+            } else {
+                name
+            }
+        } else if let Some(rest) = path_l.strip_prefix("/p/") {
+            let rest = &path[path.len() - rest.len()..];
+            let (name, tail) = seg(rest)?;
+            if tail.starts_with('/') {
+                name
+            } else {
+                match path.strip_prefix('/') {
+                    Some(r) => seg(r)?.0,
+                    None => return None,
+                }
+            }
+        } else {
+            let rest = path
+                .strip_prefix(":/cvsroot/")
+                .or_else(|| path.strip_prefix('/'))?;
+            seg(rest)?.0
+        };
+        let listing = (!url.contains("/rss/") && !url.ends_with("/rss") && !url.contains("/rss?"))
+            .then(|| format!("https://sourceforge.net/projects/{project}/rss"));
+        let pattern = format!(
+            "url=.*?/{}/files/.*?[-_/](\\d+(?:[-.]\\d+)+)[-_/%.]",
+            ruby_regex_escape(project)
+        );
+        Some((listing, pattern))
+    }
+
+    /// Brew's Sourceforge RSS URL + effective regex.
+    fn sourceforge_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        values: &(Option<String>, String),
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(&values.1, "i")?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Sourceforge,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: values.0.clone(),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// The GNOME package a download.gnome.org URL
+    /// belongs to (the oracle Gnome strategy's
+    /// `URL_MATCH_REGEX` in livecheck/strategy/
+    /// gnome.rb): the segment after `/sources/`,
+    /// requiring the trailing slash.
+    fn gnome_package(url: &str) -> Option<String> {
+        if url_host(url) != "download.gnome.org" {
+            return None;
+        }
+        let path = url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, p)| p)?;
+        let rest = path.strip_prefix("sources/")?;
+        let (name, tail) = rest.split_once('/')?;
+        let _ = tail;
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// Brew's Gnome cache.json URL + effective regex.
+    /// Without an explicit spec regex, the old-scheme
+    /// unstable filter applies to the matched versions.
+    fn gnome_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        package: &str,
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let (re, gnome_filter) =
+            match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+                Some((p, f)) => (Some(lc_regex(p, f)?), false),
+                None => (
+                    Some(lc_regex(
+                        &format!(
+                            "{}(\\d+(?:\\.\\d+)*)\\.t",
+                            format!("{}-", ruby_regex_escape(package))
+                        ),
+                        "i",
+                    )?),
+                    true,
+                ),
+            };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Gnome,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(format!(
+                "https://download.gnome.org/sources/{package}/cache.json"
+            )),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// The Gnome executor: PageMatch over the cache,
+    /// then (derived-regex runs only) drop old-scheme
+    /// unstable versions: below major 40, an odd minor,
+    /// a minor of 90+, or a patch of 90+ disqualifies;
+    /// versions without a minor are kept (brew's
+    /// `version.minor.blank?` guard).
+    /// The Gnome old-scheme stability rule for one
+    /// matched version string.
+    fn gnome_stable(v: &str) -> bool {
+        let mut nums = v.split('.').map(|t| t.parse::<u64>().ok());
+        let major = nums.next().flatten();
+        let minor = nums.next().flatten();
+        let patch = nums.next().flatten();
+        match (major, minor) {
+            (Some(maj), _) if maj >= 40 => true,
+            (_, None) => true,
+            (_, Some(min)) => min % 2 == 0 && min < 90 && patch.is_none_or(|p| p < 90),
+        }
+    }
+
+    fn gnome_versions(rp: &RunPlan) -> Found {
+        let found = page_versions(
+            rp.strategy_url.as_deref().unwrap_or(&rp.url),
+            rp.re.as_ref().unwrap(),
+            rp.ua.as_deref(),
+        );
+        if !rp.gnome_filter {
+            return found;
+        }
+        match found {
+            Found::Versions(mut versions, fin) => {
+                versions.retain(|v| gnome_stable(v));
+                Found::Versions(versions, fin)
+            }
+            other => other,
+        }
+    }
+
+    /// Whether the oracle Xorg strategy applies to
+    /// `url` (`URL_MATCH_REGEX` in
+    /// livecheck/strategy/xorg.rb): an x.org host with
+    /// an `individual` path segment, a freedesktop.org
+    /// host under /archive|dist|software/, or
+    /// archive.mesa3d.org — each followed by a tail
+    /// containing `-\d`.
+    fn xorg_match(url: &str) -> bool {
+        let Some(after) = ["https://", "http://"].iter().find_map(|sch| {
+            url.to_ascii_lowercase()
+                .starts_with(sch)
+                .then(|| &url[sch.len()..])
+        }) else {
+            return false;
+        };
+        let (host, path) = match after.split_once('/') {
+            Some((h, p)) => (h.to_ascii_lowercase(), format!("/{p}")),
+            None => (after.to_ascii_lowercase(), String::new()),
+        };
+        let domain_is = |d: &str| {
+            host == d
+                || host
+                    .strip_suffix(d)
+                    .is_some_and(|pre| pre.len() > 1 && pre.ends_with('.'))
+        };
+        // The `/(segment/)*(.+)-\d+` tail: a `-<digit>`
+        // with at least one character before it.
+        let tail_ok = |rest: &str| -> bool {
+            let b = rest.as_bytes();
+            (2..b.len()).any(|i| b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
+        };
+        let path_l = path.to_ascii_lowercase();
+        if domain_is("x.org") {
+            // `(segment/)*individual` then the tail.
+            let mut at = 0;
+            while let Some(rel) = path_l[at..].find("/individual/") {
+                if tail_ok(&path[at + rel + "/individual".len()..]) {
+                    return true;
+                }
+                at += rel + 1;
+            }
+            false
+        } else if domain_is("freedesktop.org") {
+            ["/archive/", "/dist/", "/software/"]
+                .iter()
+                .any(|seg| path_l.starts_with(seg) && tail_ok(&path[seg.len() - 1..]))
+        } else if domain_is("archive.mesa3d.org") {
+            tail_ok(&path)
+        } else {
+            false
+        }
+    }
+
+    /// Brew's Xorg inputs for `url`
+    /// (`generate_input_values`): the directory
+    /// listing URL (/pub/ rewritten to /archive/,
+    /// file name removed) and derived-regex pattern,
+    /// from the basename's module. Generated even for
+    /// URLs the strategy would not derive-match
+    /// (explicit `:xorg` uses them regardless).
+    fn xorg_values(url: &str) -> Option<(String, String)> {
+        let file_name = match url.trim_end_matches('/').rsplit('/').next() {
+            Some(n) if !n.is_empty() => n,
+            _ => url,
+        };
+        // `^(.+)-\d+`: greedy to the last hyphen-digit.
+        let module = {
+            let b = file_name.as_bytes();
+            let mut cut = None;
+            for i in 1..b.len() {
+                if b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    cut = Some(i);
+                }
+            }
+            cut.map(|i| &file_name[..i])
+        }?;
+        if module.is_empty() {
+            return None;
+        }
+        let listing = url.replace("x.org/pub/", "x.org/archive/");
+        let listing = listing
+            .strip_suffix(file_name)
+            .map_or(listing.clone(), str::to_string);
+        let pattern = format!(
+            "href=.*?{}[._-]v?(\\d+(?:\\.\\d+)+)\\.t",
+            ruby_regex_escape(module)
+        );
+        Some((listing, pattern))
+    }
+
+    /// Brew's Xorg listing URL + effective regex.
+    fn xorg_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        values: &(String, String),
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(&values.1, "i")?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Xorg,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(values.0.clone()),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// Brew's Cpan strategy inputs for `url`
+    /// (`URL_MATCH_REGEX` + `generate_input_values` in
+    /// livecheck/strategy/cpan.rb): the www.cpan.org
+    /// listing URL and derived-regex pattern. Host is
+    /// exactly cpan.metacpan.org or www.cpan.org, path
+    /// `/authors/id/` plus at least three segments,
+    /// then filename `<prefix>-v?<version><suffix>`
+    /// with greedy prefix and nonempty suffix.
+    fn cpan_values(url: &str) -> Option<(String, String)> {
+        let after = ["https://", "http://"].iter().find_map(|sch| {
+            url.to_ascii_lowercase()
+                .starts_with(sch)
+                .then(|| &url[sch.len()..])
+        })?;
+        let (host, path) = match after.split_once('/') {
+            Some((h, p)) => (h.to_ascii_lowercase(), format!("/{p}")),
+            None => (after.to_ascii_lowercase(), String::new()),
+        };
+        if host != "cpan.metacpan.org" && host != "www.cpan.org" {
+            return None;
+        }
+        let rest = path
+            .to_ascii_lowercase()
+            .starts_with("/authors/id/")
+            .then(|| &path["/authors/id/".len()..])?;
+        // (?:/[^/]+){3,} then the filename: the greedy
+        // directory run leaves only the last segment as
+        // the filename, with at least three directories
+        // before it (authors may nest subdirectories).
+        let slash = rest.rfind('/')?;
+        if rest[..slash].matches('/').count() < 2 {
+            return None;
+        }
+        let listing_path = &path[.."/authors/id/".len() + slash + 1];
+        let file = &rest[slash + 1..];
+        if file.is_empty() {
+            return None;
+        }
+        // Greedy prefix: the last hyphen whose tail is
+        // v?<digits>(.<digits>)*<suffix, nonempty>.
+        let b = file.as_bytes();
+        for hy in (1..b.len()).rev() {
+            if b[hy] != b'-' {
+                continue;
+            }
+            let tail = &file[hy + 1..];
+            for digits in [tail.strip_prefix(['v', 'V']), Some(tail)]
+                .into_iter()
+                .flatten()
+            {
+                let db = digits.as_bytes();
+                // Measure the dotted-digit groups.
+                let mut ends: Vec<usize> = Vec::new();
+                let mut i = 0;
+                loop {
+                    let d0 = i;
+                    while i < db.len() && db[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i == d0 {
+                        break;
+                    }
+                    ends.push(i);
+                    if i < db.len()
+                        && db[i] == b'.'
+                        && i + 1 < db.len()
+                        && db[i + 1].is_ascii_digit()
+                    {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                for end in ends.iter().rev() {
+                    let suffix = &digits[*end..];
+                    if !suffix.is_empty() {
+                        let listing = format!("https://www.cpan.org{listing_path}");
+                        let pattern = format!(
+                            "href=.*?{}[._-]v?(\\d+(?:\\.\\d+)*){}",
+                            ruby_regex_escape(&file[..hy]),
+                            ruby_regex_escape(&apache_tarball_t(suffix))
+                        );
+                        return Some((listing, pattern));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Brew's Cpan listing URL + effective regex.
+    fn cpan_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        values: &(String, String),
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(&values.1, "i")?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Cpan,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(values.0.clone()),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// The crate package a static.crates.io URL
+    /// belongs to (the oracle Crate strategy's
+    /// `URL_MATCH_REGEX` in livecheck/strategy/
+    /// crate.rb): the segment after `/crates/`, with
+    /// a `.crate` filename following.
+    fn crate_package(url: &str) -> Option<String> {
+        if url_host(url) != "static.crates.io" {
+            return None;
+        }
+        let path = url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, p)| p)?;
+        let rest = path.strip_prefix("crates/")?;
+        let (package, tail) = rest.split_once('/')?;
+        if package.is_empty() || !tail.to_ascii_lowercase().contains(".crate") {
+            return None;
+        }
+        Some(package.to_string())
+    }
+
+    /// The sparse-index URL for a crate (brew's
+    /// generate_input_values): lowercase name shard
+    /// directories by name length.
+    fn crate_index_url(package: &str) -> String {
+        let package = package.to_ascii_lowercase();
+        let dirs = if package.len() < 3 {
+            package.len().to_string()
+        } else if package.len() == 3 {
+            format!("{}/{}", package.len(), &package[..1])
+        } else {
+            format!("{}/{}", &package[..2], &package[2..4])
+        };
+        format!("https://index.crates.io/{dirs}/{package}")
+    }
+
+    /// Brew's Crate index URL + effective regex (the
+    /// anchored default when the spec gives none).
+    fn crate_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        package: &str,
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex("^v?(\\d+(?:\\.\\d+)+)$", "i")?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::CrateStrategy,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(crate_index_url(package)),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// The Crate executor: each sparse-index line is
+    /// a JSON object; un-yanked entries whose `vers`
+    /// matches the regex contribute capture 1.
+    fn crate_versions(url: &str, re: &LcRegex, ua: Option<&str>) -> Found {
+        let (content, fin) = match page_get(url, ua) {
+            Ok(ok) => ok,
+            Err(msgs) => return Found::Messages(msgs),
+        };
+        let mut out: Vec<String> = Vec::new();
+        for line in content.lines() {
+            let Ok(v) = aterm_json::from_slice::<aterm_json::Value>(line.as_bytes()) else {
+                continue;
+            };
+            if v.get("yanked").and_then(aterm_json::Value::as_bool) == Some(true) {
+                continue;
+            }
+            if let Some(vers) = v.get("vers").and_then(|s| s.as_str())
+                && let Some(m) = search_group1(re, vers)
+            {
+                out.push(m);
+            }
+        }
+        Found::Versions(out, Some(fin))
+    }
+
+    /// Whether the oracle Hackage strategy applies
+    /// (`URL_MATCH_REGEX` in
+    /// livecheck/strategy/hackage.rb): a
+    /// downloads|hackage.haskell.org host with at
+    /// least one path segment and a `-<digit>` tail.
+    fn hackage_match(url: &str) -> bool {
+        if url_host(url) != "downloads.haskell.org" && url_host(url) != "hackage.haskell.org" {
+            return false;
+        }
+        let Some(path) = url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, p)| p)
+        else {
+            return false;
+        };
+        // `(?:/[^/]+)+` then lazy `(.+?)-\d+` (the
+        // capture may span segments): some `-<digit>`
+        // after the first segment start.
+        let b = path.as_bytes();
+        !path.is_empty()
+            && (1..b.len()).any(|i| b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
+    }
+
+    /// Brew's Hackage inputs for `url`
+    /// (`generate_input_values`): the lazy
+    /// package-name from the basename, its /src/
+    /// listing URL, and the h3-heading regex.
+    fn hackage_values(url: &str) -> Option<(String, String)> {
+        let trimmed = url.trim_end_matches('/');
+        let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        let b = file_name.as_bytes();
+        let mut hyphen = None;
+        for i in 1..b.len() {
+            if b[i] == b'-' && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                hyphen = Some(i);
+                break;
+            }
+        }
+        let package = &file_name[..hyphen?];
+        if package.is_empty() {
+            return None;
+        }
+        Some((
+            format!("https://hackage.haskell.org/package/{package}/src/"),
+            format!("<h3>{}-(.*?)/?</h3>", ruby_regex_escape(package)),
+        ))
+    }
+
+    /// Brew's Hackage listing URL + effective regex.
+    fn hackage_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        values: &(String, String),
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(&values.1, "i")?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Hackage,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(values.0.clone()),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
+    }
+
+    /// The gem name of a rubygems.org download URL
+    /// (the oracle RubyGems strategy's
+    /// `URL_MATCH_REGEX`/`FILENAME_REGEX` in
+    /// livecheck/strategy/ruby_gems.rb): under
+    /// `/downloads/` or `/gems/<something>/versions/`,
+    /// the greedy name before the final
+    /// `-<version>(-<platform>)?.gem`.
+    fn ruby_gem_name(url: &str) -> Option<String> {
+        if url_host(url) != "rubygems.org" {
+            return None;
+        }
+        let path = url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split_once('/'))
+            .map(|(_, p)| format!("/{p}"))?;
+        let file = if let Some(rest) = path.strip_prefix("/downloads/") {
+            rest
+        } else {
+            let rest = path.strip_prefix("/gems/")?;
+            let (_, tail) = rest.split_once("/versions/")?;
+            tail
+        };
+        let stem = file
+            .to_ascii_lowercase()
+            .ends_with(".gem")
+            .then(|| &file[..file.len() - 4])?;
+        // Greedy name: the last hyphen whose tail is a
+        // version (digits then dotted alphanumerics)
+        // plus an optional -platform tail.
+        let b = stem.as_bytes();
+        for hy in (1..b.len()).rev() {
+            if b[hy] != b'-' {
+                continue;
+            }
+            let tail = &stem[hy + 1..];
+            let tb = tail.as_bytes();
+            let mut i = 0;
+            while i < tb.len() && tb[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == 0 {
+                continue;
+            }
+            let mut ok = true;
+            loop {
+                if i < tb.len() && tb[i] == b'.' {
+                    let d0 = i + 1;
+                    let mut j = d0;
+                    while j < tb.len() && tb[j].is_ascii_alphanumeric() {
+                        j += 1;
+                    }
+                    if j == d0 {
+                        ok = false;
+                        break;
+                    }
+                    i = j;
+                } else {
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let rest = &tail[i..];
+            if rest.is_empty() || (rest.starts_with('-') && rest.len() > 1) {
+                return Some(stem[..hy].to_string());
+            }
+        }
+        None
+    }
+
+    /// The project name of a launchpad.net URL (the
+    /// oracle Launchpad strategy's `URL_MATCH_REGEX` in
+    /// livecheck/strategy/launchpad.rb): any
+    /// `*.launchpad.net` host, project = the first path
+    /// segment.
+    fn launchpad_project(url: &str) -> Option<String> {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))?;
+        let (host, path) = rest.split_once('/')?;
+        let host = host.to_lowercase();
+        if host != "launchpad.net" && !host.ends_with(".launchpad.net") {
+            return None;
+        }
+        let project = path.split('/').next()?;
+        (!project.is_empty()).then(|| project.to_string())
+    }
+
+    /// Brew's Launchpad project-page URL + effective
+    /// regex (a provided regex wins over the strategy's
+    /// `DEFAULT_REGEX`).
+    fn launchpad_plan(
+        spec: Option<&LivecheckSpec>,
+        url: &str,
+        project: &str,
+        candidates: Vec<&'static str>,
+    ) -> Result<UrlPlan, Outside> {
+        let re = match spec.and_then(|s| s.regex.as_ref().map(|r| (r, &s.regex_flags))) {
+            Some((p, f)) => Some(lc_regex(p, f)?),
+            None => Some(lc_regex(
+                r#"class="[^"]*version[^"]*"[^>]*>\s*Latest version is (.+)\s*<"#,
+                "",
+            )?),
+        };
+        let ua = spec_ua(spec);
+        Ok(UrlPlan::Run(Box::new(RunPlan {
+            strat: Strat::Launchpad,
+            url: url.to_string(),
+            re,
+            candidates,
+            strategy_url: Some(format!("https://launchpad.net/{project}/")),
+            ua: ua.0,
+            ua_option: ua.1,
+            ua_symbol: ua.2,
+            gnome_filter: false,
+            json: None,
+            xml: None,
+            yaml: None,
+            major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
+        })))
     }
 
     /// Brew's Gnu listing URL + effective regex.
@@ -18018,6 +19330,7 @@ mod livecheck {
             ua: ua.0,
             ua_option: ua.1,
             ua_symbol: ua.2,
+            gnome_filter: false,
             json: None,
             xml: None,
             yaml: None,
@@ -18056,6 +19369,7 @@ mod livecheck {
             ua: ua.0,
             ua_option: ua.1,
             ua_symbol: ua.2,
+            gnome_filter: false,
             json: None,
             xml: None,
             yaml: None,
@@ -18078,11 +19392,44 @@ mod livecheck {
         if git_match(url).is_some() {
             out.push("Git");
         }
+        if apache_values(url).is_some() {
+            out.push("Apache");
+        }
+        if bitbucket_values(url).is_some() {
+            out.push("Bitbucket");
+        }
+        if cpan_values(url).is_some() {
+            out.push("Cpan");
+        }
+        if crate_package(url).is_some() {
+            out.push("Crate");
+        }
+        if gnome_package(url).is_some() {
+            out.push("Gnome");
+        }
         if gnu_project(url).is_some() {
             out.push("Gnu");
         }
+        if hackage_values(url).is_some() && hackage_match(url) {
+            out.push("Hackage");
+        }
+        if launchpad_project(url).is_some() {
+            out.push("Launchpad");
+        }
+        if npm_package(url).is_some() {
+            out.push("Npm");
+        }
         if pypi_project(url).is_some() {
             out.push("Pypi");
+        }
+        if ruby_gem_name(url).is_some() {
+            out.push("RubyGems");
+        }
+        if sourceforge_values(url).is_some() {
+            out.push("Sourceforge");
+        }
+        if xorg_match(url) {
+            out.push("Xorg");
         }
         let http = url.starts_with("https://") || url.starts_with("http://");
         let zero: &[(&str, &'static str, bool)] = &[
@@ -18148,6 +19495,7 @@ mod livecheck {
                 ua: ua.0.clone(),
                 ua_option: ua.1.clone(),
                 ua_symbol: ua.2,
+                gnome_filter: false,
                 json: None,
                 xml: None,
                 yaml: None,
@@ -18184,9 +19532,51 @@ mod livecheck {
                         UrlPlan::SkipUrl
                     });
                 }
+                "apache" => {
+                    return Ok(match apache_values(url) {
+                        Some(values) => apache_plan(spec, url, &values, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "crate" => {
+                    return Ok(match crate_package(url) {
+                        Some(package) => crate_plan(spec, url, &package, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "bitbucket" => {
+                    return Ok(match bitbucket_values(url) {
+                        Some(values) => bitbucket_plan(spec, url, &values, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "cpan" => {
+                    return Ok(match cpan_values(url) {
+                        Some(values) => cpan_plan(spec, url, &values, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "hackage" => {
+                    return Ok(match hackage_values(url) {
+                        Some(values) => hackage_plan(spec, url, &values, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "gnome" => {
+                    return Ok(match gnome_package(url) {
+                        Some(package) => gnome_plan(spec, url, &package, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
                 "gnu" => {
                     return Ok(match gnu_project(url) {
                         Some(project) => gnu_plan(spec, url, &project, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "launchpad" => {
+                    return Ok(match launchpad_project(url) {
+                        Some(project) => launchpad_plan(spec, url, &project, candidates)?,
                         None => UrlPlan::SkipUrl,
                     });
                 }
@@ -18253,6 +19643,46 @@ mod livecheck {
                         None => UrlPlan::SkipUrl,
                     });
                 }
+                "npm" => {
+                    return Ok(match npm_package(url) {
+                        Some(package) => run(
+                            Strat::Npm,
+                            url.to_string(),
+                            spec_regex()?,
+                            Some(format!(
+                                "https://registry.npmjs.org/{}/latest",
+                                form_encode_component(&package)
+                            )),
+                        ),
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "xorg" => {
+                    return Ok(match xorg_values(url) {
+                        Some(values) => xorg_plan(spec, url, &values, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "ruby_gems" => {
+                    return Ok(match ruby_gem_name(url) {
+                        Some(gem) => run(
+                            Strat::RubyGems,
+                            url.to_string(),
+                            spec_regex()?,
+                            Some(format!(
+                                "https://rubygems.org/api/v1/versions/{}/latest.json",
+                                form_encode_component(&gem)
+                            )),
+                        ),
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
+                "sourceforge" => {
+                    return Ok(match sourceforge_values(url) {
+                        Some(values) => sourceforge_plan(spec, url, &values, candidates)?,
+                        None => UrlPlan::SkipUrl,
+                    });
+                }
                 "header_match" => {
                     if !url.starts_with("https://") && !url.starts_with("http://") {
                         return Ok(UrlPlan::SkipUrl);
@@ -18285,8 +19715,42 @@ mod livecheck {
         if let Some(processed) = git_match(url) {
             return Ok(run(Strat::Git, processed, Some(git_regex(spec)?), None));
         }
+        if let Some(values) = apache_values(url) {
+            return apache_plan(spec, url, &values, candidates);
+        }
+        if let Some(values) = bitbucket_values(url) {
+            return bitbucket_plan(spec, url, &values, candidates);
+        }
+        if let Some(package) = crate_package(url) {
+            return crate_plan(spec, url, &package, candidates);
+        }
+        if let Some(values) = cpan_values(url) {
+            return cpan_plan(spec, url, &values, candidates);
+        }
+        if hackage_match(url)
+            && let Some(values) = hackage_values(url)
+        {
+            return hackage_plan(spec, url, &values, candidates);
+        }
+        if let Some(package) = gnome_package(url) {
+            return gnome_plan(spec, url, &package, candidates);
+        }
         if let Some(project) = gnu_project(url) {
             return gnu_plan(spec, url, &project, candidates);
+        }
+        if let Some(project) = launchpad_project(url) {
+            return launchpad_plan(spec, url, &project, candidates);
+        }
+        if let Some(package) = npm_package(url) {
+            return Ok(run(
+                Strat::Npm,
+                url.to_string(),
+                spec_regex()?,
+                Some(format!(
+                    "https://registry.npmjs.org/{}/latest",
+                    form_encode_component(&package)
+                )),
+            ));
         }
         if let Some(project) = pypi_project(url) {
             return Ok(run(
@@ -18295,6 +19759,25 @@ mod livecheck {
                 spec_regex()?,
                 Some(format!("https://pypi.org/pypi/{project}/json")),
             ));
+        }
+        if xorg_match(url)
+            && let Some(values) = xorg_values(url)
+        {
+            return xorg_plan(spec, url, &values, candidates);
+        }
+        if let Some(gem) = ruby_gem_name(url) {
+            return Ok(run(
+                Strat::RubyGems,
+                url.to_string(),
+                spec_regex()?,
+                Some(format!(
+                    "https://rubygems.org/api/v1/versions/{}/latest.json",
+                    form_encode_component(&gem)
+                )),
+            ));
+        }
+        if let Some(values) = sourceforge_values(url) {
+            return sourceforge_plan(spec, url, &values, candidates);
         }
         if other_strategy_host(url) {
             return Err(Outside);
@@ -18577,8 +20060,34 @@ mod livecheck {
     /// A resource's own livecheck block supplies its spec
     /// (references resolve like a package's, `:parent` to
     /// the owning formula); without one it is checked
-    /// against its own URL spec-free. Its current version
-    /// is the stanza's explicit one or the file-name token.
+    /// against its own URL spec-free.
+    /// A resource's current version as brew computes it
+    /// (r409): the explicit `version` stanza, else
+    /// detection from the git `tag:` when declared
+    /// (Version.detect fetches :tag in place of the
+    /// URL), else detection from the URL; when all
+    /// detect nothing, the owning spec's version is
+    /// stamped at load (SoftwareSpec#owner=), which is
+    /// how test resources and other undetectable-URL
+    /// resources get the formula's version.
+    fn resource_current(
+        version: Option<String>,
+        tag: Option<String>,
+        url: &str,
+        pkg_current: &str,
+    ) -> Option<String> {
+        if let Some(v) = version
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+        let detected = match &tag {
+            Some(t) => version_parse(t),
+            None => version_parse(url),
+        };
+        detected.or_else(|| (!pkg_current.is_empty()).then(|| pkg_current.to_string()))
+    }
+
     fn resource_plans(pkg: &Pkg) -> Result<Vec<ResPlan>, Outside> {
         let (Some(dir), Some(rel)) = (&pkg.tap_dir, &pkg.rel_file) else {
             return Err(Outside);
@@ -18586,11 +20095,8 @@ mod livecheck {
         let text = fs::read_to_string(dir.join(rel)).map_err(|_| Outside)?;
         let stanzas = tap::parse_resource_stanzas(&text).ok_or(Outside)?;
         let mut out = Vec::new();
-        for (name, url, version, spec) in stanzas {
-            let current = match version {
-                Some(v) if !v.is_empty() => Some(v),
-                _ => url_version_token(&url),
-            };
+        for (name, url, version, tag, spec) in stanzas {
+            let current = resource_current(version, tag, &url, &pkg.current);
             let spec_defined = spec.is_some();
             let (plans, references, parent_ref) = match resource_check_plans(pkg, &url, &spec)? {
                 ResourcePlans::Urls(plans, refs) => (plans, refs, false),
@@ -18920,6 +20426,22 @@ mod livecheck {
             }
             Strat::Sparkle => sparkle_versions(&rp.url, rp.ua.as_deref()),
             Strat::PageMatch => page_versions(&rp.url, rp.re.as_ref().unwrap(), rp.ua.as_deref()),
+            Strat::Bitbucket => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::Apache => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::Gnome => gnome_versions(rp),
+            Strat::Launchpad => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
             Strat::Gnu => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
@@ -18929,6 +20451,39 @@ mod livecheck {
             Strat::Xml => xml_versions(rp),
             Strat::Yaml => yaml_versions(rp),
             Strat::ExtractPlist => plist_versions(rp),
+            Strat::Sourceforge => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::Hackage => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::CrateStrategy => crate_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::Cpan => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::Xorg => page_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+            ),
+            Strat::RubyGems => npm_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.ua.as_deref(),
+            ),
+            Strat::Npm => npm_versions(
+                rp.strategy_url.as_deref().unwrap_or(&rp.url),
+                rp.ua.as_deref(),
+            ),
             Strat::Pypi => pypi_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref(),
@@ -19053,7 +20608,14 @@ mod livecheck {
                 meta: Box::new(meta),
             };
         }
-        err(last_messages.unwrap_or_else(|| vec![NO_VERSIONS_MSG.to_string()]))
+        // A resource whose checks produced neither
+        // versions nor messages reports brew's fallback
+        // (a strategy may return an empty message list,
+        // e.g. Git with no matching tags on hercules'
+        // sha-pinned resources — r411).
+        err(last_messages
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| vec![NO_VERSIONS_MSG.to_string()]))
     }
 
     fn check_plans(
@@ -19573,6 +21135,25 @@ mod livecheck {
 
     /// The PyPI JSON API's current version for the project
     /// (`info.version`); a spec regex captures from it.
+    /// The Npm strategy: `version` at the top of the
+    /// `/latest` JSON. The oracle's default block takes
+    /// only the JSON, so a spec regex is ignored
+    /// (arity-1 block in Json.versions_from_content).
+    fn npm_versions(json_url: &str, ua: Option<&str>) -> Found {
+        let (content, fin) = match page_get(json_url, ua) {
+            Ok(ok) => ok,
+            Err(msgs) => return Found::Messages(msgs),
+        };
+        let latest = aterm_json::from_slice::<aterm_json::Value>(content.as_bytes())
+            .ok()
+            .and_then(|v| {
+                v.get("version")
+                    .and_then(|s| s.as_str().map(str::to_string))
+            })
+            .unwrap_or_default();
+        Found::Versions(vec![latest], Some(fin))
+    }
+
     fn pypi_versions(json_url: &str, re: Option<&LcRegex>, ua: Option<&str>) -> Found {
         let (content, fin) = match page_get(json_url, ua) {
             Ok(ok) => ok,
@@ -20602,7 +22183,9 @@ mod livecheck {
                 0x6 => {
                     let raw = bytes.get(pos..pos.checked_add(len.checked_mul(2)?)?)?;
                     let units: Vec<u16> = raw
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| u16::from_be_bytes([c[0], c[1]]))
                         .collect();
                     Some(BVal::Str(String::from_utf16_lossy(&units)))

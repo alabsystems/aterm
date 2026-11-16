@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reap credit (SA §7.5): attributed CPU charges and independently observed actual own CPU.
+//! Reap credit (SA §7.5): reconciled inherited charges and published own-counter growth.
 //!
-//! The charge reconciles inherited kernel counters and is diagnostic, not an actual-work
-//! lower bound: an unobserved auto-reaping process can pass up doubled child time. The own-CPU
-//! floor is tracked independently by process incarnation; ambiguous charge epochs make that
-//! floor the primary actual-work evidence.
+//! The two channels are diagnostic observations, not actual-window execution bounds.
+//! Inherited counters can repeat child accounting; independent own counters avoid that
+//! inheritance but can still publish CPU from before the earlier read or omit unpublished
+//! execution. Frontend read stamps establish observation continuity, not accounting epochs.
+//! Ownership, count-once reconciliation and temporal assurance are independent.
 //!
 //! A sweep reads only the processes alive when it runs, and a build's processes mostly start
 //! and finish between two sweeps. The kernel keeps their work: at each reap it adds the child's
@@ -42,11 +43,11 @@
 //! after a reading, or taken out at a later one, says launchd may have reaped it, so what was
 //! taken out against it may be the reaper's other children's: the ledger marks each such step as
 //! one that missed some of the tab's work. So a killed build takes out at most a reading or two
-//! of its reaper's reaped growth, and the tab's figure over them is a lower bound, save where that
-//! growth covered all of it at the first reading. Reaped growth past what is absorbed counts,
+//! of its reaper's reaped growth, and the tab's charge can omit reported accounting, save where
+//! that growth covered all of it at the first reading. Reaped growth past what is absorbed counts,
 //! save where it may hold work twice: a process the kernel reaps for, at its reading or the one
 //! before, and the reaper of a gone one (or of a member gone under one) over its next two
-//! readings count none of it, so the tab's figure there is a lower bound. That is as far as the
+//! readings count none of it, so the tab's charge can omit that reported accounting. That is as far as the
 //! readings see the flag: the sweep reads it of every process at each one, and nothing records
 //! it between two readings or after a process exits, so a parent that ignores `SIGCHLD` and
 //! starts and exits between two readings, or ignores it only between them (around its
@@ -83,8 +84,8 @@
 //! it); aterm's coalition holds what its counters kept of them, as the split's unattributed work,
 //! and the rest is unaccounted (a probe's launchd job kept 958 of 1,200 ms of its orphans' work
 //! on macOS 27; over a live loop of 6 ms orphans, 819 mc, the split's windows read 824–1,035 mc
-//! unaccounted). Missing coverage and ambiguous inherited charges stay separate: the own-CPU
-//! floor records actual observed own growth even when conservative reconciliation withholds a
+//! unaccounted). Missing coverage and ambiguous inherited charges stay separate: the
+//! own-counter channel records published growth even when conservative reconciliation withholds a
 //! retained child's charge to avoid a nonsimultaneous parent read counting it again.
 //! `aterm_models_misc::reap_credit_model` is the model; `tests/conformance_reap_credit.rs` binds
 //! it.
@@ -223,7 +224,7 @@ struct Counter {
     ns: u64,
     /// The last step that knowingly missed some of its work; 0 for none.
     missed: u64,
-    floor_ns: u64,
+    reported_ns: u64,
     ambiguous: u64,
 }
 
@@ -238,8 +239,8 @@ pub struct TabTotal {
     pub ns: u64,
     /// The last step that knowingly missed some of its work ([module docs](self)); 0 for none.
     pub missed: u64,
-    /// Independently observed own CPU only, never an inherited child charge.
-    pub floor_ns: u64,
+    /// Published own-counter growth only, never an inherited child charge.
+    pub reported_ns: u64,
     /// Last step whose attributed raw charge could contain unobserved inherited child time.
     pub ambiguous: u64,
 }
@@ -254,45 +255,50 @@ pub struct ReapTotals {
     pub all: u64,
     /// Last step that knowingly missed work in any scope, including aterm's own/shared work.
     pub missed: u64,
-    /// Every scope's independently observed own CPU, including closed tabs, nanoseconds.
-    pub all_floor: u64,
+    /// Every scope's published own-counter growth, including closed tabs, nanoseconds.
+    pub all_reported: u64,
     /// Last ambiguous inherited charge in any scope.
     pub ambiguous: u64,
     /// Last ambiguous inherited charge in aterm's own scope.
     pub own_ambiguous: u64,
-    /// Independent nondelegated own CPU grouped by its observed resource coalition.
-    pub coalition_floors: IdMap<u64, u64>,
-    /// Own CPU in each current pane, separate from a logical tab's pooled counter.
-    pub pane_floors: IdMap<u64, u64>,
-    /// Independent own CPU whose coalition could not be established for that counter delta.
-    pub unmapped_floor: u64,
+    /// Published nondelegated own-counter growth grouped by its observed resource coalition.
+    pub coalition_reported: IdMap<u64, u64>,
+    /// Published own-counter growth in each current pane, separate from its logical tab.
+    pub pane_reported: IdMap<u64, u64>,
+    /// Published own-counter growth whose resource coalition could not be established.
+    pub unmapped_reported: u64,
     /// Each open tab's counter, by key.
     pub tabs: Vec<TabTotal>,
 }
 
 impl ReapTotals {
-    /// Independent own CPU observed in this pane since `base`.
+    /// Published own-counter growth observed in this pane since `base`.
     #[must_use]
-    pub fn pane_floor_since(&self, base: &Self, pane: u64) -> u64 {
-        self.pane_floors
+    pub fn pane_reported_since(&self, base: &Self, pane: u64) -> u64 {
+        self.pane_reported
             .get(&pane)
             .copied()
             .unwrap_or(0)
-            .saturating_sub(base.pane_floors.get(&pane).copied().unwrap_or(0))
+            .saturating_sub(base.pane_reported.get(&pane).copied().unwrap_or(0))
     }
-    /// Own CPU observed in `coalition` since `base`, without inherited child charges.
+    /// Published own-counter growth observed in `coalition` since `base`, without child charges.
     #[must_use]
-    pub fn coalition_floor_since(&self, base: &Self, coalition: u64) -> u64 {
-        self.coalition_floors
+    pub fn coalition_reported_since(&self, base: &Self, coalition: u64) -> u64 {
+        self.coalition_reported
             .get(&coalition)
             .copied()
             .unwrap_or(0)
-            .saturating_sub(base.coalition_floors.get(&coalition).copied().unwrap_or(0))
+            .saturating_sub(
+                base.coalition_reported
+                    .get(&coalition)
+                    .copied()
+                    .unwrap_or(0),
+            )
     }
-    /// Independent own CPU of this tab since `base`, and whether inherited charges in that
+    /// Published own-counter growth of this tab since `base`, and whether inherited charges in that
     /// interval were ambiguous. Identity is the stable tab id, including a pane-key change.
     #[must_use]
-    pub fn floor_since(&self, base: &Self, key: u64) -> (u64, bool) {
+    pub fn reported_since(&self, base: &Self, key: u64) -> (u64, bool) {
         let Some(tab) = self.tabs.iter().find(|t| t.key == key) else {
             return (0, false);
         };
@@ -300,23 +306,23 @@ impl ReapTotals {
             .tabs
             .iter()
             .find(|t| t.id == tab.id)
-            .map_or(0, |t| t.floor_ns);
+            .map_or(0, |t| t.reported_ns);
         (
-            tab.floor_ns.saturating_sub(before),
+            tab.reported_ns.saturating_sub(before),
             tab.ambiguous > base.step,
         )
     }
 
-    /// Own-scope floor over the interval, excluding open tabs. Closed historical counters do
+    /// Own-scope published growth between readings, excluding open tabs. Closed historical counters do
     /// not become fresh work: only the aggregate's growth since `base` participates.
     #[must_use]
-    pub fn own_floor_since(&self, base: &Self) -> (u64, bool) {
+    pub fn own_reported_since(&self, base: &Self) -> (u64, bool) {
         let tabs = self.tabs.iter().fold(0_u64, |sum, t| {
-            sum.saturating_add(self.floor_since(base, t.key).0)
+            sum.saturating_add(self.reported_since(base, t.key).0)
         });
         (
-            self.all_floor
-                .saturating_sub(base.all_floor)
+            self.all_reported
+                .saturating_sub(base.all_reported)
                 .saturating_sub(tabs),
             self.own_ambiguous > base.step,
         )
@@ -414,11 +420,11 @@ pub struct ReapLedger {
     whole_at_ns: Option<u64>,
     whole_wall_ms: Option<i64>,
     whole_cpu_cut: crate::model::NativeCpuCut,
-    floor_rows: IdMap<crate::delegated::ProcessKey, OwnFloor>,
-    coalition_floors: IdMap<u64, u64>,
-    pane_floors: IdMap<u64, u64>,
-    unmapped_floor: u64,
-    own_floor: u64,
+    reported_rows: IdMap<crate::delegated::ProcessKey, OwnReported>,
+    coalition_reported: IdMap<u64, u64>,
+    pane_reported: IdMap<u64, u64>,
+    unmapped_reported: u64,
+    own_reported: u64,
     ambiguity: u64,
     own_ambiguity: u64,
     terminal_totals: IdMap<crate::delegated::ProcessKey, Option<u64>>,
@@ -469,7 +475,7 @@ pub struct ReapLedger {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct OwnFloor {
+struct OwnReported {
     cpu: u64,
     /// Whole frontend observation that read this counter, including terminal passes at its cut.
     at_ns: u64,
@@ -492,7 +498,7 @@ impl ReapLedger {
             .is_some_and(|(birth, before)| before < birth && birth <= i.at_unix_ms)
     }
 
-    fn floor_is_consecutive(&self, before: &OwnFloor, now: u64) -> bool {
+    fn reported_is_consecutive(&self, before: &OwnReported, now: u64) -> bool {
         Some(before.at_ns) == self.whole_at_ns || before.at_ns == now
     }
 
@@ -508,29 +514,39 @@ impl ReapLedger {
             return false;
         }
         // An exit in this interval does not place its whole lifetime here. An existing
-        // consecutive own-counter baseline bounds its delta; otherwise its birth must be
-        // proved inside this actual model interval, including deferred whole-sweep adoption.
+        // consecutive own-counter baseline identifies reported growth; otherwise its birth must
+        // be observed between the reads, including deferred whole-sweep adoption. Neither
+        // condition places execution behind a lagged baseline inside the read separation.
         let consecutive = record.process.start.is_some_and(|start| {
-            self.floor_rows
+            self.reported_rows
                 .get(&crate::delegated::ProcessKey {
                     pid: record.process.pid,
                     start,
                 })
-                .is_some_and(|row| self.floor_is_consecutive(row, i.at_ns))
+                .is_some_and(|row| self.reported_is_consecutive(row, i.at_ns))
         });
         consecutive || self.born_in_window(&record.process, i)
     }
 
-    fn observe_own_floor(&mut self, i: &StepIn) {
+    fn observe_own_reported(&mut self, i: &StepIn) {
         self.name_tabs(i.tabs);
         for ((p, member), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
             let (Some(start), Some(cpu)) = (p.start, p.cpu_ns) else {
+                let scope = member
+                    .tab
+                    .and_then(|index| i.tabs.get(index))
+                    .and_then(|tab| self.keys.iter().find(|(key, _)| *key == tab.tab))
+                    .map(|(_, id)| Scope::Tab(*id))
+                    .or_else(|| member.aterm.then_some(Scope::Own));
+                if let Some(scope) = scope {
+                    miss(&mut self.tabs, &mut self.missed, scope, self.step + 1);
+                }
                 continue;
             };
             let key = crate::delegated::ProcessKey { pid: p.pid, start };
-            let previous = self.floor_rows.get(&key).copied();
+            let previous = self.reported_rows.get(&key).copied();
             if previous.is_some_and(|p| p.delegated) && !*delegated && !member.aterm {
-                self.floor_rows.remove(&key);
+                self.reported_rows.remove(&key);
                 continue;
             }
             if p.uid != Some(i.self_uid) && !member.aterm && previous.is_none() {
@@ -567,7 +583,7 @@ impl ReapLedger {
             let born = self.born_in_window(p, i);
             let regressed = previous.is_some_and(|before| cpu < before.cpu);
             let consecutive = !regressed
-                && previous.is_some_and(|before| self.floor_is_consecutive(&before, i.at_ns));
+                && previous.is_some_and(|before| self.reported_is_consecutive(&before, i.at_ns));
             let delta = if consecutive {
                 cpu.saturating_sub(previous.map_or(0, |before| before.cpu))
             } else if previous.is_none() && born {
@@ -581,7 +597,7 @@ impl ReapLedger {
                 && (previous.is_some() || !born)
                 && (cpu > 0 || regressed)
             {
-                // A readable counter after a gap bounds a lifetime, not this interval.
+                // A readable counter after a gap has no consecutive published-growth baseline.
                 // Rebaseline it; the raw reconciled charge remains separately visible.
                 // A rollback keeps its prior maximum and read stamp until a later recovery.
                 miss(&mut self.tabs, &mut self.missed, scope, self.step + 1);
@@ -598,9 +614,9 @@ impl ReapLedger {
                     .filter(|before| p.version.is_some() && p.version == before.version)
                     .and_then(|before| before.coalition)
             });
-            self.floor_rows.insert(
+            self.reported_rows.insert(
                 key,
-                OwnFloor {
+                OwnReported {
                     cpu: previous
                         .filter(|_| regressed)
                         .map_or(cpu, |before| before.cpu),
@@ -618,20 +634,20 @@ impl ReapLedger {
             );
             if !*delegated {
                 if let Some(pane) = pane {
-                    let total = self.pane_floors.entry(pane).or_default();
+                    let total = self.pane_reported.entry(pane).or_default();
                     *total = total.saturating_add(delta);
                 }
                 if let Some(coalition) = coalition {
-                    let total = self.coalition_floors.entry(coalition).or_default();
+                    let total = self.coalition_reported.entry(coalition).or_default();
                     *total = total.saturating_add(delta);
                 } else {
-                    self.unmapped_floor = self.unmapped_floor.saturating_add(delta);
+                    self.unmapped_reported = self.unmapped_reported.saturating_add(delta);
                 }
                 match scope {
-                    Scope::Own => self.own_floor = self.own_floor.saturating_add(delta),
+                    Scope::Own => self.own_reported = self.own_reported.saturating_add(delta),
                     Scope::Tab(id) => {
                         let counter = self.tabs.entry(id).or_default();
-                        counter.floor_ns = counter.floor_ns.saturating_add(delta);
+                        counter.reported_ns = counter.reported_ns.saturating_add(delta);
                     }
                 }
             }
@@ -646,8 +662,8 @@ impl ReapLedger {
     /// process. An inactive coalition's prior snapshots keep their own immutable counters.
     pub(crate) fn retain_coalitions(&mut self, read: &super::CoalSample) {
         let mut present: IdSet<_> = read.rows.iter().map(|row| row.id).collect();
-        present.extend(self.floor_rows.values().filter_map(|row| row.coalition));
-        self.coalition_floors.retain(|id, _| present.contains(id));
+        present.extend(self.reported_rows.values().filter_map(|row| row.coalition));
+        self.coalition_reported.retain(|id, _| present.contains(id));
     }
     /// Accept transport custody before checking whether a process sweep can run. A source
     /// cursor may advance on a truncated or machine-only observation; those observations must
@@ -719,7 +735,7 @@ impl ReapLedger {
                     true
                 } else {
                     // Preserve the receipt in Snapshot, consume its cursor once, and withhold
-                    // both synthetic raw charge and own floor. The real reaper counter remains
+                    // both synthetic raw charge and published own-counter growth. The real reaper counter remains
                     // free to grow once in whichever ordinary sweep actually reads it.
                     invalid.push(record.tab);
                     false
@@ -967,8 +983,8 @@ impl ReapLedger {
                 })
             })
             .collect();
-        self.floor_rows.retain(|key, _| present.contains(key));
-        self.pane_floors
+        self.reported_rows.retain(|key, _| present.contains(key));
+        self.pane_reported
             .retain(|key, _| i.tabs.iter().any(|tab| tab.key == *key));
         if incomplete {
             self.missed = self.step;
@@ -1015,7 +1031,7 @@ impl ReapLedger {
                     id,
                     ns: c.ns,
                     missed: c.missed,
-                    floor_ns: c.floor_ns,
+                    reported_ns: c.reported_ns,
                     ambiguous: c.ambiguous,
                 }
             })
@@ -1024,15 +1040,14 @@ impl ReapLedger {
         ReapTotals {
             step: self.step,
             missed: self.missed,
-            all_floor: self
-                .tabs
-                .values()
-                .fold(self.own_floor, |sum, c| sum.saturating_add(c.floor_ns)),
+            all_reported: self.tabs.values().fold(self.own_reported, |sum, c| {
+                sum.saturating_add(c.reported_ns)
+            }),
             ambiguous: self.ambiguity,
             own_ambiguous: self.own_ambiguity,
-            coalition_floors: self.coalition_floors.clone(),
-            pane_floors: self.pane_floors.clone(),
-            unmapped_floor: self.unmapped_floor,
+            coalition_reported: self.coalition_reported.clone(),
+            pane_reported: self.pane_reported.clone(),
+            unmapped_reported: self.unmapped_reported,
             all: self
                 .tabs
                 .values()
@@ -1159,7 +1174,7 @@ impl ReapLedger {
         if i.truncated {
             return;
         }
-        self.observe_own_floor(i);
+        self.observe_own_reported(i);
         self.terminal_overlap.clear();
         let by_pid: IdMap<_, _> = i.procs.iter().map(|p| (p.pid, p)).collect();
         let mut overlaps = IdMap::default();
@@ -1346,7 +1361,7 @@ impl ReapLedger {
             held,
             baseline_only,
             terminal_overlap,
-            own_floor,
+            own_reported,
             ambiguity,
             own_ambiguity,
             ..
@@ -1360,7 +1375,7 @@ impl ReapLedger {
             let keep = open.contains(id);
             if !keep {
                 *own = own.saturating_add(c.ns);
-                *own_floor = own_floor.saturating_add(c.floor_ns);
+                *own_reported = own_reported.saturating_add(c.reported_ns);
                 *own_ambiguity = (*own_ambiguity).max(c.ambiguous);
             }
             keep

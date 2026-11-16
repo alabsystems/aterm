@@ -2042,7 +2042,13 @@ fn every_argv_reaches_its_whole_selection() {
         assert!(
             lint[sep..]
                 .windows(2)
-                .any(|w| w[0] == "-D" && w[1] == "warnings")
+                .any(|w| w[0] == "-D" && w[1] == "unused_must_use")
+        );
+        // LS-78: a named deny list, never every warning, so one main already carries (dead code,
+        // an unused variable) stops no landing of a branch that did not write it.
+        assert!(
+            !lint[sep..].iter().any(|word| word == "warnings"),
+            "{lint:?}"
         );
         for c in scope.crates() {
             assert!(lint[..sep].contains(c), "{c}: {lint:?}");
@@ -2054,7 +2060,7 @@ fn every_argv_reaches_its_whole_selection() {
     let g = tippy_gated_args(&Scope::workspace(), &fixture_gated()).expect("gated");
     let sep = g.iter().position(|x| x == "--").expect("a -- separator");
     assert!(
-        has(&g[..sep], "--keep-going") && has(&g[sep..], "warnings"),
+        has(&g[..sep], "--keep-going") && has(&g[sep..], "unused_must_use"),
         "{g:?}"
     );
 }
@@ -3162,7 +3168,7 @@ fn the_spec_check_runs_whole_under_release_and_names_a_missing_checker() {
     assert_eq!(tail(&dev), ["spec-check"]);
     let argv = dev.argv();
     assert!(
-        argv.windows(2).any(|w| w == ["-p", "aterm-models"])
+        argv.windows(2).any(|w| w == ["-p", "aterm-spec-closure"])
             && !argv.iter().any(|a| a == "--workspace"),
         "a run keeps its package; `targo run` refuses --workspace: {argv:?}"
     );

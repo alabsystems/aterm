@@ -220,13 +220,12 @@ fn the_pass_lock_lets_one_pass_run_at_a_time() {
 
 /// THE RESERVE IS SIZED TO TEN MINUTES OF THE MEASURED FALL: a twelfth of the room, never over
 /// the emergency line nor under [`RESERVE_BYTES`] (which wins where the line is under it), and
-/// the look writes it at that size once free space is twice that size over the emergency line,
-/// its `written` row carrying the bytes. NEGATIVE CONTROLS: free space over the emergency line
-/// by twice [`RESERVE_BYTES`] alone writes nothing (the gate is the size, so a look that still
-/// added the fixed [`RESERVE_BYTES`] fails it); with no room read the look writes
-/// [`RESERVE_BYTES`] (a size that ignored the room fails the first length, a constant one
-/// this); and a room a tenth larger keeps the file as it is, inode, length and time (a look that
-/// rewrote to the exact size each time fails it).
+/// the look writes it once free space is twice that size over the emergency line, its
+/// `written` row carrying the bytes. NEGATIVE CONTROLS: twice [`RESERVE_BYTES`] alone and one
+/// byte below the actual gate write nothing; the exact gate writes below the build-room target.
+/// With no room read the look writes [`RESERVE_BYTES`] (a size that ignored the room fails the
+/// first length, a constant one this); a room a tenth larger keeps the file's inode, length and
+/// time (rewriting to the exact size each time fails it).
 #[test]
 fn the_reserve_is_sized_to_ten_minutes_of_the_measured_fall() {
     use crate::harness::cli::{DISK_LEDGER, ReserveMove, disk_reserve_look};
@@ -245,31 +244,34 @@ fn the_reserve_is_sized_to_ten_minutes_of_the_measured_fall() {
     let room = 12 * (RESERVE_BYTES + MIB);
     let want = sized(Some(room), t.emergency);
     assert_eq!(want, RESERVE_BYTES + MIB, "a twelfth of the room");
-    let gate = t.emergency;
+    let gate = t.emergency + 2 * want;
+    assert!(gate < t.floor, "partial recovery is sufficient");
     let last_row = || -> aterm_json::Value {
         let text = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
         let line = text.lines().last().expect("a row");
         aterm_json::from_str(line).expect("a row")
     };
 
-    let short = Some(gate + 2 * RESERVE_BYTES);
     let reserve = path_for(&tmp.path().join("short"));
-    assert_eq!(
-        disk_reserve_look(
-            &state,
-            &reserve,
-            t.level(short, None),
-            short,
-            &t,
-            Some(room),
-            1,
-        ),
-        ReserveMove::Kept,
-        "free space short of twice the size over the emergency line writes nothing"
-    );
-    assert!(!reserve.exists());
+    for free in [t.emergency + 2 * RESERVE_BYTES, gate - 1] {
+        let short = Some(free);
+        assert_eq!(
+            disk_reserve_look(
+                &state,
+                &reserve,
+                t.level(short, None),
+                short,
+                &t,
+                Some(room),
+                1,
+            ),
+            ReserveMove::Kept,
+            "insufficient recovery at {free} bytes writes nothing"
+        );
+        assert!(!reserve.exists());
+    }
 
-    let plenty = Some(gate + 2 * want);
+    let plenty = Some(gate);
     let reserve = path_for(&tmp.path().join("home"));
     assert_eq!(
         disk_reserve_look(
@@ -291,7 +293,7 @@ fn the_reserve_is_sized_to_ten_minutes_of_the_measured_fall() {
     assert_eq!(row["bytes"].as_u64(), Some(want), "{row:?}");
 
     let grown = room + room / 10;
-    let plenty_grown = Some(gate + 2 * sized(Some(grown), t.emergency));
+    let plenty_grown = Some(t.emergency + 2 * sized(Some(grown), t.emergency));
     assert_eq!(
         disk_reserve_look(
             &state,

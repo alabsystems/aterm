@@ -4187,7 +4187,6 @@ fn a_pin_admits_only_its_own_vendors_pages() {
     assert!(flow.is_callback("http://127.0.0.1:7777/cb?code=c&state=s"));
 }
 
-#[cfg(unix)]
 #[test]
 fn a_hosted_claude_callback_is_exact_and_its_code_is_taken_once() {
     let flow = MailboxFlow::new(
@@ -5937,7 +5936,6 @@ fn local_browser_outcomes_are_hostless_even_with_public_fields() {
         assert_eq!(read_outcome(&path), Some(expected));
     }
 }
-#[cfg(unix)]
 #[test]
 fn opener_outcome_phases_preserve_diagnostics_and_only_explicit_ends_are_terminal() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -5978,7 +5976,38 @@ fn opener_outcome_phases_preserve_diagnostics_and_only_explicit_ends_are_termina
     }
 }
 
-#[cfg(unix)]
+/// AN OUTCOME RECORD IS NEVER READ THROUGH A LINK: a symbolic link planted at the outcome path,
+/// naming a terminal failure's record, ends no renewal and reads as no outcome, on Unix (its open
+/// fails, `O_NOFOLLOW`) and on Windows (it opens as itself, `FILE_FLAG_OPEN_REPARSE_POINT`, and so
+/// is no regular file). CONTROL: the record it names, read at its own path, is terminal. On
+/// Windows a file link needs the symbolic-link right (Developer Mode, or an elevated process);
+/// where this process has none it can plant none, and the test is COULD NOT RUN.
+#[cfg(any(unix, windows))]
+#[test]
+fn an_outcome_record_is_never_read_through_a_link() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let record = tmp.path().join("record");
+    let met = Met::new(MetWord::BotCheck, Some("claude.ai"));
+    write_outcome(&record, &met);
+    assert_eq!(
+        read_terminal_outcome(&record),
+        Some(TerminalFailure(Some(met.clone()))),
+        "CONTROL: the record at its own path"
+    );
+    let link = tmp.path().join("outcome");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&record, &link).unwrap();
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_file(&record, &link) {
+        aterm_uds::host::could_not_run(format!(
+            "this process may not make a symlink ({e}): Developer Mode is off and it is not \
+             elevated, so no unelevated process can plant one here either"
+        ));
+    }
+    assert_eq!(read_terminal_outcome(&link), None, "a link ends nothing");
+    assert_eq!(read_outcome(&link), None, "a link is no outcome");
+}
+
 #[test]
 fn a_profile_fallback_retains_its_headless_diagnostic_without_stopping_success() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -6004,7 +6033,6 @@ fn a_profile_fallback_retains_its_headless_diagnostic_without_stopping_success()
 /// no window, and neither does anything else the environment holds. CONTROL: a headless
 /// attempt that failed lets the named-profile opener continue, with its record made terminal
 /// only where that opener fails too.
-#[cfg(unix)]
 #[test]
 fn the_sign_in_window_opens_only_on_its_grant() {
     let var = |value: Option<&'static str>| {
@@ -6481,7 +6509,6 @@ fn the_listeners_answer_is_recognised_exactly() {
 /// record, it publishes a failure with an empty `met=`; a diagnostic it recorded is kept and made
 /// terminal; a terminal record already there is left. CONTROL: once a callback was handed to the
 /// CLI, nothing is published.
-#[cfg(unix)]
 #[test]
 fn a_failing_opener_exit_is_terminal_even_where_it_met_nothing() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -6529,7 +6556,6 @@ fn a_failing_opener_exit_is_terminal_even_where_it_met_nothing() {
 /// code and be exchanging it, so the record says what was met and is not terminal. A hand-over
 /// that wrote nothing offered nothing: its failure is the opener's own and terminal. CONTROL:
 /// the same refusal with no callback handed over is terminal.
-#[cfg(unix)]
 #[test]
 fn a_refusal_after_the_callback_was_handed_over_is_not_terminal() {
     use super::super::headless_oauth::{note_callback_offered, take_callback_offered, take_met};
@@ -6568,7 +6594,6 @@ fn a_refusal_after_the_callback_was_handed_over_is_not_terminal() {
 
 /// ONLY A FAILURE MAY RECORD THAT IT MET NOTHING: an empty `met=` is read under `phase=failed`
 /// alone, and the record's grammar stays closed around it.
-#[cfg(unix)]
 #[test]
 fn only_a_failure_may_record_that_it_met_nothing() {
     let tmp = aterm_tempfile::tempdir().unwrap();

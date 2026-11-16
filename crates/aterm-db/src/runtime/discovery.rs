@@ -500,6 +500,12 @@ struct Peer {
     /// `repair`, which an outgoing worker owns while it runs and replaces when it returns.
     /// The actor keeps a rebound endpoint from using its former seat's lists.
     listed: Option<Listed>,
+    /// The table lists of the last round this side dialled here that completed its table
+    /// exchange, with the seat it bound ([`Self::remember_own`]). Kept apart from `repair` as
+    /// `listed` is, so a dial in flight leaves them standing, and never replaced by a round the
+    /// seat dialled in: a later round's lists widen what these found both sides listing and never
+    /// narrow it ([`may_take`]).
+    own: Option<(Actor, crate::replica::Listing)>,
     repair: Repair,
 }
 
@@ -535,6 +541,7 @@ impl Peer {
             auditing: false,
             slept: Duration::ZERO,
             listed: None,
+            own: None,
             repair: Repair::default(),
         }
     }
@@ -555,20 +562,23 @@ impl Peer {
     }
     /// Keep only authenticated list evidence, without replacing scan state or requests.
     /// A round returning late keeps the time its lists were exchanged, so it cannot replace
-    /// newer evidence learned from an incoming round while this endpoint was busy.
-    fn remember_lists(&mut self, repair: &Repair) {
+    /// newer evidence learned from an incoming round while this endpoint was busy. Whether what
+    /// the walk reads of the seat's lists changed ([`Hints::reoffer`]).
+    fn remember_lists(&mut self, repair: &Repair) -> bool {
         let Some(actor) = repair.authenticated_actor() else {
-            return;
+            return false;
         };
+        let mut changed = false;
         if self
             .listed
             .as_ref()
             .is_some_and(|lists| lists.actor != actor)
         {
             self.listed = None;
+            changed = true;
         }
         let Some(lists) = repair.listed() else {
-            return;
+            return changed;
         };
         #[cfg(test)]
         let replace_old = mutant(&LISTS_ROLL_BACK);
@@ -585,6 +595,7 @@ impl Peer {
                 snapshot: lists.clone(),
                 ambiguous: false,
             });
+            return true;
         } else if let Some(previous) = &mut self.listed
             && lists.same_time(&previous.snapshot)
             && !lists.same_tables(&previous.snapshot)
@@ -593,8 +604,33 @@ impl Peer {
             let learns_ties = !mutant(&TIED_LISTS_LEFT);
             #[cfg(not(test))]
             let learns_ties = true;
+            changed |= learns_ties && !previous.ambiguous;
             previous.ambiguous |= learns_ties;
         }
+        changed
+    }
+    /// Keep the table lists of the round this side dialled here that left `repair`, where that
+    /// round completed its table exchange ([`Repair::application`]), which traded them in that
+    /// round: not lists its state kept from an earlier round in either direction
+    /// (`crate::control::peers`' cache), nor those of a round that broke off, which leaves the
+    /// lists of the last one that completed. A round that authenticated another seat drops the
+    /// last seat's. Whether what the walk reads of the seat's lists changed ([`Hints::reoffer`]).
+    fn remember_own(&mut self, repair: &Repair) -> bool {
+        let Some(actor) = repair.authenticated_actor() else {
+            return false;
+        };
+        let mut changed = false;
+        if self.own.as_ref().is_some_and(|(seat, _)| *seat != actor) {
+            self.own = None;
+            changed = true;
+        }
+        if repair.application().is_some()
+            && let Some(lists) = repair.listed()
+        {
+            self.own = Some((actor, lists.clone()));
+            changed = true;
+        }
+        changed
     }
     /// The lead its next dial takes: none once it is verified, when it is served as an
     /// established peer or rediscovered by its own turn.
@@ -828,10 +864,10 @@ thread_local! {
     /// that finished does.
     pub(super) static UNFINISHED_SETTLES: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    /// MUTANT of [`Hints::moved`], on for one test thread: every seat a move was received from
-    /// is tried for it, though its round began before an earlier move of the same subject that
-    /// it then could not have carried.
-    pub(super) static STALE_SOURCE_TRIED: std::cell::Cell<bool> =
+    /// MUTANT of [`Hints::cool`], on for one test thread: a moved subject that the lists of no
+    /// untried seat let the walk offer is dropped, not parked, so a seat whose later lists take
+    /// it is never walked for it ([`Hints::reoffer`]), as before 2026-11-14.
+    pub(super) static PARKS_NOTHING: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// MUTANT of [`Hints::cool`], on for one test thread: only established endpoints' seats
     /// keep a moved subject, so one whose dial just failed drops it and its own next dial leads
@@ -839,13 +875,18 @@ thread_local! {
     pub(super) static COOLS_UNESTABLISHED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// MUTANT of the walk, on for one test thread: a seat is walked for a moved table whatever
-    /// its last round's lists said ([`Repair::lists`]), so a seat that holds none of it is
-    /// dialled for it, twice.
+    /// its last round's lists said ([`may_take`]), so a seat that holds none of it is dialled
+    /// for it, twice.
     pub(super) static WALKS_UNLISTED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// MUTANT of [`Hints::next_allowed`], on for one test thread: an endpoint whose audit is due
     /// waits for the ordinary scan's turn.
     pub(super) static AUDIT_UNPICKED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`may_take`], on for one test thread: the newest lists alone tell what a seat
+    /// takes, as 2c91654df0d had it, so a later round the seat dialled in that left a table out
+    /// narrows what this Mac's own last round there found both sides listing.
+    pub(super) static LATER_LISTS_NARROW: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
@@ -861,6 +902,11 @@ struct Hot {
     /// When the move was seen: only a round that began at or after it settles a seat
     /// ([`Hints::settle`]).
     since: Instant,
+    /// For a table the look found grown here (`super::moved::Source::Here`), when this Mac took
+    /// up a store of it as its look tells ([`may_take`]); none for the control journal and the
+    /// membership records, for a table no look found a store of, and for a move no more than
+    /// rounds brought (a store taken up empty or from rounds alone), whose sources hold it.
+    held: Option<Instant>,
     /// How many seats in a row answered that they already held all of it ([`COLD`]).
     cold: usize,
     /// The seats that hold it, were offered it, or were handed it to lead with: no walk dials
@@ -922,6 +968,11 @@ pub(super) struct Hints {
     /// What moved here and is still offered to seats that may lack it ([`Self::moved`]). At most
     /// [`MAX_HOT`].
     hot: BTreeMap<Subject, Hot>,
+    /// What moved here that seats not yet tried for it may lack, though the lists of the last
+    /// round with each of them say it does not take it ([`Self::cool`]): offered again once a
+    /// later round's lists say such a seat takes it ([`Self::reoffer`]). At most [`MAX_HOT`], the
+    /// latest moves.
+    parked: BTreeMap<Subject, Hot>,
     /// The seats found gone since [`Self::take_departures`], each with when the dial that found
     /// it so began ([`Standing`]). At most [`MAX_PEERS`].
     departed: BTreeMap<Actor, Instant>,
@@ -953,24 +1004,54 @@ fn speaks_bus(
             .is_some_and(|actor| bus.contains(&actor))
 }
 
-/// Whether a walk may offer `subject` to the seat whose hints are `repair` ([`Hints::moved`]):
-/// every seat takes the control journal and the membership records, and a table, unless the last
-/// round with the seat that traded table lists found it not among the tables both list
-/// ([`Repair::listed`]). A seat that holds none of a table (it subscribes to none of it, its
-/// catalog excludes it, or it repairs no tables) takes nothing of it from a round led to it,
-/// and one that subscribes to it since is its own walk's to fill (its look finds the table's
-/// store as it is enrolled); while nothing tells of its tables, it is offered each.
-fn may_take(peer: &Peer, subject: &Subject) -> bool {
+/// Whether a walk may offer `subject`, which moved as `hot` tells, to the seat `peer` is an
+/// endpoint of ([`Hints::moved`]): every seat takes the control journal and the membership
+/// records, and a table as the rounds with the seat that traded table lists tell. Where the last
+/// round this Mac dialled here found both sides listing the table ([`Peer::own`]), it may: a
+/// later round's lists widen that and never narrow it. A seat's selection can leave a table out
+/// for one round and take it again with no round between (its owner excludes it and includes it
+/// again, a round reads a ring table's state as none, or it falls back to the recovery region),
+/// and nothing makes a round when it does, so a write here passed over on a round the seat
+/// dialled in would wait for the next round with it, at rest an audit. Where the seat truly
+/// dropped the table, this costs a walk dial per write until this Mac's next own round there.
+///
+/// Otherwise the newest round with the seat that traded table lists tells, whichever side began
+/// it ([`Peer::listed`], [`crate::replica::Listing::takes`]). A seat that those lists showed holds
+/// none of a table this Mac listed (it subscribes to none of it, its catalog excludes it, or it
+/// repairs no tables) takes nothing of it from a round led to it, and one that subscribes to it
+/// since is its own walk's to fill once it holds a store of it. A table this Mac did not list
+/// then is offered only for a write here to a store younger than those lists (one this Mac
+/// created or took up since, or held when its configuration changed since, which may select it
+/// again), so the write reaches the seat before an audit. A store taken up since from what rounds
+/// brought alone is not offered: its sources hold it, and the seat takes the table up in its own
+/// rounds if it subscribes to it at all. One this Mac held then and did not list, its
+/// configuration unchanged since, is no table of its rounds, and offering it would only cost the
+/// seat rounds. While nothing tells of the seat's tables, it is offered each.
+fn may_take(peer: &Peer, subject: &Subject, hot: &Hot) -> bool {
     #[cfg(test)]
     if mutant(&WALKS_UNLISTED) {
         return true;
     }
     match subject {
-        Subject::Table(table) => peer
-            .listed
-            .as_ref()
-            .filter(|lists| Some(lists.actor) == peer.seat())
-            .is_none_or(|lists| lists.ambiguous || lists.snapshot.contains(table)),
+        Subject::Table(table) => {
+            #[cfg(test)]
+            let narrows = mutant(&LATER_LISTS_NARROW);
+            #[cfg(not(test))]
+            let narrows = false;
+            let seat = peer.seat();
+            if !narrows
+                && peer
+                    .own
+                    .as_ref()
+                    .is_some_and(|(actor, own)| Some(*actor) == seat && own.shares(table))
+            {
+                return true;
+            }
+            peer.listed
+                .as_ref()
+                .filter(|lists| Some(lists.actor) == seat)
+                .is_none_or(|lists| lists.ambiguous || lists.snapshot.takes(table, hot.held))
+        }
         Subject::Control | Subject::Members => true,
     }
 }
@@ -1019,6 +1100,7 @@ impl Hints {
             remembered_changed: false,
             remembered_read: None,
             hot: BTreeMap::new(),
+            parked: BTreeMap::new(),
             departed: BTreeMap::new(),
             catalog: None,
             catalog_heard: None,
@@ -1282,26 +1364,79 @@ impl Hints {
             }
         }
     }
-    /// `subject` moved here, as a look at `now` found (`super::moved::Look`); `sources` are the
-    /// seats it was received from since the look before, each with when the round that brought
-    /// it began. A walk offers it: [`Self::next_allowed`] dials, one at a time and in this
-    /// node's order ([`Self::spread`]), each established endpoint whose seat has not been tried
-    /// for it and may take it ([`may_take`]), whether or not that endpoint's own wait is over,
-    /// and hands the dial a moved table to lead with. Each completed round settles its seat
-    /// ([`Self::settle`]), so a walk dials a seat once per move. A table's walk ends once
-    /// [`COLD`] seats in a row already held it; the control journal's and the membership
-    /// records' reach every established seat, so a revocation is never left to that cutoff. A
-    /// seat the walk does not reach keeps its own wait: a move makes no endpoint due. Past
-    /// [`MAX_HOT`] subjects a new one is not kept, and each endpoint's own dials carry it.
+    /// Offer again each parked move ([`Self::cool`]) that the seat `actor` was not tried for and
+    /// now takes ([`may_take`]), by the lists an endpoint of it just took
+    /// ([`Peer::remember_lists`], [`Peer::remember_own`]): a write here that a look found while a
+    /// round with the seat that lists the table anew was in flight (one the seat dialled in once
+    /// it took the table up, or this Mac's dial there, whose lists no later round the seat dials
+    /// in narrows), and that the walk passed by on the seat's other lists, reaches it before an
+    /// audit. The seat's endpoints this side does not dial, those of a fleet bus, offer nothing,
+    /// as in [`Self::cool`].
+    fn reoffer(&mut self, actor: Actor) {
+        if self.parked.is_empty() {
+            return;
+        }
+        let (bus, addresses) = (&self.bus, &self.addresses);
+        let endpoints: Vec<&Peer> = self
+            .peers
+            .iter()
+            .filter(|(address, peer)| {
+                peer.verified
+                    && peer.seat() == Some(actor)
+                    && !speaks_bus(bus, addresses, address, peer)
+            })
+            .map(|(_, peer)| peer)
+            .collect();
+        let taken: Vec<Subject> = self
+            .parked
+            .iter()
+            .filter(|(subject, hot)| {
+                !hot.tried.contains(&actor)
+                    && endpoints.iter().any(|peer| may_take(peer, subject, hot))
+            })
+            .map(|(subject, _)| *subject)
+            .collect();
+        for subject in taken {
+            if self.hot.len() >= MAX_HOT {
+                break;
+            }
+            if let Some(hot) = self.parked.remove(&subject) {
+                self.hot.insert(subject, hot);
+            }
+        }
+    }
+    /// `subject` moved here, as a look at `now` found (`super::moved::Look`); `held`, for a
+    /// table the look found grown here (`super::moved::Source::Here`), is when this Mac took up a
+    /// store of it here (`super::moved::Look::held_since`);
+    /// `sources` are the seats the look named for it, of those it was received from since the look
+    /// before ([`super::moved::Moves::take`]). A walk offers it: [`Self::next_allowed`]
+    /// dials, one at a time and in this node's order ([`Self::spread`]), each established
+    /// endpoint whose seat has not been tried for it and may take it ([`may_take`]), whether or
+    /// not that endpoint's own wait is over, and hands the dial a moved table to lead with. Each
+    /// completed round settles its seat ([`Self::settle`]), so a walk dials a seat once per move.
+    /// A table's walk ends once [`COLD`] seats in a row already held it; the control journal's
+    /// and the membership records' reach every established seat, so a revocation is never left
+    /// to that cutoff. A seat the walk does not reach keeps its own wait: a move makes no
+    /// endpoint due. Past [`MAX_HOT`] subjects a new one is not kept, and each endpoint's own
+    /// dials carry it.
     ///
-    /// A subject that moves again starts again: what moved since may be what every seat lacks.
-    /// A source holds what it sent, and is tried for the move, only where it could also hold
-    /// what moved before: where the subject's earlier move is still offered, only a source whose
-    /// round began once that move was seen, which repaired it both ways, is tried. One whose
-    /// round began before (a long round that brought a control node while a revocation was
-    /// written here) is walked like any other seat. A move seen in the same look as what a
-    /// source sent is the residue: the seats this walk reaches offer it on in their own walks,
-    /// and the next audit between the source and this Mac brings it at the latest.
+    /// A subject that moves again starts again, replacing its earlier move, offered or parked:
+    /// what moved since may be what every seat lacks. Its sources are tried for it: the look names
+    /// seats only where their rounds together brought all of it, and each holds what its own
+    /// round carried both ways ([`super::moved::Moves::take`]). A seat whose
+    /// round began before an earlier look found the subject moved is named no source: it may
+    /// lack that earlier move (a long round that brought a control node while a revocation was
+    /// written here), and that look may have found what its round added before the receipt came,
+    /// which then covers nothing found since (a write here). A look that found a table or the
+    /// control journal grown by more than its sources' rounds added to it names none of them,
+    /// so a write made here before that look is offered to the seat that had just sent a record
+    /// of it; a record a round brought that this Mac already held adds nothing
+    /// (`crate::replica::Report::added`). What a look cannot tell is the residue: a move of the
+    /// membership records, which a look tells by digest alone, and, where two sources' rounds ran
+    /// at once, a record one of them brought after the other's round read this Mac's inventory,
+    /// which that other source may lack. The seats this walk reaches offer it on in their own
+    /// walks, and the next audit between a seat that lacks it and this Mac brings it at the
+    /// latest.
     ///
     /// A walk orders dials and grants nothing: it sets no contact, lease, `verified` or `seen`,
     /// and each round's own lists and inventories decide what is repaired.
@@ -1316,27 +1451,22 @@ impl Hints {
     pub(super) fn moved(
         &mut self,
         subject: Subject,
-        sources: impl IntoIterator<Item = (Actor, Instant)>,
+        held: Option<Instant>,
+        sources: impl IntoIterator<Item = Actor>,
         now: Instant,
     ) {
         if !self.hot.contains_key(&subject) && self.hot.len() >= MAX_HOT {
             return;
         }
-        let earlier = self.hot.get(&subject).map(|hot| hot.since);
-        #[cfg(test)]
-        let earlier = earlier.filter(|_| !mutant(&STALE_SOURCE_TRIED));
         #[cfg(test)]
         let sources = sources.into_iter().filter(|_| !mutant(&SOURCE_WALKED));
-        let tried = sources
-            .into_iter()
-            .filter(|(_, began)| earlier.is_none_or(|since| *began >= since))
-            .map(|(actor, _)| actor)
-            .take(MAX_PEERS)
-            .collect();
+        let tried = sources.into_iter().take(MAX_PEERS).collect();
+        self.parked.remove(&subject);
         self.hot.insert(
             subject,
             Hot {
                 since: now,
+                held,
                 cold: 0,
                 tried,
             },
@@ -1344,7 +1474,8 @@ impl Hints {
     }
     /// A round with the seat `actor` that began at `started` completed its control exchange,
     /// leaving `repair`: one this side dialled to `dialled`, or one the seat dialled in. Its
-    /// exchanged lists refresh matching endpoints, including busy ones, by their exchange time.
+    /// exchanged lists refresh matching endpoints, including busy ones, by their exchange time,
+    /// and a parked move the seat now takes is offered again ([`Self::reoffer`]).
     /// This leaves the endpoints' own clocks, requests and repair snapshots alone. The round
     /// settles the seat for each subject whose move was seen by the time the round began and
     /// that the round exchanged: the control journal, which every such round repairs; the
@@ -1398,12 +1529,16 @@ impl Hints {
         #[cfg(not(test))]
         let learns = true;
         if learns && repair.authenticated_actor() == Some(actor) {
+            let mut changed = false;
             for peer in self
                 .peers
                 .values_mut()
                 .filter(|peer| peer.seat() == Some(actor))
             {
-                peer.remember_lists(repair);
+                changed |= peer.remember_lists(repair);
+            }
+            if changed {
+                self.reoffer(actor);
             }
         }
         let led = dialled
@@ -1544,14 +1679,22 @@ impl Hints {
     /// own next dial, at its retry or its backoff, leads with what it is still owed
     /// ([`Self::next_allowed`]). One that stops answering keeps them until it expires
     /// ([`VERIFIED_EXPIRES`]), which dials nothing more.
+    ///
+    /// A subject dropped while some seat is untried for it, only because the lists of the rounds
+    /// with each such seat say it does not take it ([`may_take`]), is parked ([`Self::parked`]):
+    /// a round with that seat may be in flight that lists it anew (one the seat dialled in once
+    /// it took the table up, or this Mac's dial there), whose lists come only as it ends
+    /// ([`Self::reoffer`]), which offers it again. A parked subject dials nothing. Past
+    /// [`MAX_HOT`] parked subjects the one that moved first goes.
     fn cool(&mut self) {
         if self.hot.is_empty() {
             return;
         }
         #[cfg(test)]
-        let established_only = mutant(&COOLS_UNESTABLISHED);
+        let (established_only, parks_nothing) =
+            (mutant(&COOLS_UNESTABLISHED), mutant(&PARKS_NOTHING));
         #[cfg(not(test))]
-        let established_only = false;
+        let (established_only, parks_nothing) = (false, false);
         let (bus, addresses) = (&self.bus, &self.addresses);
         let seats: Vec<(Actor, &Peer)> = self
             .peers
@@ -1563,11 +1706,35 @@ impl Hints {
             })
             .filter_map(|(_, peer)| peer.seat().map(|seat| (seat, peer)))
             .collect();
-        self.hot.retain(|subject, hot| {
-            seats
-                .iter()
-                .any(|(seat, peer)| !hot.tried.contains(seat) && may_take(peer, subject))
-        });
+        let ended: Vec<(Subject, bool)> = self
+            .hot
+            .iter()
+            .filter_map(|(subject, hot)| {
+                let untried = || seats.iter().filter(|(seat, _)| !hot.tried.contains(seat));
+                if untried().any(|(_, peer)| may_take(peer, subject, hot)) {
+                    return None;
+                }
+                Some((*subject, untried().next().is_some() && !parks_nothing))
+            })
+            .collect();
+        for (subject, park) in ended {
+            let Some(hot) = self.hot.remove(&subject) else {
+                continue;
+            };
+            if !park {
+                continue;
+            }
+            if self.parked.len() >= MAX_HOT
+                && let Some(first) = self
+                    .parked
+                    .iter()
+                    .min_by_key(|(_, hot)| hot.since)
+                    .map(|(subject, _)| *subject)
+            {
+                self.parked.remove(&first);
+            }
+            self.parked.insert(subject, hot);
+        }
     }
     /// The endpoints a walk may dial ([`Self::moved`]), each with when it may: established,
     /// idle, one this side may dial, with no unfinished round standing ([`Peer::unfinished`]),
@@ -1621,7 +1788,7 @@ impl Hints {
                     && peer.repair.actor().is_some_and(|seat| {
                         !flying.contains(&seat)
                             && self.hot.iter().any(|(subject, hot)| {
-                                !hot.tried.contains(&seat) && may_take(peer, subject)
+                                !hot.tried.contains(&seat) && may_take(peer, subject, hot)
                             })
                     })
             })
@@ -2158,14 +2325,16 @@ impl Hints {
         }
         peer.dialled = repair.actor();
         // Whichever turn chose it, a dial to a seat not yet tried for a table that moved here
-        // leads with that table, one table a dial, and never with one the seat's last listing
-        // left out ([`may_take`]): the request is asked of the state handed out, where the
+        // leads with that table, one table a dial, and never with one the seat's last lists say
+        // it cannot take ([`may_take`]): the request is asked of the state handed out, where the
         // round's lease keeps it (`Repair::lead`). A request past that state's bound is not
         // kept; the round still settles its seat for the table, which the peer's own scan then
         // reaches.
         peer.led = peer.dialled.filter(|_| peer.verified).and_then(|seat| {
             self.hot.iter().find_map(|(subject, hot)| match subject {
-                Subject::Table(table) if !hot.tried.contains(&seat) && may_take(peer, subject) => {
+                Subject::Table(table)
+                    if !hot.tried.contains(&seat) && may_take(peer, subject, hot) =>
+                {
                     Some(*table)
                 }
                 _ => None,
@@ -2489,10 +2658,17 @@ impl Hints {
         peer.led = None;
         peer.catalog = false;
         peer.failed = !completed;
-        peer.remember_lists(&repair);
+        // The dial's own lists, which no later round the seat dials in narrows ([`may_take`]), may
+        // take a move the walk passed by while the dial flew.
+        let learned = peer.remember_lists(&repair);
+        let owned = peer.remember_own(&repair);
+        let listed = repair.authenticated_actor().filter(|_| learned || owned);
         peer.repair = repair;
         if unsettled {
             peer.repair.audit();
+        }
+        if let Some(actor) = listed {
+            self.reoffer(actor);
         }
         if let Some((seat, began)) = departed {
             self.depart(address, seat, began);

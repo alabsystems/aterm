@@ -157,7 +157,9 @@ fn setup() -> (Registration, Context, Facts) {
         shell,
     };
     let context = Context {
-        session: aterm_session::SessionId::new("s-abcdef"),
+        session: aterm_session::SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(
+            0x0b5_0001,
+        )),
         nonce: aterm_session::LaunchNonce::from_bytes([3; 16]),
         host_epoch: registration.host_epoch.clone(),
         caller: SupervisorInputCaller {
@@ -826,7 +828,13 @@ fn actor_or_session_guard_change_invalidates_without_revival() {
             3 => changed.host_epoch = "9".repeat(32),
             4 => changed.caller.principal = crate::control::Principal::Instance,
             5 => changed.actor.birth += 1,
-            6 => changed.session = aterm_session::SessionId::new("s-other"),
+            6 => {
+                changed.session = {
+                    aterm_session::SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(
+                        0x0b5_0002,
+                    ))
+                }
+            }
             7 => changed.caller.peer = Some(777),
             8 => {
                 let meta = crate::session_timeline::SessionMeta {

@@ -502,7 +502,7 @@ fn a_dispatch_that_admits_nothing_looks_once_per_interval() {
     );
 
     // Through the real loop: eight workers, four binaries, nothing starts.
-    let plan = test_plan::plan(&vec![None; 4], &[], 4, None, 4);
+    let plan = test_plan::plan(&[None; 4], &[], 4, None, 4);
     let state = Mutex::new(Dispatcher::new(&plan, None));
     let turn = Condvar::new();
     let stopped = std::sync::atomic::AtomicBool::new(false);
@@ -520,8 +520,10 @@ fn a_dispatch_that_admits_nothing_looks_once_per_interval() {
                         visits.lock().unwrap().push((look.seq, Instant::now()));
                         None::<()>
                     },
-                    &mut |_, _| {},
-                    &|_| LOOK_AGAIN,
+                    LookHooks {
+                        rejected: &mut |_: &Planned, _: test_plan::DispatchResources| {},
+                        again: &|_| LOOK_AGAIN,
+                    },
                 );
                 assert!(started.is_none());
             });

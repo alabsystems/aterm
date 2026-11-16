@@ -459,6 +459,78 @@ pub(crate) fn file_id_of_handle(handle: BorrowedHandle<'_>) -> Result<FileId, i3
     })
 }
 
+/// `FILE_INFO_BY_HANDLE_CLASS::FileCaseSensitiveInfo`: a directory's `FILE_CASE_SENSITIVE_INFO`, whose one field is its flags, a `ULONG`.
+const FILE_CASE_SENSITIVE_INFO_CLASS: i32 = 23;
+/// `FILE_CS_FLAG_CASE_SENSITIVE_DIR`: the directory tells its entries' names apart by case.
+const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x1;
+
+/// Whether the directory at `dir` tells its entries' names apart by case (`crate::case_sensitive_dir`): opened for `FILE_READ_ATTRIBUTES` alone, every sharing mode granted, `OPEN_EXISTING`, `FILE_FLAG_BACKUP_SEMANTICS` (a link followed), under [`quiet`], and its `FILE_CASE_SENSITIVE_INFO` read (`GetFileInformationByHandleEx`).
+pub(crate) fn case_sensitive_dir(dir: &Path) -> std::io::Result<bool> {
+    let _quiet = quiet();
+    let f = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?;
+    let mut flags = 0u32;
+    let size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(0);
+    // SAFETY: `f` is open for the call; `flags` is a writable `FILE_CASE_SENSITIVE_INFO` (one `ULONG`) of exactly `size` bytes.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            f.as_raw_handle(),
+            FILE_CASE_SENSITIVE_INFO_CLASS,
+            (&raw mut flags).cast(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0)
+}
+
+#[cfg(any(test, debug_assertions))]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetFileInformationByHandle(
+        file: Handle,
+        file_information_class: i32,
+        file_information: *const c_void,
+        buffer_size: u32,
+    ) -> i32;
+}
+
+/// Turn the directory `dir`'s case sensitivity on or off (`crate::set_case_sensitive_dir`): opened for `FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES`, every sharing mode granted, `FILE_FLAG_BACKUP_SEMANTICS`, and its `FILE_CASE_SENSITIVE_INFO` set (`SetFileInformationByHandle`), as `fsutil file setCaseSensitiveInfo` sets it, which needs no privilege on a directory this account may write.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn set_case_sensitive_dir(dir: &Path, on: bool) -> std::io::Result<()> {
+    /// `winnt.h`: `FILE_WRITE_ATTRIBUTES`.
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    let f = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?;
+    let flags: u32 = if on {
+        FILE_CS_FLAG_CASE_SENSITIVE_DIR
+    } else {
+        0
+    };
+    let size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(0);
+    // SAFETY: `f` is open for the call; `flags` is a readable `FILE_CASE_SENSITIVE_INFO` (one `ULONG`) of exactly `size` bytes, alive for the call.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            f.as_raw_handle(),
+            FILE_CASE_SENSITIVE_INFO_CLASS,
+            (&raw const flags).cast(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `OpenProcess` right: the image, where the environment block is.
 pub(crate) const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 /// `OpenProcess` right: the environment block and its strings.
@@ -992,7 +1064,7 @@ const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 /// Making the directory, opening it, or the control code failed.
 #[cfg(test)]
 pub(crate) fn make_junction(link: &Path, target: &Path) -> std::io::Result<()> {
-    let plain = crate::paths::plain(target).into_owned();
+    let plain = aterm_path::plain(target).into_owned();
     let print: Vec<u16> = plain.as_os_str().encode_wide().collect();
     let substitute: Vec<u16> = OsStr::new(r"\??\")
         .encode_wide()

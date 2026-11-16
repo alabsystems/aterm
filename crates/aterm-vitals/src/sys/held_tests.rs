@@ -402,6 +402,7 @@ fn sys_disk_held_prints_each_holding_with_its_session_mark_and_next_pass() {
             stale_days: Some(3),
         },
         Next::RunEnd { stale_days: None },
+        Next::OutsideCaches { idle_days: 7 },
         Next::Unknown,
     ];
     for next in every {
@@ -414,6 +415,7 @@ fn sys_disk_held_prints_each_holding_with_its_session_mark_and_next_pass() {
             | Next::DailyCache { .. }
             | Next::DailyUnused { .. }
             | Next::RunEnd { .. }
+            | Next::OutsideCaches { .. }
             | Next::Unknown => {}
         }
         let statement = format!("holding n=1 pass={} next: {}", next.pass(), next.says());
@@ -563,4 +565,90 @@ fn sys_disk_held_prints_no_path_outside_the_callers_tab() {
     let refused = render_json(&jq, &ctx(&w, &s, None, false));
     let held = refused.get("disk").and_then(|d| d.get("held"));
     assert_eq!(held, Some(&Jv::why("refused")));
+}
+
+/// WHAT THE PASSES REMOVED SHOWS IN SYS DISK HELD (DC-05): each deed of the disk journal that
+/// removed something is a `removed` line, newest first, with its age, its rows, its bytes,
+/// whose it was and what went, and the JSON's `removed` array says the same; a cache folder
+/// outside aterm's names the outside-cache step and its days. Nothing of it warns or asks.
+/// NEGATIVE CONTROLS: a deed that only checked the disk or was refused is no line, and a
+/// snapshot with no disk facts prints none.
+#[test]
+fn sys_disk_held_says_what_the_passes_removed_and_the_outside_cache_step() {
+    use crate::model::{DeedBy, DeedKind, DiskDeed, DiskFacts};
+    let outside = Next::OutsideCaches { idle_days: 7 };
+    let caches = Holding {
+        worktree: Worktree::Caches,
+        class: Class::Rebuildable,
+        next: outside,
+        ..row("/Users//a/.cache", Bytes::AtLeast(90))
+    };
+    let w = world(vec![caches], 1_000);
+    let now = 1_792_185_697_412_i64;
+    let deed = |ago_ms: i64, kind: DeedKind, bytes: Option<u64>| DiskDeed {
+        at_unix_ms: now - ago_ms,
+        n: 2,
+        kind,
+        by: DeedBy::Aterm,
+        bytes,
+        free: None,
+    };
+    let mut s = snap();
+    s.facts.disk = Some(DiskFacts {
+        deeds: vec![
+            deed(
+                60_000,
+                DeedKind::Removed("Caches/tool-x".into()),
+                Some(5 << 20),
+            ),
+            deed(120_000, DeedKind::Checked, None),
+            deed(180_000, DeedKind::Refused("x".into()), None),
+            DiskDeed {
+                by: DeedBy::Tab(Some(2)),
+                ..deed(3_600_000, DeedKind::Removed("build caches".into()), None)
+            },
+        ],
+        ..DiskFacts::default()
+    });
+    let c = ctx(&w, &s, None, true);
+    let r = render_text(&SysQuery::parse("disk held").unwrap(), &c);
+    says(&r, 1, "none", None, "rebuildable", outside);
+    assert_eq!(
+        line_of(&r, "removed 1"),
+        "removed n=1 age_s=60 rows=2 bytes=5242880 by=aterm what=Caches/tool-x"
+    );
+    assert_eq!(
+        line_of(&r, "removed 2"),
+        "removed n=2 age_s=3600 rows=2 bytes=unavailable(not_read) by=tab:2 what=build%20caches"
+    );
+    assert!(
+        !r.lines.iter().any(|l| l.key == "removed 3"),
+        "{:#?}",
+        r.lines
+    );
+    for l in &r.lines {
+        assert!(!asks_or_warns(&l.text), "{}", l.text);
+    }
+    let json = render_json(&SysQuery::parse("disk held --json").unwrap(), &c);
+    let violations = contract_violations(&json);
+    assert!(violations.is_empty(), "{violations:?}");
+    let held = json.get("disk").and_then(|d| d.get("held")).expect("held");
+    let Some(Jv::Arr(removed)) = held.get("removed") else {
+        panic!("no removed array: {}", json.to_text());
+    };
+    assert_eq!(removed.len(), 2, "{}", json.to_text());
+    assert_eq!(removed[0].get("what"), Some(&Jv::s("Caches/tool-x")));
+    assert_eq!(removed[1].get("by"), Some(&Jv::s("tab:2")));
+    let next = json_rows(&json)[0].get("next").cloned().expect("next");
+    assert_eq!(next.get("pass"), Some(&Jv::s("outside-caches")));
+    assert_eq!(next.get("idle_days"), Some(&Jv::u(7)));
+
+    let bare = snap();
+    let c = ctx(&w, &bare, None, true);
+    let r = render_text(&SysQuery::parse("disk held").unwrap(), &c);
+    assert!(
+        !r.lines.iter().any(|l| l.key.starts_with("removed")),
+        "CONTROL: {:#?}",
+        r.lines
+    );
 }

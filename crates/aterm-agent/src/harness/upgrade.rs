@@ -3320,7 +3320,7 @@ fn announcement_has(message: &Value, marker: &str) -> bool {
 /// `authentication_failed` API error, unless its words are Cloudflare's block or challenge page
 /// answering in the API's place, which Claude Code types `authentication_failed` too (2.1.323,
 /// [`aterm_phase::wall::edge_block`]): a network block, never a login wall.
-fn is_auth_wall_row(v: &Value) -> bool {
+pub(crate) fn is_auth_wall_row(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("assistant")
         && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
         && v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
@@ -5314,9 +5314,16 @@ pub const CONTINUE_HEADS: [&str; 3] = [
     concat!(harness_mark!(), " Relaunched"),
 ];
 
+/// The head of the disk ask's line (`disk-free@v1`). No build types that line now; one an
+/// earlier build typed, which a person's gesture left unsent in a composer a seamless update
+/// carried, is still aterm's words: asked about and never sent, where a person's draft is
+/// entered once their grace is out.
+const RETIRED_ASK_HEAD: &str = concat!(harness_mark!(), " aterm: the volume this tab works on (");
+
 /// Every head [`own_draft`] and [`own_words`] read as aterm's own: the harness's lines it types
 /// through a fenced `turn`, which a person's gesture can leave unsent in the composer (`turn …
-/// reason=person typed=0 pasted=<n>`).
+/// reason=person typed=0 pasted=<n>`), and the one an earlier build typed
+/// ([`RETIRED_ASK_HEAD`]).
 const OWN_HEADS: [&str; 8] = [
     ANNOUNCE_HEAD,
     RELEASE_HEAD,
@@ -5325,7 +5332,7 @@ const OWN_HEADS: [&str; 8] = [
     CONTINUE_HEADS[1],
     CONTINUE_HEADS[2],
     super::disk::RESUME_HEAD,
-    super::disk::ask::LINE_HEAD,
+    RETIRED_ASK_HEAD,
 ];
 
 /// `text` with no whitespace and no leading caret, as [`own_draft`] and [`own_words`] compare it.

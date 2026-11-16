@@ -979,7 +979,7 @@ fn a_caller_failure_preserves_older_worker_custody_and_its_original_reds() {
                     world.retired,
                     if replaced { vec![sid.clone()] } else { vec![] }
                 );
-                assert_eq!(world.worker_reads, [sid.clone()]);
+                assert_eq!(world.worker_reads.as_slice(), std::slice::from_ref(&sid));
                 if replaced {
                     assert_ne!(posted.worker(), Some(sid.as_str()));
                 } else {

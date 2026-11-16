@@ -2751,6 +2751,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             active_item: aia,
             workers_in_front: wfa,
             restored_tabs: rta,
+            dock: da,
         } = a;
         let WindowLayout {
             rows: rb,
@@ -2768,6 +2769,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             active_item: aib,
             workers_in_front: wfb,
             restored_tabs: rtb,
+            dock: db,
         } = b;
         ra == rb
             && ca == cb
@@ -2780,6 +2782,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && sa == sb
             && aia == aib
             && wfa == wfb
+            && da == db
             && toa == tob
             && nta == ntb
             && ta.len() == tb.len()

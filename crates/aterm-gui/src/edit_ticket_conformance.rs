@@ -359,7 +359,7 @@ impl Rig {
     fn wait_on(&mut self, key: AwaitKey, actions: &[&str]) -> WaiterId {
         let waiter = WaiterId(self.next_waiter);
         self.next_waiter += 1;
-        let (reply, answer) = std::sync::mpsc::channel();
+        let (reply, answer) = crate::control::control_media::DoorReply::pair();
         self.waits.push(answer);
         let real_uri = match &key {
             AwaitKey::Uri(uri) => crate::control_edit::real_file_uri(uri),

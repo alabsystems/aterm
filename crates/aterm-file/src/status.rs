@@ -136,10 +136,13 @@ pub struct State {
     /// Why the last pass, which opened custody, did not take its projection; `None` where it
     /// took it, projected nothing new, or was refused.
     pub kept: Option<Kept>,
-    /// How many passes have recorded. A pass that opened custody at one count records nothing
-    /// once the count has moved (section 4, Materializer).
+    /// How many passes have recorded: each that changed the file, and each that changed
+    /// nothing while another pass's look was outstanding (`Recorded::Fenced`); a pass that
+    /// changed nothing with no look outstanding leaves it. A pass that looked at one count
+    /// records nothing once the count has moved (section 4, Materializer).
     pub seq: u64,
-    /// When the last pass recorded, Unix milliseconds: this Mac's clock, for display only.
+    /// When the last pass that changed the file or fenced a look recorded, Unix milliseconds:
+    /// this Mac's clock, for display only.
     pub pass_ms: u64,
     /// The snapshot's revision; 0 with none.
     pub rev: u64,
@@ -152,8 +155,22 @@ pub struct State {
     pub fingerprint: String,
     /// The records the table held at that frontier.
     pub records: u64,
-    /// The projection rules' version the snapshot was made with.
-    pub projection: u32,
+    /// The materializer's key of the read the snapshot was projected from, lower-case hex: a
+    /// digest of everything the projection reads. `None` in a status file that does not say,
+    /// which the materializer projects again rather than trust.
+    pub key: Option<String>,
+    /// The key of the last read whose projection was too large to take ([`Kept::TooLarge`]),
+    /// lower-case hex: a pass at the same key does not project it again. Recorded with that
+    /// word only.
+    pub kept_key: Option<String>,
+    /// SHA-256 of the history file the snapshot's pass wrote, lower-case hex: a history file
+    /// that differs (removed, edited, cut short) is projected again.
+    pub history: Option<String>,
+    /// The content digest ([`crate::Snapshot::content`]) of the snapshot the status records,
+    /// lower-case hex: a snapshot file at the recorded revision that says otherwise (one put
+    /// back from a copy, written by another hand) is projected again. `None` in a status file
+    /// that does not say, which the materializer projects again rather than trust.
+    pub snapshot: Option<String>,
     /// No retained record could still become visible at that frontier.
     pub complete: bool,
     /// Cells left out because their value was shaped like a credential.
@@ -192,7 +209,10 @@ impl State {
         put("generation", Value::from(u64::from(self.generation)));
         put("fingerprint", Value::from(self.fingerprint.as_str()));
         put("records", Value::from(self.records));
-        put("projection", Value::from(u64::from(self.projection)));
+        put("key", Value::from(self.key.as_deref()));
+        put("kept_key", Value::from(self.kept_key.as_deref()));
+        put("history", Value::from(self.history.as_deref()));
+        put("snapshot", Value::from(self.snapshot.as_deref()));
         put("complete", Value::from(self.complete));
         put("withheld", Value::from(self.withheld));
         put("inert", Value::from(self.inert));
@@ -241,7 +261,19 @@ impl State {
             generation: u32::try_from(number("generation")).ok()?,
             fingerprint: text("fingerprint"),
             records: number("records"),
-            projection: u32::try_from(number("projection")).ok()?,
+            key: value.get("key").and_then(Value::as_str).map(str::to_owned),
+            kept_key: value
+                .get("kept_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            history: value
+                .get("history")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            snapshot: value
+                .get("snapshot")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             complete: value.get("complete").and_then(Value::as_bool) == Some(true),
             withheld: number("withheld"),
             inert: value.get("inert").and_then(Value::as_u64),
@@ -332,7 +364,8 @@ impl Status {
         line
     }
 
-    /// The status as JSON, for `--json`.
+    /// The status as JSON, for `--json`: `passes` and `pass_ms` are the count of passes that
+    /// changed the file or fenced a look ([`State::seq`]) and the time of the last of them.
     #[must_use]
     pub fn json(&self) -> Value {
         let mut object = Map::new();
@@ -354,6 +387,7 @@ impl Status {
             }
             object.insert("complete".to_owned(), Value::from(state.complete));
             object.insert("kept".to_owned(), Value::from(state.kept.map(Kept::as_str)));
+            object.insert("key".to_owned(), Value::from(state.key.as_deref()));
             object.insert(
                 "last_pass".to_owned(),
                 Value::from(state.word.map(Word::as_str)),

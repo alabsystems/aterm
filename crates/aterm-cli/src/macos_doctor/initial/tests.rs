@@ -12511,6 +12511,30 @@ fn init_grant_rows_name_the_app_the_reading_measured() {
     ));
 }
 
+#[test]
+fn init_required_authorization_keeps_unread_evidence_unread() {
+    use aterm_machines::init::Grant;
+    use aterm_types::macos_setup::{Access, Standing};
+    for access in [
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
+    ] {
+        assert_eq!(
+            init_grant(
+                access,
+                Standing::Unknown,
+                Some("planted read refusal".into()),
+                "aterm"
+            ),
+            Grant::Unread("planted read refusal".into()),
+            "{access:?} is neither authorized nor inapplicable"
+        );
+    }
+}
+
 /// `aterm init` over developer mode off whose password is not coming by itself (a person
 /// declined, or the record cannot be read) says what the row says, aterm does not ask again
 /// and the person's routes, never that aterm asks by itself.

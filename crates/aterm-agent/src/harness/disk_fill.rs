@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROJECTION (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.1): where a volume's fill takes
-//! its free space. The window's disk watch feeds each look's reading to the volume's [`Fill`],
-//! which reads the slope with System State's own arithmetic (`aterm_vitals::history`) and says,
-//! once the fill has gone on for [`STAND_MS`], when the volume crosses its floor: to the pass
-//! while it stands ([`Fill::pressing`]), and to the ask while the last look still crossed
-//! ([`Fill::crossing`]).
+//! THE PROJECTION: where a volume's fill takes its free space. The window's disk watch feeds
+//! each look's reading to the volume's [`Fill`], which reads the slope with System State's own
+//! arithmetic (`aterm_vitals::history`) and says, once the fill has gone on for [`STAND_MS`],
+//! when the volume crosses its floor: to the pass while it stands ([`Fill::pressing`]).
+//!
+//! A reading is the space used plus what this process's passes freed since the ring began
+//! ([`credited`]), so aterm's own freeing is not read as the fill slowing. The volume fills now
+//! when its 5- and 10-minute rates are each at least [`NOISE_BPS`]; the fill rate is the
+//! 10-minute rate, raised to the hour's while the 10-minute rate is at least half the hour's;
+//! and a look projects a crossing when the volume fills now and reaches its floor within
+//! [`HORIZON_MS`]. A streak that has not stood ends at a look that reads clear, at a look whose
+//! ring has no rate, and at a gap of more than [`GAP_MS`] since the last look; a standing
+//! projection lapses once looks for [`STAND_MS`] have not projected.
 
 use aterm_vitals::history::{FILLING_FOR_MS, Rates, rates_within, time_to_line};
 use aterm_vitals::ring::{BucketRing, RING_BUCKETS, Taken};
 
-/// How far ahead a crossing counts: two hours (§8.1, "Why two hours").
+/// How far ahead a crossing counts: two hours, twice the span of the hour rate the projection
+/// reads. A longer horizon would extrapolate that slope past twice its own span.
 pub const HORIZON_MS: i64 = 2 * 3_600_000;
 
 /// How long every look must project a crossing before the projection stands, and must not before
@@ -53,12 +61,6 @@ impl Projection {
         }
     }
 
-    /// The same rate read from `free` bytes against `floor`.
-    #[must_use]
-    pub fn at(&self, free: u64, floor: u64, total: Option<u64>) -> Projection {
-        Projection::of(self.rate_bps, free, floor, total)
-    }
-
     /// The fill rate an hour, as the line says it (`130.8 GiB/h`).
     #[must_use]
     pub fn per_hour(&self) -> String {
@@ -92,8 +94,8 @@ impl Projection {
 /// of KB/s either way, so a sign test would hold a fill that stopped on that noise.
 pub const NOISE_BPS: f64 = 1_048_576.0;
 
-/// A look later than this after the last one ends a streak that has not stood (§8.1): a pass that
-/// ran long, not a sleep.
+/// A look later than this after the last one ends a streak that has not stood: a pass that ran
+/// long, not a sleep.
 pub const GAP_MS: i64 = 5 * 60_000;
 
 /// What one look's rates say.
@@ -121,12 +123,8 @@ pub struct Fill {
     since_ms: Option<i64>,
     /// When the last look read.
     last_ms: Option<i64>,
-    /// The last look projected a crossing.
-    crossed: bool,
     /// The fill rate the last look read, bytes a second; `0.0` where it read none.
     rate_bps: f64,
-    /// A look has read a 10-minute rate.
-    warm: bool,
 }
 
 impl Default for Fill {
@@ -137,9 +135,7 @@ impl Default for Fill {
             standing: None,
             since_ms: None,
             last_ms: None,
-            crossed: false,
             rate_bps: 0.0,
-            warm: false,
         }
     }
 }
@@ -183,8 +179,6 @@ impl Fill {
             .is_some_and(|last| now_ms.saturating_sub(last) > GAP_MS);
         self.last_ms = Some(now_ms);
         let read = self.read(free, total, floor);
-        self.crossed = matches!(read, Read::Crossing(_));
-        self.warm |= read != Read::Unknown;
         match (self.standing, read) {
             (None, Read::Crossing(p)) => {
                 if gap {
@@ -225,27 +219,10 @@ impl Fill {
         ));
     }
 
-    /// The standing projection, lapsing or not: what presses the pass (§8.2).
+    /// The standing projection, lapsing or not: what presses the pass.
     #[must_use]
     pub fn pressing(&self) -> Option<Projection> {
         self.standing
-    }
-
-    /// The standing projection read from `free` bytes against `floor`, while the last look projected
-    /// a crossing and the crossing from `free` is within the horizon: what presses the ask (§8.3).
-    /// A pass that freed the horizon's fill presses nothing more of it.
-    #[must_use]
-    pub fn crossing(&self, free: u64, floor: u64, total: Option<u64>) -> Option<Projection> {
-        self.standing
-            .filter(|_| self.crossed)
-            .map(|p| p.at(free, floor, total))
-            .filter(|p| p.eta_ms <= HORIZON_MS)
-    }
-
-    /// No look has read a 10-minute rate yet: a process started under ten minutes ago (§8.3).
-    #[must_use]
-    pub fn cold(&self) -> bool {
-        !self.warm
     }
 
     /// The rates the ring reads now.

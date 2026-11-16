@@ -232,9 +232,122 @@ impl Bed {
     }
 }
 
-fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
+/// THE READ OVER A ROW THE FILES SPEAK OF (`evidence`, as the model numbers it): Claude Code's
+/// default login's row `next`, signed out at [`NOW`] with a session on it and the default
+/// home's profile naming it, its tab's usage-tap file as the upkeep first saw it after the
+/// sign-out, and then a request the tab was served with the API time it grew: for 1, typed
+/// and answered after the sign-out; for 2, answered at the sign-out itself. (A row on a login
+/// directory of its own is proved by no file and is never hidden: `login_adoption`.) Returns
+/// what [`case`] does.
+fn evidence_case(evidence: i64) -> (bool, bool, bool, bool) {
+    use crate::harness::login_adoption::tests::{write_profile, write_served_turn, write_tap};
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let (home, state) = (root.path().join("home"), root.path());
+    fs::create_dir_all(&home).unwrap();
+    let store = accounts::Store::at_for(state, Cli::Claude, &home).bounded_by(&[]);
+    let path = state.join(Cli::Claude.accounts().roster_file);
+    let raw = Roster {
+        rows: vec![Row {
+            label: "next".into(),
+            email: Some("next@example.test".into()),
+            ..Row::default()
+        }],
+    };
+    fs::write(
+        &path,
+        accounts::append_rows_for(Cli::Claude, "", &raw.rows).unwrap(),
+    )
+    .unwrap();
+    store
+        .transact_logins(NOW, &mut None, |state, _| {
+            let mut events = accounts::note_session(state, "s-next", "next", None, NOW);
+            events.extend(accounts::note_auth(
+                state,
+                "next",
+                accounts::Auth::SignedOut,
+                NOW,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    write_profile(&home, "next@example.test");
+    let on_login = |at: i64, api_ms: u64| {
+        write_tap(
+            state,
+            None,
+            Some(crate::harness::tap::Route::Stored),
+            (at, api_ms),
+            true,
+        );
+    };
+    on_login(NOW - 5, 4_000);
+    let first = crate::harness::login_adoption::adopt_live_logins(
+        &home,
+        state,
+        &path,
+        NOW + 10,
+        &crate::harness::login_adoption::Pass::default(),
+        &|_| {},
+    );
+    assert_eq!(
+        first,
+        crate::harness::login_adoption::Step::default(),
+        "the first look takes a baseline alone"
+    );
+    let (asked, answered) = if evidence == 1 {
+        (NOW + 95, NOW + 97)
+    } else {
+        (NOW - 2, NOW)
+    };
+    write_served_turn(&home, asked, answered);
+    on_login(answered, 9_000);
+    let records =
+        || [path.clone(), store.state_file(), store.logins_file()].map(|path| fs::read(path).ok());
+    let before = records();
+    let candidates = read_renewal_candidates(
+        Cli::Claude,
+        &store,
+        (&home, state),
+        &path,
+        NOW + 120,
+        &crate::harness::login_adoption::Pass::default(),
+    )
+    .unwrap();
+    assert_eq!(records(), before, "the read writes nothing");
+    let captured = candidates.records.clone();
+    assert_eq!(captured.raw_roster, raw);
+    let next = captured.roster.row("next").unwrap().clone();
+    assert!(
+        accounts::signed_out_here(&next, &captured.state),
+        "the row is still signed out on record, which this read does not change"
+    );
+    // A login the files show live after its sign-out is ranked nowhere.
+    let candidate = !candidates.tiered.is_empty();
+    if candidate {
+        assert_eq!(candidates.tiered, vec![(0_u8, next.clone())]);
+    }
+    let admitted = store
+        .admit_renewal_attempt(
+            accounts::RenewalPolicy {
+                roster_path: &path,
+                roster: &captured.raw_roster,
+                row: &next,
+                logins: &captured.logins,
+            },
+            None,
+            NOW,
+        )
+        .unwrap_or(false);
+    (true, admitted, candidates.records == captured, candidate)
+}
+
+fn case(provider: i64, fault: i64, later: bool, evidence: i64) -> (bool, bool, bool, bool) {
     let cli =
         [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok][usize::try_from(provider - 1).unwrap()];
+    if evidence != 0 {
+        assert_eq!((cli, fault, later), (Cli::Claude, 0, false));
+        return evidence_case(evidence);
+    }
     let bed = Bed::new(cli);
     let credentials_before = bed
         .dirs
@@ -250,20 +363,20 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
     }
     let _held = (fault == 6).then(|| bed.store.acquire().unwrap());
     let before = bed.records();
-    let result = read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW);
+    let live = crate::harness::login_adoption::Pass::default();
+    let result = read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW, &live);
     if fault != 1 {
         assert_eq!(bed.records(), before, "only admitted recovery may publish");
     }
-    let (available, admitted, retained) = match result {
-        Err(_) => (false, false, true),
+    let (available, admitted, retained, candidate) = match result {
+        Err(_) => (false, false, true, false),
         Ok(candidates) => {
             let captured = candidates.records.clone();
             let ranked = candidates.tiered.clone();
             assert_eq!(captured.raw_roster, bed.raw);
-            assert_eq!(ranked.len(), 1);
-            assert_eq!(ranked[0].0, 0);
+            let next = captured.roster.row("next").unwrap().clone();
+            assert_eq!(ranked, vec![(0_u8, next)]);
             assert_eq!(ranked[0].1.label, "next");
-            assert_eq!(ranked[0].1, *captured.roster.row("next").unwrap());
             assert_eq!(
                 ranked[0].1.dir.as_deref(),
                 bed.dirs[if fault == 1 { 2 } else { 1 }].to_str()
@@ -286,9 +399,15 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
             );
             if later {
                 bed.later();
-                let fresh =
-                    read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW + 1)
-                        .unwrap();
+                let fresh = read_renewal_candidates(
+                    cli,
+                    &bed.store,
+                    bed.paths(),
+                    &bed.path,
+                    NOW + 1,
+                    &crate::harness::login_adoption::Pass::default(),
+                )
+                .unwrap();
                 assert!(fresh.tiered.is_empty(), "no session needs the changed row");
                 assert_ne!(fresh.records.raw_roster, captured.raw_roster);
             }
@@ -309,6 +428,7 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
                 true,
                 admitted,
                 candidates.records == captured && candidates.tiered == ranked,
+                true,
             )
         }
     };
@@ -322,7 +442,7 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
             }
         );
     }
-    (available, admitted, retained)
+    (available, admitted, retained, candidate)
 }
 
 pub(crate) fn renewal_read_transition(
@@ -340,13 +460,21 @@ pub(crate) fn renewal_read_transition(
         "LaterChange" => {
             next.insert("later", 1);
         }
+        "LoginEvidence" => {
+            next.insert("evidence", state["evidence"] + 1);
+        }
         "Read" => {
-            let (available, admitted, retained) =
-                case(state["provider"], state["fault"], state["later"] == 1);
+            let (available, admitted, retained, candidate) = case(
+                state["provider"],
+                state["fault"],
+                state["later"] == 1,
+                state["evidence"],
+            );
             next.insert("phase", 1);
             next.insert("available", i64::from(available));
             next.insert("admitted", i64::from(admitted));
             next.insert("retained", i64::from(retained));
+            next.insert("candidate", i64::from(candidate));
         }
         _ => unreachable!(),
     }
@@ -356,7 +484,7 @@ pub(crate) fn renewal_read_transition(
 #[test]
 fn renewal_candidates_keep_one_publication_and_recheck_worker_policy() {
     let model = aterm_models_harness::account_renewal_read_model();
-    assert_eq!(model.mutant_dials(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(model.mutant_dials(), vec![1, 2, 3, 4, 5, 6, 7]);
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let mut cases = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
@@ -371,12 +499,33 @@ fn renewal_candidates_keep_one_publication_and_recheck_worker_policy() {
             }
         }
     }
-    assert_eq!(cases, 56);
+    assert_eq!(cases, 58);
     let good = renewal_read_transition(&model.init_state(), "Read");
+    assert_eq!(
+        good["candidate"], 1,
+        "a signed-out row with no evidence is ranked"
+    );
+    // NEGATIVE CONTROLS for the evidence guard: a read that ranks a login the files show live,
+    // and one that lets evidence no newer than the sign-out hide the row, each break a law.
+    let mut live = model.init_state();
+    live.insert("evidence", 1);
+    let mut asked = renewal_read_transition(&live, "Read");
+    assert_eq!(asked["candidate"], 0, "a live login is no candidate");
+    asked.insert("candidate", 1);
+    assert!(!model.check_invariant("LiveLoginIsNoCandidate", &asked));
+    live.insert("evidence", 2);
+    let mut stale = renewal_read_transition(&live, "Read");
+    assert_eq!(
+        stale["candidate"], 1,
+        "evidence that is not newer hides nothing"
+    );
+    stale.insert("candidate", 0);
+    assert!(!model.check_invariant("SignedOutLoginStaysCandidate", &stale));
     for (field, value, law) in [
         ("available", 0, "RecoveredCandidatesAvailable"),
         ("admitted", 0, "CapturedPolicyAdmissible"),
         ("retained", 0, "CapturedRankingRetained"),
+        ("candidate", 0, "SignedOutLoginStaysCandidate"),
     ] {
         let mut bad = good.clone();
         bad.insert(field, value);
@@ -393,8 +542,15 @@ fn renewal_admission_checks_policy_and_generation_but_allows_unrelated_budget_up
     for cli in [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok] {
         for change in 0..3 {
             let bed = Bed::new(cli);
-            let captured =
-                read_renewal_candidates(cli, &bed.store, bed.paths(), &bed.path, NOW).unwrap();
+            let captured = read_renewal_candidates(
+                cli,
+                &bed.store,
+                bed.paths(),
+                &bed.path,
+                NOW,
+                &crate::harness::login_adoption::Pass::default(),
+            )
+            .unwrap();
             match change {
                 0 => {
                     let mut raw = bed.raw.clone();

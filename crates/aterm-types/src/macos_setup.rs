@@ -220,15 +220,30 @@ pub enum Access {
     Debugger,
     /// Accessibility, which the Messages and FaceTime sign-outs need.
     Accessibility,
+    /// macOS's own Local Network authorization for this application.
+    LocalNetwork,
+    /// The narrow administrator-installed permission to name this Mac.
+    NameRule,
+    /// Administrator-installed Spotlight exclusions for home folders.
+    SpotlightScope,
+    /// Authenticated membership of the configured ALab vault.
+    NetworkAuth,
+    /// The authenticated local-network helper installed by setup.
+    NetworkHelper,
 }
 
 impl Access {
     /// Every access row, in page order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 9] = [
         Self::FullDiskAccess,
         Self::DeveloperTools,
         Self::Debugger,
         Self::Accessibility,
+        Self::LocalNetwork,
+        Self::NameRule,
+        Self::SpotlightScope,
+        Self::NetworkAuth,
+        Self::NetworkHelper,
     ];
 
     /// The row's name.
@@ -239,6 +254,11 @@ impl Access {
             Self::DeveloperTools => "Developer Tools",
             Self::Debugger => "Debugger access",
             Self::Accessibility => "Accessibility",
+            Self::LocalNetwork => "Local Network access",
+            Self::NameRule => "Mac naming permission",
+            Self::SpotlightScope => "Home folders in Spotlight",
+            Self::NetworkAuth => "Network authorization",
+            Self::NetworkHelper => "Network helper",
         }
     }
 
@@ -249,6 +269,10 @@ impl Access {
             Self::FullDiskAccess | Self::DeveloperTools | Self::Debugger | Self::Accessibility => {
                 "On"
             }
+            Self::LocalNetwork => "Allowed",
+            Self::NameRule | Self::NetworkHelper => "Installed",
+            Self::SpotlightScope => "Excluded",
+            Self::NetworkAuth => "Authorized",
         }
     }
 
@@ -261,6 +285,23 @@ impl Access {
                 selection.contains(Setting::Messages) || selection.contains(Setting::FaceTime)
             }
             _ => true,
+        }
+    }
+
+    /// Whether init must observe this requirement in place or explicitly not needed before
+    /// claiming readiness. An unread optional macOS grant may be offered; these requirements
+    /// remain unknown until their own observation succeeds.
+    #[must_use]
+    pub const fn requires_confirmation(self) -> bool {
+        match self {
+            Self::LocalNetwork
+            | Self::NameRule
+            | Self::SpotlightScope
+            | Self::NetworkAuth
+            | Self::NetworkHelper => true,
+            Self::FullDiskAccess | Self::DeveloperTools | Self::Debugger | Self::Accessibility => {
+                false
+            }
         }
     }
 }
@@ -349,6 +390,11 @@ impl Subject {
             Self::Access(Access::DeveloperTools) => "devtools",
             Self::Access(Access::Debugger) => "debugger",
             Self::Access(Access::Accessibility) => "ax",
+            Self::Access(Access::LocalNetwork) => "local-network",
+            Self::Access(Access::NameRule) => "name-rule",
+            Self::Access(Access::SpotlightScope) => "spotlight-scope",
+            Self::Access(Access::NetworkAuth) => "network-auth",
+            Self::Access(Access::NetworkHelper) => "network-helper",
             Self::Setting(Setting::CapsLock) => "capslock",
             Self::Setting(Setting::NaturalScrolling) => "scrolling",
             Self::Setting(Setting::TrackpadScrolling) => "trackpad",
@@ -633,6 +679,9 @@ pub mod spotlight_scope;
 /// stop and Apple's window closed without installing them each with a code of its own); any
 /// other end said nothing, and the window ends the tab with [`COMMAND_LINE_TOOLS_NOT_FINISHED`].
 pub const COMMAND_LINE_TOOLS_TAB: &str = "ATERM_COMMAND_LINE_TOOLS_TAB";
+
+/// The Mac Setup tab was opened by a person's explicit Finish setup action.
+pub const COMMAND_LINE_TOOLS_TAB_EXPLICIT: &str = "ATERM_COMMAND_LINE_TOOLS_TAB_EXPLICIT";
 
 /// The variable the window sets beside [`COMMAND_LINE_TOOLS_TAB`] where it reads developer mode
 /// off as the person's own choice (they turned it off in aterm's Settings ▸ Security, or
@@ -1368,6 +1417,11 @@ impl Access {
             Self::DeveloperTools => "developer-tools",
             Self::Debugger => "debugger",
             Self::Accessibility => "accessibility",
+            Self::LocalNetwork => "local-network",
+            Self::NameRule => "name-rule",
+            Self::SpotlightScope => "spotlight-scope",
+            Self::NetworkAuth => "network-auth",
+            Self::NetworkHelper => "network-helper",
         }
     }
 
@@ -1600,7 +1654,8 @@ pub mod opt_out {
         }
     }
 
-    static OPTED_OUT: std::sync::Mutex<[Option<OptOut>; 4]> = std::sync::Mutex::new([None; 4]);
+    static OPTED_OUT: std::sync::Mutex<[Option<OptOut>; Access::ALL.len()]> =
+        std::sync::Mutex::new([None; Access::ALL.len()]);
 
     const fn slot(access: Access) -> usize {
         match access {
@@ -1608,6 +1663,11 @@ pub mod opt_out {
             Access::DeveloperTools => 1,
             Access::Debugger => 2,
             Access::Accessibility => 3,
+            Access::LocalNetwork => 4,
+            Access::NameRule => 5,
+            Access::SpotlightScope => 6,
+            Access::NetworkAuth => 7,
+            Access::NetworkHelper => 8,
         }
     }
 

@@ -915,3 +915,28 @@ fn a_stream_over_its_own_descriptor_lists_rewinds_and_lends_its_descriptor() {
     want.sort();
     assert_eq!(again, want);
 }
+
+/// A DIRECTORY'S ENTRY COUNT IS READ OFF THE DIRECTORY (`dir_entry_count`, Apple): `.` and `..`
+/// are not counted, the count follows each entry made and removed, and what is open and is no
+/// directory has no count. NEGATIVE CONTROLS: a count that took `.` and `..` reads two more than
+/// the three files made, and one that trusted a reply holding no count reads 0 for the file.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_directorys_entry_count_is_read_off_the_directory() {
+    let base = aterm_tempfile::tempdir().unwrap();
+    let dir = base.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let fd = open_root_mine(&dir);
+    assert_eq!(mine::dir_entry_count(&fd), Ok(0));
+    for name in ["a", "b", "c"] {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+    assert_eq!(mine::dir_entry_count(&fd), Ok(3));
+    std::fs::remove_file(dir.join("b")).unwrap();
+    assert_eq!(mine::dir_entry_count(&fd), Ok(2));
+    let file = std::fs::File::open(dir.join("a")).unwrap();
+    assert!(
+        mine::dir_entry_count(&file).is_err(),
+        "a file holds no entry count"
+    );
+}

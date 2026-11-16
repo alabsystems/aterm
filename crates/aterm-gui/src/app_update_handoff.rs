@@ -5046,6 +5046,7 @@ impl App {
     #[cfg(unix)]
     pub(crate) fn prepare_cold_exec(&mut self, build: u64, same_image: bool, automatic: bool) {
         self.note_update_switch_started(build, same_image, automatic);
+        self.flush_session_table_at_exit();
         self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
         let _ = crate::requests_host::flush_within(crate::requests_host::FLUSH_WAIT);
         self.consent_observer.stop();
@@ -5789,6 +5790,7 @@ impl App {
             teardown: crate::DeferredHandoffTeardown::None,
             commit_drain_started: None,
             commit_flush: None,
+            table_flush: None,
             held_commit: None,
             revoked_by_activity: false,
         });
@@ -7468,6 +7470,7 @@ impl App {
             teardown: crate::DeferredHandoffTeardown::None,
             commit_drain_started: None,
             commit_flush: None,
+            table_flush: None,
             held_commit: None,
             revoked_by_activity: false,
         });
@@ -7613,10 +7616,10 @@ impl App {
             })
     }
 
-    /// Bring the session table's rows to disk before an update ends this process: the Commit's
-    /// `seamless::commit_and_exit` and the Windows replacement's exit run no run end, and a row or
-    /// a told conclusion still queued on the table's worker would go with the process
-    /// (`session_table::SessionTable::flush`). An idle table answers at once.
+    /// Bring queued rows to disk before cold exec or the Windows replacement's exit, which run
+    /// no run end. The seamless Commit queues the same barrier before its claim and polls it
+    /// across input dispatches (`commit_flush_refences`). The worker may need to sync the
+    /// directory, so this blocking exit helper is not used in the parked window's Commit.
     fn flush_session_table_at_exit(&self) {
         let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
         if !table.flush() {
@@ -7635,6 +7638,29 @@ impl App {
         {
             return false;
         }
+        // Queue the table barrier before the claim. Poll it across dispatches; the window
+        // never waits for the worker's writes or directory sync.
+        let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
+        let pending = self.pending_update_handoff.as_mut().expect("checked above");
+        let (started, ack) = pending
+            .table_flush
+            .get_or_insert_with(|| (std::time::Instant::now(), table.flush_started()));
+        let table_landed = match ack.try_recv() {
+            Ok(landed) => landed,
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if started.elapsed() < crate::session_table::FLUSH_WAIT =>
+            {
+                pending.commit_drain_started = None;
+                return true;
+            }
+            Err(_) => false,
+        };
+        let table_held = started.elapsed();
+        if !table_landed {
+            aterm_log::warn!(
+                "update apply: the session table's rows did not all reach disk before the Commit"
+            );
+        }
         let writer = self.messages_log.is_some();
         let started = std::time::Instant::now();
         let landed = self.flush_messages_log_within(MESSAGES_FLUSH_COMMIT_WAIT);
@@ -7643,7 +7669,8 @@ impl App {
         } else {
             std::time::Duration::ZERO
         };
-        self.settle_commit_flush(landed, held)
+        // commit_flush records the messages writer's answer. Table errors are reported above.
+        self.settle_commit_flush(landed, held + table_held)
     }
 
     #[cfg(unix)]
@@ -8191,7 +8218,17 @@ impl App {
                     input_drain_spins: 0,
                     ..completion
                 }) {
-                    Some((completion, ..)) => completion,
+                    Some((completion, ..)) => {
+                        if self
+                            .pending_update_handoff
+                            .as_ref()
+                            .is_some_and(|p| p.commit_flush.is_none())
+                        {
+                            let _ = self.repost_handoff_completion(completion);
+                            return;
+                        }
+                        completion
+                    }
                     None => return,
                 }
             } else {
@@ -8267,7 +8304,6 @@ impl App {
             {
                 self.flush_messages_log_within(HANDOFF_INPUT_DRAIN_YIELD);
             }
-            self.flush_session_table_at_exit();
             let carried: Vec<aterm_session::SessionId> = self
                 .store
                 .read()
@@ -8892,14 +8928,22 @@ impl App {
     }
 
     /// Audits every connection the manifest left out as dropped (`action=drop origin=handoff`).
+    /// A connection joins two sessions, so a row whose ends do not read as sessions' IDs names
+    /// no edge and is not audited.
     #[cfg(unix)]
     pub(crate) fn audit_connections_left_out(rows: &[crate::session_store::ConnectionCarry]) {
         for row in rows {
+            let (Some(src), Some(dst)) = (
+                aterm_session::SessionId::parse(&row.src),
+                aterm_session::SessionId::parse(&row.dst),
+            ) else {
+                continue;
+            };
             crate::session_edge_audit::emit(
                 crate::session_edge_audit::EdgeAction::Drop,
                 "handoff",
-                &aterm_session::SessionId::new(row.src.clone()),
-                &aterm_session::SessionId::new(row.dst.clone()),
+                &src,
+                &dst,
                 &row.op,
             );
         }

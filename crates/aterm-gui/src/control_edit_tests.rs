@@ -20,6 +20,47 @@ fn never() -> bool {
     false
 }
 
+fn always() -> bool {
+    true
+}
+
+/// An unserved lane of [`short`] slices that asks after its caller with `hung_up`.
+fn lane(hung_up: fn() -> bool) -> crate::park::Lane {
+    crate::park::Lane {
+        slice: short,
+        hung_up,
+        bell: None,
+    }
+}
+
+thread_local! {
+    /// The hops a counted `await edit`'s lane looks at, and what each of its asks found there.
+    static ASKED: std::cell::RefCell<(Option<&'static Hops>, Vec<bool>)> =
+        const { std::cell::RefCell::new((None, Vec::new())) };
+}
+
+/// A lane's ask after its caller that records whether its request's hop still counts.
+fn counted_ask() -> bool {
+    ASKED.with(|asked| {
+        let mut asked = asked.borrow_mut();
+        if let Some(hops) = asked.0 {
+            let counted = hops.since_ns().is_some();
+            asked.1.push(counted);
+        }
+    });
+    false
+}
+
+/// Look at `hops` from this thread's next [`counted_ask`]s on.
+fn count_asks(hops: &'static Hops) {
+    ASKED.with(|asked| *asked.borrow_mut() = (Some(hops), Vec::new()));
+}
+
+/// What this thread's [`counted_ask`]s found since [`count_asks`].
+fn asks() -> Vec<bool> {
+    ASKED.with(|asked| std::mem::take(&mut asked.borrow_mut().1))
+}
+
 /// A count of hops of the calling test's own.
 fn fresh_hops() -> &'static Hops {
     Box::leak(Box::new(Hops::new()))
@@ -161,7 +202,7 @@ fn edit_requests_are_counted_hops_until_taken() {
     }
 
     let mut posted = Vec::new();
-    let mut counted = Vec::new();
+    count_asks(hops);
     let line = serve_await_edit(
         Scope::Owner,
         "edit ticket=5 timeout=10",
@@ -172,12 +213,9 @@ fn edit_requests_are_counted_hops_until_taken() {
             },
             hops,
         ),
-        &mut || {
-            counted.push(hops.since_ns().is_some());
-            false
-        },
-        short,
+        lane(counted_ask),
     );
+    let counted = asks();
     assert_eq!(line, "OK timeout\n");
     assert!(
         !counted.is_empty() && counted.iter().all(|&c| c),
@@ -191,7 +229,7 @@ fn edit_requests_are_counted_hops_until_taken() {
     }
 
     let mut taken = Vec::new();
-    let mut counted = Vec::new();
+    count_asks(hops);
     let line = serve_await_edit(
         Scope::Owner,
         "edit ticket=5 timeout=10",
@@ -202,12 +240,9 @@ fn edit_requests_are_counted_hops_until_taken() {
             },
             hops,
         ),
-        &mut || {
-            counted.push(hops.since_ns().is_some());
-            false
-        },
-        short,
+        lane(counted_ask),
     );
+    let counted = asks();
     assert_eq!(line, "OK timeout\n");
     assert!(
         !counted.is_empty() && counted.iter().all(|&c| !c),
@@ -272,8 +307,7 @@ fn await_edit_withdraws_on_every_exit() {
         Scope::Owner,
         "edit ticket=5",
         &mut main_thread(&mut post),
-        &mut never,
-        short,
+        lane(never),
     );
     assert_eq!(line, "OK edit done result=closed saved=1 seq=2\n");
     let mut parked = Vec::new();
@@ -289,8 +323,7 @@ fn await_edit_withdraws_on_every_exit() {
         Scope::Owner,
         &format!("edit uri={X} timeout=10"),
         &mut main_thread(&mut post_timeout),
-        &mut never,
-        short,
+        lane(never),
     );
     assert_eq!(line, "OK timeout\n");
     let mut post_hung = |wake: Wake| {
@@ -305,8 +338,7 @@ fn await_edit_withdraws_on_every_exit() {
         Scope::Owner,
         "edit ticket=5",
         &mut main_thread(&mut post_hung),
-        &mut || true,
-        short,
+        lane(always),
     );
     assert_eq!(line, crate::control::HUNG_UP_REPLY);
     assert_eq!(withdrawn.len(), 3, "{withdrawn:?}");
@@ -321,8 +353,7 @@ fn await_edit_withdraws_on_every_exit() {
             Scope::Owner,
             "edit ticket=x",
             &mut main_thread(&mut nothing),
-            &mut never,
-            short
+            lane(never),
         )
         .starts_with("ERR")
     );
@@ -332,8 +363,7 @@ fn await_edit_withdraws_on_every_exit() {
             edge,
             "edit ticket=5",
             &mut main_thread(&mut nothing),
-            &mut never,
-            short
+            lane(never),
         ),
         "ERR scope\n"
     );
@@ -374,8 +404,7 @@ fn edit_lanes_resolve_the_realpath_spelling() {
         Scope::Owner,
         &rest,
         &mut main_thread(&mut post),
-        &mut never,
-        short,
+        lane(never),
     );
     let parked = parked.expect("posted");
     assert_eq!(
@@ -414,4 +443,294 @@ fn tickets_are_unique_and_carry_this_process() {
     let b = mint_ticket();
     assert_ne!(a, b);
     assert_eq!(a.0 >> 32, u64::from(std::process::id()));
+}
+
+/// The `await edit` (`amacs --wait`) the hang-up bell rings: its caller is a socket pair's
+/// client, its lane a thread the test starts, its main thread a channel to the test. Each wait for
+/// something that must happen is the one-minute hang detector, and no count depends on time.
+#[cfg(unix)]
+mod belled {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use aterm_control::hangup::{HANGUP_POLL, ServingFd, caller_hung_up, hangup_park};
+    use aterm_control::park::BellLane;
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    use aterm_uds::CtlStream;
+    use aterm_uds::hangup::Bell;
+
+    use super::{AwaitCall, MainPost, Scope, Wake, await_edit, main_thread, serve_await_edit};
+    use crate::park::Lane;
+
+    /// The `await edit` every test here parks: ten minutes, so only a ring ends it within the
+    /// hang detector.
+    const REST: &str = "edit ticket=5 timeout=600000";
+
+    #[track_caller]
+    fn until(what: &str, mut seen: impl FnMut() -> bool) {
+        until_within(MUST_HAPPEN, what, || seen().then_some(()));
+    }
+
+    /// [`REST`] over `server` on `lane` ([`serve_await_edit`]), as [`served_by`] runs it.
+    fn parked_await(
+        server: CtlStream,
+        lane: Lane,
+    ) -> (
+        std::thread::JoinHandle<(String, usize)>,
+        std::sync::mpsc::Receiver<AwaitCall>,
+    ) {
+        served_by(server, move |post| {
+            serve_await_edit(Scope::Owner, REST, post, lane)
+        })
+    }
+
+    /// `serve` over `server`, on a lane thread of its own that serves that connection, whose main
+    /// thread hands each posted wait to the receiver returned and counts the withdraws.
+    fn served_by(
+        server: CtlStream,
+        serve: impl FnOnce(&mut MainPost<'_>) -> String + Send + 'static,
+    ) -> (
+        std::thread::JoinHandle<(String, usize)>,
+        std::sync::mpsc::Receiver<AwaitCall>,
+    ) {
+        let (calls, posted) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _serving = ServingFd::enter(server.as_raw_fd());
+            let mut withdrawn = 0;
+            let mut post = |wake: Wake| {
+                match wake {
+                    Wake::EditAwait(call) => calls.send(*call).expect("the test hears it"),
+                    Wake::EditAwaitWithdraw { .. } => withdrawn += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+                true
+            };
+            let line = serve(&mut main_thread(&mut post));
+            (line, withdrawn)
+        });
+        (thread, posted)
+    }
+
+    /// AN `await edit` WHOSE CALLER CLOSES ANSWERS `ERR hangup` AT THE RING AND WITHDRAWS, though
+    /// its timeout is ten minutes: armed on the process's bell, it waits once at its door for all
+    /// that is left (its bell lane asked once, its sliced lane never), and the caller closes only
+    /// once that arm stands, so only the bell's ring of the door can end it within the hang
+    /// detector.
+    /// NEGATIVE CONTROL: arming the bell to ring a slot that is not the door leaves it waiting past
+    /// the hang detector.
+    #[test]
+    fn an_await_edit_whose_caller_closes_answers_hangup_at_the_ring() {
+        static BELLED: AtomicUsize = AtomicUsize::new(0);
+        fn belled(left: Duration) -> Duration {
+            BELLED.fetch_add(1, Ordering::SeqCst);
+            left
+        }
+        fn sliced(_left: Duration) -> Duration {
+            panic!("an armed await on a live bell is never sliced")
+        }
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        let served = server.as_raw_fd();
+        let (lane, posted) = parked_await(
+            server,
+            Lane {
+                slice: sliced,
+                hung_up: caller_hung_up,
+                bell: Some(BellLane {
+                    bell: Bell::process,
+                    slice: belled,
+                }),
+            },
+        );
+        let _call = posted
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the wait is posted");
+        until("the await to arm the bell on its connection", || {
+            Bell::process().armed_for_test(served)
+        });
+        drop(client);
+        until("the parked await to hear its caller hang up", || {
+            lane.is_finished()
+        });
+        assert_eq!(
+            lane.join().expect("the lane"),
+            (crate::control::HUNG_UP_REPLY.to_string(), 1),
+            "it answers the hang-up and withdraws its waiter"
+        );
+        assert_eq!(BELLED.load(Ordering::SeqCst), 1, "one wait, to the ring");
+    }
+
+    /// AN ARMED `await edit` HEARS ITS ANSWER AT ITS DOOR: its one wait is for all of its ten
+    /// minutes, so the main thread's answer, sent once the arm stands, ends it within the hang
+    /// detector only because the answer rings the door the lane parks at.
+    /// NEGATIVE CONTROL: an answer that does not ring the door leaves the lane waiting past the
+    /// hang detector.
+    #[test]
+    fn an_armed_await_edit_hears_its_answer_at_its_door() {
+        fn unsliced(left: Duration) -> Duration {
+            left
+        }
+        let (_client, server) = CtlStream::pair().expect("socket pair");
+        let served = server.as_raw_fd();
+        let (lane, posted) = parked_await(
+            server,
+            Lane {
+                slice: unsliced,
+                hung_up: caller_hung_up,
+                bell: Some(BellLane {
+                    bell: Bell::process,
+                    slice: unsliced,
+                }),
+            },
+        );
+        let call = posted
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the wait is posted");
+        until("the await to arm the bell on its connection", || {
+            Bell::process().armed_for_test(served)
+        });
+        let done = "OK edit done result=closed saved=1 seq=2\n";
+        call.reply.send(done.to_string()).expect("the lane waits");
+        until("the parked await to hear its answer", || lane.is_finished());
+        assert_eq!(lane.join().expect("the lane"), (done.to_string(), 1));
+        drop(call);
+    }
+
+    /// AN UNARMED `await edit` IS SLICED AT HANGUP_POLL: on a bell whose thread has ended it
+    /// cannot arm, so it waits at its door by its lane's slices, each no longer than HANGUP_POLL,
+    /// and asks after its caller between them, ending at the lane's second ask, its bell lane
+    /// never asked.
+    /// NEGATIVE CONTROL: a park that takes its bell lane whether or not the arm stands waits once
+    /// for ten minutes and is reported at the hang detector.
+    #[test]
+    fn an_unarmed_await_edit_is_sliced_at_hangup_poll() {
+        static BELLED: AtomicUsize = AtomicUsize::new(0);
+        static SLICED: AtomicUsize = AtomicUsize::new(0);
+        static LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn belled(left: Duration) -> Duration {
+            BELLED.fetch_add(1, Ordering::SeqCst);
+            left
+        }
+        fn sliced(left: Duration) -> Duration {
+            SLICED.fetch_add(1, Ordering::SeqCst);
+            let slice = hangup_park(left);
+            let nanos = u64::try_from(slice.as_nanos()).unwrap_or(u64::MAX);
+            LONGEST.fetch_max(nanos, Ordering::SeqCst);
+            slice
+        }
+        fn gone_after_two_slices() -> bool {
+            SLICED.load(Ordering::SeqCst) >= 2
+        }
+        let (_client, server) = CtlStream::pair().expect("socket pair");
+        let (lane, posted) = parked_await(
+            server,
+            Lane {
+                slice: sliced,
+                hung_up: gone_after_two_slices,
+                bell: Some(BellLane {
+                    bell: Bell::ended_for_test,
+                    slice: belled,
+                }),
+            },
+        );
+        let _call = posted
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the wait is posted");
+        until("the unarmed await to end", || lane.is_finished());
+        assert_eq!(
+            lane.join().expect("the lane"),
+            (crate::control::HUNG_UP_REPLY.to_string(), 1)
+        );
+        assert_eq!(
+            (BELLED.load(Ordering::SeqCst), SLICED.load(Ordering::SeqCst)),
+            (0, 2),
+            "a bell that has ended arms nothing, and the await is sliced"
+        );
+        let longest = Duration::from_nanos(LONGEST.load(Ordering::SeqCst));
+        assert!(
+            longest <= HANGUP_POLL,
+            "a slice of {longest:?} outran HANGUP_POLL"
+        );
+    }
+
+    /// AN ARMED `await edit` HEARS ITS WAIT DROPPED UNANSWERED AT ITS DOOR: its one wait is for
+    /// all of its ten minutes (its bell lane asked once, its sliced lane never), and the main
+    /// thread drops the posted wait without an answer (as the event loop does with a queued
+    /// `Wake::EditAwait` it never serves) once the arm stands. The DoorReply's drop lets its answer
+    /// go and then rings the door, so the woken lane reads the answer gone and answers
+    /// `ERR edit waiter was dropped` and withdraws, within the hang detector.
+    /// NEGATIVE CONTROL: a DoorReply whose drop does not ring leaves the lane waiting past the hang
+    /// detector. (A drop that rings before it lets the answer go fails only where the lane reads
+    /// the answer between the two, which no test can arrange.)
+    #[test]
+    fn an_armed_await_edit_hears_its_wait_dropped_at_its_door() {
+        static BELLED: AtomicUsize = AtomicUsize::new(0);
+        fn belled(left: Duration) -> Duration {
+            BELLED.fetch_add(1, Ordering::SeqCst);
+            left
+        }
+        fn sliced(_left: Duration) -> Duration {
+            panic!("an armed await on a live bell is never sliced")
+        }
+        let (_client, server) = CtlStream::pair().expect("socket pair");
+        let served = server.as_raw_fd();
+        let (lane, posted) = parked_await(
+            server,
+            Lane {
+                slice: sliced,
+                hung_up: caller_hung_up,
+                bell: Some(BellLane {
+                    bell: Bell::process,
+                    slice: belled,
+                }),
+            },
+        );
+        let call = posted
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the wait is posted");
+        until("the await to arm the bell on its connection", || {
+            Bell::process().armed_for_test(served)
+        });
+        drop(call);
+        until("the parked await to hear its wait dropped", || {
+            lane.is_finished()
+        });
+        assert_eq!(
+            lane.join().expect("the lane"),
+            ("ERR edit waiter was dropped\n".to_string(), 1),
+            "it answers the drop and withdraws its waiter"
+        );
+        assert_eq!(BELLED.load(Ordering::SeqCst), 1, "one wait, to the ring");
+    }
+
+    /// AN `await edit` ARMS THE PROCESS'S HANG-UP BELL ON ITS SHIPPED LANE: served as the
+    /// dispatcher serves it ([`await_edit`], no lane of the test's own), it arms
+    /// `Bell::process()` on its connection while it waits at its door, and a caller that then
+    /// closes is answered `ERR hangup`, its waiter withdrawn, though its timeout is ten minutes.
+    /// The arm is the sign: a shipped lane that armed no bell would hear the close too, by its
+    /// HANGUP_POLL slices, so only the arm tells the bell's lane from the sliced one.
+    /// NEGATIVE CONTROL: an [`await_edit`] whose lane carries no bell lane never arms, and the hang
+    /// detector fires before the close.
+    #[test]
+    fn an_await_edit_arms_the_process_bell_on_its_shipped_lane() {
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        let served = server.as_raw_fd();
+        let (lane, posted) = served_by(server, |post| await_edit(post, Scope::Owner, REST));
+        let _call = posted
+            .recv_timeout(MUST_HAPPEN)
+            .expect("the wait is posted");
+        until(
+            "the await to arm the process bell on its connection",
+            || Bell::process().armed_for_test(served),
+        );
+        drop(client);
+        until("the parked await to hear its caller hang up", || {
+            lane.is_finished()
+        });
+        assert_eq!(
+            lane.join().expect("the lane"),
+            (crate::control::HUNG_UP_REPLY.to_string(), 1),
+            "it answers the hang-up and withdraws its waiter"
+        );
+    }
 }

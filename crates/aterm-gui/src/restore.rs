@@ -1989,6 +1989,12 @@ pub(crate) struct WindowLayout {
     pub workers_in_front: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restored_tabs: Vec<RestoredTab>,
+    /// The window's navigator dock record (`App`'s `Dock::pref`): absent never decided, `0`
+    /// hidden, `k` shown at `k` cells. The grid and frame above are the window's with it, so a
+    /// window saved with the dock shown is born with it at the frame it had
+    /// (`crate::app_window::birth_dock`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dock: Option<u16>,
 }
 
 impl WindowLayout {
@@ -2202,6 +2208,7 @@ impl WindowLayout {
     #[cfg(test)]
     pub(crate) const fn lone_workers_list(rows: u16, cols: u16) -> Self {
         Self {
+            dock: None,
             rows,
             cols,
             active_tab: 0,
@@ -2222,6 +2229,7 @@ impl WindowLayout {
 
     const fn spill_of(donor: &Self) -> Self {
         Self {
+            dock: donor.dock,
             rows: donor.rows,
             cols: donor.cols,
             active_tab: 0,
@@ -2818,6 +2826,7 @@ impl RestoreManifest {
     #[cfg(test)]
     pub(crate) fn one_terminal_for_test(log_ep: Option<u32>) -> RestoreManifest {
         RestoreManifest::new(vec![WindowLayout {
+            dock: None,
             rows: 24,
             cols: 80,
             active_tab: 0,
@@ -2969,6 +2978,39 @@ impl AdmittedWindows {
             "{left_out} of {offered} saved windows not reopened: {}",
             causes.join(", ")
         ))
+    }
+}
+
+/// The dock record and birth of a launch's first window, which a launch makes before any row
+/// is placed: `manifest`'s first row (the handed layout at a handoff, else the saved one), held
+/// as that row is, at `carried_origin` (a handoff's carried place) where one came, else the
+/// row's. With no manifest the window is no restored one.
+pub(crate) fn bootstrap_dock(
+    manifest: Option<&RestoreManifest>,
+    carried_origin: Option<(i32, i32)>,
+) -> (Option<u16>, crate::app_window::DockBirth) {
+    let Some(manifest) = manifest else {
+        return (None, crate::app_window::DockBirth::default());
+    };
+    match manifest.windows.first() {
+        Some(row) => {
+            let birth = crate::app_window::DockBirth::of_row(row);
+            (
+                row.dock,
+                crate::app_window::DockBirth {
+                    origin: carried_origin.or(birth.origin),
+                    ..birth
+                },
+            )
+        }
+        None => (
+            None,
+            crate::app_window::DockBirth {
+                restored: true,
+                held: false,
+                origin: carried_origin,
+            },
+        ),
     }
 }
 

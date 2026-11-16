@@ -89,6 +89,7 @@ fn a_change_at_initial_subscription_reaches_both_accessibility_readings() {
 #[test]
 fn a_cold_restores_first_window_carries_its_frame_unless_sized_otherwise() {
     let layout = |maximized, inner_px| crate::restore::WindowLayout {
+        dock: None,
         rows: 66,
         cols: 146,
         active_tab: 0,

@@ -99,7 +99,7 @@ pub(super) fn call(
 pub(super) fn wait(app: &mut App, key: AwaitKey) -> (WaiterId, Receiver<String>) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let waiter = WaiterId(NEXT.fetch_add(1, Ordering::Relaxed));
-    let (reply, answer) = std::sync::mpsc::channel();
+    let (reply, answer) = crate::control::control_media::DoorReply::pair();
     let real_uri = match &key {
         AwaitKey::Uri(uri) => crate::control_edit::real_file_uri(uri),
         AwaitKey::Ticket(_) => None,
@@ -914,8 +914,11 @@ fn edit_and_await_edit_answer_on_the_wire() {
             crate::control::Scope::Owner,
             &rest,
             &mut MainPost::injected(|wake| wakes.send(wake).is_ok(), hops),
-            &mut || false,
-            slice,
+            crate::park::Lane {
+                slice,
+                hung_up: || false,
+                bell: None,
+            },
         )
     });
     let deliver = |app: &mut App, wake| match take_hop(wake) {

@@ -19,6 +19,7 @@ fn outcomes_round_trip_without_free_form_messages() {
         SyncDiagnostic::Failed(ErrorKind::VaultChanged),
         SyncDiagnostic::Failed(ErrorKind::MembershipCapacity),
         SyncDiagnostic::Failed(ErrorKind::MembershipHistoryUnavailable),
+        SyncDiagnostic::Failed(ErrorKind::HistoryUnopened),
         SyncDiagnostic::Failed(ErrorKind::TimedOut),
         SyncDiagnostic::Failed(ErrorKind::JoinQueueIncomplete),
         SyncDiagnostic::Failed(ErrorKind::NotStored),

@@ -434,7 +434,7 @@ fn a_valid_migration_stays_committed_when_a_later_sync_plan_is_refused() {
         cli,
         (&bed.home, &bed.state, &bed.config),
         (None, None),
-        false,
+        SyncCaller::Person,
         1,
         (&fetch_source_text, &[]),
         || {
@@ -497,7 +497,7 @@ fn every_provider_refuses_changed_sources_after_signin_custody() {
                     cli,
                     (&bed.home, &bed.state, &bed.config),
                     (None, None),
-                    false,
+                    SyncCaller::Person,
                     1,
                     (&fetch_source_text, &[]),
                     || {

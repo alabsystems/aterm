@@ -2703,3 +2703,19 @@ fn a_title_that_animates_is_written_at_the_title_rate() {
     assert_eq!(lane.next_wake(due), None);
     lane.retire(MUST_HAPPEN).unwrap();
 }
+
+#[test]
+fn a_dock_change_alone_is_a_changed_layout_to_the_crash_journal() {
+    let mut shown = layout(&[("/a", "zsh")]);
+    shown.windows[0].dock = Some(30);
+    // CONTROL: the same layout is the same.
+    assert!(super::same_but_titles(&shown, &shown.clone()));
+    for dock in [None, Some(0)] {
+        let mut other = shown.clone();
+        other.windows[0].dock = dock;
+        assert!(
+            !super::same_but_titles(&shown, &other),
+            "a dock of {dock:?} against 30 is a layout change, not a title"
+        );
+    }
+}

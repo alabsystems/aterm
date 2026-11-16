@@ -157,7 +157,7 @@ use std::path::{Path, PathBuf};
 
 use super::arena::{self, Halt};
 use super::bench_build::{
-    self, Built, Provenance, Targo, another_build, cpus, ledger_paths, load_average,
+    self, PreparedBench, Provenance, Targo, another_build, cpus, ledger_paths, load_average,
 };
 use super::{LaneRun, workspace_root};
 
@@ -371,8 +371,7 @@ fn measure(args: &Args) -> Result<String, Halt> {
     std::fs::create_dir_all(&ledger_dir)
         .map_err(|e| format!("could not make {}: {e}", ledger_dir.display()))?;
     let driver = crate::perf::driver::cargo_driver()?;
-    let (targo, built, load_before) =
-        bench_build::prepare(driver, args.profile, &args.build_args())?;
+    let (prepared, load_before) = bench_build::prepare(driver, args.profile, &args.build_args())?;
     let plan = args.plan();
     let mut written = Vec::with_capacity(plan.len());
     let mut load = format!("{load_before} before the build");
@@ -380,7 +379,7 @@ fn measure(args: &Args) -> Result<String, Halt> {
         if plan.len() > 1 {
             eprintln!("  run {} of {}: arm={}", i + 1, plan.len(), arm.word());
         }
-        let entry = run_arm(&targo, args, arm, &built, &ledger_dir, &load)?;
+        let entry = run_arm(&prepared, args, arm, &ledger_dir, &load)?;
         written.push(entry.display().to_string());
         load = format!("{} before the run", load_average());
     }
@@ -388,10 +387,9 @@ fn measure(args: &Args) -> Result<String, Halt> {
 }
 
 fn run_arm(
-    targo: &Targo<'_>,
+    prepared: &PreparedBench<Targo<'_>>,
     args: &Args,
     arm: Arm,
-    built: &Built,
     ledger_dir: &Path,
     load_before: &str,
 ) -> Result<PathBuf, Halt> {
@@ -402,14 +400,13 @@ fn run_arm(
         .map_err(|e| format!("could not make a scratch directory: {e}"))?;
     let words = args.bench_words(arm);
     bench_build::run_bench(
-        targo,
-        &args.build_args(),
+        prepared,
         (bench_spec::ENV, &words),
         (bench_spec::OUT_ENV, scratch.path()),
         PROGRESS,
-        built,
         bench_build::Entry::Timed,
     )?;
+    let built = prepared.built();
     let read = |name: &str| {
         let path = scratch.path().join(name);
         crate::read_regular_text(&path)

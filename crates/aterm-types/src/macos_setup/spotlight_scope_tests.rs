@@ -355,3 +355,23 @@ fn the_live_file_reading_admits_only_the_owners_bounded_regular_file() {
         "the folder lists the file and the link"
     );
 }
+
+/// A new checkout is visible work, but cannot reopen a completed password episode.
+#[test]
+fn completed_scope_needs_an_explicit_extension() {
+    let mac = Mac::alice();
+    assert!(automatic_owed(&mac));
+    mac.file(RECEIPT, 0, FULL);
+    assert!(!automatic_owed(&mac));
+    mac.put(&format!("{ALICE}/NewCheckout"), FOLDER);
+    assert!(owed(&mac), "the new folder remains visible as work");
+    assert!(
+        !automatic_owed(&mac),
+        "a restart must not request the password again"
+    );
+    mac.file(RECEIPT, 501, FULL);
+    assert!(
+        !automatic_owed(&mac),
+        "an untrusted receipt never admits a password ask"
+    );
+}

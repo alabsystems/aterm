@@ -2175,3 +2175,260 @@ fn speed_bps_psi_and_zones_reject_plus_prefixed_tokens() {
     ]);
     assert!(Root::new(root.path()).zones().is_empty());
 }
+
+/// A Linux machine's model is its DMI product name as written, a code included; a placeholder
+/// there falls to the device tree's model, whose closing NUL is no part of it; a placeholder in
+/// both names none.
+/// NEGATIVE CONTROL: with `product_model` taking the product name without the placeholder
+/// filter, the second assertion reads `To Be Filled By O.E.M.`.
+#[test]
+fn a_machines_model_is_its_dmi_product_name_else_its_device_tree_model() {
+    let dmi = tree(&[
+        ("sys/class/dmi/id/product_name", "21K9CTO1WW\n"),
+        ("proc/device-tree/model", "Raspberry Pi 5 Model B Rev 1.0\0"),
+    ]);
+    assert_eq!(
+        Root::new(dmi.path()).product_model().as_deref(),
+        Some("21K9CTO1WW")
+    );
+    for placeholder in ["To Be Filled By O.E.M.\n", "System Product Name\n", "\n"] {
+        let board = tree(&[
+            ("sys/class/dmi/id/product_name", placeholder),
+            ("proc/device-tree/model", "Raspberry Pi 5 Model B Rev 1.0\0"),
+        ]);
+        assert_eq!(
+            Root::new(board.path()).product_model().as_deref(),
+            Some("Raspberry Pi 5 Model B Rev 1.0"),
+            "{placeholder:?}"
+        );
+    }
+    let neither = tree(&[
+        ("sys/class/dmi/id/product_name", "Default string\n"),
+        ("proc/device-tree/model", "Not Specified\0"),
+    ]);
+    assert_eq!(Root::new(neither.path()).product_model(), None);
+    assert_eq!(Root::new(tree(&[]).path()).product_model(), None);
+}
+
+/// The chip is x86's `model name` less its marks, its clock and a closing `Processor`; an ARM
+/// board's `Model` names the board and states no chip.
+/// NEGATIVE CONTROL: with `chip_name` keeping the `model name` as written, the first assertion
+/// reads `AMD Ryzen 9 7950X 16-Core Processor`, which the registry's 32-character column refuses.
+#[test]
+fn a_chip_is_the_cpuinfo_model_name_without_its_marks_and_clock() {
+    let cases = [
+        (
+            "AMD Ryzen 9 7950X 16-Core Processor",
+            "AMD Ryzen 9 7950X 16-Core",
+        ),
+        (
+            "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz",
+            "Intel Xeon CPU E5-2680 v4",
+        ),
+        (
+            "13th Gen Intel(R) Core(TM) i9-13900K",
+            "13th Gen Intel Core i9-13900K",
+        ),
+        ("Intel(R) Celeron(R) CPU", "Intel Celeron"),
+    ];
+    for (named, chip) in cases {
+        let cpuinfo = format!("processor\t: 0\nmodel name\t: {named}\n");
+        assert_eq!(linux::chip_name(&cpuinfo).as_deref(), Some(chip), "{named}");
+    }
+    assert_eq!(linux::chip_name("Model\t\t: Raspberry Pi 5\n"), None);
+    assert_eq!(linux::chip_name("model name\t: (R) Processor\n"), None);
+    let root = tree(&[(
+        "proc/cpuinfo",
+        "model name\t: AMD EPYC 9654 96-Core Processor\n",
+    )]);
+    assert_eq!(
+        Root::new(root.path()).chip().as_deref(),
+        Some("AMD EPYC 9654 96-Core")
+    );
+}
+
+/// Cores are physical: two threads of one core are one, on a machine of one level and on a
+/// hybrid one, whose efficiency level is counted apart; a core with no topology is its own.
+/// NEGATIVE CONTROL: with `core_counts` counting logical cores, the first assertion reads
+/// `(Some(8), None)`.
+#[test]
+fn cores_are_counted_once_per_physical_core_and_split_by_level() {
+    let mut files = vec![
+        (
+            "sys/devices/system/cpu/present".to_owned(),
+            "0-7\n".to_owned(),
+        ),
+        (
+            "sys/devices/system/cpu/online".to_owned(),
+            "0-7\n".to_owned(),
+        ),
+    ];
+    for id in 0..8 {
+        files.push((
+            format!("sys/devices/system/cpu/cpu{id}/topology/core_cpus_list"),
+            format!("{},{}\n", id % 4, id % 4 + 4),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    assert_eq!(Root::new(tree(&refs).path()).core_counts(), (Some(4), None));
+    let mut hybrid = vec![
+        (
+            "sys/devices/system/cpu/present".to_owned(),
+            "0-11\n".to_owned(),
+        ),
+        (
+            "sys/devices/system/cpu/online".to_owned(),
+            "0-11\n".to_owned(),
+        ),
+        ("sys/devices/cpu_core/cpus".to_owned(), "0-7\n".to_owned()),
+        ("sys/devices/cpu_atom/cpus".to_owned(), "8-11\n".to_owned()),
+    ];
+    for id in 0..8 {
+        hybrid.push((
+            format!("sys/devices/system/cpu/cpu{id}/topology/thread_siblings_list"),
+            format!("{}-{}\n", id & !1, id | 1),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = hybrid
+        .iter()
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    assert_eq!(
+        Root::new(tree(&refs).path()).core_counts(),
+        (Some(4), Some(4))
+    );
+    let bare = tree(&[
+        ("sys/devices/system/cpu/present", "0-2\n"),
+        ("sys/devices/system/cpu/online", "0-2\n"),
+    ]);
+    assert_eq!(Root::new(bare.path()).core_counts(), (Some(3), None));
+}
+
+/// The names an owner gave a Linux machine are its pretty and static host names; `localhost`
+/// and a comment are none.
+/// NEGATIVE CONTROL: with `static_hostname` taking `localhost`, the last assertion lists it.
+#[test]
+fn a_machines_owner_names_are_its_pretty_and_static_host_names() {
+    let root = tree(&[
+        (
+            "etc/machine-info",
+            "CHASSIS=desktop\nPRETTY_HOSTNAME=\"Andrew's Box\"\n",
+        ),
+        ("etc/hostname", "# set by the installer\nm31\n"),
+    ]);
+    assert_eq!(
+        Root::new(root.path()).owner_host_names(),
+        ["Andrew's Box", "m31"]
+    );
+    assert_eq!(
+        linux::pretty_hostname("PRETTY_HOSTNAME='Lab one'\n").as_deref(),
+        Some("Lab one")
+    );
+    assert_eq!(linux::pretty_hostname("PRETTY_HOSTNAME=\n"), None);
+    for unset in ["localhost\n", "localhost.localdomain\n", "\n", "# none\n"] {
+        assert_eq!(linux::static_hostname(unset), None, "{unset:?}");
+    }
+    let unset = tree(&[("etc/hostname", "localhost\n")]);
+    assert!(Root::new(unset.path()).owner_host_names().is_empty());
+}
+
+/// `/etc/machine-id` is 32 hex digits, read lower-cased; the empty file and `uninitialized` of
+/// an image before its first boot, an all-zero id and a missing file are none. Memory and the
+/// root's volume are read under the root.
+/// NEGATIVE CONTROL: with `machine_id` taking any first line, `uninitialized` is an identity.
+#[test]
+fn a_machine_id_is_32_hex_digits_and_memory_and_volume_read_under_the_root() {
+    let id = "4F1C0E2A9B7D4C3E8A6F5B2D1C0E9F8A";
+    let root = tree(&[
+        ("etc/machine-id", &format!("{id}\n")),
+        (
+            "proc/meminfo",
+            "MemTotal:       32617000 kB\nMemFree: 1 kB\n",
+        ),
+    ]);
+    let root = Root::new(root.path());
+    assert_eq!(root.machine_id(), Some(id.to_ascii_lowercase()));
+    assert_eq!(root.mem_total_kib(), Some(32_617_000));
+    assert!(root.volume_bytes().is_some_and(|bytes| bytes > 0));
+    for refused in [
+        "",
+        "\n",
+        "uninitialized\n",
+        "00000000000000000000000000000000\n",
+        "4f1c0e2a9b7d4c3e8a6f5b2d1c0e9f8\n",
+        "4f1c0e2a-9b7d-4c3e-8a6f-5b2d1c0e9f8a\n",
+    ] {
+        assert_eq!(linux::machine_id(refused), None, "{refused:?}");
+    }
+    assert_eq!(Root::new(tree(&[]).path()).machine_id(), None);
+}
+
+/// An APU's `model name` loses the graphics it names after ` w/ ` or ` with `, and a name still
+/// longer than the registry's column its leading words, so every chip fits the column; a 32-bit
+/// ARM kernel's `model name` names the architecture and states no chip.
+/// NEGATIVE CONTROL: with `chip_name` keeping what follows ` w/ ` and every leading word, the
+/// first case reads `AMD Ryzen 7 7840U w/ Radeon 780M Graphics` (41 characters), which the
+/// column refuses; with no `ARMv` rule, the last assertion reads `ARMv7 Processor rev 3 (v7l)`.
+#[test]
+fn a_long_chip_name_fits_the_column_and_an_armv7_kernel_states_no_chip() {
+    for (named, chip) in [
+        (
+            "AMD Ryzen 7 7840U w/ Radeon 780M Graphics",
+            "AMD Ryzen 7 7840U",
+        ),
+        (
+            "AMD Ryzen 7 5800H with Radeon Graphics",
+            "AMD Ryzen 7 5800H",
+        ),
+        (
+            "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+            "AMD Ryzen AI 9 HX 370",
+        ),
+        (
+            "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+            "Threadripper PRO 5995WX 64-Cores",
+        ),
+    ] {
+        let cpuinfo = format!("processor\t: 0\nmodel name\t: {named}\n");
+        let read = linux::chip_name(&cpuinfo);
+        assert_eq!(read.as_deref(), Some(chip), "{named}");
+        assert!(chip.len() <= linux::CHIP_NAME_MAX, "{chip}");
+    }
+    assert_eq!(
+        linux::chip_name("processor\t: 0\nmodel name\t: ARMv7 Processor rev 3 (v7l)\n"),
+        None
+    );
+}
+
+/// A static host name written as a domain name names the machine by its first label, as a Mac's
+/// local host name does; `localhost` in any form is still none.
+/// NEGATIVE CONTROL: with `static_hostname` keeping the name as written, the first assertion
+/// reads `m31.lab.example.com`.
+#[test]
+fn a_static_host_name_written_as_a_domain_name_is_its_first_label() {
+    assert_eq!(
+        linux::static_hostname("m31.lab.example.com\n").as_deref(),
+        Some("m31")
+    );
+    assert_eq!(linux::static_hostname("m31\n").as_deref(), Some("m31"));
+    for unset in ["localhost.localdomain\n", "LOCALHOST\n", ".lab\n"] {
+        assert_eq!(linux::static_hostname(unset), None, "{unset:?}");
+    }
+}
+
+/// With SMT off, the sibling threads are present but offline and have no topology: only the
+/// online cores count, so two cores of four threads are two.
+/// NEGATIVE CONTROL: with `core_counts` counting every present core, it reads `(Some(4), None)`.
+#[test]
+fn with_smt_off_the_offline_sibling_threads_are_no_cores() {
+    let root = tree(&[
+        ("sys/devices/system/cpu/present", "0-3\n"),
+        ("sys/devices/system/cpu/online", "0-1\n"),
+        ("sys/devices/system/cpu/cpu0/topology/core_cpus_list", "0\n"),
+        ("sys/devices/system/cpu/cpu1/topology/core_cpus_list", "1\n"),
+    ]);
+    assert_eq!(Root::new(root.path()).core_counts(), (Some(2), None));
+}

@@ -1,33 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+/// The low-disk news, its cleanup-off form, what a pass freed and a paused session journal are
+/// each a record: none asks anyone to act.
 #[test]
-fn a_volume_short_while_cleanup_is_off_is_not_the_passes_line() {
-    let passes = super::disk_low_entry(3, 17, &["~/a 9 GiB (a)".to_string()], None);
-    let off = super::disk_low_cleanup_off_entry(3, 17);
-    let settings = super::disk_settings_entry(&["disk.apply is not read".to_string()]);
-    assert_ne!(off.key(), passes.key());
-    assert!(passes.mover().is_none());
-    assert!(off.mover().is_some());
-    assert_eq!(off.mover(), settings.mover());
-}
-
-#[test]
-fn the_disk_line_keeps_what_the_ask_did_beside_its_largest_holder() {
-    let hogs: Vec<String> = ["~/a 9 GiB (a)", "~/b 5 GiB (b)", "~/c 1 GiB (c)"]
-        .iter()
-        .map(|h| (*h).to_string())
-        .collect();
-    let asked = "aterm asked @s-a at 2026-10-24T10:00:00Z to free space";
-    let (_, _, _, lines) = entry_words(&super::disk_low_entry(3, 17, &hogs, Some(asked)));
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines[1].contains("~/a") && lines[1].contains("; 2 more"),
-        "{lines:?}"
+fn the_disk_news_is_records_that_ask_no_one() {
+    let hogs = ["~/a 9 GiB (a)".to_string()];
+    let passes = super::disk_low_record(3, 17, &hogs);
+    assert_eq!(
+        passes.detail[1],
+        format!("aterm cannot reclaim: {}", hogs[0])
     );
-    assert_eq!(lines[2], asked);
-    let (_, _, _, plain) = entry_words(&super::disk_low_entry(3, 17, &hogs, None));
-    assert!(plain.iter().any(|l| l.contains("~/b")), "{plain:?}");
+    for record in [
+        passes,
+        super::disk_low_cleanup_off_record(3, 17),
+        super::disk_freed_record(1 << 30, &["1.0 GiB ~/.cache/pip".to_string()]),
+        super::session_journal_paused_record("the volume is full"),
+    ] {
+        assert!(
+            matches!(record.need(), aterm_messages::need::Need::Record),
+            "{}",
+            record.title
+        );
+    }
 }
 
 fn entry_words(entry: &Entry) -> (String, String, String, Vec<String>) {
@@ -3159,107 +3154,6 @@ fn every_notices_ask_is_its_own_row_keyed_whole() {
     );
 }
 
-fn disk_full_faults(msg: &Message, cause: DiskFullCause, left: &str) -> Vec<String> {
-    let aterm_messages::need::Need::Now(ask) = msg.need() else {
-        return vec!["not a standing ask".to_owned()];
-    };
-    let mut out: Vec<String> = ask.fault().map(str::to_owned).into_iter().collect();
-    let (why, then) = (ask.why().words(), ask.then().words().to_owned());
-    if msg.detail.first() != Some(&then) {
-        out.push("the detail does not open on the step".to_owned());
-    }
-    if msg.detail.get(1) != Some(&why) {
-        out.push("Details do not show the cause".to_owned());
-    }
-    let said = msg.detail.iter().filter(|l| l.contains(left)).count();
-    if said > 1 {
-        out.push(format!("the bytes left said on {said} lines"));
-    }
-    let claims = msg
-        .detail
-        .iter()
-        .filter(|l| {
-            l.contains("every unused build cache")
-                || l.contains("every build cache it may")
-                || l.contains("nothing more")
-        })
-        .count();
-    if claims > 1 || (claims == 1 && cause != DiskFullCause::Spent) {
-        out.push(format!("says aterm took all it may on {claims} lines"));
-    }
-    for key in [
-        "auto_free_gib",
-        "dead_build_dirs",
-        "[disk]",
-        "ATERM_STATE_HOME",
-    ] {
-        if msg.detail.iter().any(|l| l.contains(key)) {
-            out.push(format!("names the key {key}"));
-        }
-    }
-    out.extend(
-        msg.detail
-            .iter()
-            .filter(|l| l.ends_with('\u{2026}'))
-            .map(|l| format!("clipped: {l}")),
-    );
-    out
-}
-
-fn disk_lines() -> aterm_agent::harness::disk::Thresholds {
-    aterm_agent::harness::disk::Config::default().thresholds(None)
-}
-
-#[test]
-fn the_disk_full_alert_says_what_ends_it() {
-    use super::DiskFullCause as C;
-    let human = aterm_agent::harness::disk::human_bytes;
-    let lines = disk_lines();
-    let other = aterm_agent::harness::disk::Thresholds {
-        emergency: 9 << 30,
-        files_emergency: 70_000,
-        ..lines
-    };
-    assert_eq!(
-        (human(lines.emergency).as_str(), lines.files_emergency),
-        ("4.0 GiB", 50_000)
-    );
-    let hogs = vec!["~/src/w/target 9.0 GiB".to_string()];
-    for cause in [
-        C::Spent,
-        C::Unrecorded,
-        C::Unsupervised { whole: true },
-        C::CleanupOff { fault: false },
-        C::Inodes,
-        C::Private(crate::harness_host::DiskPrivate::StateRoot),
-    ] {
-        let said = |t: &aterm_agent::harness::disk::Thresholds| {
-            super::disk_full(Some(1 << 20), 31 << 30, &hogs, cause, t)
-        };
-        let msg = said(&lines);
-        let expect = &msg.detail[2];
-        let (figure, theirs) = if cause == C::Inodes {
-            ("50,000".to_string(), "70,000".to_string())
-        } else {
-            (human(lines.emergency), human(other.emergency))
-        };
-        assert!(expect.contains(&figure), "{cause:?}: {expect}");
-        assert_eq!(
-            super::sentence_lines(msg.key.as_deref(), &msg.detail),
-            3,
-            "{cause:?}: the step, the cause and what to expect"
-        );
-        assert!(msg.detail[3].starts_with("Largest: "), "{cause:?}");
-        let moved = said(&other);
-        assert!(
-            moved.detail[2].contains(&theirs),
-            "{cause:?}: {}",
-            moved.detail[2]
-        );
-        assert!(!moved.detail[2].contains(&figure), "{cause:?}");
-    }
-}
-
 /// A BACKED-UP EPISODE OF MACOS'S PROGRAM CHECK IS A RECORD AT EACH EDGE: the opening says how
 /// many are held and the oldest, and, when aterm started none of them, that aterm's grant does
 /// not reach them; the drain says how long it lasted (at least its longest wait) and the most at
@@ -3430,7 +3324,8 @@ fn the_program_check_alert_leads_with_the_restart() {
 
 /// fseventsd told past its bar, as the watch tells it.
 fn fseventsd_over(footprint: u64) -> aterm_vitals::services::Seen {
-    use aterm_vitals::services::{FSEVENTSD, Seen, Service, size};
+    use aterm_process_facts::services::Service;
+    use aterm_vitals::services::{FSEVENTSD, Seen, size};
     Seen {
         service: Service {
             coalition: 7,
@@ -3548,7 +3443,8 @@ fn the_service_memory_alert_and_entry_lead_with_the_restart() {
 /// nothing of the old episode, which then ends.
 #[test]
 fn a_pass_keeps_the_entry_of_a_service_followed_but_not_yet_told() {
-    use aterm_vitals::services::{Member, Told};
+    use aterm_process_facts::services::Member;
+    use aterm_vitals::services::Told;
     let entry =
         |pid: u32| super::service_memory_entry_key("fseventsd", &format!("{pid}-1790000000"));
     let told = |services, unread| Told {
@@ -3588,10 +3484,12 @@ fn a_pass_keeps_the_entry_of_a_service_followed_but_not_yet_told() {
     );
 }
 
+/// A FULL DISK IS A RECORD: one line with what is left, what aterm freed and the cause's own
+/// words, then at most three of the largest folders left; never a message on any glass, and
+/// nothing in it asks anyone to act. Each cause reads apart.
 #[test]
-fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
+fn a_full_disk_is_a_record_that_asks_no_one_to_act() {
     use super::DiskFullCause as C;
-    let human = aterm_agent::harness::disk::human_bytes;
     let causes = [
         C::Spent,
         C::Unrecorded,
@@ -3604,113 +3502,43 @@ fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
         C::Private(crate::harness_host::DiskPrivate::DeviceUnnamed),
         C::Private(crate::harness_host::DiskPrivate::NoAccountHome),
     ];
-    let widest_free = (1u64 << 30) - (1u64 << 20) / 10;
-    let widest_freed = (1u64 << 40) - (1u64 << 30) / 10;
-    assert_eq!(human(widest_free), "1023.9 MiB");
-    assert_eq!(human(widest_freed), "1023.9 GiB");
     let hog = |i: usize| format!("~/src/w{i}/target 9{i}.0 GiB (cargo build; targo clean)");
-    let mut reasons = std::collections::BTreeSet::new();
+    let mut lines = std::collections::BTreeSet::new();
     for cause in causes {
-        for free in [1u64 << 20, widest_free] {
-            for freed in [0, 31u64 << 30, widest_freed] {
-                for n in [0, 1, 4] {
-                    let hogs: Vec<String> = (0..n).map(hog).collect();
-                    let msg = super::disk_full(Some(free), freed, &hogs, cause, &disk_lines());
-                    let left = human(free);
-                    let at = format!("{cause:?} free={left} freed={} hogs={n}", human(freed));
-                    assert_eq!(
-                        disk_full_faults(&msg, cause, &left),
-                        Vec::<String>::new(),
-                        "{at}: {:?}",
-                        msg.detail
-                    );
-                    assert_eq!(attention(&msg), Ok(Attention::Failure), "{at}");
-                    assert_eq!(msg.key.as_deref(), Some(super::DISK_FULL_KEY), "{at}");
-                    let largest: Vec<String> = hogs
-                        .iter()
-                        .take(3)
-                        .map(|h| format!("Largest: {h}"))
-                        .collect();
-                    assert_eq!(msg.detail[3..], largest[..], "{at}");
-                    let step = &msg.detail[0];
-                    if cause == C::Inodes {
-                        assert!(step.contains("small files"), "{at}: {step}");
-                    } else if n > 0 {
-                        assert!(step.contains("largest folder in Details"), "{at}: {step}");
-                    } else {
-                        assert!(step.contains("aterm harness disk"), "{at}: {step}");
-                    }
-                    if cause != C::Inodes {
-                        assert!(msg.detail[1].starts_with(&left), "{at}: {}", msg.detail[1]);
-                    }
-                    if free == 1 << 20 && freed == 31 << 30 && n == 0 {
-                        reasons.insert(msg.detail[1].clone());
-                    }
-                }
+        for n in [0, 1, 4] {
+            let hogs: Vec<String> = (0..n).map(hog).collect();
+            let msg = super::disk_full_record(Some(1 << 20), 31 << 30, &hogs, cause);
+            assert!(
+                matches!(msg.need(), aterm_messages::need::Need::Record),
+                "{cause:?}"
+            );
+            assert_eq!(msg.key.as_deref(), Some(super::DISK_FULL_KEY));
+            let line = &msg.detail[0];
+            assert!(
+                line.starts_with("1.0 MiB free") && line.contains("aterm freed 31.0 GiB"),
+                "{cause:?}: {line}"
+            );
+            assert!(line.ends_with(cause.log_words()), "{cause:?}: {line}");
+            let largest: Vec<String> = hogs
+                .iter()
+                .take(3)
+                .map(|h| format!("Largest: {h}"))
+                .collect();
+            assert_eq!(msg.detail[1..], largest[..], "{cause:?}");
+            for said in &msg.detail {
+                assert!(!said.contains("Free up space"), "{cause:?}: {said}");
+            }
+            if n == 0 {
+                lines.insert(line.clone());
             }
         }
     }
-    assert_eq!(
-        reasons.len(),
-        causes.len(),
-        "one reason per cause: {reasons:?}"
-    );
-    let kept = |freed| {
-        super::disk_full(Some(1 << 20), freed, &[], C::Unrecorded, &disk_lines()).detail[1].clone()
-    };
-    let spent = |freed| {
-        super::disk_full(Some(1 << 20), freed, &[], C::Spent, &disk_lines()).detail[1].clone()
-    };
-    for freed in [0, 31u64 << 30] {
-        let (kept, spent) = (kept(freed), spent(freed));
-        assert!(
-            kept.contains("could not log a removal")
-                && !kept.contains("found no unused build cache")
-                && !kept.contains("every unused build cache"),
-            "{kept}"
-        );
-        assert!(
-            spent.contains("found no unused build cache")
-                || spent.contains("every unused build cache"),
-            "{spent}"
-        );
-    }
-
-    let old = |why: &str| {
-        Message::new(tags::SYSTEM, Severity::Error, "Disk full")
-            .line("1.0 MiB left on /Users//x; aterm freed 0 B and can free nothing more safely")
-            .line(why)
-            .now(Ask::standing(
-                StandingWhy::Spent {
-                    tried: Reason::new("freed 0 B of rebuildable caches"),
-                    reason: Reason::new("nothing more on the volume is safe for aterm to remove"),
-                },
-                Then::step("Free up space on the home volume"),
-            ))
-            .key(super::DISK_FULL_KEY)
-    };
-    let spent = disk_full_faults(
-        &old("aterm reclaimed every build cache it may and nothing more is safe to remove"),
-        C::Spent,
-        "1.0 MiB",
-    );
+    assert_eq!(lines.len(), causes.len(), "one line per cause: {lines:?}");
+    let unknown = super::disk_full_record(None, 0, &[], C::Spent);
     assert!(
-        spent.contains(&"the detail does not open on the step".to_owned())
-            && spent.contains(&"says aterm took all it may on 2 lines".to_owned()),
-        "{spent:?}"
-    );
-    let off = disk_full_faults(
-        &old(
-            "the automatic removal is off ([disk] auto_free_gib is 0, or a [disk] value aterm \
-             cannot read)",
-        ),
-        C::CleanupOff { fault: false },
-        "1.0 MiB",
-    );
-    assert!(
-        off.contains(&"says aterm took all it may on 1 lines".to_owned())
-            && off.contains(&"names the key auto_free_gib".to_owned()),
-        "{off:?}"
+        unknown.detail[0].starts_with("little space free"),
+        "{:?}",
+        unknown.detail
     );
 }
 

@@ -1,27 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hang-up bell ([`Bell`], [`Armed`]): one thread per bell hears an armed stream's peer close
-//! entirely and rings that arm's channel, so a parked wait hears its caller go without polling.
+//! The hang-up bell ([`Bell`], [`Armed`], [`Ring`]): one thread per bell hears an armed stream's
+//! peer close entirely and rings that arm's [`Ring`], so a parked wait hears its caller go without
+//! polling.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Hears each stream armed on it ([`Bell::arm`]) become HUNG UP, as
 /// [`fd_peer_closed`](super::fd_peer_closed) judges it: every descriptor of the peer end closed,
-/// where a peer's write-side shutdown is not, and rings that arm's channel once for it. One
-/// `aterm-hangup` thread serves a bell, started at its first arm. As that thread ends it rings
-/// every arm standing then once more, a hung-up one included. A bell whose thread could not
-/// start, or has ended, arms nothing, so its callers keep asking after their callers themselves.
+/// where a peer's write-side shutdown is not, and rings that arm's [`Ring`] once for it. One
+/// `aterm-hangup` thread serves a bell, started by [`Bell::start`] and never by an arm: a start
+/// opens the kernel queue through [`crate::kept_out`], which on Apple waits for every spawn in
+/// flight, and a park arms under the lock of the state it guards, so the start comes first, with
+/// no such lock held. As that thread ends it rings every arm standing then once more, a
+/// hung-up one included. A bell not started, whose thread could not start, or has ended, arms
+/// nothing, so its callers keep asking after their callers themselves.
 /// On macOS the thread waits on a kqueue (`EVFILT_WRITE` with `EV_CLEAR`, acting on `EV_EOF`
 /// alone: the filter `poll(POLLOUT)` reads, which reports `POLLHUP` exactly then); on Linux on an
 /// epoll instance (interest 0, one-shot: `EPOLLHUP` and `EPOLLERR` alone report, once); elsewhere
 /// no bell starts.
 pub struct Bell {
-    /// The started bell, or `None` where it could not start: decided once, at the first arm.
+    /// The started bell, or `None` where it could not start: decided once, at the first
+    /// [`Bell::start`]; unset until then.
     started: OnceLock<Option<Arc<Shared>>>,
 }
 
@@ -43,8 +48,8 @@ struct Shared {
     /// Whether the thread still serves this bell: cleared under `arms`' lock as it ends, after
     /// which every arm it held has been rung and no arm succeeds.
     live: AtomicBool,
-    /// The standing arms. A STRICT LEAF: nothing else is locked under it, and a ring under it is
-    /// a non-blocking `try_send`.
+    /// The standing arms. A STRICT LEAF: nothing else is locked under it, and a ring under it
+    /// ([`Ring::ring`]) never blocks.
     arms: Mutex<Arms>,
 }
 
@@ -58,7 +63,38 @@ struct Arms {
 struct Arm {
     id: u64,
     fd: RawFd,
-    ring: SyncSender<()>,
+    ring: Ring,
+}
+
+/// What an arm's ring wakes. A ring runs on the bell's thread under its arms' lock, so each kind
+/// is a call that never blocks and takes no lock of its caller's.
+#[derive(Clone, Debug)]
+pub enum Ring {
+    /// `try_send(())` on a channel. A single-slot channel keeps a ring its waiter has not yet
+    /// read, so a wait that begins after the ring still ends at once: none is lost.
+    Slot(SyncSender<()>),
+    /// `notify_all` on the condition variable a park waits on with the lock of its state. A
+    /// notify finds only the waits already begun: one sent between the park's last look and its
+    /// wait is lost, so such a park bounds each wait while armed.
+    Notify(Arc<Condvar>),
+}
+
+impl Ring {
+    /// Wake what this ring names, without blocking.
+    fn ring(&self) {
+        match self {
+            Ring::Slot(slot) => {
+                let _ = slot.try_send(());
+            }
+            Ring::Notify(signal) => signal.notify_all(),
+        }
+    }
+}
+
+impl From<SyncSender<()>> for Ring {
+    fn from(slot: SyncSender<()>) -> Self {
+        Ring::Slot(slot)
+    }
 }
 
 /// What one wait of a bell's queue heard.
@@ -71,7 +107,7 @@ enum Heard {
 }
 
 impl Bell {
-    /// A bell whose thread starts at its first [`Self::arm`].
+    /// A bell whose thread starts at its first [`Self::start`].
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -86,21 +122,32 @@ impl Bell {
         &PROCESS
     }
 
-    /// Ring `ring` (its `try_send`, which never blocks: a full channel already holds a wake) once
-    /// when `stream`'s peer is HUNG UP, now or later, until the returned [`Armed`] drops. A stream
-    /// already hung up rings at once. The thread's end rings it too, after which
-    /// [`Armed::ringing`] reads false.
+    /// Open this bell's kernel queue and start its thread, at the first call; every later call
+    /// reads what the first decided. Whether the bell started (its thread may have ended since).
+    /// The first call opens the queue through [`crate::kept_out`], which on Apple waits for every
+    /// spawn in flight: make it with none of the caller's locks held, before any arm.
+    pub fn start(&self) -> bool {
+        self.started.get_or_init(start).is_some()
+    }
+
+    /// Ring `ring` ([`Ring`]: a channel's `try_send`, which never blocks, a full channel already
+    /// holding a wake, or a condition variable's `notify_all`) once when `stream`'s peer is HUNG
+    /// UP, now or later, until the returned [`Armed`] drops. A stream already hung up rings at
+    /// once. The thread's end rings it too, after which [`Armed::ringing`] reads false. An arm
+    /// never starts the bell ([`Self::start`]): it takes only the bell's own leaf lock and makes
+    /// one kernel registration, so it may be made under its caller's locks.
     ///
     /// # Errors
-    /// The bell could not start (no kernel queue or thread here, or this platform has none), its
-    /// thread has ended, `stream`'s descriptor is already armed on this bell, or the kernel
-    /// refused the registration. The caller then asks after its caller itself, as without a bell.
-    pub fn arm<'a>(&self, stream: &'a impl AsFd, ring: SyncSender<()>) -> io::Result<Armed<'a>> {
-        let shared = self
-            .started
-            .get_or_init(start)
-            .as_ref()
-            .ok_or_else(|| io::Error::other("the hang-up bell did not start"))?;
+    /// The bell was never started, could not start (no kernel queue or thread here, or this
+    /// platform has none), or its thread has ended; `stream`'s descriptor is already armed on
+    /// this bell; or the kernel refused the registration. The caller then asks after its caller
+    /// itself, as without a bell.
+    pub fn arm<'a>(&self, stream: &'a impl AsFd, ring: impl Into<Ring>) -> io::Result<Armed<'a>> {
+        let shared = match self.started.get() {
+            Some(Some(shared)) => shared,
+            Some(None) => return Err(io::Error::other("the hang-up bell did not start")),
+            None => return Err(io::Error::other("the hang-up bell was not started")),
+        };
         let fd = stream.as_fd();
         let raw = fd.as_raw_fd();
         let mut arms = shared.lock_arms();
@@ -116,7 +163,11 @@ impl Bell {
         let id = arms.next;
         arms.next += 1;
         shared.queue.add(raw, id)?;
-        arms.rings.push(Arm { id, fd: raw, ring });
+        arms.rings.push(Arm {
+            id,
+            fd: raw,
+            ring: ring.into(),
+        });
         Ok(Armed {
             shared: Arc::clone(shared),
             fd,
@@ -133,6 +184,27 @@ impl Bell {
         if let Some(Some(shared)) = self.started.get() {
             shared.queue.stop();
         }
+    }
+
+    /// A bell whose thread has ended, so it arms nothing: a test's park on it keeps its lane's
+    /// slices. Its end is seen through the ring of an arm standing then, waited for under a
+    /// minute's hang detector.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn ended_for_test() -> &'static Self {
+        static ENDED: Bell = Bell::new();
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let (ring, rung) = std::sync::mpsc::sync_channel(1);
+            if ENDED.start()
+                && let Ok((near, _far)) = crate::CtlStream::pair()
+                && let Ok(_armed) = ENDED.arm(&near, ring)
+            {
+                ENDED.end_thread_for_test();
+                let _ = rung.recv_timeout(std::time::Duration::from_secs(60));
+            }
+        });
+        &ENDED
     }
 
     /// Whether descriptor `fd` stands armed on this bell: a test's sign that a park armed the
@@ -190,7 +262,7 @@ impl Shared {
     fn ring(&self, id: u64) {
         let arms = self.lock_arms();
         if let Some(arm) = arms.rings.iter().find(|arm| arm.id == id) {
-            let _ = arm.ring.try_send(());
+            arm.ring.ring();
         }
     }
 }
@@ -243,7 +315,7 @@ impl Drop for Ended<'_> {
         let arms = self.0.lock_arms();
         self.0.live.store(false, Ordering::Release);
         for arm in &arms.rings {
-            let _ = arm.ring.try_send(());
+            arm.ring.ring();
         }
     }
 }

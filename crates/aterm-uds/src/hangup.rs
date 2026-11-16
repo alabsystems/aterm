@@ -11,7 +11,7 @@ use crate::CtlStream;
 #[path = "hangup_bell.rs"]
 mod bell;
 #[cfg(unix)]
-pub use bell::{Armed, Bell};
+pub use bell::{Armed, Bell, Ring};
 
 /// What [`peer_state`] finds at the far end of a connected stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

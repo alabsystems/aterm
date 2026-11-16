@@ -17,46 +17,208 @@ use std::{
 
 /// What a runtime's transports have reported ([`Attachment::observe`]).
 #[derive(Default)]
-struct Progress {
+pub(super) struct Progress {
     /// The most operations each table's rounds saw retained. A wait asks for at least so many,
     /// and a rebuilt transport, which has seen no round yet, says nothing of what its store holds.
-    retained: BTreeMap<Digest, usize>,
+    pub(super) retained: BTreeMap<Digest, usize>,
     /// Application rounds that completed, on any table or none, whether or not each exchanged it.
-    rounds: u64,
+    pub(super) rounds: u64,
+    /// Whether a round of the runtime's, on any table or none, was in flight at its transport's
+    /// last turn ([`super::transport::Transport::rounds_in_flight`]).
+    pub(super) in_flight: bool,
 }
 impl Progress {
+    pub(super) fn held(&self, table: &Digest) -> usize {
+        self.retained.get(table).copied().unwrap_or(0)
+    }
+
+    /// What the runtime's rounds did, as a wait on processes this one started reads it
+    /// ([`Minute::worked`]).
+    pub(super) fn rounds(&self) -> Rounds {
+        Rounds {
+            ended: self.rounds,
+            in_flight: self.in_flight,
+        }
+    }
+}
+
+/// What the runtimes doing a wait's repair did of their rounds ([`Minute::worked`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Rounds {
+    /// How many rounds they ended, counted from any start.
+    pub(super) ended: u64,
+    /// Whether one of their rounds is in flight.
+    pub(super) in_flight: bool,
+}
+
+/// Why a wait ended without what it waited for ([`Minute::remaining`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Unmet {
+    /// A hang detector's minute passed with no progress ([`Minute`]): `quiet` is how long it has
+    /// been since the last, or since the wait began.
+    Hung { quiet: Duration },
+    /// Progress kept the wait open for [`aterm_spec::wait::WORKING_GUARD`] without what it waited
+    /// for: the processes doing the repair work on and never bring it.
+    Guard,
+}
+
+/// A hang detector's minute ([`aterm_spec::wait::MUST_HAPPEN`]) for a wait whose repair other
+/// runtimes do: progress starts it again, and a wait that progress keeps open ends at
+/// [`aterm_spec::wait::WORKING_GUARD`]. What counts as progress is the waiter's: [`Watch`] counts
+/// its table's retained operations, and where processes this one started do the repair, a wait
+/// counts the work they do on it ([`Self::worked`]).
+pub(super) struct Minute {
+    began: Instant,
+    progressed_at: Instant,
+    /// What the processes doing the repair had done at the last note ([`Self::worked`]): how many
+    /// rounds they had ended, and their work count.
+    noted: Option<(u64, u64)>,
+}
+impl Minute {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            began: now,
+            progressed_at: now,
+            noted: None,
+        }
+    }
+
+    /// Progress at `now`: the minute starts again.
+    pub(super) fn progressed(&mut self, now: Instant) {
+        self.progressed_at = now;
+    }
+
+    /// Note what the processes this one started did, where they do the repair: their `rounds`,
+    /// and `used`, a count that rises whenever they used CPU or did I/O
+    /// ([`aterm_uds::deadline::descendants_work`]). A round they ended since the last note is
+    /// progress, and so is their work while one of their rounds is in flight: a loaded Mac
+    /// stretches a round's wall time without bound while they work on it, so its minute is
+    /// theirs. Their work between rounds is not: their timers, beacons and polls bring no record,
+    /// so a pair that rests until its audit ends the wait a minute after its last round, and a
+    /// write that waits for an audit is named at a minute, not at the guard.
+    pub(super) fn worked(&mut self, rounds: Rounds, used: u64, now: Instant) {
+        if let Some((ended, was)) = self.noted.replace((rounds.ended, used))
+            && (rounds.ended > ended || (rounds.in_flight && used != was))
+        {
+            self.progressed_at = now;
+        }
+    }
+
+    /// How long a wait may sleep before this must be asked again, or why it ended unmet.
+    pub(super) fn remaining(&self, now: Instant) -> std::result::Result<Duration, Unmet> {
+        if now.saturating_duration_since(self.began) >= aterm_spec::wait::WORKING_GUARD {
+            return Err(Unmet::Guard);
+        }
+        let quiet = now.saturating_duration_since(self.progressed_at);
+        aterm_spec::wait::MUST_HAPPEN
+            .checked_sub(quiet)
+            .filter(|left| !left.is_zero())
+            .ok_or(Unmet::Hung { quiet })
+    }
+
+    /// How long the wait has run.
+    pub(super) fn ran(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.began)
+    }
+}
+
+/// A minute without progress on the requested table is a hang ([`Minute`]). Progress is a higher
+/// retained count on that table and, where processes this one started do the repair, the work
+/// they do on it ([`Self::worked`]). For runtimes in this process alone, unrelated or deferred
+/// rounds neither exhaust nor renew that table's wait, and no count of rounds judges it.
+pub(super) struct Watch {
+    table: Digest,
+    rounds_at_start: u64,
+    high_water: usize,
+    minute: Minute,
+}
+impl Watch {
+    pub(super) fn new(table: Digest, progress: &Progress, now: Instant) -> Self {
+        Self {
+            table,
+            rounds_at_start: progress.rounds,
+            high_water: progress.held(&table),
+            minute: Minute::new(now),
+        }
+    }
+
+    /// Note what the processes this one started did of their `rounds`, and their work count
+    /// `used`, where they do the repair ([`Minute::worked`]).
+    pub(super) fn worked(&mut self, rounds: Rounds, used: u64, now: Instant) {
+        self.minute.worked(rounds, used, now);
+    }
+
+    /// How long a wait may sleep before this must be asked again, or why it ended unmet.
+    pub(super) fn remaining(
+        &mut self,
+        progress: &Progress,
+        now: Instant,
+    ) -> std::result::Result<Duration, Unmet> {
+        if progress.held(&self.table) > self.high_water {
+            self.high_water = progress.held(&self.table);
+            self.minute.progressed(now);
+        }
+        self.minute.remaining(now)
+    }
+
+    /// How many application rounds completed since the wait began, and how long it has run.
+    pub(super) fn ran(&self, progress: &Progress, now: Instant) -> (u64, Duration) {
+        (
+            progress.rounds.saturating_sub(self.rounds_at_start),
+            self.minute.ran(now),
+        )
+    }
+}
+
+/// What a wait on processes this one started reads beside what it waits for: the clock, their
+/// work ([`Minute::worked`]), and how long it pauses between two looks. A live wait reads
+/// [`Instant::now`] and [`aterm_uds::deadline::descendants_work`]; a test of the wait passes its
+/// own, with the clock in its hands.
+pub(super) struct Seams<'a> {
+    pub(super) now: &'a mut dyn FnMut() -> Instant,
+    pub(super) used: &'a mut dyn FnMut() -> u64,
+    pub(super) pause: Duration,
+}
+
+/// How often a wait whose repair runs in processes this one started reads their progress: a
+/// sweep of the process table, so not once a report.
+const WORK_TICK: Duration = Duration::from_millis(500);
+
+/// What a wait for one table's operations saw ([`Attachment::observe_until`]).
+#[derive(Debug)]
+struct Observed {
+    /// What the runtime's rounds saw retained, by table.
+    retained: BTreeMap<Digest, usize>,
+    /// Why the wait ended without the operations; none where they came.
+    unmet: Option<Unmet>,
+    /// The application rounds the runtime completed while the wait ran.
+    rounds: u64,
+    /// How long the wait ran.
+    elapsed: Duration,
+}
+impl Observed {
     fn held(&self, table: &Digest) -> usize {
         self.retained.get(table).copied().unwrap_or(0)
     }
-}
 
-/// A minute without a higher retained count on the requested table is a hang.
-/// Unrelated or deferred rounds neither exhaust nor renew that table's wait.
-struct Watch {
-    table: Digest,
-    high_water: usize,
-    progressed_at: Instant,
-}
-impl Watch {
-    fn new(table: Digest, progress: &Progress, now: Instant) -> Self {
-        Self {
-            table,
-            high_water: progress.held(&table),
-            progressed_at: now,
-        }
-    }
-
-    /// How long a wait may sleep before this must be asked again; `None` once repair has stopped.
-    fn remaining(&mut self, progress: &Progress, now: Instant) -> Option<Duration> {
-        if progress.held(&self.table) > self.high_water {
-            self.high_water = progress.held(&self.table);
-            self.progressed_at = now;
-        }
-        aterm_spec::wait::MUST_HAPPEN
-            .checked_sub(now.saturating_duration_since(self.progressed_at))
-            .filter(|left| !left.is_zero())
+    /// Fail, naming the `phase`, why the wait ended, its rounds and its time, unless the runtime's
+    /// rounds saw `operations` on `table`.
+    #[track_caller]
+    fn holds(&self, table: &Digest, operations: usize, phase: &str) {
+        assert!(
+            self.held(table) >= operations,
+            "{phase}: automatic repair did not retain {operations} operations; observed {:?}; \
+             the wait ended {:?} after {} rounds in {:?}",
+            self.retained,
+            self.unmet,
+            self.rounds,
+            self.elapsed,
+        );
     }
 }
+
+/// Told whether a round of an attachment's runtime is in flight ([`Attachment::telling_flight`]).
+type Flight = Arc<dyn Fn(bool) + Send + Sync>;
 
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -64,6 +226,9 @@ pub(super) struct Attachment {
     /// Whether the isolated attachment delivers its links' sends ([`super::transport::Transport::isolated`]).
     pub(super) delivering: Arc<std::sync::atomic::AtomicBool>,
     progress: Arc<(Mutex<Progress>, Condvar)>,
+    /// Told whether a round of its runtime's is in flight, each time that changes
+    /// ([`Self::telling_flight`]).
+    flight: Option<Flight>,
 }
 impl Attachment {
     pub(super) fn new(port: u16) -> Self {
@@ -71,14 +236,25 @@ impl Attachment {
             port,
             delivering: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             progress: Arc::new((Mutex::new(Progress::default()), Condvar::new())),
+            flight: None,
         }
     }
 
-    /// Note what a transport saw retained, and the `rounds` it finished since its last call.
-    pub(super) fn observe(&self, observed: &BTreeMap<Digest, usize>, rounds: u64) {
+    /// This attachment, telling `tell` whether a round of its runtime's is in flight each time
+    /// that changes: a child runtime's fixture logs it for the waits of the test that started it
+    /// ([`Minute::worked`]).
+    pub(super) fn telling_flight(mut self, tell: impl Fn(bool) + Send + Sync + 'static) -> Self {
+        self.flight = Some(Arc::new(tell));
+        self
+    }
+
+    /// Note what a transport saw retained, the `rounds` it finished since its last call, and
+    /// whether a round of its is `in_flight`.
+    pub(super) fn observe(&self, observed: &BTreeMap<Digest, usize>, rounds: u64, in_flight: bool) {
         let (state_mu, changed) = &*self.progress;
         let mut state = state_mu.lock().unwrap_or_else(|p| p.into_inner());
-        let mut moved = rounds != 0;
+        let flew = std::mem::replace(&mut state.in_flight, in_flight) != in_flight;
+        let mut moved = rounds != 0 || flew;
         state.rounds += rounds;
         for (table, retained) in observed {
             let held = state.retained.entry(*table).or_default();
@@ -90,33 +266,109 @@ impl Attachment {
         if moved {
             changed.notify_all();
         }
-    }
-
-    pub(super) fn wait_for(&self, table: Digest, operations: usize, phase: &str) {
-        let state = self.wait_for_observation(table, operations);
-        assert!(
-            state.get(&table).copied().unwrap_or(0) >= operations,
-            "{phase}: automatic repair did not retain {operations} operations; observed {state:?}"
-        );
-    }
-
-    /// What this runtime's rounds saw retained once they saw `operations` on `table`, or once
-    /// repair stopped short of that ([`Watch`]).
-    fn wait_for_observation(&self, table: Digest, operations: usize) -> BTreeMap<Digest, usize> {
-        let (state_mu, changed) = &*self.progress;
-        let mut state = state_mu.lock().unwrap_or_else(|p| p.into_inner());
-        let mut watch = Watch::new(table, &state, Instant::now());
-        while state.held(&table) < operations {
-            let Some(remaining) = watch.remaining(&state, Instant::now()) else {
-                break;
-            };
-            let (next, _) = changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|p| p.into_inner());
-            state = next;
+        drop(state);
+        if flew && let Some(tell) = &self.flight {
+            tell(in_flight);
         }
+    }
+
+    /// What this runtime's rounds did ([`Progress::rounds`]).
+    pub(super) fn rounds(&self) -> Rounds {
+        let (state_mu, _) = &*self.progress;
+        state_mu.lock().unwrap_or_else(|p| p.into_inner()).rounds()
+    }
+
+    /// Wait until this runtime's rounds saw `operations` on `table`, the `phase` this is, where
+    /// runtimes in this process alone do the repair ([`Watch`]). A wait that ends unmet fails,
+    /// naming why, after how many rounds and how long, and what the rounds saw retained.
+    #[track_caller]
+    pub(super) fn wait_for(&self, table: Digest, operations: usize, phase: &str) {
+        self.observe_until(table, operations, None)
+            .holds(&table, operations, phase);
+    }
+
+    /// [`Self::wait_for`] where processes this one started take part in the repair, in rounds
+    /// with this runtime: the wait's minute is theirs while they work on a round
+    /// ([`Minute::worked`]).
+    #[track_caller]
+    pub(super) fn wait_for_while_children_work(
+        &self,
+        table: Digest,
+        operations: usize,
+        phase: &str,
+    ) {
+        let mut used = aterm_uds::deadline::descendants_work();
+        self.while_children(
+            table,
+            operations,
+            &mut Seams {
+                now: &mut Instant::now,
+                used: &mut used,
+                pause: WORK_TICK,
+            },
+        )
+        .holds(&table, operations, phase);
+    }
+
+    /// [`Self::wait_for_while_children_work`]'s wait, over its `seams`.
+    fn while_children(&self, table: Digest, operations: usize, seams: &mut Seams<'_>) -> Observed {
+        self.observe_until(table, operations, Some(seams))
+    }
+
+    /// What this runtime's rounds saw retained once they saw `operations` on `table`, or once the
+    /// wait ended unmet ([`Watch`]), and why. `children` are the seams of a wait on processes this
+    /// one started, where they take part in the repair; with none, the wall's clock judges.
+    fn observe_until(
+        &self,
+        table: Digest,
+        operations: usize,
+        mut children: Option<&mut Seams<'_>>,
+    ) -> Observed {
+        fn clock(children: &mut Option<&mut Seams<'_>>) -> Instant {
+            match children {
+                Some(seams) => (seams.now)(),
+                None => Instant::now(),
+            }
+        }
+        let (state_mu, changed) = &*self.progress;
+        let lock = || state_mu.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = lock();
+        let mut watch = Watch::new(table, &state, clock(&mut children));
+        let mut unmet = None;
+        while state.held(&table) < operations {
+            let remaining = match watch.remaining(&state, clock(&mut children)) {
+                Ok(remaining) => remaining,
+                Err(why) => {
+                    unmet = Some(why);
+                    break;
+                }
+            };
+            let Some(seams) = children.as_deref_mut() else {
+                state = changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+                continue;
+            };
+            state = changed
+                .wait_timeout(state, remaining.min(seams.pause))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+            let rounds = state.rounds();
+            // Read the process table without the lock, which the transports' reports take.
+            drop(state);
+            let used = (seams.used)();
+            watch.worked(rounds, used, (seams.now)());
+            state = lock();
+        }
+        let (rounds, elapsed) = watch.ran(&state, clock(&mut children));
         // Release the observer's lock before any caller's assertion can unwind.
-        state.retained.clone()
+        Observed {
+            retained: state.retained.clone(),
+            unmet,
+            rounds,
+            elapsed,
+        }
     }
 }
 
@@ -127,39 +379,184 @@ fn a_wait_tracks_its_tables_progress_without_a_round_count_budget() {
     let began = Instant::now();
     let mut progress = Progress::default();
     let mut watch = Watch::new(table, &progress, began);
-    assert_eq!(watch.remaining(&progress, began), Some(hang));
+    assert_eq!(watch.remaining(&progress, began), Ok(hang));
     progress.rounds = 128;
-    assert_eq!(watch.remaining(&progress, began), Some(hang));
+    assert_eq!(watch.remaining(&progress, began), Ok(hang));
     progress.retained.insert([8; 32], 9);
     assert_eq!(
         watch.remaining(&progress, began + Duration::from_secs(59)),
-        Some(Duration::from_secs(1))
+        Ok(Duration::from_secs(1))
     );
     progress.retained.insert(table, 1);
     assert_eq!(
         watch.remaining(&progress, began + Duration::from_secs(59)),
-        Some(hang)
+        Ok(hang)
     );
     progress.rounds += 1;
     assert_eq!(
         watch.remaining(&progress, began + hang),
-        Some(Duration::from_secs(59))
+        Ok(Duration::from_secs(59))
     );
     progress.retained.insert(table, 2);
     assert_eq!(
         watch.remaining(&progress, began + Duration::from_secs(118)),
-        Some(hang)
+        Ok(hang)
     );
     progress.rounds += 128;
     progress.retained.insert([8; 32], 10);
     assert_eq!(
         watch.remaining(&progress, began + Duration::from_secs(177)),
-        Some(Duration::from_secs(1))
+        Ok(Duration::from_secs(1))
     );
     assert_eq!(
         watch.remaining(&progress, began + Duration::from_secs(178)),
-        None
+        Err(Unmet::Hung { quiet: hang })
     );
+    assert_eq!(
+        watch.ran(&progress, began + Duration::from_secs(178)),
+        (257, Duration::from_secs(178))
+    );
+}
+
+/// A wait whose repair runs in processes this one started, with the clock in the test's hands:
+/// their work while a round of theirs is in flight keeps its minute open however long the wall
+/// runs, as does each round they end; their work between rounds (timers, beacons, polls) does
+/// not, so a minute of it with no round ends the wait; and work that never brings the table's
+/// operations ends it at the guard.
+#[test]
+fn a_wait_on_children_lasts_while_they_work_on_rounds_and_ends_a_minute_into_their_rest() {
+    let table = [7; 32];
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let second = Duration::from_secs(1);
+    let flying = Rounds {
+        ended: 0,
+        in_flight: true,
+    };
+    let began = Instant::now();
+    let progress = Progress::default();
+    let mut watch = Watch::new(table, &progress, began);
+    watch.worked(flying, 0, began);
+    // Each reading rises just inside the minute since the last while a round is in flight:
+    // three minutes of wall go by.
+    for minute in 1..=3 {
+        let at = began + hang * minute - second;
+        watch.worked(flying, u64::from(minute), at);
+        assert_eq!(
+            watch.remaining(&progress, at),
+            Ok(hang),
+            "children that work on a round keep the wait open"
+        );
+    }
+    let last = began + hang * 3 - second;
+    // The same reading again is no work, a round in flight or not.
+    watch.worked(flying, 3, last + hang / 2);
+    assert_eq!(watch.remaining(&progress, last + hang - second), Ok(second));
+    assert_eq!(
+        watch.remaining(&progress, last + hang),
+        Err(Unmet::Hung { quiet: hang }),
+        "a minute in which the children did nothing is a hang"
+    );
+    assert_eq!(watch.ran(&progress, last + hang), (0, hang * 4 - second));
+
+    // At rest the children still work: their work is no progress, a round they end is.
+    let mut watch = Watch::new(table, &progress, began);
+    let resting = Rounds::default();
+    watch.worked(resting, 0, began);
+    let ended = Rounds {
+        ended: 1,
+        in_flight: false,
+    };
+    for (reading, (rounds, at, left)) in [
+        (resting, began + hang / 2, hang / 2),
+        (ended, began + hang - second, hang),
+        (ended, began + hang * 3 / 2, hang / 2 - second),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        watch.worked(rounds, u64::try_from(reading).unwrap() + 1, at);
+        assert_eq!(
+            watch.remaining(&progress, at),
+            Ok(left),
+            "reading {reading}: work at rest renews nothing, a round ended does"
+        );
+    }
+    watch.worked(ended, 9, began + hang * 2 - second);
+    assert_eq!(
+        watch.remaining(&progress, began + hang * 2 - second),
+        Err(Unmet::Hung { quiet: hang }),
+        "a minute of work at rest after the last round is a hang"
+    );
+
+    let guard = aterm_spec::wait::WORKING_GUARD;
+    let mut watch = Watch::new(table, &progress, began);
+    let mut reading = 0;
+    let mut at = began;
+    while at < began + guard {
+        reading += 1;
+        watch.worked(flying, reading, at);
+        assert!(watch.remaining(&progress, at).is_ok());
+        at += hang / 2;
+    }
+    watch.worked(flying, reading + 1, began + guard);
+    assert_eq!(
+        watch.remaining(&progress, began + guard),
+        Err(Unmet::Guard),
+        "work that never brings the operations ends at the guard"
+    );
+}
+
+/// The attachment's wait on processes this one started (`wait_for_while_children_work`, over its
+/// seams), with the clock and their work in the test's hands: every look advances the clock
+/// ten seconds and finds their work count risen, and the table's operation comes three minutes
+/// in. While a round of this runtime's is in flight, or one ends every thirty seconds, the wait
+/// lasts until it comes; where none is in flight and none ends, the children's work is their
+/// rest, and the wait ends a minute in, unmet.
+#[test]
+fn an_attachments_wait_on_children_counts_their_work_on_rounds_alone() {
+    let table = [7; 32];
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let step = Duration::from_secs(10);
+    for case in ["in flight", "ending", "resting"] {
+        let attachment = Attachment::new(0);
+        attachment.observe(&BTreeMap::new(), 0, case == "in flight");
+        let began = Instant::now();
+        let at = std::cell::Cell::new(began);
+        let mut count = 0;
+        let mut used = || {
+            at.set(at.get() + step);
+            count += 1;
+            let ended = u64::from(case == "ending" && count % 3 == 0);
+            let came = at.get() >= began + hang * 3;
+            attachment.observe(
+                &BTreeMap::from([(table, usize::from(came))]),
+                ended,
+                case == "in flight",
+            );
+            count
+        };
+        let observed = attachment.while_children(
+            table,
+            1,
+            &mut Seams {
+                now: &mut || at.get(),
+                used: &mut used,
+                pause: Duration::ZERO,
+            },
+        );
+        if case == "resting" {
+            assert!(
+                matches!(observed.unmet, Some(Unmet::Hung { quiet }) if quiet >= hang),
+                "{case}: {observed:?}"
+            );
+            assert!(observed.elapsed < hang + step * 2, "{case}: {observed:?}");
+            assert_eq!(observed.held(&table), 0, "{case}");
+        } else {
+            assert_eq!(observed.unmet, None, "{case}: {observed:?}");
+            assert!(observed.elapsed >= hang * 3, "{case}: {observed:?}");
+            assert_eq!(observed.held(&table), 1, "{case}");
+        }
+    }
 }
 
 /// Retained counts only rise: a round that read no inventory, or a rebuilt transport's empty map,
@@ -168,9 +565,9 @@ fn a_wait_tracks_its_tables_progress_without_a_round_count_budget() {
 fn an_attachment_keeps_what_its_rounds_saw_retained() {
     let table = [7; 32];
     let attachment = Attachment::new(0);
-    attachment.observe(&BTreeMap::from([(table, 4)]), 1);
-    attachment.observe(&BTreeMap::from([(table, 0)]), 1);
-    attachment.observe(&BTreeMap::new(), 0);
+    attachment.observe(&BTreeMap::from([(table, 4)]), 1, false);
+    attachment.observe(&BTreeMap::from([(table, 0)]), 1, false);
+    attachment.observe(&BTreeMap::new(), 0, false);
     // Already held, so this returns at once: the detector never runs.
     attachment.wait_for(table, 4, "a held count stays held");
 }
@@ -1397,8 +1794,8 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
         ("m4", &att_j4),
         ("m5", &att_j5),
     ] {
-        let observed = att.wait_for_observation(table.digest(), 4);
-        if observed.get(&table.digest()).copied().unwrap_or(0) < 4 {
+        let observed = att.observe_until(table.digest(), 4, None);
+        if observed.held(&table.digest()) < 4 {
             let rounds = reports.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let peers = [&rt_j1, &rt_j2, &rt_j4, &rt_j5]
                 .map(|runtime| runtime.network_observation().snapshot());
@@ -2114,7 +2511,6 @@ fn the_owner_records_the_word_of_each_state_its_custody_refuses_in() {
         settle: Duration::from_millis(20),
         every: Duration::from_millis(100),
         busy: Duration::from_millis(50),
-        look: Duration::from_millis(10),
     };
     let owner = |paths: &Paths| {
         Runtime::start_on_with_reports(

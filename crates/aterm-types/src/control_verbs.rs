@@ -1868,11 +1868,13 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "image [path]: the client frame aterm drew, as a PNG (OK <w> <h> <path>)",
+        "image [view=<id>] [path]: a frame aterm drew, as a PNG (OK <w> <h> <path>)",
         "— a bare filename lands in the runtime `images/` dir; omitted, one is chosen. Captures \
          the last presented client frame (headless: the semantic renderer's), not what the OS \
          compositor showed. `@<sid>` captures the whole window showing that session, so edge \
          tokens are refused (`ERR denied`; use `image read`, `text` or `screen`). `image \
+         view=<id>` captures the shown navigator dock's own native view; `dims` names its id \
+         as `dock=`. A view and session cannot be combined. `image \
          --bytes` returns the PNG inline (`OK 1` then `<w> <h> <nbytes> <base64>`). `image \
          --meta` adds the frame's pixel fingerprint, phase, theme and per-leaf identity: `OK <w> \
          <h> image-meta image-meta-version=3 <key=value…> path=\"<path>\"` (with `--bytes`: `OK \
@@ -2249,17 +2251,14 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "login-notice [<code> [<label>]|disk [spent|inodes|off]|end|back]: harness login notices",
+        "login-notice [<code> [<label>]|end|back]: harness login notices",
         "— bare, lists `OK notices=<code>:<id>,…`, the Claude Code login, renewal, account and \
          usage-limit notices (`aterm help harness`); the other forms need a debug or \
          `dev-seams` build. `login-notice <code|id> [<label>]` \
          (label `main` by default) raises that notice on the first tab (`account-signed-out` and \
-         `renewal-wrong-account` update the accounts line). `login-notice disk \
-         [spent|inodes|off]` raises the disk-full alert (`spent`: after cache cleanup; \
-         `inodes`: inodes exhausted; `off`: `[disk] auto_free_gib = 0`). `login-notice end` \
-         withdraws the notices; `login-notice back` marks the login restored and closes its \
-         Settings ▸ Messages row. Replies `OK sid=<sid> notice=<id|disk-full|end|back>`, the \
-         first tab's session.",
+         `renewal-wrong-account` update the accounts line). `login-notice end` withdraws the \
+         notices; `login-notice back` marks the login restored and closes its Settings ▸ \
+         Messages row. Replies `OK sid=<sid> notice=<id|end|back>`, the first tab's session.",
     )
     .input(Input::NONE),
     v(
@@ -2738,7 +2737,7 @@ pub const VERBS: &[VerbSpec] = &[
          nudge=<idle|armed|short|restoring> nudged=<N>`, then `resize`, `run` and open/owed \
          `epoch` rows. `resize <id> t=<ms> run=<r> ord=<n> from=<CxR> to=<CxR> alt=<0|1> \
          sync=<0|1> trimmed=<k> demoted=<k> pushed=<k> revealed=<k> appended=<k> restored=<k> \
-         shift=<+-k> cut=<k> site=<input|window|chrome|deck|restore|term|pass|redraw|ctl-cross|-> at=<pct \
+         shift=<+-k> cut=<k> site=<input|window|chrome|deck|dock|restore|term|pass|redraw|ctl-cross|-> at=<pct \
          file:line|-> win=<CxR|-> chrome=<k|->`. `run <r> t=<ms> n=<k> alt=<0|1> \
          geom=<CxR>><CxR>>... net=<zero|changed> displaced=<+-k> \
          verdict=<none|silent|desync-risk|unverified|healed|reflow> first_out_ms=<ms|-> \
@@ -2794,7 +2793,17 @@ pub const VERBS: &[VerbSpec] = &[
          on macOS and Linux, Commons repair's counts in this process since it started, which no \
          `reset` clears (`commons_rounds_out= commons_rounds_in= commons_rounds_quiet= \
          commons_owner_ticks= commons_beacons= commons_announces= commons_signature_checks= \
-         commons_deadline_spawns=`). \
+         commons_deadline_spawns=`), and the accounts' upkeep's counts in this process since it \
+         started, which no `reset` clears either: its passes, whatever each came to (one that \
+         only renews logins and one the accounts' off switch ends are among them), the other \
+         CLIs' pool syncs it ran and those of them that reached their roster's publication \
+         holding a receipt guard (the lab is that CLI's source), the publications by any caller \
+         here that asked a receipt guard to admit them, and, on macOS and Linux, the registry reads those admissions made with the records and \
+         payload bytes they decoded, and the strict registry reads that were no admission (the \
+         lab view's read of the registry's mail metadata, which a sync's capture of its source \
+         can make) (`accounts_upkeep_passes= accounts_pool_syncs= accounts_pool_syncs_guarded= \
+         accounts_receipt_admissions= accounts_admission_reads= \
+         accounts_admission_records= accounts_admission_bytes= accounts_observation_reads=`). \
          `echo_*` is the child round trip; `input_*` is key to the next content present (or a \
          proven prediction, when `input_predicted=` > 0). Its start uses native arrival when \
          available, otherwise dispatch time. `key_queue` and `key_write` include only observed \
@@ -2858,9 +2867,10 @@ pub const VERBS: &[VerbSpec] = &[
          `exchange`, `managed`, `memory`, `reach`, `autopilot <mode>`) with `✓`, or `✗` where it \
          holds (`  guards: none judged` before a break); `OK 1` and `occupancy=<mode> unsaid` \
          where no loop told one. `occupancy check --replay <n>s|m|h|d` (at most 36h) re-runs the \
-         decider over the window's facts ring (`<state>/occupancy/facts.ring`, one row a minute, \
-         the newest 1440 kept) with this session's `fact-hold@v1` ledger rows: `replay from \
-         <HH:MM> to <HH:MM> looks=<n> holds=<n>`, then `<HH:MM> <rule> \
+         decider over the window's facts ring (`<state>/occupancy/facts.ring`, a row for each \
+         minute look that names a supervised session, the newest 1440 kept) with this \
+         session's `fact-hold@v1` ledger rows: `replay from <HH:MM> to <HH:MM> looks=<n> \
+         holds=<n>`, then `<HH:MM> <rule> \
          <would|held:<guard>|paced|spent>` at each change, then `<rule> first would \
          <HH:MM|never>` per rule.",
     ),
@@ -3075,8 +3085,8 @@ pub const VERBS: &[VerbSpec] = &[
          or one naming a harness lane on any connection, into an agent its host has not \
          confirmed (`status supervisor_act=observe`) is `ERR busy supervisor_act=observe`, \
          nothing written, unless the lane it names is one the harness's ruling exempts \
-         (`harness-lane=relaunch|upgrade|codex-alab|agy|muse`; `disk-resume` and `disk-free` are \
-         not); any other write, and one into no agent, passes it. \
+         (`harness-lane=relaunch|upgrade|codex-alab|agy|muse`; `disk-resume` is not); any other \
+         write, and one into no agent, passes it. \
          Refusal order: `ERR halted`, `ERR rate`, `ERR busy \
          turn=`, `ERR usage` (the options), `ERR busy supervisor_act=observe`, `ERR usage` \
          (the key name), `ERR busy input-unread bytes=<n> \
@@ -3507,7 +3517,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "open a tab app: `open app mail|about|settings|tables|navigator`",
+        "open a tab app: `open app mail|about|settings|tables|navigator [split|dock]`",
         concat!(
             "From a tab not in front of the person (another tab shows, or aterm is behind \
              another app) an open answers `ERR desk refused behind: …` and brings nothing up; \
@@ -3516,7 +3526,11 @@ pub const VERBS: &[VerbSpec] = &[
              opens setup; `open app markdown|editor <local-file-uri>` opens a document; \
              `open app navigator [split]` lists every live session of every window, in a \
              tab or as the active tab's left pane, and replies `app navigator split` where \
-             it split. \
+             it split. `open app navigator dock` shows that list as a 30-cell column inside \
+             the front window, as View > Show Navigator does (window chrome: the window keeps \
+             its size and its terminals give up the columns), and replies `app navigator \
+             dock`; a window too narrow to keep its least grid beside the column, or one with \
+             no area (minimized), answers `ERR navigator not shown: …` and changes nothing. \
              `open <target> [close]` opens or \
              closes a front-window surface (",
             open_targets!(),
@@ -3760,12 +3774,19 @@ pub const VERBS: &[VerbSpec] = &[
          `resting=true|false` (whether that window rests: untouched and showing no new output \
          for `idle_rest_secs`, so it runs no blink and its deck draws still), \
          `attended=true|false` (whether a person touched that window within the last 40 s; \
-         past that its deck draws still at each reading until the next touch), and \
+         past that its deck draws still at each reading until the next touch), \
          `sight=visible|covered|off-glass` (where that window's frames can be seen: `visible`, \
          some of it on screen; `covered`, fully covered, on another Space or on a sleeping \
          display, drawing at most a frame every 5 s; `off-glass`, minimised or its app hidden, \
          drawing none; a hidden window still draws a frame a capture, a recording or an \
-         assistive client waits on). \
+         assistive client waits on), \
+         `lane_term=fade|deco|pet|celebration|body|glow|cursor_fx|streak|static_cat|none` \
+         (what armed that window's pending effect-lane slot: `fade` the load-shed fade's \
+         decoration hold, `deco` another decoration's hold, `pet` the resident pet's next \
+         step, `cursor_fx` the trail, the flier, the pet's frame train, the word decorations \
+         or the cursor bodies, the others their engine; `none` with no slot armed) and \
+         `lane_fires=` (the slots that window's effect lane served since it opened, each asking \
+         one frame, counted by the term that armed it: `fade:N,deco:N,…` in that order). \
          `trail light` prints one row, the front window's light latch as its last frame left \
          it and its light read now: `trail-light window= on= scheme_changed= fell= session= \
          fg= bg= raw= live= light= window_light= front_session= front_scheme_light=` \
@@ -4129,8 +4150,10 @@ pub const VERBS: &[VerbSpec] = &[
          retained-from=<floor> off=<n>` below `oldest_on_bus=`/`bus_head=` retention, `ERR no such \
          record off=<n>`, `ERR timeout off=<n>` after 10 s, `ERR fabric <state> off=<n>`, `ERR \
          fetch failed reason=<why> off=<n>` (a malformed, refused or log-replaced answer, or \
-         `unsettled`: an own message the bridge may still send again, or an answer whose deadline \
-         is not yet off its disk, which a later fetch reads), or `ERR busy` past 8 parked reads).",
+         `unsettled`: an own message the bridge may still send again or a message behind one, or \
+         an answer whose deadline is not yet off its disk, which a later fetch reads), or `ERR \
+         busy` past 8 parked reads). A fetch can read a message before its row comes; the rows \
+         below it still come after it, in lane order.",
     )
     .forms(&[form(AtWord).lane(Wait)]),
     v(

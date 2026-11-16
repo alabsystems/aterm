@@ -245,6 +245,95 @@ fn a_derived_write_that_breaks_a_unique_set_or_a_reference_is_refused() {
     .expect("a write that leaves a clash sync made as it is is written");
 }
 
+/// The owner's word making a live row name a row that is not live is refused, as retiring a row a
+/// live row names is ([`retired_referenced`]), from the other side: a revival of a preference
+/// whose machine the owner retired (a grid edit of its `row` cell, a revert of an `unprefer`) is
+/// refused, names the preference, its `machine` column and the machine's key, says the machine
+/// is not live, quotes no value, and appends nothing. The same revival beside the machine's own
+/// revival is written. Only what a write makes is judged: a live preference that a concurrent
+/// write (here an unchecked one) left naming a retired machine takes a write of its `rank`.
+/// NEGATIVE CONTROL: with `refused` not calling `names_not_live`, the revival is written:
+/// `` reviving a preference onto a retired machine is refused: Applied { records: 1, cells: 1,
+/// .. } ``.
+#[cfg(unix)]
+#[test]
+fn an_owner_write_reviving_a_preference_onto_a_retired_machine_is_refused() {
+    use crate::alab::registry::PREFERENCE;
+    let lab = Lab::new(&[Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let account = "ac-0000000000000001";
+    let pf = keys::preference_pk(OTHER, account).unwrap();
+    let mut other = machine(OTHER);
+    other[0] = put(&MACHINE, OTHER, "label", json!("m8"));
+    let preference = |pk: &str, row: &str| {
+        vec![
+            put(&PREFERENCE, pk, "machine", json!(OTHER)),
+            put(&PREFERENCE, pk, "account", json!(account)),
+            put(&PREFERENCE, pk, "why", json!("owner")),
+            put(&PREFERENCE, pk, "row", json!(row)),
+        ]
+    };
+    owner
+        .write(vec![
+            machine(MC),
+            other,
+            vec![
+                put(&ACCOUNT, account, "provider", json!("anthropic")),
+                put(&ACCOUNT, account, "realm", json!("claude")),
+                put(&ACCOUNT, account, "row", json!("live")),
+            ],
+            preference(&pf, "ended"),
+            vec![put(&MACHINE, OTHER, "row", json!("retired"))],
+        ])
+        .unwrap();
+    let written = handle.history().unwrap().len();
+    let refusal = handle
+        .commit_owner(|_| Ok(((), vec![vec![put(&PREFERENCE, &pf, "row", json!("live"))]])))
+        .map(|((), applied)| applied)
+        .expect_err("reviving a preference onto a retired machine is refused")
+        .to_string();
+    assert_eq!(handle.history().unwrap().len(), written, "nothing written");
+    assert!(
+        refusal.contains(&format!(
+            "preference.machine: row {pf}: names machine row {OTHER}, which is not live"
+        )),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("m8"), "a refusal quotes no value");
+
+    // Made live with its machine, it is written.
+    handle
+        .commit_owner(|_| {
+            Ok((
+                (),
+                vec![
+                    vec![put(&MACHINE, OTHER, "row", json!("live"))],
+                    vec![put(&PREFERENCE, &pf, "row", json!("live"))],
+                ],
+            ))
+        })
+        .expect("a revival beside its machine's is written");
+
+    // A live preference left naming a retired machine takes a write that leaves the reference.
+    let stray = keys::preference_pk(MC, account).unwrap();
+    owner
+        .write(vec![
+            vec![
+                put(&PREFERENCE, &stray, "machine", json!(MC)),
+                put(&PREFERENCE, &stray, "account", json!(account)),
+                put(&PREFERENCE, &stray, "why", json!("owner")),
+                put(&PREFERENCE, &stray, "row", json!("live")),
+            ],
+            vec![put(&MACHINE, MC, "row", json!("retired"))],
+        ])
+        .unwrap();
+    handle
+        .commit_owner(|_| Ok(((), vec![vec![put(&PREFERENCE, &stray, "rank", json!(2))]])))
+        .expect("a write that leaves a reference a concurrent write made is written");
+}
+
 crate::att_collection!(
     /// A log collection naming accounts, for the rule over log rows (the registry holds none).
     SEEN = Collection {
@@ -353,5 +442,76 @@ fn a_write_that_moves_both_rows_of_a_clash_onto_a_new_shared_value_is_refused() 
         vec![vec![label("ac-1", "x")]],
     ] {
         assert_eq!(refused(&LOGGED, &leaves, &view, |_, _| false), None);
+    }
+}
+
+/// A machine and the CLIs its `clis` set names, for the rule over set members.
+#[cfg(unix)]
+const MACHINES: Table = Table {
+    application: "test",
+    role: "machines",
+    collections: &[&MACHINE, &crate::alab::registry::CLI],
+    faces: &[],
+    self_quota: 24,
+    ends: &[],
+};
+
+/// A write to a live row is judged only on the references it adds: one that restates a `clis`
+/// member, or a `merged_into` value, the row already holds naming a retired row (a revert that
+/// rewrites what is there, an owner's save of an unchanged cell) adds nothing and is not refused,
+/// as a write that leaves the column alone is not; a member it makes present or a value it puts
+/// in place of another naming a retired row is refused.
+/// NEGATIVE CONTROL: with `names_not_live` judging every present member and every value a write
+/// writes (`buf.retain` keeping what `had` holds), the restated member is refused: ``
+/// assertion `left == right` failed: restating what the row holds adds no reference left:
+/// Some(Refused { collection: "machine", pk: "mc-0000000000000009", column: "clis", rule: "names
+/// cli row claude, which is not live; point it at a live row, leave it empty, or make that row
+/// live first" }) right: None ``.
+#[cfg(unix)]
+#[test]
+fn a_write_restating_a_reference_a_live_row_holds_is_not_refused_for_it() {
+    use crate::{alab::registry::CLI, typed::grid::tests::elem};
+    let mut changes = machine(MC);
+    changes.extend([
+        put(&MACHINE, MC, "merged_into", json!(OTHER)),
+        put(&MACHINE, OTHER, "label", json!("m8")),
+        put(&MACHINE, OTHER, "row", json!("retired")),
+        put(&MACHINE, MISSING, "label", json!("m7")),
+        put(&MACHINE, MISSING, "row", json!("retired")),
+        put(&CLI, "claude", "row", json!("retired")),
+        put(&CLI, "codex", "row", json!("live")),
+        put(&CLI, "grok", "row", json!("retired")),
+    ]);
+    let cells = held(&changes);
+    for restates in [
+        vec![vec![elem(&MACHINE, MC, "clis", "claude")]],
+        vec![vec![put(&MACHINE, MC, "merged_into", json!(OTHER))]],
+        vec![vec![elem(&MACHINE, MC, "clis", "codex")]],
+    ] {
+        assert_eq!(
+            names_not_live(&MACHINES, &restates, &cells),
+            None,
+            "restating what the row holds adds no reference"
+        );
+    }
+    for (adds, column, target) in [
+        (elem(&MACHINE, MC, "clis", "grok"), "clis", "cli row grok"),
+        (
+            put(&MACHINE, MC, "merged_into", json!(MISSING)),
+            "merged_into",
+            "machine row mc-00000000000000ff",
+        ),
+    ] {
+        let found = names_not_live(&MACHINES, &[vec![adds]], &cells)
+            .expect("a reference a write adds to a retired row is refused");
+        assert_eq!((found.collection, found.pk.as_str()), (MACHINE.name, MC));
+        assert_eq!(found.column, column);
+        assert!(
+            found
+                .rule
+                .starts_with(&format!("names {target}, which is not live")),
+            "{}",
+            found.rule
+        );
     }
 }

@@ -1336,7 +1336,9 @@ impl App {
         if ws.overlay_open() || ws.tab_menu.is_some() || ws.selecting || ws.divider_drag.is_some() {
             return Some(PointerRoute::Front);
         }
-        let page_buttons = if self.active_native_view(wid).is_some() {
+        let page_buttons = if ws.native_button_owners.iter().any(Option::is_some)
+            || self.active_native_view(wid).is_some()
+        {
             ws.page_buttons
         } else {
             0
@@ -1901,21 +1903,51 @@ impl App {
     }
 
     pub(crate) fn settle_native_pointer_press(&mut self, wid: WindowId) {
-        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-            let ws = &mut **route_guard_ws;
+        let owners = self
+            .windows
+            .get(&wid)
+            .map_or([None; 5], |ws| ws.native_button_owners);
+        let drag = self.windows.get_mut(&wid).and_then(|mut ws| {
             ws.page_buttons = 0;
+            ws.native_button_owners = [None; 5];
+            let x = ws.last_cursor_px.0;
+            ws.native_drag.take().map(|drag| (drag, x))
+        });
+        let views = [
+            self.active_native_view(wid).map(|(_, view)| view),
+            self.dock_view(wid),
+            drag.as_ref().map(|(drag, _)| drag.view),
+        ]
+        .into_iter()
+        .chain(owners);
+        if let Some((drag, x)) = drag
+            && let Some(crate::tab_model::View::Native(native)) =
+                self.view_store.get(drag.view).copied()
+            && self.native_runtime.view_state(drag.view).is_some()
+        {
+            let value = drag.input(x, true);
+            let _ = self.dispatch_native_target_event(
+                wid,
+                native.instance,
+                drag.view,
+                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: drag.action,
+                    value: Some(value),
+                }),
+            );
         }
-        if let Some((_, view)) = self.active_native_view(wid)
-            && self
+        for view in views.flatten() {
+            if self
                 .native_runtime
                 .view_state(view)
                 .is_some_and(|state| state.common().pressed.is_some())
-        {
-            if let Some(mut state) = self.native_runtime.view_state_mut(view) {
-                state.common_mut().pressed = None;
+                && self
+                    .native_runtime
+                    .change_view_state(view, |state| state.common_mut().pressed.take().is_some())
+            {
+                self.invalidate_native_pointer_style(wid, view);
+                self.request_redraw_all_windows();
             }
-            self.invalidate_native_pointer_style(wid, view);
-            self.request_redraw_all_windows();
         }
     }
 
@@ -2445,16 +2477,15 @@ impl App {
         {
             return;
         }
-        let Some((_, view)) = self.active_native_view(wid) else {
-            return;
-        };
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return;
-        };
-        if self
-            .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
-            .is_none()
-        {
+        let native_needs_paint = self.active_native_view(wid).is_some_and(|(_, view)| {
+            self.active_visible_leaf_plan(wid).is_some_and(|plan| {
+                self.retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
+                    .is_none()
+            })
+        });
+        let dock_needs_paint =
+            self.dock_view(wid).is_some() && self.native_dock_artifact(wid, true, false).is_none();
+        if native_needs_paint || dock_needs_paint {
             self.redraw_capture_frame(wid, None);
         }
     }
@@ -2553,39 +2584,60 @@ impl App {
         wid: WindowId,
         target: &NativePointerTarget,
     ) -> Result<(f64, f64), String> {
-        let (_, view) = self
-            .active_native_view(wid)
-            .ok_or("the front tab is not a native view")?;
-        let artifact = self
-            .retained_native_pointer_artifact(wid, view)
-            .ok_or("no presented native frame to aim at")?;
-        let (x, y) = match target {
-            NativePointerTarget::Key(key) => {
-                let compiled = &artifact.compiled;
-                let shown = compiled
-                    .paint
-                    .iter()
-                    .find(|node| node.key.as_str() == key)
-                    .map(|node| node.clip)
-                    .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
-                    .ok_or_else(|| format!("{key} is not on the presented page"))?;
-                let rect = compiled
-                    .hits
-                    .iter()
-                    .find(|hit| hit.key.as_str() == key)
-                    .map_or(shown, |hit| hit.rect);
-                (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
-            }
-            NativePointerTarget::Point(x, y) => (*x, *y),
+        let active = self.active_native_view(wid).map(|(_, view)| view);
+        let dock = self.dock_view(wid);
+        let hosts = match target {
+            NativePointerTarget::Key(_) => [active, dock],
+            NativePointerTarget::Point(_, _) => [active.or(dock), None],
         };
-        let px = artifact.device_x as f64 + f64::from(x) * artifact.scale;
-        let py = artifact.device_y as f64 + f64::from(y) * artifact.scale;
-        if !(0.0..f64::from(artifact.width)).contains(&(px - artifact.device_x as f64))
-            || !(0.0..f64::from(artifact.height)).contains(&(py - artifact.device_y as f64))
-        {
-            return Err("the point is outside the native view".into());
+        if hosts.iter().all(Option::is_none) {
+            return Err("the front tab is not a native view".into());
         }
-        Ok((px, py))
+        let mut presented = false;
+        for view in hosts.into_iter().flatten() {
+            let artifact = if Some(view) == dock {
+                self.native_dock_artifact(wid, true, true)
+            } else {
+                self.retained_native_pointer_artifact(wid, view)
+            };
+            let Some(artifact) = artifact else { continue };
+            presented = true;
+            let (x, y) = match target {
+                NativePointerTarget::Key(key) => {
+                    let compiled = &artifact.compiled;
+                    let Some(shown) = compiled
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == key)
+                        .map(|node| node.clip)
+                        .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
+                    else {
+                        continue;
+                    };
+                    let rect = compiled
+                        .hits
+                        .iter()
+                        .find(|hit| hit.key.as_str() == key)
+                        .map_or(shown, |hit| hit.rect);
+                    (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+                }
+                NativePointerTarget::Point(x, y) => (*x, *y),
+            };
+            let px = artifact.device_x as f64 + f64::from(x) * artifact.scale;
+            let py = artifact.device_y as f64 + f64::from(y) * artifact.scale;
+            if !(0.0..f64::from(artifact.width)).contains(&(px - artifact.device_x as f64))
+                || !(0.0..f64::from(artifact.height)).contains(&(py - artifact.device_y as f64))
+            {
+                return Err("the point is outside the native view".into());
+            }
+            return Ok((px, py));
+        }
+        Err(match target {
+            NativePointerTarget::Key(key) if presented => {
+                format!("{key} is not on the presented page")
+            }
+            _ => "no presented native frame to aim at".into(),
+        })
     }
 
     /// The front window's pointer as a window pixel (rounded), or `None` when it holds no position.
@@ -2640,6 +2692,20 @@ impl App {
                 tab.root.visit(&mut update_if_native);
             }
         }
+        if let Some(target) = self.dock_view(wid) {
+            let desired = hit
+                .as_ref()
+                .filter(|(view, _)| *view == target)
+                .map(|(_, key)| key.clone());
+            if self.native_runtime.change_view_state(target, |state| {
+                let common = state.common_mut();
+                let changed = common.hovered != desired;
+                common.hovered = desired;
+                changed
+            }) {
+                hover_changed.push(target);
+            }
+        }
         for target in hover_changed {
             self.invalidate_native_pointer_style(wid, target);
             self.request_redraw_all_windows();
@@ -2667,6 +2733,10 @@ impl App {
         self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)
             .and_then(|(artifact, local_x, local_y)| {
                 let hit = artifact.compiled.hit_test(local_x, local_y)?.clone();
+                // A surface's own ground is no control: the pointer over it lights nothing.
+                if artifact.compiled.is_surface(&hit.key) {
+                    return None;
+                }
                 let is_text = artifact
                     .compiled
                     .semantic(&hit.key)
@@ -2688,7 +2758,7 @@ impl App {
     /// A PAGE A WHEEL OR A PRESS MOVED IS HOVERED WHERE THE POINTER IS ON THE FRAME IT LEFT.
     #[cfg(test)]
     pub(crate) fn refresh_native_hover_for_frame(&mut self, wid: WindowId) {
-        if self.active_native_view(wid).is_none()
+        if (self.active_native_view(wid).is_none() && self.dock_view(wid).is_none())
             || !self
                 .windows
                 .get(&wid)
@@ -2707,7 +2777,11 @@ impl App {
         wid: WindowId,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) {
-        let Some((_, front)) = self.active_native_view(wid) else {
+        let dock = self.dock_pointer_target(wid, Some(plan));
+        let Some(front) = dock.or_else(|| self.active_native_view(wid).map(|(_, view)| view))
+        else {
+            // A frame placed anew under a still pointer can leave a lit dock row behind it.
+            self.clear_dock_hover(wid);
             return;
         };
         let Some(ws) = self.windows.get(&wid) else {
@@ -2721,6 +2795,19 @@ impl App {
             .retained_native_pointer_artifact_from_plan(wid, front, plan)
             .is_none()
         {
+            return;
+        }
+        if let Some(dock) = dock {
+            let hit = self.dock_hover_hit(wid, dock, x, y);
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
+                ws.native_rehover = false;
+            }
+            self.apply_native_hover(
+                wid,
+                hit.as_ref().map(|(view, _, key, ..)| (*view, key.clone())),
+            );
+            self.set_dock_hover_cursor(wid, hit.is_some());
             return;
         }
         let geom = self.pointer_geometry(wid);
@@ -2934,6 +3021,106 @@ impl App {
         if let Some(mut ws) = self.windows.get_mut(&wid) {
             ws.pointer_position_known = known;
             ws.inset_hover_cleared = true;
+        }
+    }
+
+    /// The dock's own pointer motion. The dock is window chrome beside the frame: the motion
+    /// lights only the dock's rows and sets the pointer's shape from them, and reaches no pane,
+    /// banner, divider or scrollbar of the frame (those lie in the frame, and their hit tests
+    /// clamp a pointer left of it onto the frame's first column).
+    fn dock_pointer_motion(
+        &mut self,
+        wid: WindowId,
+        dock: crate::tab_model::ViewId,
+        x: f64,
+        y: f64,
+    ) {
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            // The dock lies inside the inset: the next move into the rest of the inset retires
+            // the dock's hover again.
+            ws.inset_hover_cleared = false;
+        }
+        self.scrollbar_pointer_left(wid);
+        if let Some(drag) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.native_drag.clone())
+            .filter(|drag| drag.view == dock)
+        {
+            let _ = self.dispatch_native_view_event(
+                wid,
+                dock,
+                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                    value: Some(drag.input(x, false)),
+                    id: drag.action,
+                }),
+            );
+            self.set_hover_cursor(wid, CursorIcon::ColResize, true, true);
+            return;
+        }
+        let hit = self.dock_hover_hit(wid, dock, x, y);
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            ws.native_rest = NativePointerRest::after_motion(
+                ws.native_rest.take(),
+                (x, y),
+                hit.as_ref()
+                    .map(|(view, _, key, _, asks, _)| (*view, key, *asks)),
+            );
+        }
+        self.apply_native_hover(
+            wid,
+            hit.as_ref().map(|(view, _, key, ..)| (*view, key.clone())),
+        );
+        self.set_dock_hover_cursor(wid, hit.is_some());
+    }
+
+    /// The dock control under window pixel `(x, y)` on the dock's presented frame. While the
+    /// dock holds a button the pointer may roam the frame; nothing there lights for the dock.
+    fn dock_hover_hit(
+        &self,
+        wid: WindowId,
+        dock: crate::tab_model::ViewId,
+        x: f64,
+        y: f64,
+    ) -> Option<(
+        crate::tab_model::ViewId,
+        u64,
+        crate::native_ui::UiKey,
+        bool,
+        bool,
+        bool,
+    )> {
+        self.native_hover_hit(wid, x, y, self.stats_owns_pointer(wid), None)
+            .filter(|(view, ..)| *view == dock)
+    }
+
+    /// The pointer's shape over the dock: the hand over a control a press acts on, else the
+    /// arrow. Never the terminal's I-beam or a divider's arrows, which belong to the frame.
+    fn set_dock_hover_cursor(&mut self, wid: WindowId, over_control: bool) {
+        if over_control {
+            self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+        } else {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+        }
+    }
+
+    /// Retire the dock's hover where the pointer is not on it. Only the dock's own view is
+    /// touched; nothing happens while the dock is hidden or unlit.
+    fn clear_dock_hover(&mut self, wid: WindowId) {
+        let Some(dock) = self.dock_view(wid) else {
+            return;
+        };
+        if self
+            .native_runtime
+            .view_state(dock)
+            .is_some_and(|state| state.common().hovered.is_some())
+            && self
+                .native_runtime
+                .change_view_state(dock, |state| state.common_mut().hovered.take().is_some())
+        {
+            self.invalidate_native_pointer_style(wid, dock);
+            self.request_redraw_all_windows();
         }
     }
 
@@ -3342,7 +3529,7 @@ impl App {
     /// The pointer left the window.
     pub(crate) fn on_cursor_left(&mut self, wid: WindowId) {
         self.apply_native_hover(wid, None);
-        let native_front = self.active_native_view(wid).is_some();
+        let native_front = self.active_native_view(wid).is_some() || self.dock_view(wid).is_some();
         if native_front && let Some(mut ws) = self.windows.get_mut(&wid) {
             ws.hover_pointer = false;
             ws.native_text_cursor = false;
@@ -3654,6 +3841,13 @@ impl App {
         let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
             return Resolved(None);
         };
+        if let Some(dock) = self.dock_pointer_target(wid, frame_plan) {
+            // A dock shown, or a frame moved, under a still pointer: the dock's shape, not the
+            // terminal's I-beam it may have left there.
+            let over_control = self.dock_hover_hit(wid, dock, px, py).is_some();
+            self.set_dock_hover_cursor(wid, over_control);
+            return Resolved(None);
+        }
         if self.in_side_inset(wid, px) && !self.pointer_gesture_live(wid) {
             self.clear_side_inset_hover(wid);
             return Resolved(None);
@@ -4442,7 +4636,10 @@ impl App {
             }
             return;
         }
-        if self.in_side_inset(wid, x) && !self.pointer_gesture_live(wid) {
+        if self.in_side_inset(wid, x)
+            && !self.pointer_gesture_live(wid)
+            && self.dock_under_pointer(wid).is_none()
+        {
             self.clear_side_inset_hover(wid);
             return;
         }
@@ -4503,6 +4700,11 @@ impl App {
             || self.active_native_view(wid).is_some())
         .then(|| self.active_visible_leaf_plan(wid))
         .flatten();
+        if let Some(dock) = self.dock_pointer_target(wid, motion_plan.as_ref()) {
+            self.dock_pointer_motion(wid, dock, x, y);
+            return;
+        }
+        self.clear_dock_hover(wid);
         if self.markdown_workspace_pointer(wid, x, y, motion_plan.as_ref(), false) {
             return;
         }
@@ -5541,7 +5743,30 @@ impl App {
         button: WinitMouseButton,
         at: Instant,
     ) -> Option<crate::tab_model::ViewId> {
+        let released_native = if state == ElementState::Released && button == WinitMouseButton::Left
+        {
+            let slot = usize::from(aterm_types::mouse::MouseButton::Left.slot());
+            self.windows
+                .get(&wid)
+                .and_then(|ws| ws.native_button_owners[slot])
+        } else {
+            None
+        };
         let target = self.route_mouse_input(wid, state, button, at);
+        // A modal or chrome claim can return before the native reducer. Retire any remaining
+        // left press while its owner is still known, after normal routing had its one chance to act.
+        if let Some(view) = released_native
+            && self
+                .native_runtime
+                .view_state(view)
+                .is_some_and(|state| state.common().pressed.is_some())
+            && self
+                .native_runtime
+                .change_view_state(view, |state| state.common_mut().pressed.take().is_some())
+        {
+            self.invalidate_native_pointer_style(wid, view);
+            self.request_redraw_all_windows();
+        }
         if state == ElementState::Released
             && let Some(button) = winit_mouse_button(button)
         {
@@ -5549,6 +5774,7 @@ impl App {
             if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                 let ws = &mut **route_guard_ws;
                 ws.page_buttons &= !(1 << button.slot());
+                ws.native_button_owners[usize::from(button.slot())] = None;
             }
         }
         target
@@ -5602,7 +5828,17 @@ impl App {
         wid: WindowId,
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<crate::tab_model::ViewId> {
-        let focused = || self.active_native_view(wid).map(|(_, view)| view);
+        let ws = self.windows.get(&wid)?;
+        // A held button stays with the view that took it (the dock, or the page focused at the
+        // press), unless a selection, a divider drag or a modal layer owns the pointer.
+        let held_owner = (!(ws.selecting
+            || ws.divider_drag.is_some()
+            || ws.overlay_open()
+            || ws.tab_menu.is_some()))
+        .then(|| held_button(ws.reported_buttons | ws.page_buttons))
+        .flatten()
+        .and_then(|button| ws.native_button_owners[usize::from(button.slot())]);
+        let focused = || held_owner.or_else(|| self.active_native_view(wid).map(|(_, view)| view));
         if let Some(route) = self.pointer_capture_route_with_plan(wid, frame_plan) {
             return match route {
                 PointerRoute::Front => focused(),
@@ -5612,12 +5848,41 @@ impl App {
         self.native_view_under_pointer(wid, frame_plan)
     }
 
+    /// The dock's view where it is this pointer's target: the free pointer lies on its column, or
+    /// it holds the pointer's button. `None` whenever the dock is hidden, so every other pointer
+    /// takes the routes it takes with no dock.
+    fn dock_pointer_target(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<crate::tab_model::ViewId> {
+        let dock = self.dock_view(wid)?;
+        (self.native_pointer_view(wid, frame_plan) == Some(dock)).then_some(dock)
+    }
+
+    /// The dock's view where the window's known pointer lies on its column, whatever is held.
+    fn dock_under_pointer(&self, wid: WindowId) -> Option<crate::tab_model::ViewId> {
+        let view = self.dock_view(wid)?;
+        let host = self.dock_geometry(wid)?;
+        let window = self.windows.get(&wid)?;
+        let (x, y) = window.last_cursor_px;
+        (window.pointer_position_known
+            && x >= host.origin.0 as f64
+            && y >= host.origin.1 as f64
+            && x < host.origin.0 as f64 + f64::from(host.size.0)
+            && y < host.origin.1 as f64 + f64::from(host.size.1))
+        .then_some(view)
+    }
+
     /// The free body hit, used when a new press overrides an older hold.
     fn native_view_under_pointer(
         &self,
         wid: WindowId,
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<crate::tab_model::ViewId> {
+        if let Some(view) = self.dock_under_pointer(wid) {
+            return Some(view);
+        }
         if !self.active_tab_contains_native(wid) {
             return None;
         }
@@ -5673,6 +5938,11 @@ impl App {
             self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)?;
         if artifact.view != view {
             return None;
+        }
+        // A surface laid over the page (a list a button opens) takes the wheel over it: the
+        // least node under the pointer there can be a cell of the page under it.
+        if let Some(key) = artifact.compiled.surface_target(local_x, local_y) {
+            return Some(key.clone());
         }
         artifact
             .compiled
@@ -5828,6 +6098,7 @@ impl App {
                 .windows
                 .get(&wid)
                 .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
+            && self.dock_under_pointer(wid).is_none()
         {
             return None;
         }
@@ -5905,6 +6176,20 @@ impl App {
         let native_body_press = page_press
             .then(|| self.native_view_under_pointer(wid, input_plan.as_ref()))
             .flatten();
+        // The dock is window chrome beside the frame. A press on its column, and the release of a
+        // button it took, are the dock's alone; every other event takes the routes below exactly
+        // as it does with the dock hidden.
+        let dock_event = self.dock_view(wid).filter(|&dock| {
+            if pressed {
+                native_body_press == Some(dock)
+            } else {
+                winit_mouse_button(button).is_some_and(|button| {
+                    self.windows.get(&wid).is_some_and(|ws| {
+                        ws.native_button_owners[usize::from(button.slot())] == Some(dock)
+                    })
+                })
+            }
+        });
         let mut native_press = if !page_press {
             None
         } else if let Some(route) = self.pointer_capture_route_with_plan(wid, input_plan.as_ref()) {
@@ -5918,6 +6203,7 @@ impl App {
         let mut canonical_press_routed = false;
         if pressed
             && button == WinitMouseButton::Left
+            && dock_event.is_none()
             && let Some(plan) = input_plan.as_ref()
             && self.visible_content_route_from_plan(plan)
                 == Some(crate::VisibleContentRoute::Heterogeneous)
@@ -5955,7 +6241,8 @@ impl App {
                 return native_body_press;
             }
         }
-        let terminal_beside = self.active_native_view(wid).is_some()
+        let terminal_beside = dock_event.is_none()
+            && self.active_native_view(wid).is_some()
             && if pressed {
                 self.press_lands_on_a_terminal_pane(wid, input_plan.as_ref())
             } else {
@@ -5973,21 +6260,26 @@ impl App {
                     })
                 })
             };
-        if self.active_native_view(wid).is_some() && !terminal_beside {
+        if dock_event.is_some() || (self.active_native_view(wid).is_some() && !terminal_beside) {
             // The native handler takes this body press directly, including a
             // new left press while an older terminal button remains held.
-            native_press = native_body_press;
+            native_press = dock_event.or(native_body_press);
             // A press on this page, including a body miss, owns its drag and
             // wheel until release. An ignored press on a native sibling must
-            // not grant capture to the focused page.
+            // not grant capture to the focused page. A press on the dock owns
+            // its button by name, whatever page is in front.
             if pressed
-                && self
-                    .active_native_view(wid)
-                    .is_some_and(|(_, view)| native_press == Some(view))
+                && let Some(owner) = native_press.filter(|&view| {
+                    dock_event == Some(view)
+                        || self
+                            .active_native_view(wid)
+                            .is_some_and(|(_, active)| active == view)
+                })
                 && let Some(button) = winit_mouse_button(button)
                 && let Some(mut ws) = self.windows.get_mut(&wid)
             {
                 ws.page_buttons |= 1 << button.slot();
+                ws.native_button_owners[usize::from(button.slot())] = Some(owner);
             }
             let (px, py) = self
                 .windows
@@ -6001,7 +6293,9 @@ impl App {
                     }
                     return native_press;
                 }
-                let Some((_, view)) = self.active_native_view(wid) else {
+                let Some(view) =
+                    dock_event.or_else(|| self.active_native_view(wid).map(|(_, view)| view))
+                else {
                     return native_press;
                 };
                 if let Some(drag) = self
@@ -6036,9 +6330,16 @@ impl App {
                     .native_runtime
                     .view_state(view)
                     .and_then(|state| state.common().pressed.clone());
-                let release = (self.band_banner_at(wid, px, py).is_none()
-                    && self.find_bar_cell_at(wid, px, py).is_none()
-                    && !self.stats_owns_pointer(wid))
+                // The dock lies beside the frame, never under its banner or find bar, and a dock
+                // press released after the pointer left the window ends where it was last known.
+                let release = (if dock_event.is_some() {
+                    self.windows
+                        .get(&wid)
+                        .is_some_and(|ws| ws.pointer_position_known)
+                } else {
+                    self.band_banner_at(wid, px, py).is_none()
+                        && self.find_bar_cell_at(wid, px, py).is_none()
+                } && !self.stats_owns_pointer(wid))
                 .then(|| {
                     self.retained_native_leaf_at_pointer_from_plan(wid, px, py, input_plan.as_ref())
                 })
@@ -6083,9 +6384,8 @@ impl App {
                 if let (Some(armed), Some((release_view, generation, release, value))) =
                     (armed, release)
                     && armed == release.key
-                    && self
-                        .active_native_view(wid)
-                        .is_some_and(|(_, live)| live == release_view)
+                    && dock_event.or_else(|| self.active_native_view(wid).map(|(_, live)| live))
+                        == Some(release_view)
                     && self.native_runtime.view_generation(release_view) == Some(generation)
                 {
                     // WHAT IS LIT IS WHAT A PRESS HITS: the action may move the page under the
@@ -6108,32 +6408,41 @@ impl App {
                 return native_press;
             }
             if pressed && button == WinitMouseButton::Left {
-                if let Some(col) = self.strip_col_at(wid, px, py) {
+                // The strip, a paste or close question, the find bar, a Markdown workspace and an
+                // editor's text all lie in the frame; a press on the dock beside it is the dock's.
+                let in_frame = dock_event.is_none();
+                if in_frame && let Some(col) = self.strip_col_at(wid, px, py) {
                     self.handle_tab_strip_click(wid, col, at);
                     return None;
                 }
-                if self.press_banner_at(wid, px, py) {
+                if in_frame && self.press_banner_at(wid, px, py) {
                     return None;
                 }
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
                 }
-                if let Some((row, col)) = self.find_bar_cell_at(wid, px, py)
+                if in_frame
+                    && let Some((row, col)) = self.find_bar_cell_at(wid, px, py)
                     && self.find_bar_click_at(wid, row, col, Some(px))
                 {
                     return None;
                 }
                 let press_plan = input_plan.as_ref();
-                if self.markdown_workspace_pointer(wid, px, py, press_plan, true) {
+                if in_frame && self.markdown_workspace_pointer(wid, px, py, press_plan, true) {
                     return native_press;
                 }
-                let editor_target = self.native_editor_pointer_target(wid, px, py, press_plan);
-                let grid_target = self.native_editor_grid_target(wid, px, py, press_plan);
+                let editor_target = in_frame
+                    .then(|| self.native_editor_pointer_target(wid, px, py, press_plan))
+                    .flatten();
+                let grid_target = in_frame
+                    .then(|| self.native_editor_grid_target(wid, px, py, press_plan))
+                    .flatten();
                 let press = self
                     .retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan)
                     .and_then(|(artifact, x, y)| {
-                        let (_, active_view) = self.active_native_view(wid)?;
+                        let active_view = dock_event
+                            .or_else(|| self.active_native_view(wid).map(|(_, view)| view))?;
                         if artifact.view != active_view
                             || self.native_runtime.view_generation(artifact.view)
                                 != Some(artifact.generation)
@@ -6157,7 +6466,8 @@ impl App {
                 let picture = if press.is_none() {
                     self.retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan)
                         .and_then(|(artifact, x, y)| {
-                            let (_, active_view) = self.active_native_view(wid)?;
+                            let active_view = dock_event
+                                .or_else(|| self.active_native_view(wid).map(|(_, view)| view))?;
                             (artifact.view == active_view
                                 && self.native_runtime.view_generation(artifact.view)
                                     == Some(artifact.generation))
@@ -6277,7 +6587,8 @@ impl App {
                         }
                         None => {}
                     }
-                } else if let Some((_, view)) = self.active_native_view(wid)
+                } else if let Some(view) =
+                    dock_event.or_else(|| self.active_native_view(wid).map(|(_, view)| view))
                     && self
                         .native_runtime
                         .view_state_mut(view)
@@ -6319,6 +6630,9 @@ impl App {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
+                }
+                if dock_event.is_some() {
+                    return native_press;
                 }
                 if self.band_banner_at(wid, px, py).is_some()
                     || self.find_bar_cell_at(wid, px, py).is_some()
@@ -6829,6 +7143,7 @@ impl App {
                 .windows
                 .get(&wid)
                 .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
+            && self.dock_under_pointer(wid).is_none()
         {
             return;
         }

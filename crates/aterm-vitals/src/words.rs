@@ -1011,17 +1011,7 @@ fn scope_cell(res: Resource, fig: &ScopeFig, starts: bool) -> ScopeCell {
         return words2("–");
     };
     let forms = match res {
-        Resource::Cpu => vec![format!(
-            "{} cores",
-            fixed(
-                if fig.unread > 0 {
-                    (v * 10.0).floor() / 10.0
-                } else {
-                    v
-                },
-                1
-            )
-        )],
+        Resource::Cpu => vec![format!("{} reported cores", fixed(v, 1))],
         Resource::Memory => {
             let g = v / GIB;
             vec![format!("{} GiB", fixed(g, if g < 0.995 { 2 } else { 1 }))]
@@ -1048,7 +1038,7 @@ fn scope_cell(res: Resource, fig: &ScopeFig, starts: bool) -> ScopeCell {
         Resource::Gpu => return words2("not per app"),
     };
     ScopeCell {
-        forms: if fig.unread > 0 {
+        forms: if fig.unread > 0 && res != Resource::Cpu {
             forms.into_iter().map(|text| format!("≥{text}")).collect()
         } else {
             forms
@@ -1057,18 +1047,17 @@ fn scope_cell(res: Resource, fig: &ScopeFig, starts: bool) -> ScopeCell {
     }
 }
 
-/// A separately retained kernel CPU charge when it cannot be identified with actual CPU.
+/// An inherited counter estimate kept apart from independently observed counter growth.
 #[must_use]
 pub fn cpu_charge_words(fig: &ScopeFig) -> Option<String> {
     let charge = fig.cpu_charge?;
-    let actual = fig.now?;
+    let reported = fig.now?;
     let charge = fixed(charge, 2);
-    (charge != fixed(actual, 2)).then(|| format!("counter charge {charge} cores"))
+    (charge != fixed(reported, 2)).then(|| format!("counter charge {charge} cores"))
 }
 
-/// Why a CPU charge is kept apart from proved actual CPU.
-pub const CPU_CHARGE_NOTE: &str =
-    "Child counter estimates can repeat or miss CPU time; confirmed CPU is shown separately.";
+/// The temporal limit of published CPU counters and inherited estimates.
+pub const CPU_CHARGE_NOTE: &str = "CPU updates can arrive late. Reported rates do not measure exact execution within the read span. Child counter estimates can repeat or miss time.";
 
 fn writes_forms(bytes_per_s: f64) -> Vec<String> {
     let mb = bytes_per_s / 1e6;
@@ -1516,11 +1505,13 @@ fn busiest(snap: &Snapshot) -> Option<Clause> {
         Clause::new(
             1,
             vec![
-                format!("busiest {name}{times}{place}, {c} cores"),
+                format!("largest reported CPU: {name}{times}{place}, {c} cores"),
                 format!("{name}{times}{place}"),
             ],
         )
-        .said(format!("Busiest {name}{many}{place}, {c} cores.")),
+        .said(format!(
+            "Largest reported CPU: {name}{many}{place}, {c} cores."
+        )),
     )
 }
 
@@ -2279,7 +2270,7 @@ fn scope_sentences(
                 out.push(format!("{who} {charge}."));
             }
         }
-        if cpu_charge_words(&view.aterm).is_some() || cpu_charge_words(&view.tab).is_some() {
+        if view.aterm.now.is_some() || view.tab.now.is_some() {
             out.push(CPU_CHARGE_NOTE.into());
         }
     }

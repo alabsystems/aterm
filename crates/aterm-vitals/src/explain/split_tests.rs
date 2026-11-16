@@ -39,17 +39,42 @@ fn parts(tab: i64, aterm_rest: i64, others: i64, services: i64, unaccounted: i64
 }
 
 #[test]
-fn independently_proved_cpu_is_never_clamped_to_a_smaller_reconciled_charge() {
+fn reported_cpu_is_never_clamped_to_a_smaller_reconciled_charge() {
     let split = CoalSplit {
         tabs: vec![(1, 100)],
-        tab_floors: vec![(1, 300)],
+        tab_reported: vec![(1, 300)],
         own_mc: 20,
-        own_floor_mc: 40,
+        own_reported_mc: 40,
         ..CoalSplit::default()
     };
     assert_eq!(split.tab_charge_of(&[1]), 100);
-    assert_eq!(split.tab_actual_of(&[1]), 300);
-    assert_eq!(split.own_actual(), 40);
+    assert_eq!(split.tab_reported_of(&[1]), 300);
+    assert_eq!(split.own_reported(), 40);
+}
+
+#[test]
+fn reported_cpu_complete_coverage_does_not_turn_channels_into_window_bounds() {
+    for ownership_incomplete in [false, true] {
+        let split = CoalSplit {
+            coverage_complete: !ownership_incomplete,
+            ownership_incomplete,
+            global_mc: 1,
+            aterm_mc: 1,
+            own_mc: 20,
+            own_reported_mc: 10,
+            tabs: vec![(1, 30)],
+            tab_reported: vec![(1, 5)],
+            ..CoalSplit::default()
+        };
+        assert_eq!(split.tab_reported_of(&[1]), 5);
+        assert_eq!(split.own_reported(), 10);
+        assert_eq!(split.tab_charge_of(&[1]), 30);
+        assert_eq!(split.aterm_mc, 1);
+        assert_eq!(
+            split.cpu_accounting.execution_window,
+            crate::published_cpu::CpuExecutionWindow::Unavailable
+        );
+    }
 }
 
 #[test]
@@ -94,7 +119,10 @@ fn an_app_cli_in_another_terminals_coalition_never_claims_its_foreign_work() {
             (foreign.part, foreign.ownership_mixed, foreign.cpu_mc),
             (Part::Others, true, 850)
         );
-        assert_eq!((foreign.delegated_mc, foreign.outside_floor_mc), (50, 800));
+        assert_eq!(
+            (foreign.delegated_mc, foreign.outside_reported_mc),
+            (50, 800)
+        );
         assert_eq!(facts.split.aterm_mc + facts.split.delegated_mc, 450);
         assert_eq!(facts.split.others_mc, 1530);
         assert!(
@@ -171,7 +199,7 @@ fn the_1032_window_splits_into_its_five_parts() {
     );
     assert_eq!(f.lane, CoalLane::On);
     assert_eq!(
-        (f.split.via, f.split.exact),
+        (f.split.via, f.split.coverage_complete),
         (Via::Coalitions, false),
         "the kernel refused one listed coalition"
     );
@@ -238,14 +266,17 @@ fn an_unread_listed_coalition_prevents_an_exact_split() {
     };
     let full = facts(&whole);
     assert!(
-        full.split.exact,
+        full.split.coverage_complete,
         "every listed coalition answered both reads"
     );
     let missing = facts(&Scene {
         unanswered: 1,
         ..whole
     });
-    assert!(!missing.split.exact, "a refused usage row has unknown CPU");
+    assert!(
+        !missing.split.coverage_complete,
+        "a refused usage row has unknown CPU"
+    );
     assert_eq!(
         missing.split.rows, full.split.rows,
         "refusal cannot invent a zero owner"
@@ -317,7 +348,10 @@ fn a_coalition_made_or_reaped_inside_the_window() {
     assert_eq!((made.cpu_mc, made.measured), (300, true));
     assert!(f.split.rows.iter().all(|r| r.id != 80_000));
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 1030, 2170, 250));
-    assert!(!f.split.exact, "the kernel refused one listed coalition");
+    assert!(
+        !f.split.coverage_complete,
+        "the kernel refused one listed coalition"
+    );
 
     let mut behind = spotlight_1032();
     behind.busy_mc -= 50;
@@ -636,7 +670,7 @@ fn a_member_outside_aterm_a_job_let_go_stays_out_of_the_tab() {
 
 /// A job's member that exits inside the window took its work there out of every figure of the
 /// tab (the job's reads members alive at both ends), so the window is marked short of the tab's
-/// work, never read as exact.
+/// work, never read as coverage_complete.
 #[test]
 fn a_jobs_member_gone_inside_the_window_marks_it_short() {
     let mut scene = delegated_1032(500, 100);
@@ -683,7 +717,10 @@ fn with_the_lane_off_the_split_is_the_built_one_by_subtraction() {
         assert_eq!(f.window_ns, 1_000_000_000, "the sweep's window");
         let mc = |cores: f32| (f64::from(cores) * 1000.0).round() as i64;
         let s = &f.split;
-        assert_eq!((s.via, s.exact, s.listed), (Via::Subtraction, false, 0));
+        assert_eq!(
+            (s.via, s.coverage_complete, s.listed),
+            (Via::Subtraction, false, 0)
+        );
         assert_eq!(
             (s.global_mc, s.aterm_mc, s.others_mc),
             (mc(built.global), mc(built.aterm), mc(built.others),)
@@ -825,7 +862,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
         drop_327.split.parts(Some(1)),
         parts(200, 200, 730, 1710, 460)
     );
-    assert!(!drop_327.split.exact);
+    assert!(!drop_327.split.coverage_complete);
 
     let drop_newest = facts_edited(&spotlight_1032(), |base, _| {
         if let Some(c) = base.coalitions.as_mut() {
@@ -843,7 +880,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
         drop_newest.split.parts(Some(1)),
         parts(200, 200, 730, 2170, 0)
     );
-    assert!(!drop_newest.split.exact);
+    assert!(!drop_newest.split.coverage_complete);
     let drop_all = facts_edited(&spotlight_1032(), |base, _| {
         if let Some(c) = base.coalitions.as_mut() {
             c.rows.clear();
@@ -851,7 +888,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     });
     assert!(drop_all.split.rows.iter().all(|r| !r.measured));
     assert_eq!(drop_all.split.parts(Some(1)), parts(200, 200, 0, 0, 2900));
-    assert!(!drop_all.split.exact);
+    assert!(!drop_all.split.coverage_complete);
 
     let went_back = facts_edited(&spotlight_1032(), |base, now| {
         let before = base.coalitions.as_ref().expect("a split tick");
@@ -870,7 +907,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
         went_back.split.parts(Some(1)),
         parts(200, 200, 730, 880, 1290)
     );
-    assert!(!went_back.split.exact);
+    assert!(!went_back.split.coverage_complete);
 
     let short = facts_edited(&reaped_1032(), |base, _| {
         if let Some(c) = base.coalitions.as_mut() {
@@ -880,7 +917,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     let made = row(&short, 90_000);
     assert_eq!((made.cpu_mc, made.measured), (0, false));
     assert_eq!(short.split.parts(Some(1)), parts(200, 200, 730, 2170, 550));
-    assert!(!short.split.exact);
+    assert!(!short.split.coverage_complete);
 
     let edits: [fn(&mut Sample, &mut Sample); 2] = [
         |_, now| {
@@ -893,7 +930,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     for edit in edits {
         let f = facts_edited(&spotlight_1032(), edit);
         assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2170, 0));
-        assert!(!f.split.exact);
+        assert!(!f.split.coverage_complete);
     }
 }
 

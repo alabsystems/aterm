@@ -1001,17 +1001,17 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
                 .with_role(Role::AutoResume)
                 .map(|o| o.label.clone())
                 .unwrap_or_default();
-            v2.description = prose_of(body, cur);
+            v2.description = prose_of(body, cur, opens_path);
             v1.command.clone_from(&v2.command);
             v1.description.clone_from(&v2.description);
         }
         PromptKind::ModelSwitch => {
-            v2.description = prose_of(body, cur);
+            v2.description = prose_of(body, cur, opens_path);
             v1.description.clone_from(&v2.description);
         }
         PromptKind::Trust => {
             v2.path = trust_path(body);
-            v2.description = prose_of(body, cur);
+            v2.description = prose_of(body, cur, opens_folder);
             v2.command = v2.path.clone().unwrap_or_default();
             v1.command.clone_from(&v2.command);
             v1.description.clone_from(&v2.description);
@@ -1021,7 +1021,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
                 .strip_prefix(const { crate::anchor!("mcp.title") })
                 .map(|name| crate::text::trim(name).to_string())
                 .unwrap_or_default();
-            v2.description = prose_of(body, cur);
+            v2.description = prose_of(body, cur, opens_path);
             v1.command.clone_from(&v2.command);
             v1.description.clone_from(&v2.description);
         }
@@ -1055,7 +1055,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         }
         k if k.is_subject() => {
             v2.command = subject_of(kind, title, body);
-            v2.description = prose_of(body, cur);
+            v2.description = prose_of(body, cur, opens_path);
             v1.command.clone_from(&v2.command);
             v1.description.clone_from(&v2.description);
         }
@@ -1065,7 +1065,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
             v1.description = rows[start..end].join("\n");
             v2.description = match read_question {
                 Some(Some(text)) => text,
-                _ => prose_of(body, cur),
+                _ => prose_of(body, cur, opens_path),
             };
         }
     }
@@ -1510,11 +1510,23 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
     }
 }
 
+/// Whether the trimmed row `t` opens the folder a folder-trust dialog names: a `/` or `~` path,
+/// or a Windows folder as Claude Code on Windows draws its working folder, a drive's (`C:\…`,
+/// `C:/…`) or a share's (`\\server\share\…`).
+#[must_use]
+pub fn opens_folder(t: &str) -> bool {
+    opens_path(t)
+        || match t.as_bytes() {
+            [drive, b':', sep, ..] => drive.is_ascii_alphabetic() && matches!(sep, b'\\' | b'/'),
+            [b'\\', b'\\', next, ..] => *next != b'\\',
+            _ => false,
+        }
+}
+
 fn trust_path(body: &[String]) -> Option<String> {
-    let at = body.iter().position(|r| {
-        let t = crate::text::trim(r);
-        t.starts_with('/') || t.starts_with('~')
-    })?;
+    let at = body
+        .iter()
+        .position(|r| opens_folder(crate::text::trim(r)))?;
     Some(
         body[at..]
             .iter()
@@ -1524,7 +1536,16 @@ fn trust_path(body: &[String]) -> Option<String> {
     )
 }
 
-fn prose_of(body: &[String], cur: &[char]) -> String {
+/// Whether the trimmed row `t` opens a path a box's prose leaves out: a `/` or `~` path. Only the
+/// folder-trust dialog's prose also leaves out a Windows folder ([`opens_folder`]): in any other
+/// box a row that begins `C:\`, `C:/` or `\\` (a question's LaTeX, an escaped `\\n`) is prose.
+fn opens_path(t: &str) -> bool {
+    t.starts_with('/') || t.starts_with('~')
+}
+
+/// The prose of a box's body: its rows of more than two words that are no option and no cursor,
+/// each paragraph's rows from one that `opens` (a path's) to its end left out.
+fn prose_of(body: &[String], cur: &[char], opens: fn(&str) -> bool) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut in_path = false;
     for t in body.iter().map(|r| crate::text::trim(r)) {
@@ -1532,7 +1553,7 @@ fn prose_of(body: &[String], cur: &[char]) -> String {
             in_path = false;
             continue;
         }
-        in_path |= t.starts_with('/') || t.starts_with('~');
+        in_path |= opens(t);
         if !in_path
             && option_row(t, cur).is_none()
             && strip_cursor(t, cur).is_none()

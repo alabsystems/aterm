@@ -29,6 +29,7 @@ aterm-sysprobe = { workspace = true }
 # knows for fseventsd (`services`), which `init.fseventsd` reads; and the byte words its rows
 # print (`words::mem`). A pure model crate with no dependencies.
 aterm-vitals = { workspace = true }
+aterm-process-facts = { workspace = true }
 # The baseline, fleet and envelope documents; comment-preserving edits of fleet.toml.
 aterm-toml = { workspace = true }
 # Reports on the wire and in state/.

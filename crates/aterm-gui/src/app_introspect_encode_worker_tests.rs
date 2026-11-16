@@ -3229,3 +3229,120 @@ fn inline_image_retains_admission_through_the_wire_handoff() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_dock_capture_reserves_its_own_rectangle_in_a_narrow_window() {
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    let (cw, ch) = app.win_cell_size(wid);
+    let size = aterm_window::dpi::PhysicalSize::new(cw as u32, (512 * ch) as u32);
+    // Show needs room for the terminal's least grid beside the column; a window narrowed under
+    // its dock afterwards (an app-asked `resize px`, which the least rule does not hold) keeps it.
+    let roomy = aterm_window::dpi::PhysicalSize::new(
+        app.least_window_size_with_inset(wid, app.side_inset_px_of(wid, 30))
+            .width,
+        size.height,
+    );
+    app.windows.get_mut(&wid).unwrap().win_px = Some(roomy);
+    app.on_resize(wid, roomy);
+    app.set_dock(wid, 30)
+        .expect("a window at the floor takes the dock");
+    app.windows.get_mut(&wid).unwrap().win_px = Some(size);
+    app.on_resize(wid, size);
+    let view = app.dock_view(wid).expect("a window-owned dock");
+    let host = app.dock_geometry(wid).unwrap();
+    let pixels = host.size.0 as usize * host.size.1 as usize * 4;
+    let frame = app.capture_bytes_estimate(wid, CaptureCharge::Frame(DestinationDemand::Never));
+    assert!(
+        frame < pixels,
+        "CONTROL: the narrow frame cannot pay for the dock"
+    );
+    let (reply, _rx) = std::sync::mpsc::channel();
+    let request = CaptureRequest::NativeImage {
+        window: wid,
+        view,
+        request: image_req_for_test(
+            crate::control_auth::ConfinedImage::in_memory(),
+            false,
+            true,
+            None,
+            reply,
+        ),
+    };
+    let charge = app.capture_bytes_estimate(wid, request.charge());
+    assert!(
+        charge >= pixels + capture_encode_overhead(host.size.0 as usize, host.size.1 as usize),
+        "native capture admits its own pixel and encoder bytes before allocating them"
+    );
+}
+
+#[test]
+fn a_covered_docks_old_raster_cannot_outgrow_its_capture_reservation() {
+    let mut app = crate::scripted_redraw_fixture::scripted_app();
+    let wid = crate::WindowId(0);
+    app.redraw_window(wid);
+    let frame = app.window_frame_px_for(wid, app.windows[&wid].rows, app.windows[&wid].cols);
+    let (_, ch) = app.win_cell_size(wid);
+    let tall = aterm_window::dpi::PhysicalSize::new(frame.width, (512 * ch) as u32);
+    app.windows.get_mut(&wid).unwrap().win_px = Some(tall);
+    app.on_resize(wid, tall);
+    app.set_dock(wid, 30)
+        .expect("the fixture's window takes the dock");
+    app.publish_navigators(Instant::now());
+    app.redraw_window(wid);
+    let view = app.dock_view(wid).unwrap();
+    assert!(
+        app.native_dock_artifact(wid, true, false).is_some(),
+        "positive control: a painted current dock"
+    );
+    let old_bytes = app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .unwrap()
+        .rgba
+        .len();
+    app.on_occlusion_changed(wid, true);
+    let short = aterm_window::dpi::PhysicalSize::new(tall.width, frame.height / 4);
+    app.windows.get_mut(&wid).unwrap().win_px = Some(short);
+    app.on_resize(wid, short);
+    app.publish_navigators(Instant::now());
+    assert_eq!(
+        app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap()
+            .rgba
+            .len(),
+        old_bytes,
+        "the covered host keeps its old pixels without painting"
+    );
+    assert!(
+        app.capture_bytes_estimate(wid, CaptureCharge::NativeView(view)) < old_bytes,
+        "the smaller host cannot reserve a clone of the old raster"
+    );
+    let work = app.navigator_work();
+    let (reply, rx) = std::sync::mpsc::channel();
+    app.render_native_view_image(
+        wid,
+        view,
+        image_req_for_test(
+            crate::control_auth::ConfinedImage::in_memory(),
+            false,
+            true,
+            None,
+            reply,
+        ),
+    );
+    let response = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a stale capture is answered");
+    assert!(
+        matches!(response, Err(ref error) if error.contains("current raster")),
+        "capture refuses stale geometry before allocating its pixels"
+    );
+    assert_eq!(
+        app.navigator_work(),
+        work,
+        "capture reads no covered provider"
+    );
+}

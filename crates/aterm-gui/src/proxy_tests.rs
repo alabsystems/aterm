@@ -140,16 +140,10 @@ fn an_id_that_is_no_sid_is_never_joined_into_a_path() {
         dir.path().join("graph").join(minted.as_str()).is_file(),
         "a minted id's entry is written"
     );
+    // A name that is no sid never becomes a `SessionId`, so no graph path is made of it.
     for id in ["../x", "*", "s-0A1B", "s-"] {
-        let id = SessionId::new(id);
-        write_graph_entry(dir.path(), &id, "/x/aterm-1.sock", &nonce);
-        assert_eq!(graph_entry_host_pid(dir.path(), &id), None, "{id:?}");
-        assert!(
-            write_edge_tokens(dir.path(), &id, "aa", "bb", "cc").is_none(),
-            "{id:?}"
-        );
+        assert_eq!(SessionId::parse(id), None, "{id:?}");
     }
-    assert!(!dir.path().join("x").exists(), "`../x` left graph/");
     let mut names: Vec<_> = std::fs::read_dir(dir.path().join("graph"))
         .expect("graph/")
         .map(|e| e.expect("entry").file_name())

@@ -63,6 +63,10 @@ aterm-winship = { path = "../aterm-winship" }
 # The x86_64 slice's Rosetta session holds an `aterm_uds::lifeline`: a cut killed
 # mid-drive takes the translated instance with it.
 aterm-uds = { workspace = true }
+# The Trust lane stores each check's log zstd-compressed (`<name@version>.log.zst`) and
+# the judge reads it back: first-party, no dependencies, already in the graph through
+# atpkg.
+aterm-zstd = { workspace = true }
 # The Trust lane reads the host's load while each check runs (`load_average`): the judge
 # files a shortfall as the clock's only for a starved run. Already in the graph through
 # aterm-uds.

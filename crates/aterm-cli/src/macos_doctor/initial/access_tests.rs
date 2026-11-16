@@ -5,6 +5,21 @@ use super::*;
 
 fn grants() -> Grants {
     Grants {
+        // These tests vary legacy privacy grants; the independent setup requirements are
+        // confirmed unless a test explicitly supplies unknown or incomplete evidence.
+        additional: [
+            Access::LocalNetwork,
+            Access::NameRule,
+            Access::SpotlightScope,
+            Access::NetworkAuth,
+            Access::NetworkHelper,
+        ]
+        .map(|access| {
+            let mut seen = Observation::unknown(Subject::Access(access));
+            seen.standing = Standing::InPlace;
+            seen.now = Some(access.wanted().into());
+            Some(seen)
+        }),
         fda: Fda::NotConfirmed,
         stable: true,
         devtools: DevTools::NeedsFullDiskAccess,
@@ -152,7 +167,19 @@ fn a_grant_nobody_asked_for_is_offered_and_completes_the_stage() {
         "the sign-outs' own stage still waits for a person"
     );
     let rows = stage_rows(&offered, &[]);
-    assert!(rows.iter().all(|row| row.status == OFFERED), "{rows:?}");
+    assert!(
+        rows.iter()
+            .filter(|row| ![
+                "Local Network access",
+                "Mac naming permission",
+                "Home folders in Spotlight",
+                "Network authorization",
+                "Network helper"
+            ]
+            .contains(&row.name.as_str()))
+            .all(|row| row.status == OFFERED),
+        "{rows:?}"
+    );
     assert_eq!(
         super::super::SetupNext::of(&rows),
         super::super::SetupNext::Done
@@ -222,7 +249,7 @@ fn each_grant_reads_in_its_rows_words_and_never_guesses() {
         "CONTROL: {unmanaged:?}"
     );
     for access in Access::ALL {
-        assert_eq!(observation(access, &g, managed()).wanted, "On");
+        assert_eq!(observation(access, &g, managed()).wanted, access.wanted());
     }
 }
 
@@ -260,7 +287,10 @@ fn a_row_nobody_manages_differs_and_never_asks_for_a_person() {
     );
     let accessibility = observation(Access::Accessibility, &g, none);
     assert_eq!(accessibility.standing, Standing::NotNeeded);
-    let unstable = Grants { stable: false, ..g };
+    let unstable = Grants {
+        stable: false,
+        ..g.clone()
+    };
     assert_eq!(
         observation(Access::FullDiskAccess, &unstable, managed()).standing,
         Standing::NotNeeded
@@ -375,7 +405,20 @@ fn the_stage_completes_on_what_this_revision_handed_and_parks_otherwise() {
         (Access::Debugger, AccessOutcome::Declined),
     ];
     let rows = stage_rows(&g, &handed);
-    assert!(rows.iter().all(|row| row.status != "ok"), "{rows:?}");
+    for name in ["Full Disk Access", "Developer Tools", "Debugger access"] {
+        assert_ne!(status(&rows, name), "ok", "{rows:?}");
+    }
+    // A recorded handoff is no reading of these grants. Their independent observations in
+    // this fixture already confirm them, so the remaining legacy handoff can complete setup.
+    for access in [
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
+    ] {
+        assert_eq!(status(&rows, access.name()), "ok", "{rows:?}");
+    }
     assert_eq!(status(&rows, "Full Disk Access"), OFFERED);
     assert_eq!(
         super::super::SetupNext::of(&rows),
@@ -386,7 +429,11 @@ fn the_stage_completes_on_what_this_revision_handed_and_parks_otherwise() {
 /// [`Grants`] as [`read`] reads them over `records`: a declined step is the person's Not now.
 fn over(g: Grants, records: &[(Access, AccessOutcome)]) -> Grants {
     Grants {
-        opted_out: opted_out([None; 4], records, Access::ALL.map(|a| g.reads_off(a))),
+        opted_out: opted_out(
+            [None; Access::ALL.len()],
+            records,
+            Access::ALL.map(|a| g.reads_off(a)),
+        ),
         ..g
     }
 }
@@ -452,9 +499,14 @@ fn a_grant_the_probe_reads_missing_is_never_ok_and_never_parks() {
         AccessOutcome::Declined,
     ] {
         let records = [(Access::FullDiskAccess, outcome)];
-        let rows = stage_rows(&over(on, &records), &records);
+        let rows = stage_rows(&over(on.clone(), &records), &records);
         assert!(
-            rows.iter().all(|row| row.status == "ok"),
+            rows.iter()
+                .filter(
+                    |row| ["Full Disk Access", "Developer Tools", "Debugger access"]
+                        .contains(&row.name.as_str())
+                )
+                .all(|row| row.status == "ok"),
             "CONTROL: {rows:?}"
         );
     }
@@ -542,15 +594,22 @@ fn a_not_now_in_this_approvals_record_is_an_opt_out() {
         // The latest step for a row decides it.
         (Access::Accessibility, AccessOutcome::Handed),
     ];
-    let opted = opted_out([None; 4], &records, [false; 4]);
+    let opted = opted_out(
+        [None; Access::ALL.len()],
+        &records,
+        [false; Access::ALL.len()],
+    );
     assert_eq!(opted[0], None);
     assert_eq!(opted[1], Some(NOT_NOW));
     assert_eq!(opted[3], None);
     // What the window published comes first.
     let switch = "You turned aterm's privacy steps off.";
-    let mut published = [None; 4];
+    let mut published = [None; Access::ALL.len()];
     published[1] = Some(OptOut::Always(switch));
-    assert_eq!(opted_out(published, &records, [false; 4])[1], Some(switch));
+    assert_eq!(
+        opted_out(published, &records, [false; Access::ALL.len()])[1],
+        Some(switch)
+    );
 }
 
 /// The window publishes a debugger opt-out at every launch, before any probe (§4), so it is
@@ -558,7 +617,7 @@ fn a_not_now_in_this_approvals_record_is_an_opt_out() {
 #[test]
 fn a_turned_off_debugger_is_said_only_of_an_off_reading() {
     let why = "You turned debugger access off, so aterm leaves it off.";
-    let mut published = [None; 4];
+    let mut published = [None; Access::ALL.len()];
     published[2] = Some(OptOut::WhileOff(why));
     for (debugger, standing, now, status, stage) in [
         (
@@ -617,7 +676,7 @@ fn a_turned_off_debugger_is_said_only_of_an_off_reading() {
         debugger: Debugger::Unknown,
         ..grants()
     };
-    let mut published = [None; 4];
+    let mut published = [None; Access::ALL.len()];
     published[2] = Some(OptOut::Always(switch));
     g.opted_out = opted_out(published, &[], Access::ALL.map(|a| g.reads_off(a)));
     let row = observation(Access::Debugger, &g, managed());
@@ -643,11 +702,93 @@ fn a_declined_debugger_record_is_no_opt_out() {
         (Access::FullDiskAccess, AccessOutcome::Declined),
         (Access::Debugger, AccessOutcome::Declined),
     ];
-    let opted = opted_out([None; 4], &records, [false; 4]);
+    let opted = opted_out(
+        [None; Access::ALL.len()],
+        &records,
+        [false; Access::ALL.len()],
+    );
     assert_eq!(opted[0], Some(NOT_NOW));
     assert_eq!(opted[2], None);
     let mut g = grants();
     g.opted_out = opted;
     let row = observation(Access::Debugger, &g, managed());
     assert_ne!(row.standing, Standing::InPlace);
+}
+
+#[test]
+fn init_keeps_network_and_password_requirements_visible_without_opt_in() {
+    let mut grants = grants();
+    grants.acquiring = false;
+    for access in [
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
+    ] {
+        let subject = Subject::Access(access);
+        let mut required = Observation::unknown(subject);
+        required.standing = Standing::NeedsYou;
+        required.now = Some("Incomplete".into());
+        required.note = Some("Finish this requirement".into());
+        grants.additional[additional::index(access).unwrap()] = Some(required);
+        assert_eq!(
+            observation(access, &grants, managed()).standing,
+            Standing::NeedsYou
+        );
+        assert!(
+            stage_rows(&grants, &[])
+                .iter()
+                .any(|row| row.name == access.name() && row.status != "ok")
+        );
+    }
+}
+
+#[test]
+fn unread_required_setup_evidence_never_completes_the_permissions_stage() {
+    for access in [
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
+    ] {
+        for acquiring in [false, true] {
+            let mut grants = grants();
+            grants.acquiring = acquiring;
+            let mut unread = Observation::unknown(Subject::Access(access));
+            unread.note = Some("planted read refusal".into());
+            grants.additional[additional::index(access).expect("required reading")] = Some(unread);
+            assert_eq!(
+                observation(access, &grants, managed()).standing,
+                Standing::Unknown,
+                "{access:?} retains its actual reading"
+            );
+            for opted_out in [None, Some(NOT_NOW)] {
+                grants.opted_out[Access::ALL.iter().position(|row| *row == access).unwrap()] =
+                    opted_out;
+                let seen = observation(access, &grants, managed());
+                assert_eq!(seen.standing, Standing::Unknown, "{access:?}");
+                assert_eq!(seen.note.as_deref(), Some("planted read refusal"));
+                let rows = stage_rows(&grants, &[]);
+                let row = rows.iter().find(|row| row.name == access.name()).unwrap();
+                assert_eq!(row.status, WAITING, "{access:?}: {row:?}");
+                assert!(!super::super::row_ready(row), "{access:?}: {row:?}");
+                assert!(row.detail.contains("planted read refusal"), "{row:?}");
+            }
+        }
+    }
+    // Existing privacy probes can be unreadable to this process without parking setup.
+    let rows = stage_rows(
+        &Grants {
+            fda: Fda::Unknown,
+            ..grants()
+        },
+        &[],
+    );
+    for access in [Access::FullDiskAccess, Access::DeveloperTools] {
+        let row = rows.iter().find(|row| row.name == access.name()).unwrap();
+        assert_eq!(row.status, UNREAD, "{row:?}");
+        assert!(super::super::row_ready(row), "{row:?}");
+    }
 }

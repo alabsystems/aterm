@@ -244,10 +244,46 @@ fn a_locked_tree_never_falls_back_to_the_laid_build() {
     assert!(failed.contains("its install failed: offline"), "{failed}");
     assert!(!build_dir(&prefix, 16387).exists());
 
+    let subject = crate::lease::Subject::build(PROGRAM, 16387).unwrap();
+    let other_consumer = crate::lease::take(
+        &prefix,
+        &subject,
+        "another compiler consumer",
+        crate::lease::DEFAULT_WAIT,
+    )
+    .unwrap();
+    let held = shim_target(&laid, &tree, &mut |prefix, asked| {
+        let _mutation = crate::compat::sdk_mutation_guard(prefix, PROGRAM, asked.build)
+            .map_err(|why| why.to_string())?;
+        panic!("an installer must not replace another consumer's build")
+    })
+    .unwrap_err();
+    assert!(held.contains("another compiler consumer"), "{held}");
+    assert!(!build_dir(&prefix, 16387).exists());
+    drop(other_consumer);
+
+    let vanished = shim_target(&laid, &tree, &mut |prefix, asked| {
+        let mutation = crate::compat::sdk_mutation_guard(prefix, PROGRAM, asked.build)
+            .map_err(|why| why.to_string())?;
+        assert_eq!(store_build(prefix, asked.build), asked.tree_root);
+        drop(mutation);
+        let _reclaim = crate::compat::sdk_mutation_guard(prefix, PROGRAM, asked.build)
+            .map_err(|why| why.to_string())?;
+        std::fs::remove_dir_all(build_dir(prefix, asked.build)).map_err(|why| why.to_string())?;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        vanished.contains("which this machine's store does not hold"),
+        "{vanished}"
+    );
+
     let mut installs = 0;
-    let ran = shim_target(&laid, &tree, &mut |_, asked| {
+    let ran = shim_target(&laid, &tree, &mut |prefix, asked| {
         installs += 1;
-        assert_eq!(store_build(&prefix, asked.build), asked.tree_root);
+        let _mutation = crate::compat::sdk_mutation_guard(prefix, PROGRAM, asked.build)
+            .map_err(|why| why.to_string())?;
+        assert_eq!(store_build(prefix, asked.build), asked.tree_root);
         Ok(())
     });
     assert_eq!(ran, Ok(Some(build_dir(&prefix, 16387).join("bin/targo"))));
@@ -277,6 +313,25 @@ fn a_locked_tree_never_falls_back_to_the_laid_build() {
         unreadable.contains("trust.lock does not read"),
         "{unreadable}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_locked_tree_without_lease_custody_starts_no_install() {
+    let scratch = crate::testdir::dir("atpkg-lock-no-lease-");
+    let prefix = scratch.join("pkg");
+    store_build(&prefix, 16500);
+    let tree = scratch.join("checkout");
+    let laid = build_dir(&prefix, 16500).join("bin/targo");
+    write_lock(&tree, &lock_of(16387, &"a".repeat(64)));
+    std::fs::write(prefix.join("leases"), b"not a lease directory\n").unwrap();
+
+    let refused = shim_target(&laid, &tree, &mut no_install).unwrap_err();
+    assert!(
+        refused.contains("cannot hold Trust build 16387"),
+        "{refused}"
+    );
+    assert!(!build_dir(&prefix, 16387).exists());
 }
 
 /// A LOCKED BUILD NO PUBLISHED INSTALL SERVES IS REFUSED, NOT INSTALLED: where the store's signed

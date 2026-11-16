@@ -2249,6 +2249,11 @@ impl Bootstrap {
     /// ([`super::roster::Access::with_log_history`]), and a basis the log does not open falls back
     /// on its own: to the control journal, which checks the membership again, and to the handoff
     /// it was given, which opens under the same history.
+    ///
+    /// A basis's answer is [`crate::ErrorKind::HistoryUnopened`] only where every path it was
+    /// asked by proved this device cannot open it under the history it holds; where any path
+    /// failed otherwise (a busy vault, a moved observation, a file that does not read), the
+    /// answer keeps that failure's kind, since that path might have opened it.
     pub fn historicals(
         &self,
         journal: &Journal,
@@ -2371,15 +2376,19 @@ impl Bootstrap {
                     // A log-era Commons epoch this device holds no `Wrap` of (one from before it
                     // joined) opens through the handoff it was given, as an older control node
                     // does.
-                    native.or_else(|error| match self.cached_handoff(basis)? {
-                        Some(handoff) => match &history {
-                            Ok(Some(history)) => {
-                                handoff.open_in(journal, access, identity, history)
+                    native.or_else(|error| {
+                        let handed = match self.cached_handoff(basis) {
+                            Ok(Some(handoff)) => match &history {
+                                Ok(Some(history)) => {
+                                    handoff.open_in(journal, access, identity, history)
+                                }
+                                _ => handoff.open(journal, access, identity),
                             }
-                            _ => handoff.open(journal, access, identity),
-                        }
-                        .map(&held),
-                        None => Err(error),
+                            .map(&held),
+                            Ok(None) => return Err(error),
+                            Err(unread) => Err(unread),
+                        };
+                        handed.map_err(|refused| unopened_by_both(error, refused))
                     })
                 })
                 .collect()
@@ -2509,6 +2518,18 @@ impl Bootstrap {
                 Ok(handoff)
             })
             .transpose()
+    }
+}
+
+/// The answer for a basis this device's own history did not open (`native`) and the handoff it
+/// holds of it did not either (`handed`): proved unopened ([`crate::ErrorKind::HistoryUnopened`])
+/// only where both were; otherwise whichever failed without that proof, the native path's first,
+/// so a busy vault the native path met stays busy whatever the handoff answered.
+fn unopened_by_both(native: Error, handed: Error) -> Error {
+    if native.kind() == crate::ErrorKind::HistoryUnopened {
+        handed
+    } else {
+        native
     }
 }
 

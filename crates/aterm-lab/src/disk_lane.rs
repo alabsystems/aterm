@@ -193,7 +193,7 @@ pub(crate) fn lay_target(dir: &Path) -> Result<(), String> {
 /// `incremental` bytes in its `incremental/`.
 /// # Errors
 /// A file could not be written.
-pub(crate) fn lay_target_sized(dir: &Path, deps: u64, incremental: u64) -> Result<(), String> {
+fn lay_target_sized(dir: &Path, deps: u64, incremental: u64) -> Result<(), String> {
     let debug = dir.join("debug");
     for d in [
         ".fingerprint/lay-1",
@@ -263,7 +263,11 @@ pub(crate) fn lay_source(dir: &Path) -> Result<(), String> {
     write(dir.join("src/main.rs"), b"fn main() {}\n")
 }
 
-fn backdate(root: &Path, days: u64) -> Result<(), String> {
+/// Date every file and folder under `root`, itself included, `days` days before now (links
+/// passed over).
+/// # Errors
+/// An entry could not be read or dated.
+pub(crate) fn backdate(root: &Path, days: u64) -> Result<(), String> {
     let when = SystemTime::now() - Duration::from_secs(days * 86_400);
     let mut stack = vec![(root.to_path_buf(), false)];
     while let Some((p, visited)) = stack.pop() {

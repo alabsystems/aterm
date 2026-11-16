@@ -6,7 +6,8 @@
 //! closes the lifetime pass lock and the existing write-ahead journal and durable removal stages
 //! describe any interrupted work. This is not a bound on uninterruptible filesystem I/O.
 //! Between pressure passes it sizes the rebuildable budget on a thread of its own and, over the
-//! cap, runs the budget's pass ([`BudgetWatch`]).
+//! cap, runs the budget's pass ([`BudgetWatch`]); once an hour it runs the entry-bound pass at
+//! any level ([`BoundWatch`]).
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -33,6 +34,7 @@ struct Watch {
     notes: Vec<String>,
     worktrees: worktree::Schedule,
     budget: BudgetWatch,
+    bound: BoundWatch,
 }
 
 impl Watch {
@@ -47,6 +49,7 @@ impl Watch {
             notes: Vec::new(),
             worktrees: worktree::Schedule::new(),
             budget: BudgetWatch::new(state),
+            bound: BoundWatch::new(),
         }
     }
 
@@ -178,6 +181,20 @@ impl Watch {
                 // While space is ample, measure who holds the disk, so the row a later
                 // crossing writes names holders from its first tick.
                 let _ = atpkg::build_cache::holders::measure_home(super::HOLDERS_DAILY_BUDGET);
+                // The stale branch names: each goes once the commits it alone names are pinned
+                // under refs/orphans/ and pushed.
+                let names = cli::disk_refs_journalled(&env.state, home, now, &|| {
+                    held.validate_for(&pass_path).is_ok()
+                });
+                if !names.pruned.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "disk watch: pruned {} stale branch name(s), pinning {} under \
+                         refs/orphans/ first",
+                        names.pruned.len(),
+                        names.pinned.len()
+                    );
+                }
             },
         )?;
         let pass_level = if projected.is_some() && level < super::Level::Short {
@@ -212,7 +229,15 @@ impl Watch {
         // The worktree step runs hourly on a look with no pressure pass due, never ahead of
         // one: under pressure it waits for a look between passes (a pass that freed nothing
         // stops being due), and it is bounded by its wall and its git's.
-        if !due && self.worktrees.due(started) {
+        let lines = thresholds.lines();
+        let clear = || {
+            !aterm_capacity::floor::custody_writes_wait(
+                Some(volume.free),
+                volume.files_free,
+                &lines,
+            )
+        };
+        if !due && self.worktrees.due(started, clear) {
             let snap = Snapshot::read();
             let open = worktree::open_sessions(home);
             let transcripts = home.join(".claude/projects");
@@ -237,6 +262,7 @@ impl Watch {
                 roster: None,
                 starts: &starts,
                 record: record.as_deref(),
+                lines,
             };
             held.validate_for(&pass_path)?;
             let done = cli::disk_worktree_step(&look, config, &mut self.worktrees, &|| {
@@ -277,6 +303,11 @@ impl Watch {
                     placing: placing.as_ref(),
                 };
                 freed = freed.saturating_add(self.budget.step(&at, out)?);
+                // A sizing in flight walks the same trees: the entry-bound look waits for a
+                // look without one.
+                if !self.budget.flight.load(Ordering::SeqCst) {
+                    freed = freed.saturating_add(self.bound.step(&at, out)?);
+                }
             }
             credit(fill, freed, volume.free, measure().map(|r| r.free), started);
             writeln!(
@@ -651,6 +682,172 @@ impl BudgetWatch {
     }
 }
 
+/// THE ENTRY-BOUND SIDE OF THE WATCH: one look of the entry-bound pass an hour
+/// ([`cli::disk_tick_bound`]), at any level, on a look with no pressure pass due and no budget
+/// sizing in flight, with a discovery cursor of its own.
+struct BoundWatch {
+    cursor: discover::Cursor,
+    /// When this process last began one.
+    last: Option<i64>,
+}
+
+impl BoundWatch {
+    const fn new() -> Self {
+        Self {
+            cursor: discover::Cursor::new(),
+            last: None,
+        }
+    }
+
+    /// Whether a look at unix second `now` runs the entry-bound step: removal is on
+    /// ([`budget::bound_admitted`], `auto_free_gib`) and an hour has passed since this process
+    /// began the last ([`budget::due`]). A look it admits is the one the hour is counted from;
+    /// one it refuses stamps nothing.
+    fn admits(&mut self, auto_free_gib: u64, now: i64) -> bool {
+        if !budget::bound_admitted(true, false, false, auto_free_gib)
+            || !budget::due(self.last, now)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// One look's entry-bound step, at most hourly and only while removal is on
+    /// ([`Self::admits`]): what keeps the live sessions' builds is read first, and where it does
+    /// not read whole no pass runs. Every removal, the build caches' own sweep's included, and
+    /// every row it writes are under `at.held` and stop where a measure reads the volume worse
+    /// than `at.level` (that volume is the pressure pass's, due at the next look). The caches'
+    /// sweep stamps its own hour ([`maintenance::claim_held_early`]), leaving the daily turn its
+    /// day: none runs where a sweep, daily or early, was stamped within the hour. The bytes it
+    /// accounted reclaimed. One line goes to `out`
+    /// where it took, wrote or swept anything, or stood down.
+    fn step(&mut self, at: &BudgetAt<'_>, out: &mut dyn Write) -> io::Result<u64> {
+        if !self.admits(at.config.auto_free_gib, at.now) {
+            return Ok(0);
+        }
+        let snap = Snapshot::read();
+        let live = budget::Live::read(
+            snap.sids.clone(),
+            snap.sessions.cwds.clone(),
+            snap.sessions.unknown.clone(),
+        );
+        if live.blind() {
+            writeln!(
+                out,
+                "disk watch: no entry-bound pass: what the live sessions build could not be read \
+                 whole"
+            )?;
+            return Ok(0);
+        }
+        let pass_path = reserve::pass_lock_for(at.home);
+        let roots = search_roots(at.home, at.table, &snap);
+        let transcripts = at.home.join(".claude/projects");
+        let links = cli::default_link_dirs(at.home);
+        let look = DiskLook {
+            state: &at.env.state,
+            volume: at.home,
+            free: super::volume_of(at.home, at.table).ok().map(|r| r.free),
+            targets: &[],
+            discover: Some(&roots),
+            transcripts: Some(&transcripts),
+            now: at.now,
+            room: Some(at.room),
+            table: Some(at.table),
+            demand: None,
+            projected: None,
+            session_cwds: &live.cwds,
+            session_cwd_unknown: live.cwd_unknown.as_deref(),
+            link_dirs: &links,
+        };
+        let judge = super::Judge {
+            now: at.now,
+            threshold_days: at.config.target_stale_days,
+            device: discover::device_of(at.home),
+            volume: super::target::VolumeGuid::of_path(at.home, at.table),
+        };
+        let mut actual_remove = remover(&at.env.state, judge);
+        let mut remove = |row: &super::Row| {
+            at.held.validate_for(&pass_path)?;
+            actual_remove(row)
+        };
+        // This step runs inside the look, so no later look can stop it: it asks the volume
+        // itself before each removal and row, as a budget page's measure does.
+        let mut lock = || -> Result<(), String> {
+            at.held
+                .validate_for(&pass_path)
+                .map_err(|e| e.to_string())?;
+            let level = super::volume_of(at.home, at.table)
+                .ok()
+                .map(|r| at.thresholds.level(Some(r.free), r.files_free));
+            if level.is_none_or(|level| level > at.level) {
+                return Err(
+                    "the volume reads worse than at the look, or could not be read: that is the \
+                     pressure pass's"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        };
+        let bound = cli::BoundLook {
+            live: &live,
+            processes: &discover::scan_processes,
+        };
+        let sweeps = at.config.dead_build_dirs && at.placing.is_some();
+        let ticked = cli::disk_tick_bound(
+            &look,
+            at.config,
+            &bound,
+            &mut lock,
+            &mut remove,
+            &mut self.cursor,
+            &mut |take| {
+                if !sweeps || take().is_err() {
+                    return None;
+                }
+                match maintenance::claim_held_early(pass_path.parent()?, at.now, at.held) {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(e) => {
+                        aterm_log::warn!(
+                            "harness disk watch: the entry-bound pass ran no cache sweep: {e}"
+                        );
+                        return None;
+                    }
+                }
+                let pass = cli::disk_sweep_journalled(&at.env.state, at.now, |record| {
+                    atpkg::build_cache::reclaim_home_watched(
+                        atpkg::build_cache::ReclaimAfter::CALM,
+                        at.placing,
+                        &mut |path, why| take().is_ok() && record(path, why),
+                    )
+                });
+                Some(pass.freed())
+            },
+        );
+        let removed = match &ticked.tick {
+            DiskTick::Reclaimed(done, _) => done.freed_bytes,
+            DiskTick::Plenty => 0,
+        };
+        let freed = removed.saturating_add(ticked.swept);
+        if !ticked.taken.is_empty() || ticked.rows > 0 || ticked.swept > 0 {
+            writeln!(
+                out,
+                "disk watch: entry-bound pass; {} build director{} emptied, {} entry-bound \
+                 row(s) written, {} accounted reclaimed",
+                ticked.taken.len(),
+                if ticked.taken.len() == 1 { "y" } else { "ies" },
+                ticked.rows,
+                super::human_bytes(freed)
+            )?;
+        }
+        if let Some(why) = &ticked.stood_down {
+            writeln!(out, "disk watch: entry-bound pass stood down: {why}")?;
+        }
+        Ok(freed)
+    }
+}
+
 /// A budget page's sweep of the shared build cache (`atpkg::build_cache::reclaim_over_budget`):
 /// the parts no `live` session's builds used, unwritten an hour, each removal journalled and
 /// asked first of the shortfall (what the entries put on record so far were sized at, against
@@ -970,6 +1167,8 @@ pub fn run(env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
             );
         }
     }
+    // What an earlier build's disk ask left in the state folder goes.
+    let _ = super::retire_ask_files(&env.state);
     let mut watch = Watch::new(&env.state);
     loop {
         if let Err(error) = watch.look(env, &home, &held, out, err) {

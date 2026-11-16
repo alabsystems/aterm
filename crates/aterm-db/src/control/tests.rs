@@ -1052,16 +1052,17 @@ fn failed_append_is_deferred_and_a_later_exact_retry_is_acknowledged() {
     let mut script = offer(std::slice::from_ref(&wire));
     assert_eq!(
         receive_batch(&mut script, &store, RECORDS_PER_ROUND).unwrap(),
-        (0, 1)
+        (0, 1, 0)
     );
     assert_eq!(script.output[32], 0);
     assert_eq!(locked.inventory().count(), 0);
     drop(locked);
-    for _ in 0..2 {
+    for added in [1, 0] {
         let mut script = offer(std::slice::from_ref(&wire));
         assert_eq!(
             receive_batch(&mut script, &store, RECORDS_PER_ROUND).unwrap(),
-            (1, 0)
+            (1, 0, added),
+            "the retry adds the record once"
         );
         assert_eq!(
             script.output,
@@ -1089,7 +1090,10 @@ fn reads_and_known_records_need_no_writer_and_new_records_still_do() {
         // Acknowledging records already held opens no writer: the one flush is
         // the directory barrier behind the acknowledgement.
         let recording = aterm_durable::seam::Recording::start();
-        assert_eq!(store.retain(std::slice::from_ref(&known)).unwrap(), [true]);
+        assert_eq!(
+            store.retain(std::slice::from_ref(&known)).unwrap(),
+            [Kept::Held]
+        );
         assert_eq!(recording.take(), [aterm_durable::Flush::Durable]);
     }
     let held = lab.journal(0);
@@ -1103,7 +1107,7 @@ fn reads_and_known_records_need_no_writer_and_new_records_still_do() {
     );
     assert_eq!(
         store.retain(&[known.clone(), b"garbage".to_vec()]).unwrap(),
-        [true, false],
+        [Kept::Held, Kept::No],
         "records already held are acknowledged beside the writer"
     );
     {
@@ -1122,7 +1126,7 @@ fn reads_and_known_records_need_no_writer_and_new_records_still_do() {
     );
     assert_eq!(
         deferred.unwrap(),
-        [true, false],
+        [Kept::Held, Kept::No],
         "a new record needs the writer; while it is busy, the peer offers it again"
     );
     assert_eq!(
@@ -1133,9 +1137,36 @@ fn reads_and_known_records_need_no_writer_and_new_records_still_do() {
     drop(held);
     assert_eq!(
         store.retain(&[known, fresh.bytes().to_vec()]).unwrap(),
-        [true, true]
+        [Kept::Held, Kept::Added]
     );
     assert_eq!(store.inventory().unwrap().len(), 2);
+}
+
+/// A batch of the control journal counts as added only the nodes the journal lacked
+/// ([`Report::added`]): one it held already, as when another of this Mac's rounds brought it
+/// after this round read the journal's inventory, is acknowledged and adds nothing, under the
+/// writer a new node beside it takes. A look that finds the journal grown by a node written here
+/// besides is then not taken as the sending seat's (`crate::runtime::moved`).
+/// MUTANT (`HELD_NODES_ADDED`): the held node counts as added.
+#[test]
+fn a_control_batch_counts_as_added_only_the_nodes_the_journal_lacked() {
+    for mutant in [false, true] {
+        let lab = Lab::new();
+        let path = lab.path(0);
+        lab.journal(0).ingest(lab.genesis.bytes()).unwrap();
+        let fresh = lab.update(lab.genesis.id(), b"brought by this round alone", &[]);
+        let mut script = offer(&[lab.genesis.bytes().to_vec(), fresh.bytes().to_vec()]);
+        HELD_NODES_ADDED.with(|flag| flag.set(mutant));
+        let counted =
+            receive_batch(&mut script, &Disk::new(&path, lab.trust), RECORDS_PER_ROUND).unwrap();
+        HELD_NODES_ADDED.with(|flag| flag.set(false));
+        assert_eq!(
+            counted,
+            (2, 0, if mutant { 2 } else { 1 }),
+            "both acknowledged, the new one added (MUTANT {mutant})"
+        );
+        assert_eq!(lab.journal(0).inventory().count(), 2);
+    }
 }
 
 #[test]
@@ -1170,7 +1201,7 @@ fn network_reads_and_writes_never_own_the_journal_lock() {
     };
     assert_eq!(
         receive_batch(&mut stream, &store, RECORDS_PER_ROUND).unwrap(),
-        (1, 0)
+        (1, 0, 1)
     );
     assert_eq!(lab.journal(0).inventory().count(), 1);
 }
@@ -1196,7 +1227,7 @@ fn missing_channel_proof_and_invalid_signatures_do_not_touch_storage() {
     let mut stream = offer(&[corrupt]);
     assert_eq!(
         receive_batch(&mut stream, &Disk::new(&path, lab.trust), RECORDS_PER_ROUND).unwrap(),
-        (0, 1)
+        (0, 1, 0)
     );
     assert!(
         !path.exists(),
@@ -1338,7 +1369,7 @@ fn one_bad_record_does_not_block_other_signed_records_in_the_batch() {
     let mut script = offer(&[bad, node.bytes().to_vec(), lab.genesis.bytes().to_vec()]);
     assert_eq!(
         receive_batch(&mut script, &store, RECORDS_PER_ROUND).unwrap(),
-        (2, 1)
+        (2, 1, 2)
     );
     assert_eq!(script.output[32], 0);
     assert_eq!(script.output[65], 1);
@@ -1822,6 +1853,7 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
             sent: 2,
             received: 1,
             deferred: 0,
+            added: 0,
         })
     );
     assert_eq!(
@@ -1830,6 +1862,7 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
             sent: 1,
             received: 2,
             deferred: 0,
+            added: 0,
         })
     );
     let complete_union = BTreeSet::from([
@@ -3097,8 +3130,8 @@ impl Store for Refusing {
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
         Ok(ids.iter().map(|id| id.to_vec()).collect())
     }
-    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>> {
-        Ok(vec![false; wires.len()])
+    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<Kept>> {
+        Ok(vec![Kept::No; wires.len()])
     }
 }
 

@@ -23,8 +23,9 @@
 //!   run's records with every record the spool still holds that its kind's reader takes (one it
 //!   refuses is said and stays), so a kill, a failed append or a spool that could not be written
 //!   loses none the spool keeps, and none another landing of the clone appended is appended
-//!   twice. A run a signal
-//!   interrupted does not append: its next land does. A failed append never changes the exit, and
+//!   twice. A run a signal interrupted does not append: its next land does. A merge conflict also
+//!   defers its append where this run's records, including its end, were kept in the spool;
+//!   otherwise it still attempts publication to rescue records held only in memory. A failed append never changes the exit, and
 //!   is not a push race: it counts against neither [`COMPOSES`] nor [`RETRIES`].
 //! - Nothing reads the records to decide anything: a landing's verdicts, its exit and what it
 //!   pushes are the same with them as without them.
@@ -34,8 +35,26 @@ use crate::land_record::{self, Entry, Judging as At, Origin, Record, Run, Signed
 use crate::land_run::{self, Cause, Kind, Landing};
 use crate::land_spool::Spool;
 
+#[cfg(test)]
+#[path = "land_records_cli_tests.rs"]
+mod cli_tests;
+#[path = "land_flush.rs"]
+mod flush;
+#[cfg(test)]
+#[path = "land_records_io_tests.rs"]
+mod io_tests;
+
 /// [`Records::publish`]'s append.
 pub type AppendSeam<'a> = Box<dyn FnMut(&Path, &[Signed], u64) -> Result<(), String> + 'a>;
+
+/// When the run delivers the records its end has kept.
+#[derive(Clone, Copy)]
+pub(super) enum Delivery {
+    /// Attempt publication at the run's end.
+    Publish,
+    /// Leave a fully kept run for the clone's next land; rescue unkept records by publishing.
+    DeferIfKept,
+}
 
 /// The records' seams for writing: the journal's append, the clone's spool, this Mac's signer
 /// and host, the clock, this run, and the interrupt it took. Boxed, so a fixture builds them
@@ -192,13 +211,14 @@ impl Records<'_> {
 
     /// Write `record`, a run record of `kind` made now, as this run's next: its schema, ordinal,
     /// moment and run set here, signed, kept ([`Self::keep`]). Said where it could not be signed
-    /// or kept; the landing goes on either way.
+    /// or kept; the landing goes on either way. Whether the record was made and kept in the
+    /// spool, signed where this Mac has a signer and unsigned otherwise.
     pub(super) fn run_record(
         &mut self,
         kind: Kind,
         mut record: land_run::Record,
         say: &mut dyn FnMut(&str),
-    ) {
+    ) -> bool {
         record.schema = land_run::SCHEMA;
         record.kind = kind.word().to_owned();
         record.seq = self.tally.seq;
@@ -213,12 +233,18 @@ impl Records<'_> {
                          it is appended at the run's end, or recorded nowhere",
                         kind.word()
                     ));
+                    false
+                } else {
+                    true
                 }
             }
-            Err(why) => say(&format!(
-                "verify land: this run's {} record was not written: {why}",
-                kind.word()
-            )),
+            Err(why) => {
+                say(&format!(
+                    "verify land: this run's {} record was not written: {why}",
+                    kind.word()
+                ));
+                false
+            }
         }
     }
 
@@ -498,14 +524,17 @@ pub(super) fn result_of(decision: &Decision) -> &'static str {
 
 /// The run's end, whatever its exit `code`: its end record (the exit, the interrupt it took, the
 /// checkout as it stands, and its landing where main holds one), kept with the rest of the run's
-/// records; then, unless an interrupt ends the run, the one append that carries them all, after
-/// the run's last use of main ([`Records::publish`]). An append that failed is said, and changes
-/// nothing: the exit is `code` either way.
+/// records; then the delivery selected by the landing, after its last use of main. An interrupt
+/// leaves the records local. [`Delivery::DeferIfKept`] does so only when this run's records,
+/// including its end, were kept: otherwise [`Records::publish`] attempts to rescue records held
+/// only in memory. An append that failed is said, and changes nothing: the exit is `code` either
+/// way.
 pub(super) fn finish(
     git: &Git<'_>,
     records: &mut Records<'_>,
     say: &mut dyn FnMut(&str),
     code: i32,
+    delivery: Delivery,
 ) {
     let signal = (records.interrupt)();
     let now = (records.now)();
@@ -534,13 +563,30 @@ pub(super) fn finish(
         landing,
         ..land_run::Record::default()
     };
-    records.run_record(Kind::End, end, &mut *say);
+    let end_kept = records.run_record(Kind::End, end, &mut *say);
     if let Some(signal) = signal {
         say(&format!(
             "verify land: interrupted by signal {signal}: this run's records are kept in this \
              clone, and its next land appends them"
         ));
         return;
+    }
+    if matches!(delivery, Delivery::DeferIfKept)
+        && end_kept
+        && records.tally.made.iter().all(|made| made.spooled)
+    {
+        match records.spool.flush() {
+            Ok(()) => {
+                say(
+                    "verify land: this run's records are kept in this clone; its next land appends them",
+                );
+                return;
+            }
+            Err(why) => say(&format!(
+                "verify land: this run's records were not confirmed durable in this clone \
+                 ({why}); attempting journal publication"
+            )),
+        }
     }
     if let Err(Unwritten { why, unkept }) = records.publish(git.root, &mut *say) {
         say(&match unkept {
@@ -648,39 +694,116 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// `verify land records [<tree>|<commit>] [--show-seal]`'s usage.
+/// The record listing and explicit spool flush commands.
 pub const RECORDS_USAGE: &str = "usage: targo --unverified verify land records [<tree>|<commit>] \
-                                 [--show-seal]";
+                                 [--show-seal]\n       targo --unverified verify land records --flush";
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordsOptions {
+    List {
+        named: Option<String>,
+        show_seal: bool,
+    },
+    Flush,
+}
+
+fn records_options(args: &[String]) -> Result<Option<RecordsOptions>, ()> {
+    match args {
+        [flag] if flag == "--help" || flag == "-h" => return Ok(None),
+        [flag] if flag == "--flush" => return Ok(Some(RecordsOptions::Flush)),
+        _ => {}
+    }
+    if args.iter().any(|arg| arg == "--flush") {
+        return Err(());
+    }
+    let mut named = None;
+    let mut show_seal = false;
+    for arg in args {
+        match arg.as_str() {
+            "--show-seal" if !show_seal => show_seal = true,
+            "--help" | "-h" => return Ok(None),
+            word if named.is_none() && !word.starts_with('-') => named = Some(word.to_owned()),
+            _ => return Err(()),
+        }
+    }
+    Ok(Some(RecordsOptions::List { named, show_seal }))
+}
+
+/// Flush one snapshot of existing signed records without making a run or reading a tree.
+fn flush_cli(root: &Path) -> i32 {
+    let pending = crate::land_spool::Dir::of_clone(root).and_then(|spool| {
+        flush::flush(
+            root,
+            &spool,
+            &mut |root, records, now| {
+                crate::judged::append_land(root, REMOTE, records, now, crate::judged::deadline())
+                    .map(drop)
+            },
+            unix_now(),
+            &|| crate::exec::group::taken().is_some(),
+        )
+    });
+    let flushed = match pending {
+        Ok(flushed) => flushed,
+        Err(why) => {
+            eprintln!("verify land records: COULD NOT RUN — {why}");
+            return exit::COULD_NOT_RUN;
+        }
+    };
+    for why in &flushed.invalid {
+        eprintln!("verify land records: retained unreadable record: {why}");
+    }
+    for why in &flushed.cleanup {
+        eprintln!("verify land records: could not clean acknowledged record: {why}");
+    }
+    if flushed.interrupted {
+        eprintln!("verify land records: flush interrupted after journal acknowledgement");
+    }
+    if flushed.appended == 0 && flushed.complete() {
+        println!("verify land records: no pending records");
+    } else {
+        println!(
+            "verify land records: journal acknowledged {} pending records",
+            flushed.appended
+        );
+    }
+    if flushed.complete() {
+        exit::PASS
+    } else {
+        exit::COULD_NOT_RUN
+    }
+}
 
 /// `verify land records [<tree>|<commit>] [--show-seal]`: every verdict record of a tree (a
 /// commit's tree; HEAD's where none is named), from the journal on [`REMOTE`] and this clone's
 /// spool: each one's check, word, host, age, base, run, whether that run was whole and sealed
 /// through, whose key signed it, and where it is kept; each one that does not read, and why.
 /// `--show-seal` adds each record's seal and local field digests (digests only; no value, no
-/// path). It lists; it decides nothing.
+/// path). It lists; it decides nothing. A failed journal or spool read is nonzero; available
+/// records are still shown.
+/// `--flush` instead appends one snapshot of the clone's existing readable records, without
+/// starting a landing, making a record or changing the source tree. Partial flushes are nonzero.
 pub fn records_cli(args: &[String], cwd: &Path) -> i32 {
-    let mut named = None;
-    let mut show_seal = false;
-    for arg in args {
-        match arg.as_str() {
-            "--show-seal" if !show_seal => show_seal = true,
-            "--help" | "-h" => {
-                println!("{RECORDS_USAGE}");
-                return exit::PASS;
-            }
-            word if named.is_none() && !word.starts_with('-') => named = Some(word.to_owned()),
-            _ => {
-                eprintln!("{RECORDS_USAGE}");
-                return exit::USAGE;
-            }
+    let options = match records_options(args) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            println!("{RECORDS_USAGE}");
+            return exit::PASS;
         }
-    }
+        Err(()) => {
+            eprintln!("{RECORDS_USAGE}");
+            return exit::USAGE;
+        }
+    };
     let Some(root) = crate::checkout_root(cwd) else {
         eprintln!(
             "verify land records: COULD NOT RUN — {} is not inside a git checkout",
             cwd.display()
         );
         return exit::COULD_NOT_RUN;
+    };
+    let RecordsOptions::List { named, show_seal } = options else {
+        return super::interruptible(|| crate::judged::interruptible(|| flush_cli(&root)));
     };
     let named = named.unwrap_or_else(|| "HEAD".to_owned());
     let tree = match crate::judged::git(
@@ -698,42 +821,72 @@ pub fn records_cli(args: &[String], cwd: &Path) -> i32 {
             return exit::COULD_NOT_RUN;
         }
     };
+    let own = aterm_types::dirs::state_dir()
+        .and_then(|dir| {
+            aterm_net::fleet_member::read_node_identity(&dir)
+                .ok()
+                .flatten()
+        })
+        .map(|identity| identity.key());
+    list_records(
+        &root,
+        &tree,
+        own,
+        unix_now,
+        show_seal,
+        &mut |line| println!("{line}"),
+        &mut |line| eprintln!("{line}"),
+    )
+}
+
+/// List every available record, reporting an incomplete read if either source failed.
+fn list_records(
+    root: &Path,
+    tree: &str,
+    own: Option<aterm_net::fleet::NodeKey>,
+    now: fn() -> u64,
+    show_seal: bool,
+    say: &mut dyn FnMut(&str),
+    warn: &mut dyn FnMut(&str),
+) -> i32 {
     let until = crate::judged::deadline();
-    let journal = crate::judged::head(&root, REMOTE, until).and_then(|head| {
-        crate::judged::land_records(&root, head.as_deref(), &[tree.as_str()], until)
-    });
+    let journal = crate::judged::head(root, REMOTE, until)
+        .and_then(|head| crate::judged::land_records(root, head.as_deref(), &[tree], until));
     let mut entries = match &journal {
         Ok(entries) => entries.clone(),
         Err(_) => Vec::new(),
     };
-    let records = live(&root);
-    match spooled(&records, &tree) {
+    let spool_read = crate::land_spool::Dir::of_clone(root).and_then(|spool| spooled(&spool, tree));
+    let spool_complete = spool_read.is_ok();
+    match spool_read {
         Ok(spooled) => entries.extend(spooled),
-        Err(why) => eprintln!("verify land records: this clone's spool was not read: {why}"),
+        Err(why) => warn(&format!(
+            "verify land records: this clone's spool was not read: {why}"
+        )),
     }
-    let own = records.signer.as_ref().map(|signer| signer.key());
-    for line in listing(&tree, &entries, own, unix_now(), show_seal) {
-        println!("{line}");
+    for line in listing(tree, &entries, own, now(), show_seal) {
+        say(&line);
     }
     match journal {
-        Ok(_) => exit::PASS,
+        Ok(_) if spool_complete => exit::PASS,
+        Ok(_) => exit::COULD_NOT_RUN,
         Err(why) => {
-            eprintln!(
+            warn(&format!(
                 "verify land records: COULD NOT RUN — the journal was not read ({why}); only \
                  this clone's spool is listed"
-            );
+            ));
             exit::COULD_NOT_RUN
         }
     }
 }
 
-/// The records `records`' spool holds under `tree`, each held to [`Entry::read`]'s checks, and
+/// The records `spool` holds under `tree`, each held to [`Entry::read`]'s checks, and
 /// each spool file named as a record of it that could not be read at all ([`Entry::unread`]).
 ///
 /// # Errors
 /// The spool could not be listed.
-fn spooled(records: &Records<'_>, tree: &str) -> Result<Vec<Entry>, String> {
-    let pending = records.spool.pending()?;
+fn spooled(spool: &dyn Spool, tree: &str) -> Result<Vec<Entry>, String> {
+    let pending = spool.pending()?;
     let under = |path: &str| land_record::Filed::parse(path).is_ok_and(|filed| filed.tree == tree);
     let mut entries: Vec<Entry> = pending
         .records

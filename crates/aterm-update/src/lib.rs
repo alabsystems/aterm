@@ -2986,17 +2986,42 @@ fn asked_check<T>(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce() 
     result
 }
 
-/// Tell the background check that the system just woke.
+/// Tell the background check that the system just woke: the window's did-wake notification,
+/// which also comes when a dark wake becomes a full one, after the power domain's wake
+/// ([`hear_wakes`]) was announced at the dark wake's start.
 #[cfg(target_os = "macos")]
 pub fn note_system_woke() {
     check_wake::SYSTEM_WOKE.post();
 }
 
-/// Observe the host's settled network changes during the existing checker
-/// wait. The consuming probe must do no network or filesystem work.
+/// Tell the background check that this process's network moved: the host's settled move, past
+/// this Mac's spread, which ends the check's wait at once.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn set_network_change_probe(probe: Box<dyn Fn() -> bool + Send + Sync>) {
-    check_wake::SYSTEM_WOKE.set_network_probe(probe);
+pub fn note_network_moved() {
+    check_wake::SYSTEM_WOKE.post();
+}
+
+/// Hear this process's sleeps and wall-clock steps for the background check's waits
+/// ([`aterm_uds::wall_watch::WallWatch`]: on macOS the power domain's wake, which the listener's
+/// own thread acknowledges, and libnotify's `clock_set`; on Linux the timer every resume and set
+/// cancels), so each wait between checks is one deadline a wake ends at once. Once per process,
+/// and not while automatic checks are off at launch. The watch starts on a thread of its own, so
+/// the caller pays only its spawn. A process that never calls this, as a macOS terminal session
+/// does (a session stopped by Ctrl-Z or a debugger could not acknowledge a will-sleep, and each
+/// sleep of the Mac would wait out the 30 s the system gives an answer), reads its clocks every
+/// 5 s while it waits, as every wait did before. Whether the thread started.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn hear_wakes() -> bool {
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if automatic_at_launch() == Some(false) || ASKED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return false;
+    }
+    check_wake::hear_wakes_from(
+        &check_wake::SYSTEM_WOKE,
+        || aterm_uds::wall_watch::WallWatch::start().map(std::sync::Arc::new),
+        check_wake::wall_thread,
+    )
 }
 
 /// How long the check loop pauses after the host did not answer its settings query.
@@ -3496,6 +3521,8 @@ fn run_checker(
     args: &CheckerArgs,
 ) -> CheckerExit {
     use checker_watch::{CheckerPhase, Streak, StreakLog};
+    // Every worker's wake is the one its watch's retirements nudge.
+    watch.wake_on_retire(args.wake);
     let current_build = args.current_build;
     if !watch.beat(generation, CheckerPhase::Starting) {
         return CheckerExit::Superseded {

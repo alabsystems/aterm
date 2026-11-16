@@ -13,18 +13,28 @@
 //! The shared files' materializer (docs/DESIGN-shared-files-2026-11-11.md §4) is the owner's
 //! too, on its own `alab-files` thread ([`Materializer`]): a pass shortly after a table store of
 //! this process grew (a record it authored or took from a peer), and one a minute besides, for
-//! what another process of this Mac appended and for what custody refuses now. It passes
-//! whether or not the owner is serving, and each pass writes only under `~/.aterm/files`. The
-//! same thread runs the shared files' publisher before each pass (`crate::file::publish`): the
-//! writes this Mac queued are signed there, one record each.
+//! what another process of this Mac appended, for what changes without a record of the table
+//! (a membership record that makes an owned row readable) and for what custody refuses now
+//! (`[commons]` off, membership, a succession), none of which a store write of this process
+//! signals. Between them the thread sleeps until one is due, woken by the growth itself
+//! (`crate::file::growth`) and by nothing else but its stop and the owner's moves. Each pass
+//! projects only the files whose projection key moved, and writes only what changed, so a pass at
+//! rest writes nothing. It passes whether or not the owner is serving, and each pass writes only
+//! under `~/.aterm/files`. The same thread runs the shared files' publisher before each pass
+//! (`crate::file::publish`): the writes this Mac queued are signed there, one record each.
 //!
 //! The registry's secret store is swept on an `alab-secrets` thread ([`Secrets`]), hourly: what
 //! an ended run left owed is removed from the vault once no cell names it
 //! (`super::secret::housekeep`). A pass with nothing owed reads one directory of this Mac's.
 
 use super::journal::{Presence, Spool, Word, flush::Flushed};
+use crate::file::growth::GROWTH;
 use aterm_secrets::client::Paths;
 use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -123,8 +133,6 @@ pub(crate) struct Cadence {
     /// A pass that met a busy vault or store is followed by another this much later: another
     /// program's hold is brief, and its word should not stand for a minute.
     pub(crate) busy: Duration,
-    /// How often the materializer looks whether a pass is due.
-    pub(crate) look: Duration,
 }
 
 impl Cadence {
@@ -134,13 +142,8 @@ impl Cadence {
         settle: Duration::from_secs(2),
         every: Duration::from_secs(60),
         busy: Duration::from_secs(10),
-        look: Duration::from_secs(1),
     };
 }
-
-/// Every this many passes projects again though no record arrived, which takes up what changes
-/// without one (a membership record that makes an owned row readable).
-pub(crate) const FILES_AGAIN: u32 = 5;
 
 /// When the shared files' materializer is due: a pass shortly after a table store of this
 /// process grew, and one each [`Cadence::every`] besides.
@@ -148,46 +151,59 @@ struct Files {
     cadence: Cadence,
     /// The growth count the last pass started at.
     seen: u64,
-    /// When a look first saw the count past `seen`.
+    /// When a wake first saw the count past `seen`.
     moved_at: Option<Instant>,
     /// When the next pass is due whether or not a store grew.
     regular: Instant,
-    passes: u32,
 }
 
 impl Files {
-    /// The schedule of an owner that starts at `now`: its first pass, which projects whatever
-    /// the snapshot holds, is due [`Cadence::first`] later.
-    fn new(cadence: Cadence, now: Instant) -> Self {
+    /// The schedule of an owner that starts at `now`, the growth count reading `growth`: its first
+    /// pass is due [`Cadence::first`] later.
+    fn new(cadence: Cadence, now: Instant, growth: u64) -> Self {
         Self {
             cadence,
-            seen: crate::file::growth(),
+            seen: growth,
             moved_at: None,
             regular: now + cadence.first,
-            passes: FILES_AGAIN - 1,
         }
     }
 
-    /// Whether a pass is due at `now`, the growth count reading `growth`: `Some(again)` starts
-    /// one, `again` saying it projects though nothing arrived. A pass is due
-    /// [`Cadence::settle`] after a store was seen to have grown, and never later than the
-    /// regular one.
-    fn due(&mut self, now: Instant, growth: u64) -> Option<bool> {
-        if growth != self.seen && self.moved_at.is_none() {
+    /// When the next pass is due: [`Cadence::settle`] after a wake saw a store grow, and never
+    /// later than the regular one.
+    fn next_at(&self) -> Instant {
+        self.moved_at.map_or(self.regular, |moved| {
+            (moved + self.cadence.settle).min(self.regular)
+        })
+    }
+
+    /// The growth count the wait for the next pass wakes once the count leaves it: the one the
+    /// last pass started at, until a wake sees it moved. Inside the settle no growth wakes the
+    /// wait (`None`), so a burst is one wake and one pass, and its appends ring nothing.
+    fn awaits(&self) -> Option<u64> {
+        self.moved_at.is_none().then_some(self.seen)
+    }
+
+    /// Whether the growth count reading `growth` wakes the wait for the next pass
+    /// ([`Self::awaits`]).
+    fn wakes(&self, growth: u64) -> bool {
+        self.awaits().is_some_and(|seen| growth != seen)
+    }
+
+    /// Whether a pass is due at `now`, the growth count reading `growth` ([`Self::next_at`], once
+    /// a growth that wakes the wait is noted). A pass that is due starts the schedule again at
+    /// `now`.
+    fn due(&mut self, now: Instant, growth: u64) -> bool {
+        if self.wakes(growth) {
             self.moved_at = Some(now);
         }
-        let due = self.moved_at.map_or(self.regular, |moved| {
-            (moved + self.cadence.settle).min(self.regular)
-        });
-        if now < due {
-            return None;
+        if now < self.next_at() {
+            return false;
         }
-        let again = self.passes % FILES_AGAIN == FILES_AGAIN - 1;
         self.seen = growth;
         self.moved_at = None;
         self.regular = now + self.cadence.every;
-        self.passes = self.passes.wrapping_add(1);
-        Some(again)
+        true
     }
 
     /// A pass that ended at `now` met a busy vault or store: the next comes sooner.
@@ -202,8 +218,12 @@ impl Files {
 /// the outbox (`aterm file outbox`); with nothing queued the publisher reads three small files
 /// and opens no custody. Every materializer outcome is a state word in the file's own
 /// `state.json`: nothing to report here, and nothing a later pass does not see for itself.
-/// Returns whether the pass met a busy vault or store.
-fn files_pass(paths: &Paths, config: &std::path::Path, again: bool, publish_by: Instant) -> bool {
+/// Returns the materializer's outcomes, one a file.
+fn files_pass(
+    paths: &Paths,
+    config: &std::path::Path,
+    publish_by: Instant,
+) -> Vec<crate::file::materialize::Outcome> {
     let published = crate::file::publish::pass(
         paths,
         config,
@@ -214,14 +234,91 @@ fn files_pass(paths: &Paths, config: &std::path::Path, again: bool, publish_by: 
         },
     );
     drop(published);
-    crate::file::materialize::pass(
-        paths,
-        config,
-        None,
-        &crate::file::materialize::Pass::now(again),
-    )
-    .iter()
-    .any(|outcome| outcome.why == Some(aterm_file::Why::Busy))
+    crate::file::materialize::pass(paths, config, None, &crate::file::materialize::Pass::now())
+}
+
+/// Whether a pass's `outcomes` met a busy vault or store.
+fn met_busy(outcomes: &[crate::file::materialize::Outcome]) -> bool {
+    outcomes
+        .iter()
+        .any(|outcome| outcome.why == Some(aterm_file::Why::Busy))
+}
+
+/// Whether another process of this Mac owns the Commons runtime, so the materializer rests
+/// ([`Materializer`]): the owner's loop sets it at each report, and a flip wakes the
+/// materializer's wait ([`crate::file::growth::Growth::ring`]). Its flag is private to this
+/// module, so no flip escapes the ring.
+#[derive(Debug, Default)]
+pub(crate) struct Elsewhere(AtomicBool);
+
+impl Elsewhere {
+    /// Another process owns the Commons runtime (`true`), or none does now (`false`).
+    pub(crate) fn set(&self, elsewhere: bool) {
+        if self.0.swap(elsewhere, Ordering::AcqRel) != elsewhere {
+            GROWTH.ring();
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// What the materializer waits on ([`materialize`]): this process's clock and its stores' growth
+/// ([`Live`]), or a test's script of both.
+trait Bell {
+    fn now(&self) -> Instant;
+
+    /// Wait until the growth count leaves `seen` (`None`: no growth wakes this wait), `woke`
+    /// holds, or `until` comes (`None`: no deadline), and return the count read last
+    /// ([`crate::file::growth::Growth::wait`]).
+    fn wait(&self, until: Option<Instant>, seen: Option<u64>, woke: &dyn Fn() -> bool) -> u64;
+}
+
+/// This process's clock and growth ([`GROWTH`]).
+struct Live;
+
+impl Bell for Live {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait(&self, until: Option<Instant>, seen: Option<u64>, woke: &dyn Fn() -> bool) -> u64 {
+        GROWTH.wait(until, seen, woke)
+    }
+}
+
+/// The materializer's thread until `stop` ([`Materializer`]): a pass whenever one is due
+/// ([`Files::due`]; `pass` answers whether it met a busy vault or store), and between passes one
+/// wait, which wakes for what it waits for and nothing else: the first growth since the last pass
+/// started, the pass due next, a flip of `elsewhere` and the stop. Only a wait that growth can wake
+/// asks for growth ([`Files::awaits`]): the appends of a burst inside the settle, and any while
+/// the thread rests, ring nothing. While `elsewhere` is set it waits with no deadline; once it
+/// clears, a pass that came due meanwhile, or the growth it saw, is taken up at once.
+fn materialize(
+    files: &mut Files,
+    bell: &dyn Bell,
+    stop: &AtomicBool,
+    elsewhere: &Elsewhere,
+    pass: &mut dyn FnMut() -> bool,
+) {
+    loop {
+        let resting = elsewhere.is_set();
+        let until = (!resting).then(|| files.next_at());
+        let seen = files.awaits().filter(|_| !resting);
+        let growth = bell.wait(until, seen, &|| {
+            stop.load(Ordering::Acquire) || elsewhere.is_set() != resting
+        });
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        if elsewhere.is_set() {
+            continue;
+        }
+        if files.due(bell.now(), growth) && pass() {
+            files.met_busy(bell.now());
+        }
+    }
 }
 
 /// The shared files' materializer of one Commons runtime owner
@@ -230,12 +327,13 @@ fn files_pass(paths: &Paths, config: &std::path::Path, again: bool, publish_by: 
 /// reader of a shared file needs are the ones custody refuses under (`[commons]` off, no
 /// membership, a succession that fences this Mac's home or serves a candidate nobody admitted),
 /// and those are the states in which the owner is not serving: a pass run only by a serving
-/// owner would leave the last `live` standing through every one of them.
+/// owner would leave the last `live` standing through every one of them. Between passes the
+/// thread sleeps ([`materialize`]).
 ///
 /// It rests while `elsewhere` is set: another process of this Mac owns the Commons runtime
 /// then, and its materializer passes.
 pub(crate) struct Materializer {
-    stop: std::sync::Arc<aterm_uds::stop::Stop>,
+    stop: Arc<AtomicBool>,
     running: Option<JoinHandle<()>>,
 }
 
@@ -247,25 +345,18 @@ impl Materializer {
         paths: Paths,
         config: std::path::PathBuf,
         cadence: Cadence,
-        elsewhere: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        elsewhere: Arc<Elsewhere>,
     ) -> Option<Self> {
-        let stop = std::sync::Arc::new(aterm_uds::stop::Stop::new());
+        let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        // Read here, so a store that grows once this returns is growth the thread wakes on.
+        let mut files = Files::new(cadence, Instant::now(), GROWTH.count());
         let running = std::thread::Builder::new()
             .name("alab-files".into())
             .spawn(move || {
-                let mut files = Files::new(cadence, Instant::now());
-                while !stopped.sleep(cadence.look) {
-                    if elsewhere.load(std::sync::atomic::Ordering::Relaxed) {
-                        continue;
-                    }
-                    let Some(again) = files.due(Instant::now(), crate::file::growth()) else {
-                        continue;
-                    };
-                    if files_pass(&paths, &config, again, crate::admission::deadline()) {
-                        files.met_busy(Instant::now());
-                    }
-                }
+                materialize(&mut files, &Live, &stopped, &elsewhere, &mut || {
+                    met_busy(&files_pass(&paths, &config, crate::admission::deadline()))
+                });
             })
             .ok()?;
         Some(Self {
@@ -277,7 +368,8 @@ impl Materializer {
 
 impl Drop for Materializer {
     fn drop(&mut self) {
-        self.stop.set();
+        self.stop.store(true, Ordering::Release);
+        GROWTH.ring();
         if let Some(running) = self.running.take()
             && running.thread().id() != std::thread::current().id()
         {
@@ -381,4 +473,4 @@ impl Secrets {
 
 #[cfg(test)]
 #[path = "upkeep_tests.rs"]
-mod tests;
+pub(crate) mod tests;

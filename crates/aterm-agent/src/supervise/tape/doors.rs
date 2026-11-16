@@ -111,3 +111,6 @@ pub const PROBE_FULL_WAKE: &str = "probe.full_wake";
 
 /// Approval-policy probe walking a tree a reader descends, held to the secret rules.
 pub const PROBE_BELOW_TREE: &str = "probe.below_tree";
+
+/// Approval-policy probe for where a session's folder, as its process spells it, leads.
+pub const PROBE_FOLDER_LEADS: &str = "probe.folder_leads";

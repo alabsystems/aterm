@@ -559,7 +559,7 @@ fn a_heading_with_no_row_under_it_is_not_drawn_and_a_cut_list_fades() {
     let whole = at(900.0);
     assert!(heads(&whole) && !fades(&whole), "NEGATIVE CONTROL: it fits");
 
-    let frame = Frame::of(&app.tree, &view.fold(), width, 900.0);
+    let frame = Frame::of(&app.tree, &view.fold(), width, 900.0, false);
     let first = frame.tops[frame.machine_from.expect("a machine group")];
     let room_to =
         |row_shows: f32| frame.m.pad * 2.0 + frame.m.header_h + ROOT_GAP + first + row_shows;

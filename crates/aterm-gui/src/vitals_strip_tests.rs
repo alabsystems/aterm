@@ -24,6 +24,59 @@ use aterm_vitals::situation::{
 };
 use aterm_vitals::starts::{CoalTaskRead, CoalTasks};
 
+#[test]
+fn reported_cpu_history_codec_preserves_its_basis_without_guessing_legacy_accounts() {
+    let accounting = aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS;
+    let saved = SavedStrip {
+        last_wall_ms: 1000,
+        scope_cpu_accounting: Some(accounting),
+        ..SavedStrip::default()
+    };
+    let text = base_json(&saved, 1).expect("a base");
+    let (_, decoded) = base_of(&text).expect("current base");
+    assert_eq!(decoded.scope_cpu_accounting, Some(accounting));
+    let mut doc: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+    doc.as_object_mut().unwrap().remove("scope_cpu_accounting");
+    assert_eq!(
+        base_of(&aterm_json::to_string(&doc).unwrap())
+            .unwrap()
+            .1
+            .scope_cpu_accounting,
+        None
+    );
+    doc.as_object_mut().unwrap().insert(
+        "scope_cpu_accounting".into(),
+        aterm_json::Value::String("unknown_basis".into()),
+    );
+    assert_eq!(
+        base_of(&aterm_json::to_string(&doc).unwrap())
+            .unwrap()
+            .1
+            .scope_cpu_accounting,
+        None
+    );
+    let line = StripLine {
+        k: 1,
+        wall_ms: 1000,
+        scope_cpu_accounting: Some(accounting),
+        ..StripLine::default()
+    };
+    let text = line_json(&line, 1).expect("a tail line");
+    assert_eq!(
+        line_of(&text).unwrap().1.scope_cpu_accounting,
+        Some(accounting)
+    );
+    let mut doc: aterm_json::Value = aterm_json::from_str(&text).unwrap();
+    doc.as_object_mut().unwrap().remove("scope_cpu_accounting");
+    assert_eq!(
+        line_of(&aterm_json::to_string(&doc).unwrap())
+            .unwrap()
+            .1
+            .scope_cpu_accounting,
+        None
+    );
+}
+
 use super::{
     BASE_FILE, LEGACY_FILE, STRIP_MAX_BYTES, STRIP_SCHEMA, StripStore, TAIL_FILE, TAIL_MAX_BYTES,
     base_json, base_of, line_json, line_of, strip_dir,
@@ -1084,6 +1137,7 @@ fn a_tail_line_reads_back_as_written() {
             },
         )],
         proc_starts: Some(true),
+        scope_cpu_accounting: Some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
         time_gaps: Vec::new(),
         strip_events: Vec::new(),
         spans: vec![
@@ -1148,6 +1202,7 @@ fn four_hours_of_the_fullest_lines_fit_the_tails_bound() {
             })
             .collect(),
         proc_starts: Some(true),
+        scope_cpu_accounting: Some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
         time_gaps: Vec::new(),
         strip_events: Vec::new(),
         spans: vec![Span {

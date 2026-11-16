@@ -187,8 +187,9 @@ pub struct Record {
 pub struct Decoded {
     /// The record.
     pub record: Record,
-    /// The fields of a known kind this library does not know, at every depth: passed over and
-    /// counted. A record of an unknown kind counts none; the kind is what is counted.
+    /// Unknown member occurrences at each schema object, plus unknown words dropped from
+    /// `scope` and `takes` lists. An unknown kind counts all non-envelope members; each ignored
+    /// subtree counts once with its member. The kind itself is represented by [`Body::Unknown`].
     pub unknown: u32,
 }
 
@@ -1229,15 +1230,25 @@ pub fn is_word(text: &str) -> bool {
     (1..=WORD_MAX).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
+/// Whether `sid` is a complete current tab ID (`t` and ten lower-case Crockford base32
+/// characters), or a supported legacy ID (`s-` and nonempty ASCII hex digits).
+/// Both are single words that can never be paths or selectors.
+#[must_use]
+pub fn session_id(sid: &str) -> bool {
+    if let Some(tail) = sid.strip_prefix('t') {
+        const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+        return tail.len() == 10 && tail.bytes().all(|byte| ALPHABET.contains(&byte));
+    }
+    sid.strip_prefix("s-")
+        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 /// The verb that opens session `sid`'s stream on the claim's own connection,
 /// `stream @<sid> v=1`, answered by a [`StreamReply`]. Verb first, the way
-/// `subscribe @<sid> events` is spelled. `None` when `sid` is not an `s-<hex>` session ID.
+/// `subscribe @<sid> events` is spelled. `None` when [`session_id`] refuses `sid`.
 #[must_use]
 pub fn stream_request(sid: &str) -> Option<String> {
-    let session = sid
-        .strip_prefix("s-")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    session.then(|| format!("stream @{sid} v={STREAM_VERSION}"))
+    session_id(sid).then(|| format!("stream @{sid} v={STREAM_VERSION}"))
 }
 
 /// The longest `epoch=` word.

@@ -53,13 +53,13 @@ pub(crate) fn release_claims_for_test() {
     HELD.lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
-static ADOPTED: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+static ADOPTED: std::sync::RwLock<Vec<SessionId>> = std::sync::RwLock::new(Vec::new());
 
 /// Record that this process is answering to an id it did NOT mint.
 pub(crate) fn note_adopted(sid: &SessionId) {
     let mut g = ADOPTED.write().unwrap_or_else(|p| p.into_inner());
-    if !g.iter().any(|s| s == sid.as_str()) {
-        g.push(sid.as_str().to_string());
+    if !g.contains(sid) {
+        g.push(sid.clone());
     }
 }
 
@@ -67,7 +67,7 @@ pub(crate) fn note_adopted(sid: &SessionId) {
 fn adopted_here(sid: &SessionId) -> bool {
     let guard = ADOPTED.read();
     let adopted = guard.unwrap_or_else(|p| p.into_inner());
-    adopted.iter().any(|s| s == sid.as_str())
+    adopted.contains(sid)
 }
 
 fn claim_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
@@ -270,7 +270,7 @@ pub(crate) fn settle_transferred() {
     let sids: Vec<SessionId> = {
         let guard = ADOPTED.read();
         let adopted = guard.unwrap_or_else(|p| p.into_inner());
-        adopted.iter().map(|s| SessionId::new(s.clone())).collect()
+        adopted.clone()
     };
     settle_transferred_in(&dir, &sids, std::process::id());
 }

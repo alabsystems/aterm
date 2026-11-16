@@ -3,7 +3,8 @@
 
 //! Which windows carry the System Resources band.
 //!
-//! The band is the stats deck and the Network State band under it, one head reservation
+//! The band is the stats deck's rows and the Disk Custody and Network State bands under them
+//! ([`crate::stats_deck::bands_px`]), one head reservation
 //! ([`crate::stats_deck::reserved_deck_px`]). A window carries it or it does not
 //! (`WindowState::carries_band`): the first window a process creates is born with it, every
 //! later window without, and a person moves it per window (View ▸ Show System Resources Here,

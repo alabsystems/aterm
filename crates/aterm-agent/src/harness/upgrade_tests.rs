@@ -2200,6 +2200,26 @@ fn own_words_reads_a_whole_head_wrapped_or_past_its_caret() {
     }
 }
 
+/// THE DISK ASK'S LINE AN EARLIER BUILD TYPED IS STILL ATERM'S WORDS: no build types
+/// `disk-free@v1` now, and one left unsent in a composer a seamless update carried is asked
+/// about and never sent, as every other line of the harness's is. Spelled out here as that
+/// build typed it, since nothing in this one writes it.
+/// NEGATIVE CONTROL: `OWN_HEADS` without `RETIRED_ASK_HEAD`, and the line reads as a person's
+/// draft; a person's own words that open the same way without the harness's mark do so here.
+#[test]
+fn the_disk_ask_line_an_earlier_build_typed_is_aterms_own_words() {
+    let typed = "[aterm harness] aterm: the volume this tab works on (/) is 97% full, 9.0 GiB \
+                 free, below its 20 GiB floor, and aterm has freed what it may.";
+    for draft in [typed.to_owned(), format!("❯ {typed}")] {
+        assert!(own_words(&draft) && own_draft(&draft), "{draft}");
+    }
+    let theirs = "aterm: the volume this tab works on (/) is 97% full";
+    assert!(
+        !own_words(theirs) && !own_draft(theirs),
+        "CONTROL: {theirs}"
+    );
+}
+
 #[test]
 fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
     let brk = Facts {

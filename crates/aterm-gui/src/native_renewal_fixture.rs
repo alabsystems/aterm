@@ -1017,10 +1017,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         {
             return Err("fixture prior host is still alive".into());
         }
-        let sid = SessionId::new(adopt.sid.clone());
-        if !sid.is_minted() {
-            return Err("fixture invalid retained session".into());
-        }
+        let sid = SessionId::parse(&adopt.sid).ok_or("fixture invalid retained session")?;
         let nonce = LaunchNonce::from_hex(&adopt.nonce).ok_or("fixture invalid retained nonce")?;
         handle.sid = sid.clone();
         handle.nonce = nonce;

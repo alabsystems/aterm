@@ -433,7 +433,9 @@ fn each_guard_types_nothing_and_names_why() {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(crate::Lease::Turn {
                         id: 7,
-                        driver: Some(aterm_session::SessionId::new("another-driver")),
+                        driver: Some(aterm_session::SessionId::from_tab(
+                            aterm_types::tab_id::TabId::from_bits(0xd417_0001),
+                        )),
                         typing: false,
                     });
             },
@@ -725,7 +727,9 @@ fn a_hold_taken_mid_press_stops_it_before_the_enter() {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(crate::Lease::Turn {
                         id: 7,
-                        driver: Some(aterm_session::SessionId::new("another-driver")),
+                        driver: Some(aterm_session::SessionId::from_tab(
+                            aterm_types::tab_id::TabId::from_bits(0xd417_0002),
+                        )),
                         typing: false,
                     });
             }),

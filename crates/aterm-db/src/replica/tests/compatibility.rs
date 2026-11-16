@@ -1453,8 +1453,16 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
     let reading = process_cpu();
     let start = process_cpu();
     let reading = start - reading;
+    let mut exchange_allocations = [0_usize; 2];
     for _ in 0..measured {
-        loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+        let counted =
+            loopback_round_through(&listener, (&a, &b), (&mut ra, &mut rb), |_, exchange| {
+                aterm_heap_count::allocations_in(exchange).1
+            });
+        for (total, count) in exchange_allocations.iter_mut().zip(counted) {
+            assert!(count > 0, "the actual exchange allocates on each side");
+            *total += count;
+        }
         for repair in [&ra, &rb] {
             let application = repair.application().expect("a completed application round");
             if catalog {
@@ -1530,6 +1538,8 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
             "process_cpu_ns": u64::try_from(spent.as_nanos()).unwrap(),
             "per_round_cpu_ns": u64::try_from((spent / measured).as_nanos()).unwrap(),
             "clock_read_cpu_ns": u64::try_from(reading.as_nanos()).unwrap(),
+            "exchange_allocations": exchange_allocations,
+            "allocation_scope": "initiator and responder exchange threads; connection admission and exchange included; fixture setup, loopback responder thread creation and allocations on other threads excluded",
             "moved_records": 0,
         })
     );

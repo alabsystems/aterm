@@ -33922,49 +33922,47 @@ fn gated_server(
     (sock.to_string_lossy().into_owned(), rx)
 }
 
-/// THE DISK LANES PASS THE ONE OBSERVE GATE (H6-R1): the disk resume (`disk-resume@v1`) and the
-/// ask to free space (`disk-free@v1`) each name their lane on the write, which the gate does not
-/// exempt, so into an observed agent nothing is typed and each comes back
-/// [`agent_image::WITHHELD`], once, with no retry of the write; into a confirmed agent each is
-/// typed. NEGATIVE CONTROL (run): with `type_resume` mapping the gate's refusal to a wait, the
-/// observed rows come back `wait:ERR-busy`.
+/// THE DISK LANE PASSES THE ONE OBSERVE GATE (H6-R1): the disk resume (`disk-resume@v1`) names
+/// its lane on the write, which the gate does not exempt, so into an observed agent nothing is
+/// typed and it comes back [`agent_image::WITHHELD`], once, with no retry of the write; into a
+/// confirmed agent it is typed. NEGATIVE CONTROL (run): with `type_resume` mapping the gate's
+/// refusal to a wait, the observed row comes back `wait:ERR-busy`.
 #[cfg(unix)]
 #[test]
 fn the_disk_lines_name_their_lane_and_the_gate_withholds_them_from_an_observed_agent() {
     use agent_image::{Act, Lane};
     for (act, want) in [(Act::Observe, agent_image::WITHHELD), (Act::On, "typed")] {
-        for lane in [Lane::DiskResume, Lane::DiskFree] {
-            let dir = scratch(&format!("gate-{}-{}", act.word(), lane.word()));
-            let (sock, server) = gated_server(&dir, act);
-            let typed = super::super::disk::type_resume(&sock, None, "s-1", "carry on", lane);
-            let mut stop = std::os::unix::net::UnixStream::connect(&sock).expect("the server");
-            stop.write_all(b"AUTH stop\n").expect("stop");
-            drop(stop);
-            let seen = server
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .expect("the server read every connection");
-            assert_eq!(typed, want, "{act:?} {lane:?}: {seen:#?}");
-            let writes: Vec<&(String, String)> = seen
-                .iter()
-                .filter(|(line, _)| {
-                    matches!(
-                        line.split_whitespace().find(|w| !w.starts_with('@')),
-                        Some("turn" | "paste" | "send" | "key")
-                    )
-                })
-                .collect();
-            assert_eq!(writes.len(), 1, "one write, never retried: {seen:#?}");
-            let (line, reply) = writes[0];
-            assert!(
-                line.contains(&format!("{}{} ", agent_image::LANE_OPTION, lane.word())),
-                "the write names its lane: {line}"
-            );
-            assert_eq!(
-                agent_image::observe_refused(reply),
-                act == Act::Observe,
-                "{act:?} {lane:?}: {reply}"
-            );
-        }
+        let lane = Lane::DiskResume;
+        let dir = scratch(&format!("gate-{}-{}", act.word(), lane.word()));
+        let (sock, server) = gated_server(&dir, act);
+        let typed = super::super::disk::type_resume(&sock, None, "s-1", "carry on", lane);
+        let mut stop = std::os::unix::net::UnixStream::connect(&sock).expect("the server");
+        stop.write_all(b"AUTH stop\n").expect("stop");
+        drop(stop);
+        let seen = server
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the server read every connection");
+        assert_eq!(typed, want, "{act:?} {lane:?}: {seen:#?}");
+        let writes: Vec<&(String, String)> = seen
+            .iter()
+            .filter(|(line, _)| {
+                matches!(
+                    line.split_whitespace().find(|w| !w.starts_with('@')),
+                    Some("turn" | "paste" | "send" | "key")
+                )
+            })
+            .collect();
+        assert_eq!(writes.len(), 1, "one write, never retried: {seen:#?}");
+        let (line, reply) = writes[0];
+        assert!(
+            line.contains(&format!("{}{} ", agent_image::LANE_OPTION, lane.word())),
+            "the write names its lane: {line}"
+        );
+        assert_eq!(
+            agent_image::observe_refused(reply),
+            act == Act::Observe,
+            "{act:?} {lane:?}: {reply}"
+        );
     }
 }
 

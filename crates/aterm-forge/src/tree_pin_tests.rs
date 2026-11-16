@@ -429,8 +429,22 @@ fn a_root_in_no_checkout_could_not_run() {
 
 #[test]
 fn the_roster_applies_only_to_its_own_workspace() {
-    let (_dir, root, _) = pinned_repo("roster", "");
+    let (_dir, root, tree) = pinned_repo("roster", "");
     assert_eq!(tree_pins(&root), Ok(Vec::new()));
+    assert_eq!(
+        tree_pin(&root, DIR, PIN),
+        Ok(TreePin {
+            dir: DIR,
+            pin: PIN,
+            tag: TAG.into(),
+            tree,
+        })
+    );
+    write(&root, "vendor/up/crates/a/src/lib.rs", "//! Changed.\n");
+    assert!(matches!(
+        tree_pin(&root, DIR, PIN),
+        Err(TreePinError::Fail(_))
+    ));
 }
 
 #[test]

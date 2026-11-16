@@ -88,8 +88,8 @@
 //!   run writes or withdraws the `+tag` link.
 
 use super::registry::{
-    ACCOUNT, ADDRESS, AddressHolder, AddressIndex, DIFFER_COLUMNS, MACHINE, MAILBOX, MAX_DIFFERS,
-    PHONE, PREFERENCE, SOURCE,
+    ACCOUNT, ADDRESS, AddressHolder, AddressIndex, CLI, DIFFER_COLUMNS, MACHINE, MAILBOX,
+    MAX_DIFFERS, MODEL, PHONE, PLAN, PREFERENCE, PROVIDER, SOURCE,
 };
 use crate::{
     Error, Result,
@@ -641,6 +641,11 @@ pub enum Kind {
     Conflicted,
     /// The owner retired or ended this row: the import leaves it whole.
     RetiredKept,
+    /// A cell this run would write names a row the registry holds that is not live (the owner
+    /// retired, ended or merged it): the reference is left out, and a row whose key it is (a
+    /// preference's machine or account) is neither born nor revived, nor an account at a
+    /// provider the owner retired born.
+    TargetNotLive,
     /// Two sources disagree; the higher one won and the other's coordinates are kept.
     SourcesDisagree,
     /// One address on two rows of a sheet.
@@ -712,6 +717,7 @@ impl Kind {
             Self::OwnerKept => "owner-kept",
             Self::Conflicted => "conflicted",
             Self::RetiredKept => "retired-kept",
+            Self::TargetNotLive => "target-not-live",
             Self::SourcesDisagree => "sources-disagree",
             Self::DuplicateAddress => "duplicate-address",
             Self::FreeText => "free-text",
@@ -757,7 +763,7 @@ pub struct Finding {
 pub struct Count {
     /// Rows the sources name.
     pub rows: usize,
-    /// Of those, rows the registry does not hold yet.
+    /// Of those, rows the registry does not hold yet that the plan writes.
     pub new_rows: usize,
     /// Registers to write.
     pub cells: usize,
@@ -1594,6 +1600,8 @@ fn plan_with(
     unopened_numbers: bool,
     mut project: impl FnMut(&'static Collection) -> Projection,
 ) -> Result<Plan> {
+    // The seeded and owner-kept collections a planned reference may name too, so a reference
+    // to a row of theirs that is not live is left out ([`Kind::TargetNotLive`]).
     let current: BTreeMap<&'static str, Projection> = [
         &ADDRESS,
         &ACCOUNT,
@@ -1602,6 +1610,10 @@ fn plan_with(
         &MAILBOX,
         &PHONE,
         &SOURCE,
+        &PROVIDER,
+        &PLAN,
+        &MODEL,
+        &CLI,
     ]
     .into_iter()
     .map(|collection| (collection.name, project(collection)))
@@ -1672,6 +1684,120 @@ impl<'a> Planner<'a> {
             joined: BTreeSet::new(),
         }
     }
+}
+
+/// Whether `want`, the row `pk` of `form` this run plans (`held` as the registry holds it,
+/// `revived` where the run makes an ended preference live again), names only rows `current` holds
+/// live, once what it may not name is left out. A reference to a row the registry holds that is not
+/// live (the owner retired, ended or merged it) would have the rules every write passes refuse the
+/// whole run (`typed::check::names_not_live`), and every later run that plans it again. A row the
+/// run makes live (a birth or a revival) makes every reference it holds; any other row only those
+/// its written cells change. Each such reference is a [`Kind::TargetNotLive`] finding by key and
+/// column, and is left out of `want`; where it is a key column of a row the run makes live (a
+/// preference's machine or account), or a cell of a revived row the run does not write, the row is
+/// not written at all and this answers `false`.
+fn live_references(
+    current: &BTreeMap<&'static str, Projection>,
+    (form, pk): (&Collection, &str),
+    held: Option<&cell::Row>,
+    revived: bool,
+    want: &mut RowWant,
+    plan: &mut Plan,
+) -> bool {
+    let not_live = |target: &str, key: &str| {
+        current
+            .get(target)
+            .and_then(|projection| projection.rows.get(key))
+            .is_some_and(|row| !row.live())
+    };
+    let makes_live = held.is_none() || revived;
+    let names_not_live = |ty: &crate::typed::Ty, x: &Value| {
+        check::references(ty, x)
+            .iter()
+            .any(|&(target, key)| not_live(target, key))
+    };
+    // (column, member, where a source states it), and whether the row is not written at all.
+    let mut left: Vec<(&'static str, Option<String>, Option<Coord>)> = Vec::new();
+    let mut whole = false;
+    for (&column, wanted) in &want.values {
+        let Some(declared) = form.column(column) else {
+            continue;
+        };
+        let unchanged = held.and_then(|row| row.get(column)) == Some(&wanted.x);
+        if (makes_live || !unchanged) && names_not_live(&declared.ty, &wanted.x) {
+            whole |= makes_live && declared.fixed;
+            left.push((column, None, Some(wanted.at.clone())));
+        }
+    }
+    for (&column, members) in &want.elements {
+        let Some(crate::typed::Ty::Set(crate::typed::Ty::Ref(target))) =
+            form.column(column).map(|c| c.ty)
+        else {
+            continue;
+        };
+        for (elem, (x, at)) in members {
+            let present = held
+                .and_then(|row| row.fields.get(column))
+                .is_some_and(|field| field.has_member(elem));
+            if *x == Value::Bool(true) && (makes_live || !present) && not_live(target, elem) {
+                left.push((column, Some(elem.clone()), Some(at.clone())));
+            }
+        }
+    }
+    // A revived row's own cells the run does not write are made live with it.
+    if revived && let Some(row) = held {
+        for (column, field) in &row.fields {
+            let Some(declared) = form.column(column) else {
+                continue;
+            };
+            if want.values.contains_key(declared.name) {
+                continue;
+            }
+            let mut names = Vec::new();
+            for candidate in field.candidates() {
+                names.extend(check::references(&declared.ty, &candidate.value.x));
+            }
+            if names.iter().any(|&(target, key)| not_live(target, key)) {
+                whole = true;
+                left.push((declared.name, None, None));
+            }
+        }
+    }
+    if left.is_empty() {
+        return true;
+    }
+    let name = form.name;
+    for (column, elem, at) in &left {
+        plan.findings.push(Finding {
+            kind: Kind::TargetNotLive,
+            collection: Some(name),
+            pk: Some(pk.to_owned()),
+            column: Some(match elem {
+                Some(elem) => format!("{column}.{elem}"),
+                None => (*column).to_owned(),
+            }),
+            at: at.iter().cloned().collect(),
+        });
+    }
+    let count = plan.counts.entry(name).or_default();
+    if whole {
+        count.kept += 1;
+        return false;
+    }
+    count.kept += left.len();
+    for (column, elem, _) in left {
+        match elem {
+            None => {
+                want.values.remove(column);
+            }
+            Some(elem) => {
+                if let Some(members) = want.elements.get_mut(column) {
+                    members.remove(&elem);
+                }
+            }
+        }
+    }
+    true
 }
 
 fn coord(sheet: &Sheet, n: usize, row: usize, col: usize) -> Coord {
@@ -2273,7 +2399,13 @@ impl Planner<'_> {
     }
 
     /// Want the account of row `address_pk`, which the source names as `address`, at `realm`:
-    /// keyed from the address it signs in as ([`Self::signs_in`]); returns its key.
+    /// keyed from the address it signs in as ([`Self::signs_in`]); returns its key. An account
+    /// the registry does not hold, at a realm whose provider the owner retired, is not wanted
+    /// (a [`Kind::TargetNotLive`] finding on its `provider`, and `None`), as observation adds none
+    /// there (`observe::matched`, `account-provider-retired`): its provider is its realm's, so the
+    /// birth could only name the retired provider or leave a live account with none. An account
+    /// the registry holds is wanted as before; [`live_references`] leaves the provider out if
+    /// the run would change it to the retired one.
     fn account(
         &mut self,
         address: &str,
@@ -2283,6 +2415,21 @@ impl Planner<'_> {
     ) -> Option<String> {
         let pk = keys::account_pk(realm, &self.signs_in(address, address_pk)).ok()?;
         let provider = keys::provider_of_realm(realm)?;
+        if !self.current[ACCOUNT.name].rows.contains_key(&pk)
+            && self.current[PROVIDER.name]
+                .rows
+                .get(provider)
+                .is_some_and(|row| !row.live())
+        {
+            self.findings.insert(Finding {
+                kind: Kind::TargetNotLive,
+                collection: Some(ACCOUNT.name),
+                pk: Some(pk),
+                column: Some("provider".to_owned()),
+                at: vec![at.clone()],
+            });
+            return None;
+        }
         self.want(&ACCOUNT, &pk, "provider", json!(provider), at);
         self.want(&ACCOUNT, &pk, "realm", json!(realm), at);
         self.want(&ACCOUNT, &pk, "login", json!(address_pk), at);
@@ -2844,8 +2991,12 @@ impl Planner<'_> {
                         at: vec![vault_at.clone(), at.clone()],
                     });
                 }
+                // The account the vault sheet wanted: none where `account` declined it (its
+                // provider retired), and then no service of it either.
                 Some(_) => {
-                    if let Ok(pk) = keys::account_pk(realm, &self.signs_in(address, address_pk)) {
+                    if let Ok(pk) = keys::account_pk(realm, &self.signs_in(address, address_pk))
+                        && self.has_row(ACCOUNT.name, &pk)
+                    {
                         for (_, service) in &read {
                             self.element(&ACCOUNT, &pk, "services", service, &at);
                         }
@@ -3472,9 +3623,6 @@ impl Planner<'_> {
                 let current_row = current[name].rows.get(pk);
                 let count = plan.counts.entry(name).or_default();
                 count.rows += 1;
-                if current_row.is_none() {
-                    count.new_rows += 1;
-                }
                 // A preference an import ended and a source states again comes back; one the owner
                 // ended stays ended.
                 let revived = current_row.filter(|row| {
@@ -3523,6 +3671,21 @@ impl Planner<'_> {
                         at: want.src.iter().cloned().collect(),
                     });
                     continue;
+                }
+                if !live_references(
+                    &current,
+                    (form, pk),
+                    current_row,
+                    revived.is_some(),
+                    want,
+                    &mut plan,
+                ) {
+                    continue;
+                }
+                // Counted once the run is sure to write it: a row `live_references` leaves
+                // unborn is a row the sources name, not a new one.
+                if current_row.is_none() {
+                    plan.counts.entry(name).or_default().new_rows += 1;
                 }
                 let mut changes = Vec::new();
                 let mut step = |changes: &mut Vec<Change>,

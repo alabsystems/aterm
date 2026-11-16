@@ -51,7 +51,7 @@ impl Reader {
     pub(crate) const fn can_take(self, source: RecordsBound) -> bool {
         match self {
             Self::Files => false,
-            Self::LegacyLog => source.held != 0 && !source.crossed,
+            Self::LegacyLog => source.held != 0 && !source.fenced(),
             Self::BoundedLog(peer) => peer.can_exchange(source),
         }
     }
@@ -72,6 +72,11 @@ impl Reader {
                 "this vault's membership log has passed the {} records an older aterm takes, and \
                  the new Mac runs one: update aterm on the new Mac, then ask again",
                 crate::membership_log::LEGACY_RECORDS
+            ),
+            Self::BoundedLog(peer) if peer.format != source.format => format!(
+                "this vault's membership records are in format {} here and format {} on the new \
+                 Mac: update aterm on the Mac whose format is lower, then ask again",
+                source.format, peer.format
             ),
             // Only one side can be short: the new Mac of a history up to `source.held`, or the
             // member of one up to `peer.held`.
@@ -95,11 +100,21 @@ impl Reader {
 /// [`Reader::refusal`], seen from the new Mac. `None` where it takes it.
 pub(crate) fn source_refusal(local: RecordsBound, source: Option<RecordsBound>) -> Option<String> {
     match source {
-        None if local.crossed => Some(
+        None if local.format != crate::crossing::FORMAT_ONE => Some(format!(
+            "this Mac's membership records are in format {}, which the allowing Mac's older \
+             aterm does not read: update aterm on the allowing Mac, then ask again",
+            local.format
+        )),
+        None if local.fenced() => Some(
             "this Mac's membership log has crossed past the records the allowing Mac's older \
              aterm takes: update aterm on the allowing Mac, then ask again"
                 .to_owned(),
         ),
+        Some(source) if local.format != source.format => Some(format!(
+            "this Mac's membership records are in format {} and the allowing Mac's in format {}: \
+             update aterm on the Mac whose format is lower, then ask again",
+            local.format, source.format
+        )),
         Some(source) if !local.can_exchange(source) && local.held < source.held => Some(format!(
             "the allowing Mac's membership log may hold {} records, more than the {} this Mac's \
              aterm takes: update aterm on this Mac, then ask again",

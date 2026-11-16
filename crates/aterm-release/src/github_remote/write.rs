@@ -28,8 +28,9 @@ use std::time::Duration;
 /// ends; intent 1967-fc387e8b41a0 of 2026-11-13: begun 11:13:01, created by 11:13:54), and a
 /// cut, its lease worker and three landings were writing at once. Five minutes is six such
 /// writes in turn, and under the half hour of the shortest lease
-/// (`line_claim::lease_s`). An intent open past it has no write running that this wait can
-/// outlast (its writer died, or its outcome is unknown): the refusal names it.
+/// (`line_claim::lease_s`). An intent open past it whose writer died, or whose outcome is
+/// unknown, stops writes until agh's window for it ends (`agh::Journal::closable`); the
+/// refusal names it, and a write made after that window begins.
 pub(super) const INTENT_WAIT: Duration = Duration::from_secs(300);
 /// How often a waiting write reads the journal for the intent it waits on.
 pub(super) const INTENT_POLL: Duration = Duration::from_millis(500);
@@ -400,7 +401,9 @@ impl Remote {
         };
         let mut seen = view("for it")?;
         // An earlier attempt at this same write: the same repository, refs, expected and new
-        // objects. It is settled by what origin holds, never by a second post.
+        // objects. It is settled by what origin holds; inside agh's window for it
+        // (`agh::Journal::closable`) it is never posted a second time, and past it a second
+        // post is the same compare-and-swap, which GitHub refuses where the first landed.
         let own = seen.intent.op == agh::write::WriteOp::RefUpdateAtomic
             && seen.intent.request == asked.request;
         let made = |what: &str| {
@@ -411,11 +414,19 @@ impl Remote {
             Ok(After::Made)
         };
         let holds = || self.holds(&asked.wanted).map_err(|why| refused(&why));
+        // agh's next atomic write closes an intent whose writer can send nothing more
+        // (`agh::Journal::closable`), so the wait ends there and the write begins again.
+        let stops = |seen: &agh::journal::IntentView| {
+            intents
+                .closable(seen)
+                .map(|closable| seen.open && !closable)
+                .map_err(|clock| refused(&clock.why))
+        };
         if seen.open && own && holds()? {
             self.found(intents, intent)?;
             return made("that was left open");
         }
-        if seen.open {
+        if stops(&seen)? {
             let line = if own {
                 format!("waiting for intent {intent} of an earlier attempt at this write")
             } else {
@@ -423,7 +434,7 @@ impl Remote {
             };
             let _waiting = Waiting::new(&line);
             (self.notice)(&line);
-            while seen.open {
+            while stops(&seen)? {
                 let waited = self.mono()?.saturating_sub(began);
                 if waited >= INTENT_WAIT {
                     // A delayed receive of the earlier attempt may have landed meanwhile.
@@ -453,9 +464,13 @@ impl Remote {
                 INTENT_WAIT.as_secs()
             )));
         }
-        let created = matches!(seen.settled, Some(agh::journal::Settled::Created { .. }))
-            || seen.observed.iter().any(|(found, _)| found.is_some());
-        if own && created && holds()? {
+        // However the intent closed (its writer settled it, a read found it, or another
+        // writer's begin closed it once its writer could send nothing more), what origin holds
+        // decides whether this write landed.
+        if own && holds()? {
+            if seen.open {
+                self.found(intents, intent)?;
+            }
             return made("that its writer finished");
         }
         Ok(After::Again)

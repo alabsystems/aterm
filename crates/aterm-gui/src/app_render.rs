@@ -504,6 +504,20 @@ const fn rebase_pending_trail_tick_after_present(
 struct SuccessfulPresentWindowOutcome {
     frame_interval: Duration,
     offscreen: bool,
+    /// Whether the present carried content the window was waiting to show (session output, a
+    /// kitty animation frame): `WindowState::content_pending`, taken by the present.
+    content_presented: bool,
+}
+
+/// Whether someone asked for a present the load-shed latch judges
+/// ([`App::note_present_cost_as`]): its content, or a person in its window
+/// ([`App::judge_window_present`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentAsk {
+    /// The present carried content, or a person is in its window.
+    Asked,
+    /// Neither: a still frame of a window nobody attends, or one that rests.
+    Unasked,
 }
 
 #[cfg(test)]
@@ -541,6 +555,8 @@ fn acknowledge_successful_present(
         &mut state.last_trail_fire,
         frame_started,
     );
+    // The present took any pending slot before it was served: it books no lane fire.
+    state.trail_tick_term = None;
     let frame_interval = state.frame_interval.unwrap_or(app_frame_interval);
     state.on_present_succeeded();
     state.note_present_backlog(presented_at, frame_interval);
@@ -554,6 +570,7 @@ fn acknowledge_successful_present(
     SuccessfulPresentWindowOutcome {
         frame_interval,
         offscreen,
+        content_presented,
     }
 }
 
@@ -883,6 +900,8 @@ fn retain_native_leaf_raster(
     }
     cache.native_damage = None;
     cache.native_pointer_style_only = false;
+    // The raster compiled the page as it stands: every node it lists is the model's again.
+    cache.native_nodes_behind = false;
 }
 
 #[cfg(test)]
@@ -6564,11 +6583,19 @@ impl App {
     /// The window's whole-cell side inset in device pixels. Zero needs no renderer metrics,
     /// preserving early geometry reads before the backend joins.
     pub(crate) fn win_side_inset_px(&self, wid: WindowId) -> usize {
-        match self.windows.get(&wid).map_or(0, |ws| ws.side_inset_cells) {
+        self.side_inset_px_of(wid, self.windows.get(&wid).map_or(0, |ws| ws.dock.cells))
+    }
+
+    /// [`Self::win_side_inset_px`] were window `wid`'s side inset `cells` wide: what a dock rise
+    /// is judged by before it commits ([`Self::set_dock_at`]).
+    pub(crate) fn side_inset_px_of(&self, wid: WindowId, cells: u16) -> usize {
+        match cells {
             0 => 0,
             cells => {
                 let cw = if self.backend.is_pending() {
-                    crate::seed_cell_px(self.windows[&wid].metrics.font_px).0
+                    self.windows
+                        .get(&wid)
+                        .map_or(0, |ws| crate::seed_cell_px(ws.metrics.font_px).0)
                 } else {
                     self.win_cell_size(wid).0
                 };
@@ -6925,16 +6952,37 @@ impl App {
     }
 
     fn settle_motion_policy_transition(&mut self) {
+        self.invalidate_native_pages();
+        self.request_redraw_all_windows();
+    }
+
+    /// Drops the compiled native frame of every window whose active tab holds a native page,
+    /// and returns those windows. A page compiles the raw latch in
+    /// (`ViewMotionCx::performance_reduced`), so no frame it compiled before a flip is kept.
+    fn invalidate_native_pages(&mut self) -> Vec<WindowId> {
         let native_windows = self
             .windows
             .keys()
             .copied()
             .filter(|wid| self.active_tab_contains_native(*wid))
             .collect::<Vec<_>>();
-        for wid in native_windows {
+        for &wid in &native_windows {
             self.invalidate_native_ui_cache(wid);
         }
-        self.request_redraw_all_windows();
+        native_windows
+    }
+
+    /// Settles a raw flip of the latch that left [`Self::load_shed_active`] as it was. No
+    /// window's policy or envelope changed, but a native page reads the raw latch
+    /// (`ViewMotionCx::performance_reduced`: the Settings preview's shed and its heavy-load
+    /// note, judged against the Motion fields being edited). So each window whose active tab
+    /// holds one is invalidated and asked for one frame, and no other window is asked.
+    fn settle_raw_latch_flip(&mut self) {
+        for wid in self.invalidate_native_pages() {
+            if let Some(ws) = self.windows.get(&wid) {
+                ws.request_redraw();
+            }
+        }
     }
 
     fn gpu_backpressure_ns(&self, id: WindowId) -> u64 {
@@ -6958,11 +7006,89 @@ impl App {
         }
     }
 
+    /// Judges window `id`'s successful `present`, which cost `render_ns` and started at `at`,
+    /// against the load-shed latch; true when the raw latch flipped. An offscreen present is not
+    /// judged, nor is one at a pinned clock's instant, which feeds no wall-clock cost to the
+    /// latch: the dump's `cost` events are its presents' costs
+    /// (`crate::trail_rig::TrailRig::present_cost`).
+    ///
+    /// A present is asked for when it carried content or a person is in its window
+    /// ([`WindowState::person_here`]); one nobody asked for may clear the latch and never sets
+    /// it ([`Self::note_present_cost_as`]). A flip is logged and counted. Only a flip that
+    /// changes whether the shed applies ([`Self::load_shed_active`]) sets bloom and shimmer and
+    /// asks every window for a frame ([`Self::settle_motion_policy_transition`]). Under
+    /// `motion = "full"` or with adaptive motion off, a raw flip changes no policy and no
+    /// envelope, and asks a frame only of the windows showing a native page, which reads the raw
+    /// latch ([`Self::settle_raw_latch_flip`]).
+    fn judge_window_present(
+        &mut self,
+        id: WindowId,
+        render_ns: u64,
+        present: SuccessfulPresentWindowOutcome,
+        at: Instant,
+    ) -> bool {
+        if present.offscreen || crate::metrics::host_clock_pinned() {
+            return false;
+        }
+        let ask = if present.content_presented
+            || self.windows.get(&id).is_some_and(|ws| ws.person_here())
+        {
+            PresentAsk::Asked
+        } else {
+            PresentAsk::Unasked
+        };
+        let shed_before = self.load_shed_active();
+        if !self.note_present_cost_as(render_ns, present.frame_interval, at, ask) {
+            return false;
+        }
+        aterm_log::info!(
+            "load-shed: perf_reduced -> {} (render EMA vs {:.1}ms frame budget)",
+            self.perf_reduced,
+            present.frame_interval.as_nanos() as f64 / 1e6,
+        );
+        metrics::note_shed_transition(self.perf_reduced);
+        let shed = self.load_shed_active();
+        if shed != shed_before {
+            let gpu_post_fx = self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::GpuPostFx);
+            let bloom_on = !shed && gpu_post_fx && self.config.cursor_trail_bloom_or_default();
+            let shimmer_on = !shed && gpu_post_fx && self.config.cursor_fire_shimmer_or_default();
+            if let Some(gpu) = self.backend.gpu_mut() {
+                gpu.set_bloom(bloom_on);
+                gpu.set_shimmer(shimmer_on);
+            }
+            self.settle_motion_policy_transition();
+        } else {
+            self.settle_raw_latch_flip();
+        }
+        true
+    }
+
+    /// [`Self::note_present_cost_as`] for a present someone asked for: the entry of the tests
+    /// and of the trail rig (`trail_rig`), compiled where they are. The redraw path judges its
+    /// presents through [`Self::judge_window_present`].
+    #[cfg(any(test, all(unix, feature = "bench-support", debug_assertions)))]
     pub(crate) fn note_present_cost(
         &mut self,
         present_ns: u64,
         frame_interval: std::time::Duration,
         now: std::time::Instant,
+    ) -> bool {
+        self.note_present_cost_as(present_ns, frame_interval, now, PresentAsk::Asked)
+    }
+
+    /// Judges one present's cost `present_ns` against the load-shed latch; true exactly when
+    /// `perf_reduced` flips. Every present moves the EMA. While the latch is shed every present
+    /// counts toward its clear; while it is clear only an [`PresentAsk::Asked`] one counts
+    /// toward a set, and an unasked one leaves the set run as it was, neither counting nor
+    /// breaking it, so a window's frames nobody asked for never shed it.
+    pub(crate) fn note_present_cost_as(
+        &mut self,
+        present_ns: u64,
+        frame_interval: std::time::Duration,
+        now: std::time::Instant,
+        ask: PresentAsk,
     ) -> bool {
         let sample = present_ns as f64;
         let ema = match self.present_cost_ema_ns {
@@ -6988,7 +7114,7 @@ impl App {
             if self.perf_run >= PERF_HYSTERESIS_FRAMES && dwell_ok {
                 self.flip_shed_latch(now, false);
             }
-        } else {
+        } else if ask == PresentAsk::Asked {
             // Shed only after a sustained run over budget, judged on the raw
             // sample: one huge spike (a theme switch) keeps the decaying EMA over
             // threshold for a few frames and must not shed. The EMA still drives
@@ -7037,6 +7163,26 @@ impl App {
             1.0
         } else {
             self.shed_envelope(now)
+        }
+    }
+
+    /// The load-shed envelope window `id`'s frames apply at `now`: the App's
+    /// ([`Self::effective_shed_envelope`]) where a person is here
+    /// ([`WindowState::person_here`]), and elsewhere the fade's end, 0 while the shed applies
+    /// and 1 while it does not. A window nobody attends so never draws a fade's middle, and its
+    /// frames never hold the effect lane for the fade (`WindowState::note_shed_fade_animating`).
+    pub(crate) fn window_shed_envelope(
+        &self,
+        id: WindowId,
+        mode: crate::motion::MotionMode,
+        now: std::time::Instant,
+    ) -> f32 {
+        if self.windows.get(&id).is_none_or(|ws| ws.person_here()) {
+            self.effective_shed_envelope(mode, now)
+        } else if self.load_shed_active_with(mode) {
+            0.0
+        } else {
+            1.0
         }
     }
 
@@ -7400,11 +7546,15 @@ impl App {
             icons.push_str("none");
         }
         Ok(format!(
-            "{line} word_icons={icons} {} resting={} attended={} sight={}",
+            "{line} word_icons={icons} {} resting={} attended={} sight={} lane_term={} \
+             lane_fires={}",
             self.trail_target_fields()?,
             ws.rest.resting(),
             ws.rest.attended(),
-            ws.sight().name()
+            ws.sight().name(),
+            ws.trail_tick_term
+                .map_or("none", crate::effect_lane_tally::LaneTerm::name),
+            ws.lane_tally.line(),
         ))
     }
 
@@ -7507,7 +7657,7 @@ impl App {
         let mode = self.config.motion_mode();
         let cursor_motion =
             crate::motion::MotionPolicy::resolve(mode, self.system_reduce_motion, win_focused);
-        let shed_env = self.effective_shed_envelope(mode, frame_started);
+        let shed_env = self.window_shed_envelope(id, mode, frame_started);
         let trail_presentation = self.trail_presentation();
         let trail_voice = self.config.trail_sound_voice_for(trail_presentation);
         let mut glow_cfg = self.glow_config_for(trail_presentation);
@@ -10364,6 +10514,7 @@ impl App {
             self.windows.get(&id).map(|state| &state.present_metrics),
             self.capture_barrier == Some(id),
         );
+        let dock_geometry = self.dock_geometry(id);
         let present = self.windows.get_mut(&id).map(|mut state| {
             let state = &mut **state;
             let present = acknowledge_successful_present(
@@ -10440,12 +10591,23 @@ impl App {
                     }
                 }
             }
+            if state.dock_card.is_some() {
+                state.dock.presented = dock_geometry;
+                if let Some(raster) = state
+                    .dock
+                    .view
+                    .and_then(|view| state.leaf_render_cache.get_mut(&view))
+                    .and_then(|cache| cache.native.as_mut())
+                {
+                    raster.presented = true;
+                }
+            }
             present
         });
 
         self.report_native_ime_cursor_area(id, presented_plan);
 
-        if !matches!(route, SuccessfulPresentRoute::Terminal) {
+        if self.dock_view(id).is_some() || !matches!(route, SuccessfulPresentRoute::Terminal) {
             self.refresh_native_hover_for_frame_from_plan(id, presented_plan);
         }
         self.refresh_glass_cursor_for_frame_with_plan(id, Some(presented_plan));
@@ -10559,30 +10721,8 @@ impl App {
             }
         }
 
-        // A present at a pinned clock's instant feeds no wall-clock cost to the latch: the
-        // dump's `cost` events are its presents' costs (`crate::trail_rig::TrailRig::present_cost`).
-        if let Some(present) = present
-            && !present.offscreen
-            && !crate::metrics::host_clock_pinned()
-            && self.note_present_cost(render_ns, present.frame_interval, frame_started)
-        {
-            aterm_log::info!(
-                "load-shed: perf_reduced -> {} (render EMA vs {:.1}ms frame budget)",
-                self.perf_reduced,
-                present.frame_interval.as_nanos() as f64 / 1e6,
-            );
-            metrics::note_shed_transition(self.perf_reduced);
-            let shed = self.load_shed_active();
-            let gpu_post_fx = self
-                .serious_mode_policy()
-                .allows(crate::motion::SeriousEffect::GpuPostFx);
-            let bloom_on = !shed && gpu_post_fx && self.config.cursor_trail_bloom_or_default();
-            let shimmer_on = !shed && gpu_post_fx && self.config.cursor_fire_shimmer_or_default();
-            if let Some(gpu) = self.backend.gpu_mut() {
-                gpu.set_bloom(bloom_on);
-                gpu.set_shimmer(shimmer_on);
-            }
-            self.settle_motion_policy_transition();
+        if let Some(present) = present {
+            self.judge_window_present(id, render_ns, present, frame_started);
         }
 
         self.update_accessibility(id, presented_plan);
@@ -10780,15 +10920,12 @@ impl App {
         route: crate::VisibleContentRoute,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) {
-        match route {
-            crate::VisibleContentRoute::Terminal { .. } => state.leaf_render_cache.clear(),
-            crate::VisibleContentRoute::Native { .. }
-            | crate::VisibleContentRoute::Heterogeneous => {
-                state
-                    .leaf_render_cache
-                    .retain(|view, _| plan.leaf(*view).is_some());
-            }
-        }
+        let dock = (state.dock.cells != 0).then_some(state.dock.view).flatten();
+        state.leaf_render_cache.retain(|view, _| {
+            dock == Some(*view)
+                || (!matches!(route, crate::VisibleContentRoute::Terminal { .. })
+                    && plan.leaf(*view).is_some())
+        });
     }
 
     /// Step the cursor companions for a mixed frame of window `id` ([`step_cursor_companions`]):
@@ -11068,6 +11205,120 @@ impl App {
         }
     }
 
+    /// Retain chrome independently of the active tab's content route.
+    pub(crate) fn prepare_dock_raster(&mut self, wid: WindowId) {
+        let Some(view) = self.dock_view(wid) else {
+            return;
+        };
+        if self.windows.get(&wid).is_none_or(|ws| ws.occluded) {
+            return;
+        }
+        let Some(host) = self.dock_geometry(wid) else {
+            return;
+        };
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
+        else {
+            return;
+        };
+        let Ok(stamp) = self.native_ui_compile_stamp_for(wid, native.instance, view, host.viewport)
+        else {
+            return;
+        };
+        let (width, height) = host.size;
+        let damage = self.windows[&wid]
+            .leaf_render_cache
+            .get(&view)
+            .map_or(Some(crate::native_app::DamageRegion::All), |cache| {
+                pending_native_leaf_damage(cache, stamp, width, height)
+            });
+        if damage.is_none() && self.windows[&wid].dock_card.is_some() {
+            return;
+        }
+        let mut cache = self
+            .windows
+            .get_mut(&wid)
+            .unwrap()
+            .leaf_render_cache
+            .remove(&view)
+            .unwrap_or_default();
+        // The card the window holds when it is this raster's plain copy, before the paint.
+        let base_card = cache.native.as_ref().map_or(0, |raster| raster.card_serial);
+        if let Some(damage) = damage {
+            self.navigator_note_viewport(view, host.viewport);
+            let holes = crate::tray_raster::chrome_text_holes();
+            match self.build_native_leaf_scene(wid, native.instance, view, host.viewport, damage) {
+                Ok(scene) => retain_native_leaf_raster(
+                    &mut cache,
+                    scene,
+                    host.size,
+                    self.windows[&wid].scale.max(f64::EPSILON) as f32,
+                    self.chrome_palette(ChromeSurface::NativePage),
+                    self.theme,
+                    holes,
+                ),
+                Err(_) => {
+                    self.windows
+                        .get_mut(&wid)
+                        .unwrap()
+                        .leaf_render_cache
+                        .insert(view, cache);
+                    return;
+                }
+            }
+        }
+        let mut ws = self.windows.get_mut(&wid).unwrap();
+        if let Some(raster) = cache.native.as_mut() {
+            // A region the raster patched over the card the window holds, its plain copy, is
+            // patched into that card in place and named as rows since it: no copy of the rest
+            // here, and none, nor a compare, in a renderer that holds that card (one row's word,
+            // or the one pixel a row listed off the screen repaints). A first card, or a whole
+            // raster, is a copy of the raster.
+            let region = match (damage, raster.last_work) {
+                (Some(_), crate::NativeRasterWork::Region { rect, .. }) => Some([rect]),
+                _ => None,
+            };
+            let patched = region.is_some_and(|regions| {
+                ws.dock_card.as_mut().is_some_and(|card| {
+                    if card.serial == 0
+                        || card.serial != base_card
+                        || (card.pw, card.ph) != (raster.width, raster.height)
+                        || !crate::app_native_motion::copy_card_regions(
+                            &mut card.rgba,
+                            &raster.rgba,
+                            card.pw,
+                            &regions,
+                        )
+                    {
+                        return false;
+                    }
+                    let since = card.serial;
+                    card.serial = crate::app_native_motion::next_card_serial();
+                    card.delta = crate::app_native_motion::rows_of(&regions)
+                        .map(|rows| aterm_gpu::TrayDelta { since, rows });
+                    card.raster_fingerprint_once.take();
+                    true
+                })
+            });
+            if !patched {
+                ws.dock_card = Some(crate::SettingsCard {
+                    rgba: raster.rgba.clone(),
+                    pw: width,
+                    ph: height,
+                    dx: 0,
+                    dy: 0,
+                    fp: 0,
+                    geom: 0,
+                    raster_fingerprint_once: Default::default(),
+                    scrim: None,
+                    serial: crate::app_native_motion::next_card_serial(),
+                    delta: None,
+                });
+            }
+            raster.card_serial = ws.dock_card.as_ref().map_or(0, |card| card.serial);
+        }
+        ws.leaf_render_cache.insert(view, cache);
+    }
+
     fn redraw_window_with_layout(
         &mut self,
         id: WindowId,
@@ -11139,6 +11390,7 @@ impl App {
             _ => return,
         }
         self.bind_window_renderer_state(id);
+        self.prepare_dock_raster(id);
         let owned_layout = frame_layout
             .is_none()
             .then(|| self.active_visible_frame_layout(id))
@@ -11205,6 +11457,7 @@ impl App {
         let blink_phase = ws0.blink_phase;
         let drag_hover = ws0.drag_hover && !ws0.overlay_open();
         let last_present = ws0.last_present;
+        let dock = self.dock_shape(id);
 
         let streak_knobs = (
             self.output_streak_shows(),
@@ -11640,8 +11893,8 @@ impl App {
                 .companions_mut()
                 .cursor_cat
                 .set_collection_presentable(frame_started, cursor_companion_presentable);
-            if shed_envelope_transitioning(load_shed, shed_envelope) && ws.os_window.is_some() {
-                ws.note_deco_animating(frame_started);
+            if shed_envelope_transitioning(load_shed, shed_envelope) && crate::has_os_window(ws) {
+                ws.note_shed_fade_animating(frame_started);
             }
             ws.fx
                 .decos_mut()
@@ -11766,6 +12019,7 @@ impl App {
                 .with_caret_path(caret_path),
             );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
+            ws.note_pet_events(&pet_tick, frame_started);
             let mut verdict_heard: Option<(bool, bool)> = None;
             if let Some((code, dur_ms)) = pet_tick.completion
                 && keyed_celebration_completion(
@@ -12254,6 +12508,7 @@ impl App {
                 link_caption: ws.link_hover,
                 claude_footer_fp,
                 rewind_fp,
+                dock,
             };
             if !deco_rescan
                 && !rain_refresh
@@ -13022,6 +13277,7 @@ impl App {
         self.stack_or_fold_stats_deck(id);
         let tray_floor_y = self.paste_banner_tray_floor_y(id);
         let inset = aterm_render::SideInsetPx(self.win_side_inset_px(id));
+        let dock_geometry = self.dock_geometry(id);
         let app_frame_interval = self.frame_interval;
         let App {
             backend, windows, ..
@@ -13088,6 +13344,12 @@ impl App {
                 }),
             ) => {
                 window_gpu.set_side_inset_px(inset.0 as u32);
+                window_gpu.set_dock_quad(
+                    ws.dock_card
+                        .as_ref()
+                        .and_then(|card| tray_quad_below_y(card, 0)),
+                    dock_geometry.map_or((0, 0), |host| host.origin),
+                );
                 aterm_gpu::present_glass::arm_deck_target(deck_target_ns);
                 aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
                     input_hot: present_hot,
@@ -13134,6 +13396,12 @@ impl App {
             }
             (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => {
                 window_gpu.set_side_inset_px(inset.0 as u32);
+                window_gpu.set_dock_quad(
+                    ws.dock_card
+                        .as_ref()
+                        .and_then(|card| tray_quad_below_y(card, 0)),
+                    dock_geometry.map_or((0, 0), |host| host.origin),
+                );
                 gpu.present_overlay_virtual(
                     window_gpu,
                     invert,
@@ -13247,6 +13515,7 @@ impl App {
     ) -> Result<Option<u64>, metrics::PresentDropReason> {
         let tray_floor_y = self.paste_banner_tray_floor_y(id);
         let inset = aterm_render::SideInsetPx(self.win_side_inset_px(id));
+        let dock_geometry = self.dock_geometry(id);
         let app_frame_interval = self.frame_interval;
         let App {
             backend,
@@ -13331,6 +13600,12 @@ impl App {
                     }),
                 ) => {
                     window_gpu.set_side_inset_px(inset.0 as u32);
+                    window_gpu.set_dock_quad(
+                        ws.dock_card
+                            .as_ref()
+                            .and_then(|card| tray_quad_below_y(card, 0)),
+                        dock_geometry.map_or((0, 0), |host| host.origin),
+                    );
                     aterm_gpu::present_glass::arm_deck_target(deck_target_ns);
                     aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
                         input_hot: present_hot,
@@ -13375,6 +13650,12 @@ impl App {
                 }
                 (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => {
                     window_gpu.set_side_inset_px(inset.0 as u32);
+                    window_gpu.set_dock_quad(
+                        ws.dock_card
+                            .as_ref()
+                            .and_then(|card| tray_quad_below_y(card, 0)),
+                        dock_geometry.map_or((0, 0), |host| host.origin),
+                    );
                     if gpu.present_virtual_cropped_with_effects_transport(
                         window_gpu,
                         input,
@@ -13431,6 +13712,8 @@ impl App {
             let Backend::Cpu(r) = backend.ready_mut() else {
                 return Err(metrics::PresentDropReason::TargetMismatch);
             };
+            let dock = crate::app_window::dock_shape_of(ws.dock_card.as_ref(), dock_geometry);
+            let dock_stale = dock != ws.cpu_presented_dock;
             let chrome = invert
                 || overlay.is_some()
                 || ws.route_card.is_some()
@@ -13492,7 +13775,7 @@ impl App {
                 let n = buf.len().min(dw * dh);
                 let damage = ws.cpu_cache.last_damage();
                 let full = cpu_present_needs_full_copy(
-                    chrome || chrome_prev || chrome_bands_stale,
+                    chrome || chrome_prev || chrome_bands_stale || dock_stale,
                     translated,
                     translated_prev,
                     damage,
@@ -13536,6 +13819,18 @@ impl App {
                         invert,
                         overlay,
                     );
+                    if let (Some(card), Some(host)) = (ws.dock_card.as_ref(), dock_geometry) {
+                        if let Some(quad) = tray_quad_below_y(card, 0) {
+                            composite_tray_quad_at(
+                                &mut buf[..n],
+                                dw,
+                                dh,
+                                host.origin.0,
+                                host.origin.1,
+                                quad,
+                            );
+                        }
+                    }
                     if capture_client_requested {
                         captured_client = cpu_client_capture(&buf, dw, dh);
                     }
@@ -13600,6 +13895,7 @@ impl App {
                     u32::try_from(fh).unwrap_or(u32::MAX),
                 ));
                 ws.cpu_cache.set_presented_chrome(chrome);
+                ws.cpu_presented_dock = dock;
                 ws.cpu_cache.set_presented_edge_rows(chrome_edge_rows);
                 ws.cpu_cache.set_presented_translated(translated);
                 if capture_client_requested && let Some(client) = captured_client {
@@ -15744,8 +16040,8 @@ impl App {
                 .companions_mut()
                 .cursor_cat
                 .set_collection_presentable(now, cursor_companion_presentable);
-            if shed_envelope_transitioning(load_shed, shed_envelope) && ws.os_window.is_some() {
-                ws.note_deco_animating(now);
+            if shed_envelope_transitioning(load_shed, shed_envelope) && crate::has_os_window(ws) {
+                ws.note_shed_fade_animating(now);
             }
             let companion_step = step_cursor_companions(
                 ws,
@@ -15870,6 +16166,7 @@ impl App {
                 .with_caret_path(focus_caret_path),
             );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
+            ws.note_pet_events(&pet_tick, now);
             if let Some((code, _)) = pet_tick.completion {
                 let focus_boundary = self.pool.get(focus).and_then(|session| {
                     session
@@ -16064,6 +16361,7 @@ impl App {
             link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
             claude_footer_fp: self.claude_footer_fp(wid, plan),
             rewind_fp: self.rewind_frame_fp(wid, plan),
+            dock: self.dock_shape(wid),
         };
         let recovery_redraw_outstanding = self
             .windows

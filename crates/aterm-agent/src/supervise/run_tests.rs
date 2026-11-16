@@ -415,6 +415,11 @@ struct Mock {
     /// [`Self::autopilot_by`] moved at the `meta` read of each count, as [`Self::autopilot_at`]
     /// moves the word: who set each word in turn.
     autopilot_by_at: Vec<(usize, Option<&'static str>)>,
+    /// THE WORD MOVED WHILE THE LOOP WAITS AT REST: once `meta` was read `.0` times, the next
+    /// wait that carries the stored word while `.1` is another (no settle's `idle`) finds it moved
+    /// to `.1`, set by `.2`, and answers so, as a person's switch lands while an Off park sits on
+    /// its wait.
+    lift_at_rest: Option<(usize, Option<&'static str>, Option<&'static str>)>,
     /// `meta` writes in time, each that long after the first wait that carried `autopilot=`
     /// ([`Self::word_latch`]).
     meta_writes: VecDeque<(Duration, MetaWrite)>,
@@ -1281,6 +1286,7 @@ impl Mock {
             autopilot_once: BTreeMap::new(),
             autopilot_by: None,
             autopilot_by_at: Vec::new(),
+            lift_at_rest: None,
             meta_writes: VecDeque::new(),
             rest_from: None,
             word_deaf: false,
@@ -2110,10 +2116,20 @@ impl Mock {
             .and_then(|ms| ms.parse::<u64>().ok())
             .map_or(Duration::ZERO, Duration::from_millis);
         let asked_at = run_now(self.waits.as_deref());
+        let settles = tail.first() == Some(&"idle");
+        if let Some((after, word, by)) = self.lift_at_rest
+            && self.metas >= after
+            && !settles
+            && self.autopilot.unwrap_or("-") == carried
+            && self.autopilot != word
+        {
+            self.lift_at_rest = None;
+            self.autopilot = word;
+            self.autopilot_by = by;
+        }
         // The writes' clock starts at the first wait carrying the word at rest: one inside the
         // agent's turn carries it too ([`Session::busy_wait`]), and so does a settle's `idle`,
         // which the screen answers before any write; those answer only a word stored otherwise.
-        let settles = tail.first() == Some(&"idle");
         let from = match self.rest_from {
             Some(from) if !settles => from,
             None if !settles && worker_phase(self.last_served()) != Phase::Busy => {

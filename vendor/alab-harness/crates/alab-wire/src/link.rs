@@ -135,9 +135,11 @@
 //! inherits them.
 
 use std::ffi::OsString;
+use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::time::Duration;
 
+use crate::c3_child::{self, Binding, Mode};
 use crate::claim::{self, Child, Contract, Grant, Policy, Restart, SafePoint, Scope, Status};
 use crate::config::Config;
 use crate::record::{
@@ -148,6 +150,29 @@ use crate::stream::{
     self, AnswerError, Counts, Hand, Heard, Line, Lines, Outbox, Received, SEQ_MAX, SendError,
 };
 use crate::wire::{Connection, EventReader, Locator};
+
+#[path = "link_start.rs"]
+mod link_start;
+pub use link_start::ChildStart;
+
+/// A fresh native observation, distinct from a consumed terminal wait event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeObservation {
+    /// The native child is not currently observable. No retained child is retired.
+    #[default]
+    Unknown,
+    /// This exact native child was observed during the current caller pass.
+    Present(crate::claim::NativeChild),
+}
+
+impl NativeObservation {
+    fn present(self) -> Option<crate::claim::NativeChild> {
+        match self {
+            Self::Unknown => None,
+            Self::Present(child) => Some(child),
+        }
+    }
+}
 
 /// How long the launch may spend opening each of the two connections.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -167,10 +192,10 @@ pub const LATER_RETRY_MS: u64 = 1_000;
 /// Why a step of the link did not succeed. The text is one journal word group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// The connection could not be found, opened or authenticated, or a held
-    /// connection cannot be used again.
+    /// The transport is unavailable: its endpoint or connection could not be
+    /// used. A later attempt may recover it.
     Gone(String),
-    /// aterm answered, and the answer admits nothing.
+    /// The request or connection was refused, or its input or reply is invalid.
     Refused(String),
     /// aterm answered that the policy is off by a setting a person can switch
     /// on again while the session runs (`why=disabled`, `agent-off` or
@@ -275,7 +300,18 @@ pub fn recheck_after_ms(grace_left: Option<Duration>) -> u64 {
 fn ask(conn: &mut Connection, step: &str, request: Option<String>) -> Result<String, Failure> {
     let request = request.ok_or_else(|| Failure::Refused(format!("{step} request-unsendable")))?;
     conn.request_line(&request)
-        .map_err(|error| Failure::Gone(format!("{step} {error}")))
+        .map_err(|error| transport_failure(step, error))
+}
+
+/// Keep unavailable transport distinct from permanent admission/protocol failures.
+fn transport_failure(step: &str, error: std::io::Error) -> Failure {
+    let why = format!("{step} {error}");
+    match error.kind() {
+        std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::PermissionDenied => Failure::Refused(why),
+        _ => Failure::Gone(why),
+    }
 }
 
 /// One fresh `harness policy`.
@@ -397,13 +433,20 @@ fn claimed_line(grant: &Grant, holder: &str, child: Child<'_>) -> String {
 /// is returned. The grant, when it stands, and the `status` that proved it;
 /// or the failure, and whether a claim this sequence made may still stand
 /// because aterm did not take or did not answer its release.
+struct ClaimProof {
+    grant: Grant,
+    status: Status,
+    native: Binding,
+}
+
 fn guarded_claim(
     conn: &mut Connection,
     config: &Config,
     sid: &str,
     pid: u32,
     child: Child<'_>,
-) -> Result<(Grant, Status), (Failure, bool)> {
+    continuation: Binding,
+) -> Result<ClaimProof, (Failure, bool)> {
     let made = |failure: Failure| (failure, false);
     let policy = read_policy(conn, sid).map_err(made)?;
     admits(&policy, config.contracts()).map_err(made)?;
@@ -428,18 +471,31 @@ fn guarded_claim(
     // row, a verified record may claim any word, and a claim `status` does
     // not show proven is released below (the interface design, section 2.2
     // and HX-11).
-    if contract == Contract::Three
-        && !claim::rostered(
-            &ask(conn, "roster", claim::info_verb(sid)).map_err(made)?,
-            config.id(),
-        )
-    {
-        return Err(made(Failure::Refused("unrostered".to_string())));
-    }
+    let mode = if contract == Contract::Three {
+        let info = ask(conn, "roster", claim::info_verb(sid)).map_err(made)?;
+        if !claim::rostered(&info, config.id()) {
+            return Err(made(Failure::Refused("unrostered".to_string())));
+        }
+        if config.c3_child_tracking() {
+            Mode::parse(&info).map_err(|why| made(Failure::Refused(why.to_string())))?
+        } else {
+            Mode::Absent
+        }
+    } else {
+        Mode::Absent
+    };
+    let native = continuation.known.filter(|_| mode != Mode::Absent);
+    let generation = continuation
+        .generation_for(native)
+        .filter(|_| mode == Mode::Start);
     let reply = ask(
         conn,
         "claim",
-        claim::claim_verb(config, contract, sid, pid, child),
+        if contract == Contract::Three {
+            c3_child::claim(config, sid, pid, child, native, mode, generation)
+        } else {
+            claim::claim_verb(config, contract, sid, pid, child)
+        },
     )
     .map_err(made)?;
     if !ok(&reply) {
@@ -495,7 +551,16 @@ fn guarded_claim(
         } else {
             &grant.scopes
         };
-        proof(&status, &holder, needed).map(|()| (grant, status))
+        proof(&status, &holder, needed).map(|()| ClaimProof {
+            grant,
+            status,
+            native: Binding {
+                mode,
+                known: native,
+                generation,
+                pending: mode != Mode::Absent && native.is_none(),
+            },
+        })
     });
     match proven {
         Err(failure @ (Failure::Refused(_) | Failure::Later(_))) => Err(release(conn, failure)),
@@ -572,16 +637,21 @@ fn claim(
     locator: &Locator,
     pid: u32,
     child: Child<'_>,
+    continuation: Binding,
     opening: Duration,
     graced: bool,
 ) -> Result<Claimed, Failure> {
     let socket = locator
         .socket()
-        .map_err(|error| Failure::Gone(format!("graph {error}")))?;
+        .map_err(|error| transport_failure("graph", error))?;
     let mut conn = Connection::connect(&socket, opening)
-        .map_err(|error| Failure::Gone(format!("connect {error}")))?;
+        .map_err(|error| transport_failure("connect", error))?;
     conn.set_timeout(REQUEST_TIMEOUT);
-    let (grant, status) = match guarded_claim(&mut conn, config, locator.sid(), pid, child) {
+    let ClaimProof {
+        grant,
+        status,
+        native,
+    } = match guarded_claim(&mut conn, config, locator.sid(), pid, child, continuation) {
         Ok(proven) => proven,
         Err((failure, stands)) => {
             let failure = busy(failure, conn.timed_out());
@@ -617,6 +687,7 @@ fn claim(
             stream: None,
             stream_ask: Ask::At(0),
             status: Some(status),
+            native,
         }),
         Err(error) => {
             let _ = ask(
@@ -743,6 +814,8 @@ struct Claimed {
     /// The last `status` aterm gave, with the hand fields its `hand` records
     /// moved since.
     status: Option<Status>,
+    /// Negotiated C3 native evidence; independent from C4 epoch child metadata.
+    native: Binding,
 }
 
 /// When the session stream is asked for on the claim's connection.
@@ -856,36 +929,43 @@ impl Claimed {
                     None => return Ok(None),
                 }
             }
-            Ok(()) => match guarded_claim(&mut self.conn, config, &sid, self.pid, child) {
-                Ok((grant, status)) => {
-                    self.standing = true;
-                    self.unreleased = false;
-                    self.recheck_at_ms = 0;
-                    self.policy_due_ms = 0;
-                    if self.stream_ask != Ask::Never {
-                        self.stream_ask = Ask::At(0);
+            Ok(()) => {
+                match guarded_claim(&mut self.conn, config, &sid, self.pid, child, self.native) {
+                    Ok(ClaimProof {
+                        grant,
+                        status,
+                        native,
+                    }) => {
+                        self.standing = true;
+                        self.unreleased = false;
+                        self.recheck_at_ms = 0;
+                        self.policy_due_ms = 0;
+                        if self.stream_ask != Ask::Never {
+                            self.stream_ask = Ask::At(0);
+                        }
+                        self.last_hold = None;
+                        self.status = Some(status);
+                        self.native = native;
+                        let line = claimed_line(&grant, &self.holder, child);
+                        self.grant = grant;
+                        line
                     }
-                    self.last_hold = None;
-                    self.status = Some(status);
-                    let line = claimed_line(&grant, &self.holder, child);
-                    self.grant = grant;
-                    line
+                    Err((Failure::Gone(why), stands)) => {
+                        self.unreleased |= stands;
+                        return Err(Failure::Gone(why));
+                    }
+                    Err((
+                        Failure::Refused(why)
+                        | Failure::Off(why)
+                        | Failure::Later(why)
+                        | Failure::Unserved(why),
+                        _,
+                    )) => {
+                        self.policy_due_ms = again;
+                        format!("aterm unclaimed {why}")
+                    }
                 }
-                Err((Failure::Gone(why), stands)) => {
-                    self.unreleased |= stands;
-                    return Err(Failure::Gone(why));
-                }
-                Err((
-                    Failure::Refused(why)
-                    | Failure::Off(why)
-                    | Failure::Later(why)
-                    | Failure::Unserved(why),
-                    _,
-                )) => {
-                    self.policy_due_ms = again;
-                    format!("aterm unclaimed {why}")
-                }
-            },
+            }
         };
         if line == self.noted {
             return Ok(None);
@@ -1195,6 +1275,9 @@ enum State {
         /// aterm through its re-exec grace (D28), unreleased; 0 for none. A
         /// refused claim attempt or the link's release gives it back before.
         graced_until_ms: u64,
+        /// Native continuation survives unknown observations, including an acknowledged
+        /// pending generation with no observed child and proof-only bound children.
+        native: Binding,
     },
 }
 
@@ -1378,7 +1461,15 @@ impl Link {
         adopted: bool,
     ) -> Self {
         let mut link = Self::absent(config, pid);
-        match claim(&link.config, locator, pid, child, CONNECT_TIMEOUT, adopted) {
+        match claim(
+            &link.config,
+            locator,
+            pid,
+            child,
+            Binding::default(),
+            CONNECT_TIMEOUT,
+            adopted,
+        ) {
             Ok(claimed) => {
                 link.notes
                     .push(claimed_line(&claimed.grant, &claimed.holder, child));
@@ -1390,7 +1481,7 @@ impl Link {
                     .push(format!("aterm unclaimed {}", failure.why()));
                 let again = matches!(
                     failure,
-                    Failure::Later(_) | Failure::Off(_) | Failure::Unserved(_)
+                    Failure::Gone(_) | Failure::Later(_) | Failure::Off(_) | Failure::Unserved(_)
                 );
                 // An adopted image's claim attempt was made under the grace:
                 // an answer that gave the earlier image's claim back leaves
@@ -1408,6 +1499,7 @@ impl Link {
                         } else {
                             0
                         },
+                        native: Binding::default(),
                     };
                 }
             }
@@ -1626,6 +1718,7 @@ impl Link {
             } else {
                 0
             },
+            native: claimed.native,
         };
     }
 
@@ -1643,6 +1736,59 @@ impl Link {
     /// is open, an event subscription that is down is reopened on the same
     /// clock, but no policy read is owed for it: the stream carries `policy`.
     pub fn tick(&mut self, child: Child<'_>, now_ms: u64) {
+        self.tick_inner(child, || NativeObservation::Unknown, now_ms);
+    }
+
+    /// Drive the same link with a fresh native C3 observation. Unknown or
+    /// different observations never retire or replace a retained child. C4
+    /// continues to use `child.process` and ignores this separate observation.
+    pub fn tick_native(&mut self, child: Child<'_>, observed: NativeObservation, now_ms: u64) {
+        self.tick_inner(child, || observed, now_ms);
+    }
+
+    /// Drive C3 with a lazy native observer. It is called at most once per pass,
+    /// only for a due reclaim or pending completion that needs native data.
+    /// A steady held claim and C4 do not sample the kernel through this hook.
+    pub fn tick_native_with(
+        &mut self,
+        child: Child<'_>,
+        now_ms: u64,
+        observe: impl FnMut() -> NativeObservation,
+    ) {
+        self.tick_inner(child, observe, now_ms);
+    }
+
+    /// Record that the caller consumed the terminal event from its current
+    /// original owned child wait handle. Call this before crash-time reclaim
+    /// or permission reads. It is never inferred from a missing observation,
+    /// does no I/O and grants no restart or spawn permission. Host holds remain.
+    pub fn child_ended(&mut self) {
+        if !self.config.c3_child_tracking() {
+            return;
+        }
+        match &mut self.state {
+            State::Held(claimed) if claimed.grant.contract == Contract::Three => {
+                claimed.native.known = None;
+                claimed.native.generation = None;
+                claimed.native.pending = false;
+            }
+            State::Lost { native, .. } => {
+                native.known = None;
+                native.generation = None;
+                native.pending = false;
+            }
+            State::Held(_) | State::Absent => {}
+        }
+    }
+
+    fn tick_inner(
+        &mut self,
+        child: Child<'_>,
+        mut observe: impl FnMut() -> NativeObservation,
+        now_ms: u64,
+    ) {
+        let mut observed = None;
+        let mut observation = || *observed.get_or_insert_with(&mut observe);
         self.pump(child, now_ms);
         match &mut self.state {
             State::Absent => {}
@@ -1653,9 +1799,24 @@ impl Link {
                 claimed,
                 held,
                 graced_until_ms,
+                native,
             } => {
                 if now_ms < *retry_at_ms {
                     return;
+                }
+                if native
+                    .known
+                    .is_some_and(|known| observation().present() != Some(known))
+                {
+                    return;
+                }
+                // Retain a first exact observation before uncertain reclaim I/O.
+                // Pending acknowledged generations survive while known is None.
+                if self.config.c3_child_tracking()
+                    && (native.mode != Mode::Absent || self.config.contracts() == [Contract::Three])
+                    && let Some(known) = observation().present()
+                {
+                    native.known = Some(known);
                 }
                 let graced = now_ms < *graced_until_ms;
                 match claim(
@@ -1663,6 +1824,7 @@ impl Link {
                     locator,
                     self.pid,
                     child,
+                    *native,
                     REQUEST_TIMEOUT,
                     graced,
                 ) {
@@ -1738,6 +1900,11 @@ impl Link {
         self.stream_if_due(child, REQUEST_TIMEOUT, now_ms);
         self.flush(now_ms);
         self.settle();
+        if matches!(&self.state, State::Held(claimed) if claimed.native.pending)
+            && let observed @ NativeObservation::Present(_) = observation()
+        {
+            self.reannounce_inner(child, observed, now_ms);
+        }
     }
 
     /// The event descriptor is readable: drain it without waiting. A policy
@@ -2610,11 +2777,45 @@ impl Link {
     /// grants what its words and a person's cap allow now). A refusal, or a
     /// contract-4 reply that states no grant, loses the link.
     pub fn reannounce(&mut self, child: Child<'_>, now_ms: u64) {
+        self.reannounce_inner(child, NativeObservation::Unknown, now_ms);
+    }
+
+    /// Complete or renew a negotiated C3 child using a fresh native identifier.
+    /// Call `before_spawn` for each attempt, and positively retire a prior child
+    /// through `child_ended`; an unknown or different observation changes no binding.
+    /// The C4 announcement and stream path remain those of [`Link::reannounce`].
+    pub fn reannounce_native(
+        &mut self,
+        child: Child<'_>,
+        observed: NativeObservation,
+        now_ms: u64,
+    ) {
+        self.reannounce_inner(child, observed, now_ms);
+    }
+
+    fn reannounce_inner(&mut self, child: Child<'_>, observed: NativeObservation, now_ms: u64) {
         let State::Held(claimed) = &mut self.state else {
             return;
         };
-        // A hold aterm stated was on the child that ended.
-        claimed.last_hold = None;
+        if claimed.native.mode != Mode::Absent {
+            let Some(native) = observed.present() else {
+                return;
+            };
+            if claimed.native.known.is_some_and(|known| known != native) {
+                return;
+            }
+            // Retain the exact target through uncertain completion I/O. Only
+            // a positive response completes its pending announcement.
+            claimed.native.known = Some(native);
+            claimed.native.pending = true;
+        }
+        // Ordinary metadata reannouncement is the existing fresh-child path.
+        // Native reannouncement also renews the same live child, so preserve
+        // its prior host hold until a fresh safe-point/status decision. A bare
+        // metadata ACK says nothing about the hold.
+        if claimed.native.mode == Mode::Absent {
+            claimed.last_hold = None;
+        }
         if !claimed.standing {
             return;
         }
@@ -2628,13 +2829,25 @@ impl Link {
         let announced = ask(
             &mut claimed.conn,
             "reannounce",
-            claim::claim_verb(
-                &self.config,
-                contract,
-                claimed.locator.sid(),
-                claimed.pid,
-                child,
-            ),
+            if contract == Contract::Three {
+                c3_child::claim(
+                    &self.config,
+                    claimed.locator.sid(),
+                    claimed.pid,
+                    child,
+                    claimed.native.known,
+                    claimed.native.mode,
+                    claimed.native.generation_for(claimed.native.known),
+                )
+            } else {
+                claim::claim_verb(
+                    &self.config,
+                    contract,
+                    claimed.locator.sid(),
+                    claimed.pid,
+                    child,
+                )
+            },
         )
         .and_then(|reply| {
             if !ok(&reply) {
@@ -2654,9 +2867,11 @@ impl Link {
             .vendor
             .map_or_else(|| "-".to_string(), claim::journal_word);
         match announced {
-            Ok(None) => self
-                .notes
-                .push(format!("aterm reannounced vendor={vendor}")),
+            Ok(None) => {
+                claimed.native.pending = false;
+                self.notes
+                    .push(format!("aterm reannounced vendor={vendor}"));
+            }
             Ok(Some(grant)) => {
                 self.notes.push(format!(
                     "aterm reannounced vendor={vendor} child={} scope={} revision={}",
@@ -2677,3 +2892,7 @@ impl Link {
 #[cfg(test)]
 #[path = "link_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "link_c3_functional_tests.rs"]
+mod c3_functional_tests;

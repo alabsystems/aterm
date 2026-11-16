@@ -195,7 +195,8 @@ pub(super) fn swept(g: &mut SessionTimeline) {
 #[test]
 fn register_opens_the_session_and_deregister_closes_it_with_the_ledgers_tale() {
     let mut h = test_handle(1);
-    let parent = aterm_session::SessionId::new("s-0123456789abcdef0123");
+    let parent =
+        aterm_session::SessionId::parse("s-0123456789abcdef0123").expect("a legacy tab's id");
     h.parent = Some(parent.clone());
     let timeline = Arc::clone(&h.ctx.timeline);
     let hand = hand_clock(&timeline);
@@ -6201,9 +6202,14 @@ fn closed_log(marks: usize) -> Log {
     g.slog().log().clone()
 }
 
+/// The session [`link_closed`] closes as `n`.
+fn closed_sid(n: u64) -> aterm_session::SessionId {
+    aterm_session::SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(0x00c1_05ed_0000 + n))
+}
+
 /// Close `n`'s slot (roster seq `n + 1`, local `n`) linked into `index`, then `log`'s part attached as `keep` says: how many skeletons the two freed.
 fn link_closed(index: &mut ClosedLogs, log: &Log, n: u64, keep: ClosedKeep) -> usize {
-    let sid = aterm_session::SessionId::new(format!("s-closed-{n}"));
+    let sid = closed_sid(n);
     let linked = index.link(ClosedExit {
         seq: n + 1,
         sid: sid.clone(),
@@ -6250,10 +6256,8 @@ fn the_index_keeps_512_summaries_and_the_newest_32_skeletons() {
     assert_eq!(summary.lost(), log.lost() + log.len() as u64 - 2);
     assert_eq!(summary.last_seq(), log.last_seq());
     assert_eq!(
-        index
-            .by_sid(&aterm_session::SessionId::new("s-closed-1"))
-            .map(|e| e.sid().as_str().to_string()),
-        Some("s-closed-1".to_string())
+        index.by_sid(&closed_sid(1)).map(|e| e.sid().clone()),
+        Some(closed_sid(1))
     );
     assert_eq!(freed, CLOSED_INDEX_CAP + 1 - CLOSED_SKELETONS);
     assert_eq!(index.charge(), index.recharge());

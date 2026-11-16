@@ -777,8 +777,8 @@ fn projected_at(free: u64) -> fill::Projection {
 }
 
 /// Under a projection above the floor tier 4 takes only profiles unwritten for an hour
-/// (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2); below the floor it is revision 1's ten
-/// minutes.
+/// (`PROJECTED_MIN_IDLE_S`); below the floor it is the ten minutes every pressure tier holds
+/// (`PRESSURE_MIN_IDLE_S`).
 #[test]
 fn under_a_projection_above_the_floor_a_recent_profile_waits_an_hour() {
     let tmp = Tmp::new("pressure-projected-hour");

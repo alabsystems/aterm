@@ -31,6 +31,9 @@ pub enum EventKind {
     /// What one cross-target cell's cargo calls took.
     CellFinished,
     Disk,
+    /// A unit a compile built beside another of its package and kind, and the first input that
+    /// moved between them (`crate::disk::record_second_hashes`).
+    SecondHash,
     /// A process a cleanup sweep left, with its observed identity and reason.
     /// Diagnostic evidence; it establishes no signal authority or check verdict.
     ProcessSurvivor,

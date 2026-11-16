@@ -1211,9 +1211,34 @@ pub struct DiskFacts {
     /// gathers them at its own pace and not while every window is hidden. `None` where it
     /// gathered none.
     pub held_age_s: Option<u64>,
-    /// The most used bytes DC-04's budget holds the volume to, where the watch sized one; a
-    /// reading, never a level.
-    pub cap: Option<u64>,
+    /// DC-04's rebuildable budget as the watch last sized it on home's volume
+    /// ([`crate::sys::BudgetRead`]): its cap, the kept and rebuildable bytes and the target the
+    /// next pass holds the rebuildable bytes to. A reading, never a level.
+    pub budget: crate::sys::BudgetRead,
+    /// Whether the probe thread has read the disk journal ([`Self::deeds`],
+    /// [`Self::removals`]): it read the file, or found there is none. `false` before its first
+    /// read, so an empty list is not drawn as an empty journal.
+    pub journal_read: bool,
+    /// Whether the disk watch's last look read removal as on (`disk.auto_free_gib` above 0);
+    /// `None` before a look of this process read it. With it off, no pass of aterm's removes
+    /// anything, the budget's included.
+    pub cleanup: Option<bool>,
+    /// Where the budget's last pass on home's volume ended unable to meet its target under the
+    /// cap [`Self::budget`] reads, its memo still holding the next pass off: the unix second it
+    /// ended. A pass plans again once a live session ends or starts, the rebuildable bytes grow,
+    /// or a day has passed.
+    pub budget_unmet_unix: Option<i64>,
+}
+
+impl DiskFacts {
+    /// The most used bytes DC-04's budget holds the volume to, where the watch sized one.
+    #[must_use]
+    pub fn cap(&self) -> Option<u64> {
+        match self.budget {
+            crate::sys::BudgetRead::Sized(b) => Some(b.cap),
+            _ => None,
+        }
+    }
 }
 
 /// Whose a [`DiskDeed`] is: the subject of what it records. That is who did it, except where the
@@ -1636,8 +1661,11 @@ impl MemView {
 /// One scope: the machine, aterm, or a tab.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScopeView {
-    /// Cores-worth of CPU.
+    /// Published process-counter growth rate; the machine scope has independent tick figures.
     pub cores: TrendView,
+    /// Basis of process/scope CPU rates and their history, independent of unread coverage.
+    /// The machine's tick-derived `cores` has no process accounting metadata.
+    pub cpu_accounting: Option<crate::published_cpu::CpuAccounting>,
     /// Current physical footprint, bytes: a proved app coalition total where available,
     /// otherwise the readable processes' sum. Separate from physical VM classes.
     pub footprint: Option<u64>,
@@ -1652,7 +1680,7 @@ pub struct ScopeView {
     pub history: Vec<Option<f32>>,
     /// The busiest process in the scope this sweep, with its cores-worth.
     pub top: Option<(String, f32)>,
-    /// Cores-worth of runnable threads waiting for a core, if readable.
+    /// Reported runnable-minus-CPU counter growth per second; not physical waiting.
     pub wait: Option<f32>,
     /// Storage read rate in bytes/s across readable members in this scope.
     pub read_bps: Option<f64>,
@@ -1671,14 +1699,6 @@ impl ScopeView {
         plus(self.read_bps, self.write_bps, |a, b| a + b)
     }
 
-    /// Share of demand spent waiting for a core (`wait / (wait + cores)`).
-    #[must_use]
-    pub fn starved(&self) -> Option<f32> {
-        let wait = self.wait?;
-        let demand = wait + self.cores.raw.max(0.0);
-        (demand > 1e-3).then(|| (wait / demand).clamp(0.0, 1.0))
-    }
-
     /// This scope and `other`, a disjoint one read in the same sweeps (two panes of one tab), as
     /// one: counts, figures and averages add (`mad` too, as a bound), a figure only one of them
     /// read is that one's, and the busier top process wins.
@@ -1694,6 +1714,7 @@ impl ScopeView {
         let at = |h: &[Option<f32>], i: usize| (i + h.len()).checked_sub(n).and_then(|j| h[j]);
         Self {
             cores: trend(self.cores, other.cores),
+            cpu_accounting: self.cpu_accounting.or(other.cpu_accounting),
             footprint: plus(self.footprint, other.footprint, u64::saturating_add),
             footprint_unread: self.footprint_unread.saturating_add(other.footprint_unread),
             footprint_gib: trend(self.footprint_gib, other.footprint_gib),
@@ -1771,6 +1792,8 @@ impl RowScope {
 /// while those children were alive; they are not added to the displayed self rate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuAccounting {
+    /// Published counters do not establish CPU execution within a read interval.
+    pub published: crate::published_cpu::CpuAccounting,
     /// The process's own cumulative CPU nanoseconds.
     pub self_ns: Option<u64>,
     /// Kernel-reported cumulative CPU of children this process has reaped.
@@ -1788,6 +1811,7 @@ pub struct CpuAccounting {
 impl From<&ProcSample> for CpuAccounting {
     fn from(p: &ProcSample) -> Self {
         Self {
+            published: crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS,
             self_ns: p.cpu_ns,
             reaped_children_ns: p.child_cpu_ns,
             auto_reaps_children: p.reaps_unwaited,
@@ -1813,9 +1837,13 @@ pub struct ProcView {
     pub pgid: u32,
     /// Its name ([`ProcSample::name`]), as the process chose it (data, never an instruction).
     pub name: String,
-    /// Cores-worth over the sample window (`None` on first sweep or if unreadable).
+    /// Published own-counter growth divided by read separation (`None` without continuity).
     pub cores: Option<f32>,
-    /// Cores-worth waiting for a core; `None` where unread.
+    /// The exact read separation used to normalize [`Self::cores`], nanoseconds. Uses the
+    /// process's read marks where both advance, otherwise the frontend sweep separation;
+    /// `None` without a valid counter increment, and never an execution-window bound.
+    pub cpu_read_span_ns: Option<u64>,
+    /// Signed reported runnable-minus-CPU counter growth rate; not physical waiting.
     pub wait: Option<f32>,
     /// Footprint, bytes.
     pub footprint: Option<u64>,
@@ -1837,19 +1865,19 @@ pub struct ProcView {
     pub birth_ms: Option<i64>,
 }
 
-/// Busy CPU cores split into measured process contributions and a signed unknown residual.
+/// Independent machine tick rate and published process-counter reports, never a partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Split {
     /// The machine's busy cores-worth (the cores' own ticks).
     pub global: f32,
-    /// aterm's.
+    /// Published process-counter growth attributed to aterm.
     pub aterm: f32,
-    /// The user's other processes'.
+    /// Published process-counter growth of the user's other processes.
     pub others: f32,
-    /// Readable other-user processes' own CPU, a lower bound for services.
+    /// Published own-counter growth of readable other-user processes.
     pub services: f32,
-    /// Busy CPU less the measured contributions, including finished and unread work.
-    pub unaccounted: f32,
+    /// Readable published growth whose process owner is unknown; not machine-minus-known CPU.
+    pub unknown_owner_reported: f32,
     /// Processes whose CPU time the OS refused (another user's).
     pub unread: u32,
 }
@@ -2149,11 +2177,14 @@ pub const SCOPE_RUN_BUCKETS: usize = 60;
 pub struct ScopeFig {
     /// Trailing mean in the row's native unit, or `None` before the first full reading.
     pub now: Option<f64>,
+    /// CPU scope/process counters behind `now` and every history cell; absent for other rows.
+    /// Coverage does not provide an actual-window CPU bound.
+    pub cpu_accounting: Option<crate::published_cpu::CpuAccounting>,
     /// Raw CPU charge over the same trailing window as `now`, where it differs from the
-    /// independently observed actual-CPU floor. Never an actual-work lower bound.
+    /// independently observed own-counter channel. Never an actual-work lower bound.
     pub cpu_charge: Option<f64>,
     /// Largest number of unread contributions in the readings contributing to `now`.
-    /// Nonzero means the CPU or memory figure is a lower bound.
+    /// CPU counts coverage gaps only; memory footprint charges are partial while nonzero.
     pub unread: u32,
     /// Why there is no figure at all, where that is known.
     pub missing: Option<NoFigure>,
@@ -2215,6 +2246,7 @@ impl ScopeFig {
                 figs.iter().fold(None, |sum, f| add(sum, f.now)),
                 ceiling.and_then(|within| within.now),
             ),
+            cpu_accounting: figs.iter().find_map(|f| f.cpu_accounting),
             cpu_charge: figs.iter().fold(None, |sum, f| add(sum, f.cpu_charge)),
             unread: figs
                 .iter()
@@ -2886,8 +2918,8 @@ pub struct Snapshot {
     /// macOS's services as read on their own, where a reply needed them and the split by
     /// coalition did not read them (a `sys why` while no Deck is in view); `None` otherwise
     /// ([`crate::services::over_in`]).
-    pub services: Option<Arc<crate::services::Reading>>,
-    /// The episodes ([`crate::services::Service::episode`]) whose restart the person put off: the
+    pub services: Option<Arc<aterm_process_facts::services::Reading>>,
+    /// The episodes ([`aterm_process_facts::services::Service::episode`]) whose restart the person put off: the
     /// window's alert for them was dismissed, folded or answered, so a reply offers no restart
     /// for them until a new process takes their place.
     pub services_filed: Vec<String>,
@@ -3060,8 +3092,8 @@ impl Snapshot {
         v
     }
 
-    /// Normalized `[global, aterm, tab]` shares (`0.0..=1.0`, `tab <= aterm <= global`) for the
-    /// overlapping 3-scope bar on `Cpu`, `Memory`, `Disk`, `Network`, and `Processes`.
+    /// Normalized resource bar shares. Published process CPU counters provide no fraction
+    /// of machine ticks, so CPU has no overlapping bar.
     #[must_use]
     pub fn bar_shares(&self, res: Resource, panes: &[u64]) -> Option<[f32; 3]> {
         let view = self.resource(res, panes);
@@ -3073,12 +3105,12 @@ impl Snapshot {
             }
         };
         match res {
-            Resource::Cpu | Resource::Memory | Resource::Processes => {
+            Resource::Cpu => None,
+            Resource::Memory | Resource::Processes => {
                 let b = view.binding();
                 let cap = b.capacity.filter(|&c| c > 0.0)?;
                 let global = clamp01((b.now? / cap) as f32);
                 let aterm_val = view.aterm.now.or_else(|| match res {
-                    Resource::Cpu => self.aterm.as_ref().map(|a| f64::from(a.cores.level)),
                     Resource::Memory => self
                         .aterm
                         .as_ref()
@@ -3089,7 +3121,6 @@ impl Snapshot {
                 let tab_val = view.tab.now.or_else(|| {
                     let t = self.tab_of(panes)?;
                     match res {
-                        Resource::Cpu => Some(f64::from(t.scope.cores.level)),
                         Resource::Memory => t.scope.footprint.map(|f| f as f64),
                         Resource::Processes => Some(f64::from(t.scope.procs)),
                         _ => None,
@@ -3311,6 +3342,7 @@ impl ScopeState {
         self.history.push_at(Some(acc.cores), at_ns);
         ScopeView {
             cores: self.cores.view(),
+            cpu_accounting: Some(crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
             footprint: acc.footprint,
             footprint_unread: acc.footprint_unread,
             footprint_gib: self.footprint.view(),
@@ -3329,7 +3361,7 @@ impl ScopeState {
 #[derive(Clone, Debug, Default)]
 struct ScopeAcc {
     cores: f32,
-    /// Raw inherited CPU charge over the ledger's exact same window as the primary figure.
+    /// Reconciled inherited-counter charge, separate from own-counter reported growth.
     cpu_charge: Option<f64>,
     footprint: Option<u64>,
     footprint_unread: u32,
@@ -3386,10 +3418,32 @@ impl ScopeAcc {
 #[derive(Clone, Copy, Debug, Default)]
 struct ProcRates {
     cores: Option<f32>,
+    cpu_read_span_ns: Option<u64>,
     wait: Option<f32>,
     read_bps: Option<f64>,
     write_bps: Option<f64>,
     gpu: Option<f32>,
+}
+
+/// One reported own counter, bound to a known process generation and observed exec version.
+#[derive(Clone, Copy, Debug)]
+struct ProcessCpuCounter {
+    start: Option<u64>,
+    version: Option<i32>,
+    ns: u64,
+}
+
+impl ProcessCpuCounter {
+    fn growth(self, p: &ProcSample) -> Option<u64> {
+        let start_matches = self.start.zip(p.start).is_some_and(|(a, b)| a == b);
+        let version_matches = self.version.zip(p.version).is_some_and(|(a, b)| a == b);
+        let start_changed = self.start.zip(p.start).is_some_and(|(a, b)| a != b);
+        let version_changed = self.version.zip(p.version).is_some_and(|(a, b)| a != b);
+        if !(start_matches || version_matches) || start_changed || version_changed {
+            return None;
+        }
+        p.cpu_ns?.checked_sub(self.ns)
+    }
 }
 
 /// When a reading was taken, on both clocks, and the cadence then.
@@ -3538,8 +3592,8 @@ struct ProcPass {
     /// [`Snapshot::programs`] ([`keep_programs`]).
     programs: Vec<ProgramGroup>,
     memory_owners: Option<MemoryOwners>,
-    /// `(aterm_cores, user_other_cores, service_cores, cpu_unreadable_count)` for [`Split`].
-    split_parts: Option<(f32, f32, f32, u32)>,
+    /// App, user-other, service, unknown-owner published rates and unread CPU count.
+    split_parts: Option<(f32, f32, f32, f32, u32)>,
     /// `(aterm, others, services)` GPU shares for [`crate::gpu_clients::GpuSplit`].
     gpu_parts: Option<(f32, f32, f32)>,
     /// The sweep's window, ns.
@@ -3680,7 +3734,7 @@ pub struct Vitals {
     mem_history: History,
     last_counters: Option<(u64, MemCounters)>,
     last_sweep_at: Option<u64>,
-    last_cpu: HashMap<u32, (Option<u64>, u64)>,
+    last_cpu: HashMap<u32, ProcessCpuCounter>,
     last_runnable: HashMap<u32, u64>,
     last_read_at: HashMap<u32, u64>,
     global_foot: Trend,
@@ -3729,6 +3783,8 @@ pub const STRIP_RINGS: usize = 24;
 /// clocks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedStrip {
+    /// Basis of persisted app CPU cells; absent legacy cells cannot enter the reported channel.
+    pub scope_cpu_accounting: Option<crate::published_cpu::CpuAccounting>,
     /// Wall-clock timestamp (Unix ms) of the newest absorbed sample, or `0` when empty.
     pub last_wall_ms: i64,
     /// The newest ten-second epoch it holds closed: a tail line replays only past it
@@ -3749,9 +3805,9 @@ pub struct SavedStrip {
     pub pressure: crate::ring::SavedRing,
     /// aterm-scope multi-scale rings (1-hour 10 s and 6-hour 10-minute) in [`Resource::ALL`] order.
     pub aterm: [crate::ring::SavedRing; 7],
-    /// Scope coverage in memory/CPU order; preserves lower bounds across a restart.
+    /// Scope coverage in memory/CPU order; CPU gaps do not establish execution-window bounds.
     pub aterm_unread: [crate::ring::SavedRing; 2],
-    /// Inherited CPU counter charge, separate from confirmed CPU.
+    /// Reconciled inherited charge, separate from published own counters.
     pub aterm_cpu_charge: crate::ring::SavedRing,
     /// Compute watts, CPU + GPU + Neural Engine (1-hour 10 s and 7-hour 10-minute).
     pub compute_w: crate::ring::SavedRing,
@@ -3780,6 +3836,7 @@ pub struct SavedStrip {
 impl Default for SavedStrip {
     fn default() -> Self {
         Self {
+            scope_cpu_accounting: None,
             last_wall_ms: 0,
             through_k: i64::MIN,
             clean_stop: false,
@@ -3805,6 +3862,11 @@ impl Default for SavedStrip {
 }
 
 impl SavedStrip {
+    fn clear_scope_cpu(&mut self) {
+        self.aterm[Resource::Cpu.index()] = crate::ring::SavedRing::default();
+        self.aterm_unread[1] = crate::ring::SavedRing::default();
+        self.aterm_cpu_charge = crate::ring::SavedRing::default();
+    }
     /// Preserve a checkpoint's measured figures when its old format did not retain coverage.
     /// Every old CPU/memory scope reading stays explicitly incomplete at its original time.
     pub fn mark_scope_coverage_unknown(&mut self) {
@@ -3871,6 +3933,16 @@ impl SavedStrip {
         if line.k <= self.through_k {
             return false;
         }
+        let reported = line.scope_cpu_accounting
+            == Some(crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS);
+        if reported {
+            if self.scope_cpu_accounting != line.scope_cpu_accounting {
+                self.clear_scope_cpu();
+            }
+            self.scope_cpu_accounting = line.scope_cpu_accounting;
+        } else {
+            line.rings.retain(|(slot, _)| !matches!(*slot, 9 | 18 | 19));
+        }
         // Older tail lines retained scope figures but no coverage. Reading that absence as
         // zero would turn a historical lower bound into an exact figure after a restart.
         for (figure, coverage) in [(9, 18), (11, 17)] {
@@ -3919,6 +3991,8 @@ fn unknown_coverage(agg: Agg) -> Agg {
 /// (record §9), written at the first reading past the epoch's end ([`Vitals::strip_line`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StripLine {
+    /// Basis for app CPU cells in this line; absent means those cells are unsupported legacy data.
+    pub scope_cpu_accounting: Option<crate::published_cpu::CpuAccounting>,
     /// The epoch: unix seconds `[10 k, 10 k + 10)`.
     pub k: i64,
     /// The newest reading's wall clock when it was written, unix ms: a restore's
@@ -4105,6 +4179,7 @@ impl Vitals {
     #[must_use]
     pub fn saved_strip(&self, clean_stop: bool) -> SavedStrip {
         SavedStrip {
+            scope_cpu_accounting: Some(crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
             last_wall_ms: self.last_stamp.map_or(self.restored_wall_ms, |s| s.wall_ms),
             through_k: self.strip_open_k().map_or(i64::MIN, |k| k - 1),
             clean_stop,
@@ -4151,14 +4226,19 @@ impl Vitals {
             return;
         }
         self.restored_wall_ms = saved.last_wall_ms.min(now_unix_ms);
+        let reported = saved.scope_cpu_accounting
+            == Some(crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS);
         for i in 0..7 {
             if let Some(c) = saved.caps[i].filter(|&x| x.is_finite() && x > 0.0) {
                 self.rows.caps[i] = Some(c);
             }
             self.rows.rings[i] = BucketRing::restored(&saved.rings[i], now_unix_ms);
             let ar = BucketRing::restored(&saved.aterm[i], now_unix_ms);
-            self.rows.aterm.0[i] =
-                (!ar.is_empty() || !saved.aterm[i].recent.is_empty()).then_some(ar);
+            self.rows.aterm.0[i] = if i == Resource::Cpu.index() && !reported {
+                None
+            } else {
+                (!ar.is_empty() || !saved.aterm[i].recent.is_empty()).then_some(ar)
+            };
         }
         self.rows.net_tx = BucketRing::restored(&saved.net_tx, now_unix_ms);
         self.rows.proc_count = BucketRing::restored(&saved.proc_count, now_unix_ms);
@@ -4167,7 +4247,14 @@ impl Vitals {
             .aterm_unread
             .each_ref()
             .map(|ring| BucketRing::restored(ring, now_unix_ms));
-        self.rows.aterm.2 = BucketRing::restored(&saved.aterm_cpu_charge, now_unix_ms);
+        if !reported {
+            self.rows.aterm.1[1] = BucketRing::default();
+        }
+        self.rows.aterm.2 = if reported {
+            BucketRing::restored(&saved.aterm_cpu_charge, now_unix_ms)
+        } else {
+            BucketRing::default()
+        };
         self.rows.compute_w = BucketRing::restored(&saved.compute_w, now_unix_ms);
         self.rows.thermal = BucketRing::restored(&saved.thermal, now_unix_ms);
         self.rows.proc_exits = BucketRing::restored(&saved.proc_exits, now_unix_ms);
@@ -4280,6 +4367,7 @@ impl Vitals {
             })
             .collect();
         (!rings.is_empty()).then(|| StripLine {
+            scope_cpu_accounting: Some(crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
             k,
             wall_ms: self.last_stamp.map_or(self.restored_wall_ms, |s| s.wall_ms),
             caps: self
@@ -4670,23 +4758,23 @@ impl Vitals {
                         .enumerate()
                         .filter_map(|(i, root)| (root.tab == tab.key).then_some(i))
                         .collect();
-                    let pane_floor: f64 = indexes
+                    let pane_reported: f64 = indexes
                         .iter()
                         .filter_map(|&index| {
                             cpu.panes.iter().find(|pane| pane.key == s.tabs[index].key)
                         })
-                        .map(|pane| pane.floor)
+                        .map(|pane| pane.reported)
                         .sum();
-                    let pane_charge_known = (tab.charge - pane_floor).abs() < f64::EPSILON;
+                    let pane_charge_known = (tab.charge - pane_reported).abs() < f64::EPSILON;
                     for &index in &indexes {
-                        let floor = cpu
+                        let reported = cpu
                             .panes
                             .iter()
                             .find(|pane| pane.key == s.tabs[index].key)
-                            .map_or(0.0, |pane| pane.floor);
-                        figs.tabs[index].cores = floor as f32;
-                        figs.tabs[index].cpu_charge = pane_charge_known.then_some(floor);
-                        if tab.missed || tab.ambiguous || tab.actual() > pane_floor {
+                            .map_or(0.0, |pane| pane.reported);
+                        figs.tabs[index].cores = reported as f32;
+                        figs.tabs[index].cpu_charge = pane_charge_known.then_some(reported);
+                        if tab.missed || tab.ambiguous || tab.reported > pane_reported {
                             figs.tabs[index].cpu_incomplete += 1;
                         }
                     }
@@ -4695,12 +4783,8 @@ impl Vitals {
                     }
                     charge += tab.charge;
                 }
-                figs.aterm.cores = cpu.all_actual() as f32;
+                figs.aterm.cores = cpu.process_reported() as f32;
                 figs.aterm.cpu_charge = Some(charge);
-                if cpu.app_measured.is_some() {
-                    figs.aterm.refused = 0;
-                    figs.aterm.cpu_incomplete = u32::from(cpu.app_incomplete);
-                }
             }
         }
         // Each core's fraction this reading, every core measured: the CPU row's reading is their
@@ -4793,14 +4877,16 @@ impl Vitals {
             cpu.as_ref().and_then(CpuView::current_busy),
             pass.split_parts,
         ) {
-            (Some(busy), Some((aterm, others, services, unread))) => Some(Split {
-                global: busy,
-                aterm,
-                others,
-                services,
-                unaccounted: busy - aterm - others - services,
-                unread,
-            }),
+            (Some(busy), Some((aterm, others, services, unknown_owner_reported, unread))) => {
+                Some(Split {
+                    global: busy,
+                    aterm,
+                    others,
+                    services,
+                    unknown_owner_reported,
+                    unread,
+                })
+            }
             _ => None,
         };
 
@@ -4968,9 +5054,9 @@ impl Vitals {
                 p.cpu_ns
                     .zip(self.last_cpu.get(&p.pid))
                     .zip(wall_ns)
-                    .and_then(|((now, &(start, before)), window)| {
-                        (window > 0 && start.is_some() && start == p.start)
-                            .then(|| now.saturating_sub(before) as f32 / window as f32)
+                    .and_then(|((_, before), window)| {
+                        (window > 0).then_some(())?;
+                        Some(before.growth(p)? as f32 / window as f32)
                     }),
             );
             let mut r = ProcRates {
@@ -4991,27 +5077,35 @@ impl Vitals {
                 next_read_at.insert(p.pid, at);
             }
             if let Some(ns) = p.cpu_ns {
-                next_cpu.insert(p.pid, (p.start, ns));
-                if let (Some(wall), Some(&(birth, before))) = (wall_ns, self.last_cpu.get(&p.pid))
-                    && wall > 0
-                    && birth == p.start
+                next_cpu.insert(
+                    p.pid,
+                    ProcessCpuCounter {
+                        start: p.start,
+                        version: p.version,
+                        ns,
+                    },
+                );
+                if let Some((wall, growth)) = wall_ns
+                    .filter(|&wall| wall > 0)
+                    .zip(self.last_cpu.get(&p.pid))
+                    .and_then(|(wall, before)| Some((wall, before.growth(p)?)))
                 {
-                    r.cores = Some(ns.saturating_sub(before) as f32 / wall as f32);
+                    r.cores = Some(growth as f32 / wall as f32);
+                    r.cpu_read_span_ns = Some(wall);
                 }
             }
             if let Some(run) = p.runnable_ns {
                 next_runnable.insert(p.pid, run);
-                if let (Some(wall), Some(&before), Some(ns), Some(&(birth, cpu_before))) = (
+                if let (Some(wall), Some(&before), Some(cpu_before)) = (
                     wall_ns,
                     self.last_runnable.get(&p.pid),
-                    p.cpu_ns,
                     self.last_cpu.get(&p.pid),
                 ) && wall > 0
-                    && birth == p.start
+                    && let Some(d_cpu) = cpu_before.growth(p)
+                    && let Some(d_run) = run.checked_sub(before)
                 {
-                    let d_run = run.saturating_sub(before);
-                    let d_cpu = ns.saturating_sub(cpu_before);
-                    r.wait = Some(d_run.saturating_sub(d_cpu) as f32 / wall as f32);
+                    r.wait =
+                        Some(((i128::from(d_run) - i128::from(d_cpu)) as f64 / wall as f64) as f32);
                 }
             }
             rates.push(r);
@@ -5051,7 +5145,7 @@ impl Vitals {
                 acc.cpu_incomplete = acc.cpu_incomplete.saturating_add(1);
             }
         }
-        let (mut others, mut services) = (0.0f32, 0.0f32);
+        let (mut others, mut services, mut unknown_owner_reported) = (0.0f32, 0.0f32, 0.0f32);
         let (mut others_gpu, mut services_gpu) = (0.0f32, 0.0f32);
         let mut rows: Vec<ProcView> = Vec::with_capacity(procs.len());
         let mut job_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.delegated.len()];
@@ -5186,7 +5280,10 @@ impl Vitals {
                     services += common_cores[index].unwrap_or(0.0);
                     services_gpu += r.gpu.unwrap_or(0.0);
                 }
-                RowScope::Unknown => services_gpu += r.gpu.unwrap_or(0.0),
+                RowScope::Unknown => {
+                    unknown_owner_reported += common_cores[index].unwrap_or(0.0);
+                    services_gpu += r.gpu.unwrap_or(0.0);
+                }
                 _ => {}
             }
             rows.push(ProcView {
@@ -5197,6 +5294,7 @@ impl Vitals {
                 pgid: p.pgid,
                 name: p.name.clone(),
                 cores: r.cores,
+                cpu_read_span_ns: r.cpu_read_span_ns,
                 wait: r.wait,
                 footprint: p.footprint,
                 peak: p.peak,
@@ -5289,7 +5387,13 @@ impl Vitals {
             )),
             rows: keep_rows(rows),
             programs: keep_programs(programs),
-            split_parts: Some((aterm_cores, others, services, global_acc.refused)),
+            split_parts: Some((
+                aterm_cores,
+                others,
+                services,
+                unknown_owner_reported,
+                global_acc.refused,
+            )),
             gpu_parts,
             window_ns: Some(wall_ns),
             attribution: Some((membership, delegated_members)),
@@ -5442,7 +5546,7 @@ impl Rows {
             for tab in &cpu.tabs {
                 let rings = self.logical_cpu.entry(tab.id).or_default();
                 let mut values = [None; 7];
-                values[Cpu.index()] = Some(tab.actual());
+                values[Cpu.index()] = Some(tab.reported);
                 rings.push(t, values);
                 let _ = rings.2.push(t, Some(tab.charge), false);
                 let incomplete = tab.missed
@@ -5758,6 +5862,8 @@ impl Rows {
             let ring = rings.and_then(|r| r.ring(res));
             let has_scope = figs.is_some() || (res == Network && s.aterm_sockets.is_some());
             ScopeFig {
+                cpu_accounting: (res == Cpu)
+                    .then_some(crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
                 now: has_scope
                     .then_some(())
                     .and(ring)

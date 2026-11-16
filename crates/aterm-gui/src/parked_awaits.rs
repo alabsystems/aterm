@@ -124,24 +124,37 @@ pub(crate) fn is_elsewhere(rest: &str) -> bool {
     rest.split_whitespace().next() == Some("elsewhere")
 }
 
-/// SERVES `await elsewhere [timeout=<ms>]`, parked for its client the while ([`enter`]): it holds
-/// until the client hangs up (`hung_up`, asked every [`aterm_control::hangup::HANGUP_POLL`]) or
-/// its timeout (clamped as every await's; [`aterm_control::wire::WAIT_DEFAULT_MS`] with none) passes,
+/// SERVES `await elsewhere [timeout=<ms>]`, parked for its client the while ([`enter`]), on
+/// [`crate::park::Lane::SERVED`]'s slotted lane ([`elsewhere_on`]): one wait for all that is left
+/// while the hang-up bell's arm stands, which the caller's hang-up ends at once, and
+/// [`aterm_control::hangup::HANGUP_POLL`] slices where no arm does.
+pub(crate) fn elsewhere(rest: &str) -> String {
+    elsewhere_on(rest, crate::park::Lane::SERVED.slotted())
+}
+
+/// [`elsewhere`] on `lane`: it holds until the client hangs up (`lane.hung_up`) or its timeout
+/// (clamped as every await's; [`aterm_control::wire::WAIT_DEFAULT_MS`] with none) passes,
 /// `OK elsewhere status=timeout`. Nothing else ends it: the wait it vouches for is served by
 /// another aterm (a sibling on this Mac, or another Mac over the fleet), which the client alone
-/// hears from, so this aterm's jobs pass reads the client as waiting on aterm.
-pub(crate) fn elsewhere(rest: &str, hung_up: impl Fn() -> bool) -> String {
+/// hears from, so this aterm's jobs pass reads the client as waiting on aterm. It waits on a
+/// single-slot channel only the hang-up bell rings ([`crate::park::park_on_slot`]), by `lane`.
+pub(crate) fn elsewhere_on(rest: &str, lane: crate::park::Lane) -> String {
     let wait = timeout_ms(rest).unwrap_or(aterm_control::wire::WAIT_DEFAULT_MS);
     let until = Instant::now() + Duration::from_millis(wait);
+    let (ring, rung) = std::sync::mpsc::sync_channel(1);
     loop {
-        if hung_up() {
+        if (lane.hung_up)() {
             return crate::control::HUNG_UP_REPLY.to_string();
         }
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if Instant::now() >= until {
             return "OK elsewhere status=timeout\n".to_string();
         }
-        std::thread::sleep(left.min(aterm_control::hangup::HANGUP_POLL));
+        let wait = |bound| rung.recv_timeout(bound).is_ok();
+        if crate::park::park_on_slot(wait, until, lane, &|| false, &ring)
+            == crate::park::Woke::HungUp
+        {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
     }
 }
 

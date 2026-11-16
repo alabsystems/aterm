@@ -256,18 +256,11 @@ fn a_malformed_injected_id_never_becomes_a_path() {
         "s-not-hex-at-all-nope",
         "",
     ] {
-        let sid = SessionId::new(hostile);
-        assert!(
-            claim_path(d.path(), &sid).is_none(),
-            "{hostile:?} shaped a path"
-        );
-        assert!(
-            matches!(claim_in(d.path(), &sid), ClaimOutcome::Unprovable(_)),
-            "{hostile:?} must be unprovable, never claimable"
-        );
-        assert!(
-            !claim_for_adoption(d.path(), &sid),
-            "{hostile:?} must not be adopted"
+        // An injected name never reads as a session's ID, so no claim can be asked for it.
+        assert_eq!(
+            SessionId::parse(hostile),
+            None,
+            "{hostile:?} read as a session id"
         );
     }
     assert!(

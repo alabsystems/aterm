@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The registry rows every build compiles in (docs/DESIGN-alab-lab-model-2026-11-01.md
+//! The registry rows this build compiles in (docs/DESIGN-alab-lab-model-2026-11-01.md
 //! §4.2–§4.4): the six providers by the provider words the importer shares
 //! (`typed::keys::PROVIDERS`, `import.rs` `PROVIDERS`), the AI CLIs by their connector id words
-//! (`aterm-agent` `ai/connector.rs`, plus `codex-alab`, which shares Codex's login), and the
-//! plan words the CLIs themselves report (Claude Code's organization types, Codex's
-//! `plan_type`). Nominal values only, never a price: the owner annotates, and the reading the
+//! (`aterm-agent` `ai/connector.rs`, plus `codex-alab`, which shares Codex's login), and each
+//! provider's plans: a free row, and one row per subscription type the lab buys under a name
+//! this build can state. Another build may compile fewer rows or more: a row reaches a registry
+//! when a build that holds it runs the seed pass there.
+//!
+//! A seed writes only the columns the schema gives to a seed (`Writer::Seed`). A plan's `tier`,
+//! `price_cents` and `currency` are the owner's columns, so no seed writes them: a plan's tier is
+//! in its key and its name (`anthropic-max-20x`, "Claude Max 20x"), and its tier and price cells
+//! are the owner's to write, which land in empty cells. Nominal values only: the reading the
 //! provider shows is authoritative.
 //!
 //! A seed is an automatic write (`"a": true`, counted against the writer's quota) and goes only
@@ -145,111 +151,113 @@ pub const CLIS: [CliSeed; 7] = [
 
 /// One compiled plan row.
 pub struct PlanSeed {
-    /// `<provider>-<slug>`.
+    /// `<provider>-<slug>`: the slug names the tier, and never changes once a build shipped it.
     pub pk: &'static str,
     pub provider: &'static str,
+    /// The plan's name with its tier, as the provider sells it.
     pub name: &'static str,
+    /// How it is billed: `free` for a row with no subscription, none where this build does not
+    /// know.
     pub period: Option<&'static str>,
     /// The windows its limits are read in, each in percent; none where the plan's are unknown.
     pub windows: &'static [&'static str],
+    /// `current`, or `legacy` for a key kept only so that what names it still reads.
+    pub status: &'static str,
 }
 
-/// The plan words the CLIs report: Claude Code's organization types (`max`, `pro`, `team`,
-/// `enterprise`) and every ChatGPT `plan_type` a Codex login's claims name and the harness keeps
-/// (`aterm-agent` `harness::journal::PLANS`), so a plan a Mac observed names a row
-/// (`fleet::fold`, `<provider>-<word>`).
-pub const PLANS: [PlanSeed; 13] = [
-    PlanSeed {
-        pk: "anthropic-max",
-        provider: keys::ANTHROPIC,
-        name: "Claude Max",
-        period: Some("month"),
-        windows: &["5h", "7d"],
-    },
-    PlanSeed {
-        pk: "anthropic-pro",
-        provider: keys::ANTHROPIC,
-        name: "Claude Pro",
-        period: Some("month"),
-        windows: &["5h", "7d"],
-    },
-    PlanSeed {
-        pk: "anthropic-team",
-        provider: keys::ANTHROPIC,
-        name: "Claude Team",
-        period: None,
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "anthropic-enterprise",
-        provider: keys::ANTHROPIC,
-        name: "Claude Enterprise",
-        period: None,
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "openai-plus",
-        provider: keys::OPENAI,
-        name: "ChatGPT Plus",
-        period: Some("month"),
-        windows: &["5h", "7d"],
-    },
-    PlanSeed {
-        pk: "openai-pro",
-        provider: keys::OPENAI,
-        name: "ChatGPT Pro",
-        period: Some("month"),
-        windows: &["5h", "7d"],
-    },
-    PlanSeed {
-        pk: "openai-prolite",
-        provider: keys::OPENAI,
-        name: "ChatGPT Pro Lite",
-        period: Some("month"),
-        windows: &["5h", "7d"],
-    },
-    PlanSeed {
-        pk: "openai-free",
-        provider: keys::OPENAI,
-        name: "ChatGPT Free",
-        period: None,
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "openai-go",
-        provider: keys::OPENAI,
-        name: "ChatGPT Go",
-        period: Some("month"),
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "openai-team",
-        provider: keys::OPENAI,
-        name: "ChatGPT Team",
-        period: None,
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "openai-business",
-        provider: keys::OPENAI,
-        name: "ChatGPT Business",
-        period: None,
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "openai-enterprise",
-        provider: keys::OPENAI,
-        name: "ChatGPT Enterprise",
-        period: None,
-        windows: &[],
-    },
-    PlanSeed {
-        pk: "openai-edu",
-        provider: keys::OPENAI,
-        name: "ChatGPT Edu",
-        period: None,
-        windows: &[],
-    },
+impl PlanSeed {
+    /// A current plan whose billing period and limit windows this build does not know.
+    const fn new(pk: &'static str, provider: &'static str, name: &'static str) -> Self {
+        Self {
+            pk,
+            provider,
+            name,
+            period: None,
+            windows: &[],
+            status: "current",
+        }
+    }
+    /// Billed by the month.
+    const fn monthly(mut self) -> Self {
+        self.period = Some("month");
+        self
+    }
+    /// The provider's free use: an account with no subscription.
+    const fn free(mut self) -> Self {
+        self.period = Some("free");
+        self
+    }
+    /// Its limits are read as a five-hour and a seven-day window.
+    const fn session_and_week(mut self) -> Self {
+        self.windows = &["5h", "7d"];
+        self
+    }
+    /// Kept for what names it; an account's plan is one of its provider's other rows.
+    const fn legacy(mut self) -> Self {
+        self.status = "legacy";
+        self
+    }
+}
+
+/// Each provider's plans: a free row, and one row per tier the lab buys, the tier in the key and
+/// the name.
+///
+/// - `anthropic-max` is the word Claude Code reports for either Max tier (`max` names no tier),
+///   and the only Max row earlier builds seeded. It stays, as `legacy`, so an account or an
+///   observation that names it still reads; `anthropic-max-5x` and `anthropic-max-20x` are the
+///   plans.
+/// - `openai-prolite` is Codex's `plan_type` word, seeded as it was. The other ChatGPT rows hold
+///   every `plan_type` a Codex login's claims name and the harness keeps (`aterm-agent`
+///   `harness::journal::PLANS`), so a plan a Mac observed names a row (`fleet::fold`,
+///   `<provider>-<word>`): Go is billed by the month; Team, Business (OpenAI's later name for
+///   Team, which a login's claims may carry either way), Enterprise and Edu have no period or
+///   window this build knows.
+/// - Moonshot AI and Meta have only their free row: no code here names a paid plan either
+///   sells (the harness reads Muse Code's `tierName` as the provider sends it and holds no name
+///   of its own), and a seed states no name this build cannot confirm. A paid row of theirs is
+///   the owner's to write.
+/// - A free row's name is the provider's product and `Free`: the registry's name for an account
+///   with no subscription, whatever the provider calls it.
+pub const PLANS: [PlanSeed; 24] = [
+    PlanSeed::new("anthropic-free", keys::ANTHROPIC, "Claude Free").free(),
+    PlanSeed::new("anthropic-pro", keys::ANTHROPIC, "Claude Pro")
+        .monthly()
+        .session_and_week(),
+    PlanSeed::new("anthropic-max-5x", keys::ANTHROPIC, "Claude Max 5x")
+        .monthly()
+        .session_and_week(),
+    PlanSeed::new("anthropic-max-20x", keys::ANTHROPIC, "Claude Max 20x")
+        .monthly()
+        .session_and_week(),
+    PlanSeed::new("anthropic-max", keys::ANTHROPIC, "Claude Max")
+        .monthly()
+        .session_and_week()
+        .legacy(),
+    PlanSeed::new("anthropic-team", keys::ANTHROPIC, "Claude Team"),
+    PlanSeed::new("anthropic-enterprise", keys::ANTHROPIC, "Claude Enterprise"),
+    PlanSeed::new("openai-free", keys::OPENAI, "ChatGPT Free").free(),
+    PlanSeed::new("openai-plus", keys::OPENAI, "ChatGPT Plus")
+        .monthly()
+        .session_and_week(),
+    PlanSeed::new("openai-pro", keys::OPENAI, "ChatGPT Pro")
+        .monthly()
+        .session_and_week(),
+    PlanSeed::new("openai-prolite", keys::OPENAI, "ChatGPT Pro Lite")
+        .monthly()
+        .session_and_week(),
+    PlanSeed::new("openai-go", keys::OPENAI, "ChatGPT Go").monthly(),
+    PlanSeed::new("openai-team", keys::OPENAI, "ChatGPT Team"),
+    PlanSeed::new("openai-business", keys::OPENAI, "ChatGPT Business"),
+    PlanSeed::new("openai-enterprise", keys::OPENAI, "ChatGPT Enterprise"),
+    PlanSeed::new("openai-edu", keys::OPENAI, "ChatGPT Edu"),
+    PlanSeed::new("google-free", keys::GOOGLE, "Google AI Free").free(),
+    PlanSeed::new("google-ai-pro", keys::GOOGLE, "Google AI Pro").monthly(),
+    PlanSeed::new("google-ai-ultra", keys::GOOGLE, "Google AI Ultra").monthly(),
+    PlanSeed::new("meta-free", keys::META, "Muse Code Free").free(),
+    PlanSeed::new("kimi-free", keys::KIMI, "Kimi Free").free(),
+    PlanSeed::new("xai-free", keys::XAI, "Grok Free").free(),
+    PlanSeed::new("xai-supergrok", keys::XAI, "SuperGrok").monthly(),
+    PlanSeed::new("xai-supergrok-heavy", keys::XAI, "SuperGrok Heavy").monthly(),
 ];
 
 /// One seeded cell: its key parts and value.
@@ -313,7 +321,7 @@ fn rows() -> Vec<(&'static Collection, Vec<Seed>)> {
             scalar(p.pk, "provider", json!(p.provider)),
             scalar(p.pk, "name", json!(p.name)),
             scalar(p.pk, "limits", Value::Array(limits)),
-            scalar(p.pk, "status", json!("current")),
+            scalar(p.pk, "status", json!(p.status)),
             scalar(p.pk, "row", json!("live")),
         ];
         if let Some(period) = p.period {
@@ -324,10 +332,10 @@ fn rows() -> Vec<(&'static Collection, Vec<Seed>)> {
     rows
 }
 
-/// Whether every build compiles a seed row keyed `pk` in `collection` (a provider, CLI or plan
-/// row): a row the registry holds by construction, which a seed pass writes wherever it is
-/// absent, so an owner write may name it before any pass has run here
-/// ([`crate::att::Compiled::seeded`]).
+/// Whether this build compiles a seed row keyed `pk` in `collection` (a provider, CLI or plan
+/// row): a row this build's seed pass writes wherever it is absent, so an owner write made on
+/// this build may name it before any pass has run here ([`crate::att::Compiled::seeded`]). An
+/// earlier build may compile no such row.
 pub fn compiled(collection: &str, pk: &str) -> bool {
     rows()
         .iter()
@@ -351,10 +359,24 @@ fn held(projection: &Projection, seed: &Seed) -> bool {
     }
 }
 
+/// Whether `seed`, a cell of `collection`, names a provider row `providers` holds that is not
+/// live: the owner retired it, and a seed of a live CLI or plan naming it would be refused
+/// (`typed::check::names_not_live`), and with it every later pass that plans it again.
+fn names_ended_provider(collection: &Collection, seed: &Seed, providers: &Projection) -> bool {
+    collection.column(seed.col).is_some_and(
+        |column| matches!(column.ty, crate::typed::Ty::Ref(target) if target == PROVIDER.name),
+    ) && seed
+        .x
+        .as_str()
+        .and_then(|word| providers.rows.get(word))
+        .is_some_and(|row| !row.live())
+}
+
 /// The seed rows a complete scan of `cells` (the registry's projected cells, past-quota
 /// records left out) calls for: every seeded cell absent there, written as automatic, one entry
 /// per row so a row's cells go in one record. Empty when every seed is held, so a re-run writes
-/// nothing.
+/// nothing. A CLI's or plan's `provider` that names a provider the owner retired is left out
+/// ([`names_ended_provider`]); a later pass fills it once the provider is live again.
 ///
 /// # Errors
 /// A compiled seed breaks its column's type (a bug the tests catch).
@@ -370,7 +392,9 @@ pub fn rows_for(cells: &Cells) -> Result<Vec<Vec<Change>>> {
             _ => &plans,
         };
         let mut row = Vec::new();
-        for seed in seeds.into_iter().filter(|seed| !held(projection, seed)) {
+        for seed in seeds.into_iter().filter(|seed| {
+            !held(projection, seed) && !names_ended_provider(collection, seed, &providers)
+        }) {
             let key = CellKey {
                 pk: seed.pk,
                 col: seed.col,
@@ -388,3 +412,7 @@ pub fn rows_for(cells: &Cells) -> Result<Vec<Vec<Change>>> {
     }
     Ok(out)
 }
+
+#[cfg(all(test, unix))]
+#[path = "seeds_tests.rs"]
+mod tests;

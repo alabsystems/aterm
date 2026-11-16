@@ -369,7 +369,7 @@ fn process() -> &'static Arc<Moved> {
     PROCESS.get_or_init(|| {
         let moved = Arc::new(Moved::herded_by(process_spread(), members_here));
         #[cfg(all(any(target_os = "macos", target_os = "linux"), not(test)))]
-        aterm_update::set_network_change_probe(updater_probe(&moved));
+        relay_to_updater(&moved, aterm_update::note_network_moved);
         start_sources(&moved);
         moved
     })
@@ -386,18 +386,45 @@ pub(crate) fn observe_for_updater() {
     }
 }
 
-/// Use a separate consuming watch so an updater check cannot steal another
-/// network consumer's notification. Keep the fleet's settling/spread policy.
+/// Relay each settled move of `moved` to the update check (`post`), from a thread of its own on a
+/// watch of its own: it keeps this Mac's spread, as the fleet's consumers do, and takes no other
+/// consumer's move. The thread waits [`LONG`] at a time, one wake a day when nothing moves.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn updater_probe(moved: &Arc<Moved>) -> Box<dyn Fn() -> bool + Send + Sync> {
-    let watch = Mutex::new(moved.watch());
-    Box::new(move || {
-        watch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take_at(Instant::now())
-            .is_some()
-    })
+fn relay_to_updater(moved: &Arc<Moved>, post: impl Fn() + Send + 'static) {
+    let mut watch = updater_watch(moved);
+    let started = crate::qos::spawn_lane_thread(
+        "aterm-update-moves",
+        crate::qos::Role::Background,
+        move || {
+            loop {
+                if relay_once(&mut watch, LONG).is_some() {
+                    post();
+                }
+            }
+        },
+    );
+    if let Err(error) = started {
+        aterm_log::warn!(
+            "network moved: the update check's relay did not start ({error}); its waits hear no \
+             network move"
+        );
+    }
+}
+
+/// The update check's own watch of `moved`: it waits out this Mac's spread, since every check
+/// after a move reaches the channel a herd of Macs shares.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn updater_watch(moved: &Arc<Moved>) -> Watch {
+    moved.watch()
+}
+
+/// The settled move `watch` hears within `most`, or `None` once `most` passed with none due.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn relay_once(watch: &mut Watch, most: Duration) -> Option<Woke> {
+    match watch.wait(most) {
+        Woke::Timer => None,
+        woke => Some(woke),
+    }
 }
 
 /// The window a Mac's spread falls in: about 230 ms a Mac across ~35 Macs, short beside the 30 s

@@ -3,9 +3,8 @@
 
 [package]
 name = "amacs-files"
-# Integration tests are declared below, not discovered: every file is a module
-# of the one `amacs_files_suite` binary. With autotests off a `tests/*.rs` file
-# listed nowhere never compiles. The host's own tests live in its source files.
+# The host's tests live in its source files; it has no integration suite. With
+# autotests off a `tests/*.rs` file no [[test]] row names never compiles.
 autotests = false
 version = "0.0.0"
 edition.workspace = true
@@ -62,10 +61,6 @@ aterm-cap = { workspace = true, features = ["launcher-mint"] }
 # Hang detectors, and the reducers' Tier-1 binds to their derived models.
 aterm-spec = { workspace = true }
 aterm-models-native = { workspace = true }
-
-[[test]]
-name = "amacs_files_suite"
-path = "tests/amacs_files_suite.rs"
 
 [lints]
 workspace = true

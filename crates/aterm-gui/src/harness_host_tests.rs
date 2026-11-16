@@ -2739,6 +2739,36 @@ fn a_pass_that_freed_something_but_left_the_volume_short_still_counts() {
     assert_eq!(free_after_pass(true, below, || None), None);
 }
 
+/// A PASS THAT FREED ONLY OUTSIDE CACHES FREED SOMETHING: its bytes are no row of `removed`, and
+/// the look's cadence and its free figure after the pass read them all the same. A pass that
+/// counted nothing, and a look that admitted none, freed nothing. NEGATIVE CONTROL: counting a
+/// pass by its `removed` rows alone reads the first as fruitless, which at an emergency puts
+/// the next pass off while the step still has folders to take.
+#[test]
+fn a_pass_that_freed_only_outside_caches_freed_something() {
+    use aterm_agent::harness::cli::DiskTick;
+    use aterm_agent::harness::disk::Applied;
+    let outside_only = DiskTick::Reclaimed(
+        Applied {
+            freed_bytes: 4 << 20,
+            ..Applied::default()
+        },
+        Vec::new(),
+    );
+    assert!(pass_reclaimed(&outside_only));
+    assert!(!pass_reclaimed(&DiskTick::Reclaimed(
+        Applied::default(),
+        Vec::new()
+    )));
+    assert!(!pass_reclaimed(&DiskTick::Plenty));
+    let below = Some(3u64 << 30);
+    assert_eq!(
+        free_after_pass(pass_reclaimed(&outside_only), below, || None),
+        None,
+        "the figure read before the folders went is not the figure after"
+    );
+}
+
 #[test]
 fn disk_admission_reset_drops_partial_cycle_and_old_spent_summary_before_repressure() {
     use aterm_agent::harness::cli::{DiskLook, DiskTick, disk_tick_paged};
@@ -2867,7 +2897,6 @@ fn a_disk_setting_aterm_cannot_read_is_said_and_a_short_volume_still_opens_its_l
         Some(HostNote::DiskLowCleanupOff {
             free_gib: 2,
             floor_gib: floor,
-            asked: None,
         }),
         "short two looks running while removal is off: the owner is told no pass ran"
     );
@@ -2923,6 +2952,68 @@ fn a_disk_setting_aterm_cannot_read_is_said_and_a_short_volume_still_opens_its_l
     );
 }
 
+/// A LOOK PREPARES THE ENTRY-BOUND PASS ONCE AN HOUR, AT ANY LEVEL, WHERE IT ADMITS ONE. The
+/// owner's look on a measured volume with removal on prepares one where none started before,
+/// not a second short of the hour, and again at the hour; the volume's level and the budget's
+/// cap are not asked. NEGATIVE CONTROLS, each the rule taken away: removal off, an agent's
+/// demand, a fill projection, a window that is not the owner's watch, a volume it could not
+/// measure, and a sizing or page that walks the same trees each prepare none.
+#[test]
+fn a_look_prepares_the_entry_bound_pass_hourly_where_it_admits_one() {
+    let t = 1_790_000_000;
+    let ask = DiskBoundAsk {
+        owner: true,
+        demand: false,
+        projected: false,
+        auto_free_gib: 1,
+        measured: true,
+        busy: false,
+    };
+    assert!(disk_bound_due(ask, None, t));
+    assert!(!disk_bound_due(ask, Some(t), t + 3_599));
+    assert!(disk_bound_due(ask, Some(t), t + 3_600));
+    for (refused, why) in [
+        (
+            DiskBoundAsk {
+                auto_free_gib: 0,
+                ..ask
+            },
+            "removal is off",
+        ),
+        (
+            DiskBoundAsk {
+                demand: true,
+                ..ask
+            },
+            "an agent's demand stands",
+        ),
+        (
+            DiskBoundAsk {
+                projected: true,
+                ..ask
+            },
+            "a fill projection stands",
+        ),
+        (
+            DiskBoundAsk {
+                owner: false,
+                ..ask
+            },
+            "not the owner's watch",
+        ),
+        (
+            DiskBoundAsk {
+                measured: false,
+                ..ask
+            },
+            "the volume was not measured",
+        ),
+        (DiskBoundAsk { busy: true, ..ask }, "a sizing or page runs"),
+    ] {
+        assert!(!disk_bound_due(refused, None, t), "{why}");
+    }
+}
+
 #[test]
 fn the_disk_watch_says_each_end_once_a_change() {
     let t0 = Instant::now();
@@ -2942,7 +3033,6 @@ fn the_disk_watch_says_each_end_once_a_change() {
         free_gib: 2,
         floor_gib: 20,
         hogs: Vec::new(),
-        asked: None,
     };
     let at = t0 + minute * 11;
     assert!(said.owed(&low, at));
@@ -3019,7 +3109,7 @@ fn a_tab_in_a_short_spelled_folder_reads_its_volumes_row() {
             folder.display()
         )
     });
-    let short = aterm_sysprobe::paths::plain(&short).into_owned();
+    let short = aterm_path::plain(&short).into_owned();
     let table = aterm_sysprobe::volumes::table();
     assert!(
         aterm_sysprobe::volumes::mount_of(&short, &table).is_none(),
@@ -3059,7 +3149,7 @@ fn an_8_3_tab_reads_its_volumes_row_before_any_look_and_with_no_watch() {
             folder.display()
         )
     });
-    let short = aterm_sysprobe::paths::plain(&short).into_owned();
+    let short = aterm_path::plain(&short).into_owned();
     let spelled = short.to_str().expect("text").to_owned();
     let table = aterm_sysprobe::volumes::table();
     let r = aterm_sysprobe::volumes::read_path(&folder, &table).expect("its volume");
@@ -3176,9 +3266,7 @@ fn a_spelling_the_file_system_stalls_on_costs_one_deadline_then_nothing() {
             .expect("the speller was held past its deadline");
         assert!(!spelled, "nothing recorded for {cwd:?}");
         assert!(BOARD.board_lock().spelled.is_empty());
-        let through = aterm_sysprobe::paths::short_spelled(&cwd)
-            .expect("8.3")
-            .through;
+        let through = aterm_path::short_spelled(&cwd).expect("8.3").through;
         assert!(stuck(&through), "PREMISE: its call was made: {through:?}");
         through
     };
@@ -8153,7 +8241,6 @@ impl Acting {
                         })
                 }),
                 disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
-                disk_free: Acts::inert().disk_free,
                 disk_board: Acts::inert().disk_board,
                 jobs_board: Acts::inert().jobs_board,
                 leader_lives: Acts::inert().leader_lives,
@@ -36269,6 +36356,7 @@ impl TapWorld {
             pid: Some(TAP_PID.to_string()),
             login: login.map(str::to_owned),
             home: home.map(str::to_owned),
+            route: None,
         };
         let mut out = Vec::new();
         let _ = tap::run(
@@ -37867,7 +37955,7 @@ fn startup_mark_nameless(
     let h = store
         .read()
         .unwrap()
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .cloned()?;
     let rev = h.ctx.timeline.lock().unwrap().task()?.rev;
     startup_mark_nameless_at(store, sid, rev, mark)
@@ -37882,7 +37970,7 @@ fn startup_mark_nameless_at(
     let nonce = store
         .read()
         .unwrap()
-        .by_sid(&aterm_session::SessionId::new(sid))?
+        .by_sid(&aterm_session::SessionId::parse(sid)?)?
         .ctx
         .nonce;
     let worker = Startup {
@@ -40956,11 +41044,11 @@ fn a_drivers_hand_is_another_holders_lease_or_a_named_drivers_turn() {
     };
     let turn = |driver: Option<&str>| crate::Lease::Turn {
         id: 4,
-        driver: driver.map(aterm_session::SessionId::new),
+        driver: driver.map(|sid| aterm_session::SessionId::parse(sid).expect("a tab id")),
         typing: false,
     };
     assert!(driver_holds(Some(&drive("manager", now + 1)), now, &ours));
-    assert!(driver_holds(Some(&turn(Some("s-mgr"))), now, &ours));
+    assert!(driver_holds(Some(&turn(Some("tqn5r6e0148"))), now, &ours));
     assert!(!driver_holds(Some(&drive(&ours, now + 1)), now, &ours));
     assert!(!driver_holds(Some(&drive("manager", now)), now, &ours));
     assert!(!driver_holds(Some(&turn(None)), now, &ours));
@@ -45142,8 +45230,9 @@ fn a_panicked_body_leaves_the_face_unknown_before_the_next_runs_start_face() {
 #[test]
 fn a_stuck_program_check_holds_the_worker_and_keeps_what_it_owes() {
     use crate::program_check_watch::{Board, step};
+    use aterm_process_facts::program_check::{Daemon, Reading};
     use aterm_uds::program_check::Look;
-    use aterm_vitals::program_check::{Daemon, Reading, STUCK_AFTER_MS};
+    use aterm_vitals::program_check::STUCK_AFTER_MS;
     static STUCK: Mutex<Board> = Mutex::new(Board::new());
     static CLEAR: Mutex<Board> = Mutex::new(Board::new());
     let read = |workers, at_limit| {
@@ -45420,18 +45509,8 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         );
         n.lock().unwrap().push(h);
     };
-    let lines = aterm_agent::harness::disk::Config::default().thresholds(None);
     let alert = |level, free| {
-        disk_alert(
-            &BOARD,
-            level,
-            &lines,
-            free,
-            0,
-            &[],
-            DiskFullCause::Spent,
-            &note,
-        );
+        disk_alert(&BOARD, level, free, 0, &[], DiskFullCause::Spent, &note);
     };
     alert(Level::Low, Some(9 << 30));
     alert(Level::Emergency, Some(1 << 20));
@@ -45452,39 +45531,28 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
     let _ = std::fs::remove_dir_all(&state);
 }
 
-/// THE DISK LANES INTO AN OBSERVED AGENT (H6-R1): the server's observe gate withholds both owed
-/// lines, the resume and the ask to free space (`agent_image::WITHHELD`, the step's
-/// `released:unconfirmed`), and each is spent at its first try, so its step is said once and
-/// nothing is typed or retried; a confirmed agent's are typed (CONTROL). NEGATIVE CONTROL (run):
-/// with the resume's withheld step counted as a wait, it is tried again at every look until its
-/// tries run out.
+/// THE DISK RESUME INTO AN OBSERVED AGENT (H6-R1): the server's observe gate withholds the owed
+/// resume (`agent_image::WITHHELD`), and it is spent at its first try, so its step is said once
+/// and nothing is typed or retried; a confirmed agent's is typed (CONTROL). NEGATIVE CONTROL
+/// (run): with the resume's withheld step counted as a wait, it is tried again at every look
+/// until its tries run out.
 #[test]
-fn a_disk_line_the_observe_gate_withholds_is_spent_at_once_and_a_confirmed_one_typed() {
+fn a_disk_resume_the_observe_gate_withholds_is_spent_at_once_and_a_confirmed_one_typed() {
     use aterm_agent::harness::agent_image::WITHHELD;
     use aterm_agent::harness::disk::Level;
     use aterm_phase::disk_full::{Code, DiskFull, Source};
     static BOARD: Shelf = Shelf::new();
     let state = aterm_tempfile::TempDir::new().expect("owned disk journal");
     let world = Arc::new(World::default());
-    let tried: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::default();
-    let (r, f) = (Arc::clone(&tried), Arc::clone(&tried));
+    let tried: Arc<Mutex<Vec<String>>> = Arc::default();
+    let r = Arc::clone(&tried);
     let observed = |sid: &str| sid.ends_with("-observed");
     let mut hooks = hooks(&world, parking_body(&world));
     hooks.acts = Acts {
         due: Arc::new(|_| Due::No),
         disk_resume: Arc::new(move |sid, _| {
-            r.lock().unwrap().push(("resume", sid.to_string()));
+            r.lock().unwrap().push(sid.to_string());
             if observed(sid) { WITHHELD } else { "typed" }.to_string()
-        }),
-        disk_free: Arc::new(move |sid, _, unfit, _| {
-            assert_eq!(unfit, None, "{sid}: nothing else bars it");
-            f.lock().unwrap().push(("ask", sid.to_string()));
-            if observed(sid) {
-                "released:unconfirmed"
-            } else {
-                "typed"
-            }
-            .to_string()
         }),
         disk_board: &BOARD,
         ..Acts::inert()
@@ -45538,36 +45606,354 @@ fn a_disk_line_the_observe_gate_withholds_is_spent_at_once_and_a_confirmed_one_t
     }
     let step = idles[1].at_idle().expect("the confirmed agent's resume");
     assert_eq!(step.line, "disk-resume@v1 step=typed");
-    BOARD.publish(|b| {
-        for sid in tabs {
-            b.asks.insert(
-                sid.to_string(),
-                crate::disk_board::AskOwed {
-                    key: "dev:1".to_string(),
-                    text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)"
-                        .to_string(),
-                },
-            );
-        }
-    });
-    assert_eq!(observed_idle.at_idle().map(|s| s.line), None, "released");
-    assert!(
-        disk_ask_owed(&BOARD, tabs[0]).is_none(),
-        "the withheld ask is handed on, owed here no more"
-    );
-    assert_eq!(observed_idle.at_idle().map(|s| s.line), None);
-    let step = idles[1].at_idle().expect("the confirmed agent's ask");
-    assert_eq!(step.line, "disk-free@v1 step=typed");
     assert_eq!(
         *tried.lock().unwrap(),
-        [
-            ("resume", tabs[0].to_string()),
-            ("resume", tabs[1].to_string()),
-            ("ask", tabs[0].to_string()),
-            ("ask", tabs[1].to_string()),
-        ],
-        "each line tried once"
+        [tabs[0].to_string(), tabs[1].to_string()],
+        "each resume tried once"
     );
+}
+
+/// DC-05b'S EXIT: a volume held below its floor for a day is the disk watch's own to free. Two
+/// supervised sessions stand through 24 hours of looks, a tick apart at instants the test
+/// names, each through the real [`look_at_disk`], [`disk_watch`] and [`disk_look_on`]: the
+/// look the product runs, on a ground of the test's own ([`DiskGround`]: a scratch home and
+/// state folder, an `aterm.toml` that writes the floor, a reading held between the emergency
+/// line and that floor, and a board, runs, clock and poke flag no other test shares). The
+/// watch runs its pass at its own cadence, the first at once and each later one after a wait
+/// that doubles from [`cadence::PASS_EVERY`] to [`cadence::SHORT_EVERY_MAX`] while passes free
+/// nothing, and writes one report row a pass into `<state>/disk.jsonl`. Its first pass removes the idle `incremental/`
+/// of the one build directory laid in the home, through the look's real remover, and the rest
+/// of that directory stays. The window is told of each look, of the settings read, of what was
+/// freed and of the low volume, and of nothing else; at every look no door of either
+/// session's host offers a step; no ask's row or lease is written; nothing joins the look's
+/// store; and a window told those notes starts no session.
+///
+/// What the day leaves out: `[disk] dead_build_dirs` and `idle_build_dirs` are off in its
+/// `aterm.toml`, so no look sweeps this account's managed caches or takes a build directory
+/// whole, and nothing under the home's cache folders is old enough for the outside caches'
+/// step, whose removals are `aterm-agent`'s tick tests'. On macOS the look's hourly worktree
+/// step runs once, over a home that holds no worktree.
+///
+/// NEGATIVE CONTROL (in the test): on the same board a sighting of a full disk that ends makes
+/// the same idle door type `disk-resume@v1 step=typed`, through the act that was called for
+/// nothing all day, so the doors read are the ones a line of the host's goes through.
+#[test]
+fn a_volume_held_below_its_floor_for_a_day_starts_no_session_and_types_no_line() {
+    use aterm_agent::harness::cli::{DISK_LEDGER, disk_config_read};
+    use aterm_agent::harness::disk::{
+        CACHEDIR_SIGNATURE, DEFAULT_TARGET_STALE_DAYS, Level, RUSTC_INFO, cadence, discover,
+        reserve, target,
+    };
+    use aterm_phase::disk_full::{Code, DiskFull, Source};
+    use aterm_sysprobe::volumes::{Reading, Table, VolumeKey};
+    static BOARD: Shelf = Shelf::new();
+    static LOOKING: AtomicBool = AtomicBool::new(false);
+    const DAY: Duration = Duration::from_secs(24 * 3600);
+    /// The bytes of the idle `incremental/`, which the reading gains once it is gone.
+    const INCREMENTAL: u64 = 8192;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let (home, state) = (base.join("home"), base.join("state"));
+    std::fs::create_dir_all(&state).unwrap();
+    // What an earlier build's ask and worker left: its lease, its lock and the worker's folder.
+    for name in aterm_agent::harness::disk::RETIRED_ASK_FILES {
+        std::fs::write(state.join(name), b"{}").unwrap();
+    }
+    let worker = state.join("disk-worker");
+    std::fs::create_dir_all(&worker).unwrap();
+    // One build directory as cargo lays it out, in a checkout that is a child of the home.
+    let build = home.join("repo").join("target");
+    let profile = build.join("debug");
+    let incremental = profile.join("incremental");
+    let unit = profile.join(".fingerprint").join("lay-2bcb77ac5af7c69c");
+    let query = incremental.join("lay-1x2y3z").join("s-abc-def");
+    for dir in [&profile.join("deps"), &profile.join("build"), &unit, &query] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for lock in target::CARGO_LOCKS {
+        std::fs::write(profile.join(lock), b"").unwrap();
+    }
+    let rlib = profile.join("deps").join("liblay.rlib");
+    std::fs::write(&rlib, vec![7u8; 4096]).unwrap();
+    std::fs::write(unit.join("lib-lay"), b"0123456789abcdef").unwrap();
+    std::fs::write(query.join("query-cache.bin"), vec![9u8; 8192]).unwrap();
+    std::fs::write(
+        build.join("CACHEDIR.TAG"),
+        format!("{CACHEDIR_SIGNATURE}\n# a cargo target directory\n"),
+    )
+    .unwrap();
+    std::fs::write(build.join(RUSTC_INFO), b"{}").unwrap();
+
+    let config = base.join("aterm.toml");
+    std::fs::write(
+        &config,
+        "[disk]\nwarn_free_gib = 30\nauto_free_gib = 20\ndead_build_dirs = false\n\
+         idle_build_dirs = false\n",
+    )
+    .unwrap();
+    let written = disk_config_read(Some(&config));
+    assert_eq!(written.notes, Vec::<String>::new(), "PREMISE: read");
+    assert!(
+        !written.config.dead_build_dirs && !written.config.idle_build_dirs,
+        "PREMISE: no sweep and no whole removal: {written:?}"
+    );
+    let total = 1u64 << 40;
+    let thresholds = written.thresholds_with(Some(total), None);
+    assert_eq!(
+        thresholds,
+        written.thresholds_with(Some(total), Some(total)),
+        "PREMISE: a floor the file writes is raised to no room"
+    );
+    // Too short for the look to write its reserve, which it rearms two reserves above the
+    // emergency line.
+    let held = thresholds.emergency + reserve::RESERVE_BYTES;
+    for free in [held, held + INCREMENTAL] {
+        assert_eq!(
+            thresholds.level(Some(free), None),
+            Level::Short,
+            "PREMISE: below its floor and not full, before the pass and after"
+        );
+    }
+
+    let world = Arc::new(World::default());
+    let told: Arc<Mutex<Vec<HostNote>>> = Arc::default();
+    let note: Arc<NoteFn> = {
+        let told = Arc::clone(&told);
+        Arc::new(move |note| told.lock().unwrap().push(note))
+    };
+    let t0 = Instant::now();
+    // The build directory was written now: a day past the stale window its profile is idle.
+    let unix0 = i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("the clock fits")
+        + (DEFAULT_TARGET_STALE_DAYS + 1) * 86_400;
+    let looking_at = Arc::new(Mutex::new(t0));
+    let store = crate::session_store::new_store();
+    let run: Arc<DiskLookFn> = {
+        let (home, state, config) = (home.clone(), state.clone(), config.clone());
+        let (looking_at, store) = (Arc::clone(&looking_at), Arc::clone(&store));
+        let incremental = incremental.clone();
+        let table = Table {
+            complete: true,
+            ..Table::default()
+        };
+        let runs = DiskRuns::new();
+        let last: Mutex<Option<DiskPass>> = Mutex::new(None);
+        let poked = AtomicBool::new(false);
+        let emergency = Mutex::new(aterm_agent::harness::disk::cadence::Emergency::NONE);
+        Arc::new(move |sids, cwds, agents, seen, note| {
+            let at = *looking_at.lock().unwrap();
+            let since = i64::try_from(at.duration_since(t0).as_secs()).unwrap_or(0);
+            let measure = || {
+                let freed = if incremental.exists() { 0 } else { INCREMENTAL };
+                Some(Reading {
+                    mount: home.clone(),
+                    key: VolumeKey::Fsid(0x000D_C05B),
+                    total,
+                    free: held + freed,
+                    files_free: None,
+                    dev: 0,
+                    read_only: false,
+                })
+            };
+            let clock = move || at;
+            let roots = |reach: &[PathBuf], _agents: &[u32]| discover::Roots {
+                cwds: reach.to_vec(),
+                home: Some(home.clone()),
+                ..discover::Roots::default()
+            };
+            let ground = DiskGround {
+                home: home.as_path(),
+                state: state.as_path(),
+                config: Some(config.as_path()),
+                table: &table,
+                measure: &measure,
+                private: None,
+                now: unix0 + since,
+                clock: &clock,
+                roots: &roots,
+                board: &BOARD,
+                runs: &runs,
+                last_pass: &last,
+                poked: &poked,
+                emergency: &emergency,
+            };
+            disk_look_on(&ground, sids, cwds, agents, seen, &store, note);
+        })
+    };
+    let resumed: Arc<Mutex<Vec<String>>> = Arc::default();
+    let r = Arc::clone(&resumed);
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.disk = disk_watch(Arc::clone(&store), note, &LOOKING, run);
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_resume: Arc::new(move |sid, _| {
+            r.lock().unwrap().push(sid.to_string());
+            "typed".to_string()
+        }),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let tabs = ["s-day-a", "s-day-b"];
+    let idles: Vec<WorkerIdle> = tabs
+        .iter()
+        .map(|sid| {
+            let mut idle = idle_of(
+                hooks.clone(),
+                Program::Claude,
+                Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+            );
+            idle.sid = (*sid).to_string();
+            idle
+        })
+        .collect();
+    let wanted: HashMap<String, Program> = tabs
+        .iter()
+        .map(|sid| ((*sid).to_string(), Program::Claude))
+        .collect();
+    let off = OffSessions::default();
+
+    let looks = u32::try_from(DAY.as_secs() / DISK_TICK.as_secs()).unwrap();
+    let mut at = t0 + DISK_FIRST_LOOK;
+    for i in 0..looks {
+        let now = t0 + DISK_FIRST_LOOK + DISK_TICK * i;
+        *looking_at.lock().unwrap() = now;
+        assert_eq!(
+            look_at_disk(&mut at, now, true, &wanted, &off, &hooks),
+            Some(now + DISK_TICK),
+            "look {i}"
+        );
+        let began = Instant::now();
+        while LOOKING.load(Ordering::SeqCst) {
+            assert!(began.elapsed() < Duration::from_secs(60), "look {i} ends");
+            aterm_uds::deadline::poll_yield();
+        }
+        for idle in &idles {
+            let sid = &idle.sid;
+            idle.turn_break(None);
+            idle.busy_tap();
+            assert_eq!(idle.at_idle().map(|s| s.line), None, "look {i}: @{sid}");
+            assert!(!idle.wants(), "look {i}: @{sid} asks for no point");
+        }
+    }
+
+    let ledger = std::fs::read_to_string(state.join(DISK_LEDGER)).unwrap();
+    /// The rows of `ledger` whose kind is `kind`.
+    fn rows<'a>(ledger: &'a str, kind: &str) -> Vec<&'a str> {
+        let kind = format!(r#""kind":"{kind}""#);
+        ledger.lines().filter(|row| row.contains(&kind)).collect()
+    }
+    // One report row a pass: the first frees the idle `incremental/`, and each pass after it
+    // frees nothing, so the wait between them doubles from ten minutes to the cap and stays.
+    let reported: Vec<i64> = rows(&ledger, "report")
+        .iter()
+        .map(|row| {
+            let row = aterm_json::from_str::<aterm_json::Value>(row).expect("a row");
+            let ts = row
+                .get("ts")
+                .and_then(aterm_json::Value::as_str)
+                .expect("ts");
+            aterm_types::rfc3339::parse_utc(ts).expect("an RFC 3339 time")
+        })
+        .collect();
+    let gaps: Vec<u64> = reported
+        .windows(2)
+        .map(|w| u64::try_from(w[1] - w[0]).expect("in order"))
+        .collect();
+    let base = cadence::PASS_EVERY.as_secs();
+    let cap = cadence::SHORT_EVERY_MAX.as_secs();
+    assert_eq!(gaps.first(), Some(&base), "{gaps:?}");
+    for w in gaps.windows(2) {
+        assert_eq!(w[1], (w[0] * 2).min(cap), "{gaps:?}");
+    }
+    assert_eq!(gaps.last(), Some(&cap), "backed off to the cap: {gaps:?}");
+    let removed = rows(&ledger, "removed");
+    if cfg!(unix) {
+        assert!(!incremental.exists(), "a pass freed the idle incremental/");
+        assert_eq!(removed.len(), 1, "one removal all day: {removed:?}");
+        assert!(removed[0].contains("incremental"), "{removed:?}");
+    }
+    for kept in [&rlib, &unit.join("lib-lay"), &build.join(RUSTC_INFO)] {
+        assert!(kept.exists(), "{} stays", kept.display());
+    }
+    assert!(!ledger.contains("free-ask"), "no ask's row");
+    let leases: Vec<String> = std::fs::read_dir(&state)
+        .expect("the state folder")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("disk-ask"))
+        .collect();
+    assert_eq!(
+        leases,
+        Vec::<String>::new(),
+        "no ask's lease or lock: the earlier build's went"
+    );
+    assert!(
+        worker.is_dir(),
+        "the earlier build's worker folder stays: a shell brought back may stand in it"
+    );
+    assert_eq!(
+        *resumed.lock().unwrap(),
+        Vec::<String>::new(),
+        "nothing was typed into a session"
+    );
+    assert_eq!(store.read().unwrap().len(), 0, "nothing joined the store");
+    let told = told.lock().unwrap().clone();
+    let stray: Vec<&HostNote> = told
+        .iter()
+        .filter(|n| {
+            !matches!(
+                n,
+                HostNote::DiskSettingsRead | HostNote::DiskFreed { .. } | HostNote::DiskLow { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        stray,
+        Vec::<&HostNote>::new(),
+        "the looks told nothing else"
+    );
+    if cfg!(unix) {
+        assert!(
+            told.iter().any(|n| matches!(n, HostNote::DiskFreed { .. })),
+            "what the pass freed is recorded"
+        );
+    }
+    let beats = world
+        .notes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| **n == HostNote::DiskLooked)
+        .count();
+    assert_eq!(u32::try_from(beats), Ok(looks), "a beat at every look");
+    // The window, told each note. The look's beat goes to it once: its handler samples the
+    // machine's vitals, and a day of them at once is load on a Mac other sessions use.
+    let mut app = crate::App::headless_for_test();
+    let sessions = app.store.read().unwrap().len();
+    app.note_harness_host(HostNote::DiskLooked);
+    for note in told {
+        app.note_harness_host(note);
+    }
+    assert_eq!(
+        app.store.read().unwrap().len(),
+        sessions,
+        "no session started"
+    );
+
+    let seen = [(
+        tabs[0].to_string(),
+        DiskFull {
+            code: Code::Enospc,
+            source: Source::Notification,
+            row: 3,
+            message: "the notice".to_string(),
+        },
+    )];
+    disk_sightings(&BOARD, &seen, Level::Emergency, Some(0), &state, 1);
+    disk_episode_after(&BOARD, Level::Emergency, 0, &[]);
+    disk_episode_after(&BOARD, Level::Short, 30 << 30, &[]);
+    let step = idles[0].at_idle().expect("CONTROL: the resume is typed");
+    assert_eq!(step.line, "disk-resume@v1 step=typed");
+    assert_eq!(*resumed.lock().unwrap(), [tabs[0].to_string()]);
 }
 
 #[test]
@@ -45639,523 +46025,6 @@ fn the_disk_resume_keeps_a_continuations_gates() {
         tabs.iter().all(|sid| disk_owed(&BOARD, sid).is_none()),
         "spent, typed or not"
     );
-}
-
-#[test]
-fn the_disk_free_line_goes_only_to_the_tab_it_is_owed_at_its_turn_break_and_keeps_its_gates() {
-    static BOARD: Shelf = Shelf::new();
-    let world = Arc::new(World::default());
-    /// Each act's tab and why it was unfit.
-    type Calls = Vec<(String, Option<&'static str>)>;
-    let calls: Arc<Mutex<Calls>> = Arc::default();
-    let answer = Arc::new(Mutex::new("wait:busy".to_string()));
-    let (c, a) = (Arc::clone(&calls), Arc::clone(&answer));
-    let mut hooks = hooks(&world, parking_body(&world));
-    hooks.acts = Acts {
-        due: Arc::new(|_| Due::No),
-        disk_free: Arc::new(move |sid, owed, unfit, held| {
-            assert!(owed.text.ends_with("(rule disk-free@v1)"), "{}", owed.text);
-            assert_eq!(held, None, "nothing holds these turn breaks");
-            c.lock().unwrap().push((sid.to_string(), unfit));
-            unfit.map_or_else(
-                || a.lock().unwrap().clone(),
-                |why| format!("released:{why}"),
-            )
-        }),
-        finished: Arc::new(|sid, _, _| Some(sid == "s-df-finished")),
-        tasked: Arc::new(|sid, _, _| Some(sid != "s-df-taskless")),
-        disk_board: &BOARD,
-        ..Acts::inert()
-    };
-    hooks.autopilot =
-        Arc::new(|| std::collections::HashMap::from([("s-df-land".to_string(), Autopilot::Land)]));
-    let tabs = [
-        "s-df-open",
-        "s-df-land",
-        "s-df-finished",
-        "s-df-taskless",
-        "s-df-other",
-    ];
-    let idles: Vec<WorkerIdle> = tabs
-        .iter()
-        .map(|sid| {
-            let mut idle = idle_of(
-                hooks.clone(),
-                Program::Claude,
-                Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-            );
-            idle.sid = (*sid).to_string();
-            idle
-        })
-        .collect();
-    BOARD.publish(|b| {
-        for sid in &tabs[..4] {
-            b.asks.insert(
-                (*sid).to_string(),
-                crate::disk_board::AskOwed {
-                    key: "dev:1".to_string(),
-                    text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)"
-                        .to_string(),
-                },
-            );
-        }
-    });
-    assert!(
-        idles[0].wants(),
-        "an owed line asks for the next turn break"
-    );
-    assert_eq!(
-        idles[0].at_idle().map(|s| s.line),
-        None,
-        "the fence refused"
-    );
-    assert!(
-        disk_ask_owed(&BOARD, "s-df-open").is_some(),
-        "a wait keeps the line for the next turn break"
-    );
-    *answer.lock().unwrap() = "typed".to_string();
-    let step = idles[0].at_idle().expect("typed");
-    assert_eq!(step.line, "disk-free@v1 step=typed");
-    assert_eq!(
-        step.typed,
-        Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact),
-        "its answer is no done report"
-    );
-    assert_eq!(idles[0].at_idle().map(|s| s.line), None, "typed once");
-    let steps: Vec<Option<String>> = idles[1..]
-        .iter()
-        .map(|idle| idle.at_idle().map(|step| step.line))
-        .collect();
-    assert_eq!(
-        steps[0].as_deref(),
-        Some("disk-free@v1 step=typed"),
-        "{steps:?}"
-    );
-    assert_eq!(steps[1..], [None, None, None], "{steps:?}");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [
-            ("s-df-open".to_string(), None),
-            ("s-df-open".to_string(), None),
-            ("s-df-land".to_string(), None),
-            ("s-df-finished".to_string(), Some("finished")),
-            ("s-df-taskless".to_string(), Some("taskless")),
-        ],
-        "landing is no bar; a finished or taskless tab is released, and a tab owed nothing is \
-         never stepped"
-    );
-    assert!(
-        tabs.iter().all(|sid| disk_ask_owed(&BOARD, sid).is_none()),
-        "typed or released, nothing stays owed"
-    );
-    let own = |why| crate::disk_board::Unfit {
-        own: Some(why),
-        theirs: None,
-    };
-    assert_eq!(
-        BOARD.board_lock().unfit,
-        BTreeMap::from([
-            ("s-df-finished".to_string(), own("finished")),
-            ("s-df-taskless".to_string(), own("taskless")),
-        ]),
-        "every turn break tells the look's seats which tabs may not be asked, owed or not"
-    );
-}
-
-/// A turn break the loop's guards hold for a host's own fact types no disk-free line. A person's
-/// grace alone (`IdlePoint::held`) is a wait: the act is told, answers `wait:person`, and the line
-/// stays owed for the next turn break, which types it. A session that is the person's own
-/// exchange or a manager's worker (`IdlePoint::theirs`, whatever else holds it) is theirs for as
-/// long as they keep it: it is unfit, so the act releases its line at no election's cost and the
-/// board tells the look not to nominate it again, instead of the line waiting out its delivery
-/// window and spending an election.
-#[test]
-fn the_disk_free_line_waits_out_a_persons_grace_and_is_released_from_a_session_that_is_theirs() {
-    static BOARD: Shelf = Shelf::new();
-    let world = Arc::new(World::default());
-    /// Each act's `(unfit, held)`.
-    type Calls = Vec<(Option<&'static str>, Option<&'static str>)>;
-    let calls: Arc<Mutex<Calls>> = Arc::default();
-    let c = Arc::clone(&calls);
-    let mut hooks = hooks(&world, parking_body(&world));
-    hooks.acts = Acts {
-        due: Arc::new(|_| Due::No),
-        disk_free: Arc::new(move |_, _, unfit, held| {
-            c.lock().unwrap().push((unfit, held));
-            match (unfit, held) {
-                (Some(why), _) => format!("released:{why}"),
-                (None, Some(why)) => format!("wait:{why}"),
-                (None, None) => "typed".to_string(),
-            }
-        }),
-        finished: Arc::new(|_, _, _| Some(false)),
-        tasked: Arc::new(|_, _, _| Some(true)),
-        disk_board: &BOARD,
-        ..Acts::inert()
-    };
-    let mut idle = idle_of(
-        hooks,
-        Program::Claude,
-        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-    );
-    idle.sid = "s-df-held".to_string();
-    let owe = || {
-        BOARD.publish(|b| {
-            b.asks.insert(
-                "s-df-held".to_string(),
-                crate::disk_board::AskOwed {
-                    key: "dev:1".to_string(),
-                    text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)"
-                        .to_string(),
-                },
-            );
-        });
-    };
-    let unfit = || {
-        BOARD
-            .board_lock()
-            .unfit
-            .get("s-df-held")
-            .and_then(|found| found.bars(false))
-    };
-    let point = |held: Option<Guard>, theirs: Option<Guard>| IdlePoint {
-        held,
-        theirs,
-        ..IdlePoint::default()
-    };
-    owe();
-    assert_eq!(
-        idle.at_idle_on(point(Some(Guard::Person), None))
-            .map(|s| s.line),
-        None,
-        "a person's grace: nothing typed"
-    );
-    assert!(
-        disk_ask_owed(&BOARD, "s-df-held").is_some(),
-        "a person's grace keeps the line owed"
-    );
-    assert_eq!(unfit(), None, "and the session seated");
-    for (held, theirs, why) in [
-        (Guard::Exchange, Guard::Exchange, "exchange"),
-        (Guard::Managed, Guard::Managed, "managed"),
-        (Guard::Person, Guard::Managed, "managed"),
-    ] {
-        owe();
-        assert_eq!(
-            idle.at_idle_on(point(Some(held), Some(theirs)))
-                .map(|s| s.line),
-            None,
-            "{held:?} over {theirs:?}: nothing typed"
-        );
-        assert!(
-            disk_ask_owed(&BOARD, "s-df-held").is_none(),
-            "{held:?} over {theirs:?}: released, not kept owed through its delivery window"
-        );
-        assert_eq!(
-            unfit(),
-            Some(why),
-            "{held:?} over {theirs:?}: the look nominates it no more"
-        );
-    }
-    owe();
-    let step = idle
-        .at_idle_on(IdlePoint::default())
-        .expect("a turn break nothing holds types it");
-    assert_eq!(step.line, "disk-free@v1 step=typed");
-    assert_eq!(unfit(), None, "seated again once nothing holds it");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [
-            (None, Some("person")),
-            (Some("exchange"), Some("exchange")),
-            (Some("managed"), Some("managed")),
-            (Some("managed"), Some("person")),
-            (None, None),
-        ],
-        "the act is told what holds each turn break"
-    );
-    assert!(disk_ask_owed(&BOARD, "s-df-held").is_none());
-}
-
-/// A session whose turns end with its own background shell still running (a manager awaiting its
-/// workers in a background `aterm ctl await task`) reads busy for hours and comes to no idle point.
-/// Its loop offers the disk-free line owed it at such a break once it settles
-/// ([`IdleHost::at_background_fact`]), and the worker steps it there as at an idle point: the same
-/// act, the same guards. Before, the worker typed only the upgrade's notice there, and the line was
-/// handed on undelivered after its delivery window, and as the only seat the episode parked for
-/// six hours with nothing freed. A line its loop holds in custody ([`IdlePoint::line_held`]) holds
-/// the ask at an idle point as a person's grace does, `wait:held`, the line kept owed. Negative
-/// control by mutation: the held line's word dropped from [`WorkerIdle::disk_free_step`]: the ask
-/// typed behind it.
-#[test]
-fn the_disk_free_line_goes_at_a_background_break_where_the_turn_is_over() {
-    use aterm_agent::supervise::IdleHost;
-    static BOARD: Shelf = Shelf::new();
-    let world = Arc::new(World::default());
-    type Calls = Vec<(String, Option<&'static str>, Option<&'static str>)>;
-    let calls: Arc<Mutex<Calls>> = Arc::default();
-    let c = Arc::clone(&calls);
-    let mut hooks = hooks(&world, parking_body(&world));
-    hooks.acts = Acts {
-        due: Arc::new(|_| Due::No),
-        disk_free: Arc::new(move |sid, owed, unfit, held| {
-            assert!(owed.text.ends_with("(rule disk-free@v1)"), "{}", owed.text);
-            c.lock().unwrap().push((sid.to_string(), unfit, held));
-            match (unfit, held) {
-                (Some(why), _) => format!("released:{why}"),
-                (None, Some(why)) => format!("wait:{why}"),
-                (None, None) => "typed".to_string(),
-            }
-        }),
-        finished: Arc::new(|_, _, _| Some(false)),
-        tasked: Arc::new(|_, _, _| Some(true)),
-        disk_board: &BOARD,
-        ..Acts::inert()
-    };
-    let mut idle = idle_of(
-        hooks,
-        Program::Claude,
-        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-    );
-    idle.sid = "s-df-manager".to_string();
-    assert!(!idle.fact_owed(), "nothing owed: nothing to offer");
-    assert_eq!(
-        idle.at_background_fact(IdlePoint::default())
-            .map(|s| s.line),
-        None
-    );
-    BOARD.publish(|b| {
-        b.asks.insert(
-            "s-df-manager".to_string(),
-            crate::disk_board::AskOwed {
-                key: "dev:1".to_string(),
-                text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)".to_string(),
-            },
-        );
-    });
-    assert!(idle.fact_owed(), "an owed line is offered at the break");
-    assert_eq!(
-        idle.at_background_fact(IdlePoint {
-            held: Some(Guard::Person),
-            ..IdlePoint::default()
-        })
-        .map(|s| s.line),
-        None,
-        "a person's grace: nothing typed"
-    );
-    assert!(idle.fact_owed(), "and the line still owed");
-    assert_eq!(
-        idle.at_idle_on(held_line()).map(|s| s.line),
-        None,
-        "a line held in custody at an idle point: nothing typed"
-    );
-    assert!(idle.fact_owed(), "and the line still owed");
-    let step = idle
-        .at_background_fact(IdlePoint::default())
-        .expect("a break nothing holds types it");
-    assert_eq!(step.line, "disk-free@v1 step=typed");
-    assert_eq!(
-        step.typed,
-        Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact)
-    );
-    assert!(!idle.fact_owed(), "typed once");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [
-            ("s-df-manager".to_string(), None, Some("person")),
-            ("s-df-manager".to_string(), None, Some("held")),
-            ("s-df-manager".to_string(), None, None),
-        ]
-    );
-}
-
-/// The loop's lasting withholds at a session's turn breaks ([`IdleHost::lasting_hold`]: its credits
-/// hold, a sign-in wall, another wall that is no usage limit) go on the board every disk look
-/// seats sessions by, so the look holds the session out of its seats rather than electing one whose
-/// line would not go. Each stands until its loop says it is over (a wall once the session works
-/// past it, the credits hold once it lifts): a busy read alone ends neither, as a break of the
-/// agent's own background work at a wall reads busy too and is no work past it.
-#[test]
-fn the_loops_lasting_withholds_go_on_the_board_the_look_seats_by() {
-    use crate::disk_board::Withhold;
-    use aterm_agent::supervise::{IdleHost, Lasting};
-    static BOARD: Shelf = Shelf::new();
-    let world = Arc::new(World::default());
-    let mut hooks = hooks(&world, parking_body(&world));
-    hooks.acts = Acts {
-        disk_board: &BOARD,
-        ..Acts::inert()
-    };
-    let mut idle = idle_of(
-        hooks,
-        Program::Claude,
-        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-    );
-    idle.sid = "s-df-walled".to_string();
-    let on_board = || BOARD.board_lock().withholds.get("s-df-walled").copied();
-    idle.lasting_hold(Some(Lasting::Wall { wire: "wall:auth" }));
-    assert_eq!(on_board(), Some(Withhold::Wall { wire: "wall:auth" }));
-    idle.busy_tap();
-    assert_eq!(
-        on_board(),
-        Some(Withhold::Wall { wire: "wall:auth" }),
-        "a busy read may be a break of its own background work, still at the wall"
-    );
-    idle.lasting_hold(None);
-    assert_eq!(on_board(), None, "its loop read it working past the wall");
-    idle.lasting_hold(Some(Lasting::Credits {
-        lifts_unix: Some(1_800_000_000),
-    }));
-    assert_eq!(
-        on_board(),
-        Some(Withhold::Credits {
-            until_s: Some(1_800_000_000)
-        })
-    );
-    idle.busy_tap();
-    assert_eq!(
-        on_board(),
-        Some(Withhold::Credits {
-            until_s: Some(1_800_000_000)
-        }),
-        "a turn carried on credits is still held: the loop types nothing at its end"
-    );
-    idle.lasting_hold(None);
-    assert_eq!(on_board(), None, "its loop says it is over");
-}
-
-/// The loop tells the worker of every decided turn break before it asks whether the worker wants a
-/// step there ([`IdleHost::turn_break`]), and the worker writes what it finds of the session there
-/// to the board every disk look seats sessions by, though it owes the session no line and wants no
-/// step: a tab whose task finished is found unfit, the same tab given a task again is found fit,
-/// and one a manager waits on is theirs. A finding made only where a line was owed went stale
-/// once the session was fit again, so a later episode never nominated it, and a session never
-/// owed a line was never found unfit. The tab's first busy read drops what it found of the session
-/// itself (it was given something to do) and keeps whose it is.
-#[test]
-fn every_turn_break_finds_the_tab_fit_or_unfit_though_it_is_owed_no_disk_free_line() {
-    use aterm_agent::supervise::IdleHost;
-    static BOARD: Shelf = Shelf::new();
-    let world = Arc::new(World::default());
-    let finished = Arc::new(AtomicBool::new(true));
-    let f = Arc::clone(&finished);
-    let mut hooks = hooks(&world, parking_body(&world));
-    hooks.acts = Acts {
-        due: Arc::new(|_| Due::No),
-        disk_free: Arc::new(|sid, _, _, _| panic!("{sid}: no line is owed, so none is stepped")),
-        finished: Arc::new(move |_, _, _| Some(f.load(Ordering::SeqCst))),
-        tasked: Arc::new(|_, _, _| Some(true)),
-        disk_board: &BOARD,
-        ..Acts::inert()
-    };
-    let mut idle = idle_of(
-        hooks,
-        Program::Claude,
-        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-    );
-    idle.sid = "s-df-break".to_string();
-    idle.park.store(false, Ordering::SeqCst);
-    let found = || BOARD.board_lock().unfit.get("s-df-break").copied();
-    let own = |why| {
-        Some(crate::disk_board::Unfit {
-            own: Some(why),
-            theirs: None,
-        })
-    };
-    assert!(!idle.wants(), "owed nothing, the worker wants no step");
-    idle.turn_break(None);
-    assert_eq!(found(), own("finished"), "its task finished");
-    idle.busy_tap();
-    assert_eq!(
-        found(),
-        None,
-        "it works again: someone gave it something to do"
-    );
-    idle.turn_break(None);
-    assert_eq!(
-        found(),
-        own("finished"),
-        "its next turn break finds it again"
-    );
-    finished.store(false, Ordering::SeqCst);
-    idle.turn_break(None);
-    assert_eq!(found(), None, "given a task again, it may be asked again");
-    idle.turn_break(Some(Guard::Managed));
-    let managed = Some(crate::disk_board::Unfit {
-        own: None,
-        theirs: Some("managed"),
-    });
-    assert_eq!(found(), managed, "a manager waits on it");
-    idle.busy_tap();
-    assert_eq!(found(), managed, "the manager's for as long as it keeps it");
-    idle.turn_break(None);
-    assert_eq!(found(), None, "and the manager let it go");
-    assert!(!idle.wants(), "still owed nothing");
-}
-
-/// The loop's limit episode at a usage-limit wall is what the ask to free space reads of it: the
-/// worker publishes the wall each time the loop tells it the reset the episode holds it to (at the
-/// open, and again when a later limit point moves it later), spent at that reset plus the loop's
-/// grace (where the loop rests at the wall and a line could go), at the reset its transcript names
-/// where the episode has none, and takes it down as the episode closes or the limit ends with no
-/// sign-in that took. The look holds the tab out of its seats only while it stands at such a wall.
-/// A tab at the wall was seated, often first as its checkout was the largest, and its line waited
-/// out its delivery window and cost an election; and a wall dated once by the transcript stood
-/// spent while the loop still waited out a weekly reset a later point named.
-#[test]
-fn a_limit_episode_publishes_its_wall_for_the_ask_until_it_closes() {
-    use crate::disk_board::Wall;
-    use aterm_agent::supervise::IdleHost;
-    static BOARD: Shelf = Shelf::new();
-    let world = Arc::new(World::default());
-    let reset = Arc::new(Mutex::new(None::<u64>));
-    let r = Arc::clone(&reset);
-    let mut hooks = hooks(&world, parking_body(&world));
-    hooks.acts = Acts {
-        limit_reset: Arc::new(move |_| *r.lock().unwrap()),
-        disk_board: &BOARD,
-        ..Acts::inert()
-    };
-    let mut idle = idle_of(
-        hooks,
-        Program::Claude,
-        Some("0badf00d-1111-2222-3333-444455556666".to_string()),
-    );
-    idle.sid = "s-df-wall".to_string();
-    let wall = || BOARD.board_lock().walls.get("s-df-wall").copied();
-    assert_eq!(wall(), None, "CONTROL: no episode");
-    idle.limited(true);
-    idle.limit_wall(None);
-    assert_eq!(
-        wall(),
-        Some(Wall { until_s: None }),
-        "no reset known: it holds until the episode closes"
-    );
-    idle.limited(false);
-    assert_eq!(wall(), None, "the episode closed");
-    let grace = i64::try_from(aterm_agent::harness::upgrade_drive::LIMIT_GRACE_S).unwrap();
-    let at = 1_800_000_000i64;
-    *reset.lock().unwrap() = Some(u64::try_from(at).unwrap());
-    idle.limited(true);
-    idle.limit_wall(None);
-    assert_eq!(
-        wall(),
-        Some(Wall {
-            until_s: Some(at + grace)
-        }),
-        "the episode has no reset of its own: spent at its transcript's, where the loop takes it so"
-    );
-    let weekly = at + 4 * 86_400;
-    idle.limit_wall(Some(weekly));
-    assert_eq!(
-        wall(),
-        Some(Wall {
-            until_s: Some(weekly + grace)
-        }),
-        "a later limit point moved the episode's reset: the loop's wins over the transcript's"
-    );
-    idle.limit_over();
-    assert_eq!(wall(), None, "the limit ended");
 }
 
 /// The disk resume is a carry-on, so it is typed into no turn break the loop holds for a person,
@@ -46298,7 +46167,6 @@ fn an_unmeasured_disk_preserves_the_emergency() {
         disk_alert(
             &BOARD,
             emergency,
-            &thresholds,
             Some(0),
             0,
             &[],
@@ -46317,7 +46185,6 @@ fn an_unmeasured_disk_preserves_the_emergency() {
     disk_alert(
         &BOARD,
         measured,
-        &thresholds,
         Some(thresholds.emergency),
         0,
         &[],
@@ -46345,7 +46212,6 @@ fn an_unmeasured_disk_preserves_the_emergency() {
         disk_alert(
             &BOARD,
             unmeasured,
-            &thresholds,
             None,
             0,
             &[],
@@ -46493,9 +46359,7 @@ fn a_windows_tab_with_no_placeable_cwd_is_unknown_and_named() {
     std::fs::create_dir_all(repo.join("src")).expect("checkout");
     std::fs::create_dir_all(tmp.path().join("other")).expect("beside it");
     let canonical = std::fs::canonicalize(&repo).expect("canonical");
-    let plain = aterm_sysprobe::paths::plain(&canonical)
-        .to_string_lossy()
-        .into_owned();
+    let plain = aterm_path::plain(&canonical).to_string_lossy().into_owned();
     let (drive, rest) = plain.split_once(":\\").expect("a drive path");
     let msys = format!(
         "/{}/{}/src",
@@ -46551,9 +46415,7 @@ fn the_removal_reads_the_tabs_as_they_stand_now() {
         .expect("temp dir");
     let (first, then) = (tmp.path().join("first"), tmp.path().join("then"));
     let report = |dir: &Path| {
-        let plain = aterm_sysprobe::paths::plain(dir)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let plain = aterm_path::plain(dir).to_string_lossy().replace('\\', "/");
         let path = if plain.starts_with('/') {
             plain
         } else {
@@ -46601,7 +46463,7 @@ fn a_tab_busy_at_the_removal_is_unknown_on_windows() {
         .tempdir()
         .expect("temp dir");
     let (first, then) = (tmp.path().join("first"), tmp.path().join("then"));
-    let plain = aterm_sysprobe::paths::plain(&then)
+    let plain = aterm_path::plain(&then)
         .to_string_lossy()
         .replace('\\', "/");
     let report = if plain.starts_with('/') {
@@ -46712,9 +46574,7 @@ fn the_looks_remover_judges_tier_3_against_the_tabs_at_the_removal() {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     let report = |dir: &Path| {
-        let plain = aterm_sysprobe::paths::plain(dir)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let plain = aterm_path::plain(dir).to_string_lossy().replace('\\', "/");
         let path = if plain.starts_with('/') {
             plain
         } else {
@@ -46750,7 +46610,7 @@ fn the_looks_remover_judges_tier_3_against_the_tabs_at_the_removal() {
         device: None,
         volume: None,
     };
-    let mut remove = disk_remover(judge, &store);
+    let mut remove = disk_remover(judge, tmp.path(), &store);
 
     let first = remove(&row).expect_err("its git index was written just now");
     assert!(
@@ -46801,7 +46661,7 @@ fn an_emergency_pass_that_freed_nothing_backs_off_until_the_disk_changes() {
         free,
         fruitless: false,
         level: Level::Short,
-        low_every: DISK_LOW_EVERY,
+        every: DISK_PASS_EVERY,
     });
     assert!(!disk_pass_due(
         &mut last,
@@ -46829,7 +46689,7 @@ fn an_emergency_pass_that_freed_nothing_backs_off_until_the_disk_changes() {
         free,
         fruitless: true,
         level: Level::Emergency,
-        low_every: DISK_LOW_EVERY,
+        every: DISK_LOW_EVERY,
     });
     assert!(!disk_pass_due(
         &mut last,
@@ -46893,13 +46753,13 @@ fn at_low_a_pass_runs_hourly_and_backs_off_while_fruitless() {
     let minute = Duration::from_secs(60);
     let room = 40u64 << 30;
     let free = Some(50u64 << 30);
-    let at_low = |at, low_every| {
+    let at_low = |at, every| {
         Some(DiskPass {
             at,
             free,
             fruitless: false,
             level: Level::Low,
-            low_every,
+            every,
         })
     };
     assert!(!disk_pass_due(&mut None, t0, Level::Ok, free, true, room));
@@ -46949,13 +46809,23 @@ fn at_low_a_pass_runs_hourly_and_backs_off_while_fruitless() {
         disk_pass_due(&mut last, t0 + minute, Level::Low, fell, false, room),
         "fell"
     );
+    // A move from `short` to `low` calls no pass: free space wandering across the floor is not
+    // news, and a pass at `short` has just looked.
     let mut from_short = Some(DiskPass {
         level: Level::Short,
-        ..at_low(t0, DISK_LOW_EVERY).expect("pass")
+        ..at_low(t0, DISK_PASS_EVERY).expect("pass")
     });
-    assert!(disk_pass_due(
+    assert!(!disk_pass_due(
         &mut from_short,
         t0 + minute,
+        Level::Low,
+        free,
+        false,
+        room
+    ));
+    assert!(disk_pass_due(
+        &mut from_short,
+        t0 + DISK_PASS_EVERY,
         Level::Low,
         free,
         false,
@@ -46964,15 +46834,15 @@ fn at_low_a_pass_runs_hourly_and_backs_off_while_fruitless() {
 
     let mut every = DISK_LOW_EVERY;
     for _ in 0..6 {
-        every = disk_low_every(Level::Low, false, at_low(t0, every).as_ref());
+        every = disk_every(Level::Low, false, at_low(t0, every).as_ref());
     }
     assert_eq!(every, DISK_LOW_EVERY_MAX);
     assert_eq!(
-        disk_low_every(Level::Low, false, at_low(t0, DISK_LOW_EVERY).as_ref()),
+        disk_every(Level::Low, false, at_low(t0, DISK_LOW_EVERY).as_ref()),
         DISK_LOW_EVERY * 2
     );
     assert_eq!(
-        disk_low_every(Level::Low, true, at_low(t0, DISK_LOW_EVERY_MAX).as_ref()),
+        disk_every(Level::Low, true, at_low(t0, DISK_LOW_EVERY_MAX).as_ref()),
         DISK_LOW_EVERY
     );
     let mut backed = at_low(t0, DISK_LOW_EVERY * 4);
@@ -49433,6 +49303,8 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
 
     let setup = || {
         let a = Accts::new();
+        // The file-vault fixture is Unix-only; the non-Unix reader always answers absent.
+        #[cfg(unix)]
         aterm_agent::vault_entry::put(&a.tmp.path().join("home"), "ai-pool.toml", "version = 1\n");
         let dir = |label: &str| a.login_dir(label);
         std::fs::write(
@@ -49668,8 +49540,8 @@ fn answering_board() -> &'static Mutex<crate::program_check_watch::Board> {
 /// One reading of `board` at `at_ms`, through the stand-in `program-check full` (`full`) or
 /// `live` sets: a healthy pool, held at its limit while full.
 fn program_check_reads(board: &Mutex<crate::program_check_watch::Board>, at_ms: u64, full: bool) {
+    use aterm_process_facts::program_check::{Daemon, Reading};
     use aterm_uds::program_check::Look;
-    use aterm_vitals::program_check::{Daemon, Reading};
     let healthy = Look::Read(Reading {
         daemon: Daemon {
             pid: 690,
@@ -50070,7 +49942,7 @@ fn the_host_counts_this_hosts_records_only() {
     let landed = store
         .read()
         .unwrap()
-        .by_sid(&aterm_session::SessionId::new(second.as_str()))
+        .by_sid(&aterm_session::SessionId::parse(&second).expect("a tab id"))
         .cloned()
         .expect("the second session");
     landed

@@ -16,6 +16,7 @@
 //! opens custody, and it turns every refusal into a state word rather than an error.
 
 pub mod command;
+pub(crate) mod growth;
 pub mod limits;
 pub mod materialize;
 pub mod publish;
@@ -58,6 +59,30 @@ pub fn here(paths: &Paths) -> Option<String> {
 #[must_use]
 pub fn here_nickname(paths: &Paths) -> Option<crate::alab::view::MachineNickname> {
     here_row(paths).map(|row| crate::alab::view::MachineNickname::of_file_row(&row))
+}
+
+/// A vouched live snapshot's own row and nickname, including queued local edits.
+/// This is evidence only: an automatic local write must also admit the current native
+/// registry source through its persistence. Retained held or off rows remain display data.
+#[must_use]
+pub fn live_here_nickname(paths: &Paths) -> Option<(String, crate::alab::view::MachineNickname)> {
+    let read =
+        aterm_file::File::at(&root(&crate::generation::original(paths)), &MACHINES.file()).read();
+    if read.status.word != aterm_file::Word::Live {
+        return None;
+    }
+    let mut rows = read
+        .rows()
+        .iter()
+        .filter(|row| row.live && row.cell("here") == "yes");
+    let row = rows.next()?;
+    if rows.next().is_some() {
+        return None;
+    }
+    Some((
+        row.pk.clone(),
+        crate::alab::view::MachineNickname::of_file_row(row),
+    ))
 }
 
 /// Why the registry's `nickname` column refuses `nick` in the machine row `row`, as `aterm file
@@ -131,26 +156,12 @@ pub mod fixture {
     }
 }
 
-/// How many durable appends this process's table stores have made.
-static GREW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Note that a table store of this process grew: a record this Mac authored, or one it took from
-/// a peer. Called under the store's locks by `crate::table::store`, so it only counts; the
-/// process that owns the Commons runtime reads the count ([`growth`]) and runs a materializer
-/// pass once it has moved (`crate::alab::upkeep`).
-pub(crate) fn grew() {
-    GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// How many times [`grew`] was called in this process.
-pub(crate) fn growth() -> u64 {
-    GREW.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Seams of this crate's tests: how often this thread reached for custody, a step run between
 /// a pass's first look at its home's standing and its open of custody, one run between a pass's
-/// read and its record, and the owner act and `set` draft a test outside this module writes
-/// with.
+/// read and its record, one run where a table view is about to authenticate the records a roll
+/// carried, a part a pass's key leaves out, a later build's rules, the roster a pass reads (this
+/// Mac's machine, a member that left, a roster that does not read), and the owner act and `set`
+/// draft a test outside this module writes with.
 #[cfg(test)]
 #[path = "file_seam_tests.rs"]
 pub(crate) mod seam;

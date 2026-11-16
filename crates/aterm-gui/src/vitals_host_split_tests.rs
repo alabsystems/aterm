@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use aterm_sysprobe::coalitions::{CoalitionRead, CoalitionUsage};
 use aterm_sysprobe::identity::{CS_ADHOC, CS_PLATFORM_BINARY, CS_VALID, Identity};
 use aterm_sysprobe::timeline::Timeline;
-use aterm_vitals::explain::{ActivityId, CauseId, Via, Voucher};
+use aterm_vitals::explain::{Via, Voucher};
 
 use super::*;
 
@@ -1497,10 +1497,10 @@ fn the_lane_is_the_self_checks_and_the_test_readers_is_inert() {
 
 /// THE WHY FIXTURE READS ITS SCENE OVER THE HOST'S OWN SPLIT TICKS (the
 /// `ATERM_DEV_WHY_FIXTURE` seam): RD's 10:32 scene, split at 0 and 5 s with a
-/// sweep at 4 s or at any other spacing (0, 3.7, 6.2 s), names Spotlight
-/// after start-up over the scene's 3.30 cores, while the machine's own
-/// memory rides on where the scene has none. NEGATIVE CONTROL: the calm
-/// scene names no covering cause, and its memory is its own.
+/// sweep at 4 s or at any other spacing (0, 3.7, 6.2 s), retains the scene's
+/// machine ticks and published tab CPU without inferring a physical cause.
+/// The machine's memory rides on where the scene has none; the calm scene
+/// instead keeps its own memory.
 #[cfg(debug_assertions)]
 #[test]
 fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
@@ -1524,7 +1524,6 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
         vitals.absorb(&fixture.at(&live, false, at[1]));
         vitals.absorb(&fixture.at(&live, true, at[2]))
     };
-    let spotlight = CauseId::Activity(ActivityId::Spotlight);
     for at in [[0, 4_000, 5_000], [0, 3_700, 6_200]] {
         let snap = read(spotlight_1032(), at);
         let why = snap.why.as_deref().expect("the scene's split");
@@ -1535,14 +1534,12 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
             "{at:?}: {}",
             why.split.global_mc
         );
-        let ids: Vec<CauseId> = why.causes.iter().map(|c| c.id).collect();
+        assert!(why.split.rows.iter().any(|r| r.measured && r.cpu_mc > 0));
+        assert!(why.causes.iter().all(|c| !c.id.covering()), "{at:?}");
+        assert!(why.open.is_empty() && why.clause.is_none());
         assert_eq!(
-            ids,
-            [
-                spotlight,
-                CauseId::Context(aterm_vitals::explain::Context::Startup)
-            ],
-            "{at:?}"
+            why.split.cpu_accounting.execution_window,
+            aterm_vitals::published_cpu::CpuExecutionWindow::Unavailable
         );
         assert_eq!(
             snap.mem.as_ref().map(|m| m.sample.total),
@@ -1621,8 +1618,8 @@ fn the_why_seam_names_calm_and_spotlight_under_calms_memory() {
 /// scene installed on a reader whose machine has no lane reads under the
 /// scene's lane; the bars' first reading is a split tick, the next, at once
 /// after the last split tick (however long the first reading took), is none,
-/// and one five seconds on (on the host's clock and the scene's) names
-/// Spotlight over the scene's split. NEGATIVE CONTROL: the machine's
+/// and one five seconds on (on the host's clock and the scene's) retains
+/// reported coalition growth without a physical cause. NEGATIVE CONTROL: the machine's
 /// coalitions are never read.
 #[cfg(debug_assertions)]
 #[test]
@@ -1660,9 +1657,12 @@ fn the_reader_reads_its_scene_on_its_own_split_ticks() {
     assert!(reader.split.last > Some(first), "five seconds on, one");
     let why = snap.why.as_deref().expect("the scene's split");
     assert_eq!(why.split.via, Via::Coalitions);
+    assert!(why.split.rows.iter().any(|r| r.measured && r.cpu_mc > 0));
+    assert!(why.causes.iter().all(|c| !c.id.covering()));
+    assert!(why.open.is_empty() && why.clause.is_none());
     assert_eq!(
-        why.causes.first().map(|c| c.id),
-        Some(CauseId::Activity(ActivityId::Spotlight))
+        why.split.cpu_accounting.execution_window,
+        aterm_vitals::published_cpu::CpuExecutionWindow::Unavailable
     );
     let r = READS.take();
     assert_eq!((r.coalitions, r.swept), (0, 0), "the machine's");

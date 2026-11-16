@@ -124,6 +124,59 @@ pub fn post(name: &CStr) -> bool {
     }
 }
 
+/// Whether a Darwin notification name was posted since the last look: a check token
+/// (`notify_register_check`) and `notify_check` alone, which read no state and need no port,
+/// thread or run loop. A test's ear: whether a post reached a registration of a name (one for
+/// another state home must not). Its token is cancelled on drop. macOS alone has notify.
+#[cfg(all(any(test, debug_assertions), target_os = "macos"))]
+#[derive(Debug)]
+pub struct Posts {
+    /// The check token.
+    token: std::ffi::c_int,
+}
+
+#[cfg(all(any(test, debug_assertions), target_os = "macos"))]
+impl Posts {
+    /// Registers a check token on `name` and takes notify's first look, which says posted
+    /// whatever was: the next [`Self::posted`] says only what was posted since this returned.
+    ///
+    /// # Errors
+    /// `notify_register` or `notify_check` where that call failed.
+    pub fn new(name: &CStr) -> Result<Self, &'static str> {
+        let mut token = 0;
+        // SAFETY: a NUL-terminated name and a writable token.
+        if unsafe { ffi::notify_register_check(name.as_ptr(), &raw mut token) } != 0 {
+            return Err("notify_register");
+        }
+        let mut this = Self { token };
+        this.posted()?;
+        Ok(this)
+    }
+
+    /// Whether the name was posted since the last look.
+    ///
+    /// # Errors
+    /// `notify_check` where it failed.
+    pub fn posted(&mut self) -> Result<bool, &'static str> {
+        let mut posted = 0;
+        // SAFETY: a token notify_register_check gave and this has not cancelled, and a writable
+        // flag.
+        if unsafe { ffi::notify_check(self.token, &raw mut posted) } == 0 {
+            Ok(posted != 0)
+        } else {
+            Err("notify_check")
+        }
+    }
+}
+
+#[cfg(all(any(test, debug_assertions), target_os = "macos"))]
+impl Drop for Posts {
+    fn drop(&mut self) {
+        // SAFETY: a token notify_register_check gave, cancelled once.
+        let _ = unsafe { ffi::notify_cancel(self.token) };
+    }
+}
+
 /// A watch on the documented thermal pressure level ([`THERMAL_PRESSURE`]).
 #[must_use]
 pub fn thermal_pressure() -> Watch {

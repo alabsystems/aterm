@@ -30,7 +30,6 @@ fn plain(n: usize) -> Vec<TabStripMetadata> {
             conn: None,
             closable: true,
             team: TabTeam::NONE,
-            load: 0,
         };
         n
     ]

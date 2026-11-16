@@ -442,7 +442,7 @@ pub(crate) fn asker_as(
     };
     let asking = {
         let sessions = store.read().unwrap_or_else(|p| p.into_inner());
-        let handle = sessions.by_sid(&SessionId::new(&sid))?;
+        let handle = sessions.by_sid(&SessionId::parse(&sid)?)?;
         crate::survey::asking_of(handle)?
     };
     let requester = aterm_types::control_verbs::Requester::of(
@@ -1093,8 +1093,12 @@ fn write_look(dir: &Path, at: u64, look: &aterm_requests::Look) {
     }) {
         // Its requester's lease is over: its later drives into those tabs are a person's tab's.
         Ok(ended) => {
-            for tab in ended.iter().flat_map(|end| &end.tabs) {
-                crate::control::forget_driven_shell(&SessionId::new(tab));
+            for tab in ended
+                .iter()
+                .flat_map(|end| &end.tabs)
+                .filter_map(|tab| SessionId::parse(tab))
+            {
+                crate::control::forget_driven_shell(&tab);
             }
         }
         Err(error) => aterm_log::warn!("requests: lease look not recorded: {error}"),

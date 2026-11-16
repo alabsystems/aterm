@@ -31,6 +31,7 @@ pub mod accounts_token_run;
 pub mod accounts_token_view;
 #[cfg(unix)]
 pub mod accounts_tokens;
+pub mod accounts_upkeep_counts;
 pub mod acts;
 pub mod agent_image;
 pub mod agents;
@@ -113,6 +114,7 @@ pub mod launch_trust;
 pub mod left;
 pub mod leftover;
 pub mod lights;
+pub mod login_adoption;
 pub mod login_drive;
 pub mod login_latch;
 pub mod mail_browser;

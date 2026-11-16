@@ -10,7 +10,7 @@ use crate::items::defaults::Target;
 use crate::items::{Ctx, Item};
 use crate::model::{Effect, HostFacts, ItemReport, Mode, Outcome, PValue, Probe, Read};
 use crate::port::{Live, System};
-use aterm_converge::{Class, Laps, Layer, Remedy, Report, ReportMode, Requires};
+use aterm_converge::{Class, Explain, Laps, Layer, Remedy, Report, ReportMode, Requires};
 use aterm_types::macos_setup::{Access, Selection, Setting};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1098,7 +1098,7 @@ pub enum Grant {
     Unread(String),
 }
 
-/// No grant read: a run that lists none.
+/// No grant observations. Required rows remain unknown until their readings are supplied.
 #[must_use]
 pub fn no_grants(_sign_out: bool) -> Vec<(Access, Grant)> {
     Vec::new()
@@ -1480,9 +1480,14 @@ fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
                 .is_some_and(|value| !value.is_empty());
         let in_tab = |applies: bool| {
             let mut composed = (host.base)(options.base_lock(applies));
-            composed.clt = composed
-                .clt
-                .map(|clt| clt.in_tab(tab.clone()).leaving_developer_mode(leave));
+            composed.clt = composed.clt.map(|clt| {
+                clt.in_tab(tab.clone())
+                    .leaving_developer_mode(leave)
+                    .with_explicit_tab(
+                        std::env::var_os(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_EXPLICIT)
+                            .is_some_and(|value| !value.is_empty()),
+                    )
+            });
             composed
         };
         let mut laps = Laps::start();
@@ -4803,6 +4808,9 @@ impl Item for Guard {
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
         self.inner.probe(sys, ctx)
     }
+    fn explain(&self, probe: &Probe) -> Option<Explain> {
+        self.inner.explain(probe)
+    }
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         self.apply_guarded(sys, ctx, &|| Ok(()))
     }
@@ -6435,6 +6443,11 @@ fn permissions(grants: Grants, sign_out: bool) -> Vec<Box<dyn Item>> {
         Access::FullDiskAccess,
         Access::DeveloperTools,
         Access::Debugger,
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
         Access::Accessibility,
     ]
     .into_iter()
@@ -6457,7 +6470,8 @@ struct Readings {
 
 /// One of aterm's macOS grants in the Permissions phase: only the person switches it on, in
 /// System Settings, so its row names where; a run counts it done but `--check` does not
-/// ([`counts`]). A grant that cannot be read here is not applicable to the run, saying why.
+/// ([`counts`]). An unread mandatory requirement stays unknown; an optional grant that cannot
+/// be read here is not applicable to the run, saying why.
 struct Permission {
     access: Access,
     readings: Arc<Readings>,
@@ -6488,10 +6502,16 @@ impl Item for Permission {
                 how: how.clone(),
             },
             Some((_, Grant::NotNeeded(why))) => Probe::NotApplicable { why: why.clone() },
+            Some((_, Grant::Unread(why))) if self.access.requires_confirmation() => {
+                Probe::Unusable { why: why.clone() }
+            }
             // A grant this process cannot read (outside aterm.app, or one that reads only once
             // Full Disk Access is on) is no failure of the run: aterm.app's Permissions reads it.
             Some((_, Grant::Unread(why))) => Probe::NotApplicable {
                 why: format!("{why}; aterm.app's Permissions reads it"),
+            },
+            None if self.access.requires_confirmation() => Probe::Unusable {
+                why: format!("{} has not been read on this Mac", self.access.name()),
             },
             None => Probe::NotApplicable {
                 why: "not read on this Mac".into(),
@@ -6713,6 +6733,9 @@ impl Item for Unchanged<'_> {
             Instead::Lock(why) | Instead::Kept(why) => why.into(),
         })
     }
+    fn explain(&self, probe: &Probe) -> Option<Explain> {
+        self.inner.explain(probe)
+    }
     fn revert(&self) -> Option<String> {
         self.inner.revert()
     }
@@ -6799,6 +6822,9 @@ impl Item for HeldLate<'_> {
             Some(why) => Probe::NotApplicable { why: why.clone() },
             None => self.inner.probe(sys, ctx),
         }
+    }
+    fn explain(&self, probe: &Probe) -> Option<Explain> {
+        self.inner.explain(probe)
     }
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         self.apply_guarded(sys, ctx, &|| Ok(()))

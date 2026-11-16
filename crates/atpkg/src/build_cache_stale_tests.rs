@@ -55,6 +55,18 @@ impl Fake {
         self
     }
 
+    /// The same tree, with none of its reads.
+    fn clone_tree(&self) -> Fake {
+        Fake {
+            nodes: self.nodes.clone(),
+            unreadable: self.unreadable.clone(),
+            unreadable_heads: self.unreadable_heads.clone(),
+            blind: self.blind.clone(),
+            looked: std::cell::RefCell::default(),
+            devices: self.devices.clone(),
+        }
+    }
+
     /// Writes `path` again at `at`: its own time only, as a write into a folder moves the folder's.
     fn touch(&mut self, path: &str, at: SystemTime) {
         self.nodes.get_mut(Path::new(path)).unwrap().1 = at;
@@ -2352,4 +2364,1129 @@ fn a_bin_a_test_needs_is_recorded_by_the_unit_its_copy_came_from() {
         none.add_uplifted(&leaf, profile, package, &copy);
     }
     assert_eq!(none, Used::default());
+}
+
+/// A unit of the folder layout in [`PROFILE`]: its hash file holding `fingerprint`'s hex (as
+/// targo's `to_hex` writes it), its fingerprint JSON beside it, written `at`, and its output.
+fn unit_with(
+    fs: &mut Fake,
+    package: &str,
+    folder: &str,
+    kind: &str,
+    fingerprint: u64,
+    json: &aterm_json::Value,
+    at: SystemTime,
+) {
+    unit_in(fs, PROFILE, package, folder, kind, fingerprint, json, at);
+}
+
+/// [`unit_with`] in the profile folder `profile`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a unit's whole description, one place"
+)]
+fn unit_in(
+    fs: &mut Fake,
+    profile: &str,
+    package: &str,
+    folder: &str,
+    kind: &str,
+    fingerprint: u64,
+    json: &aterm_json::Value,
+    at: SystemTime,
+) {
+    let dir = format!("{profile}/build/{package}/{folder}");
+    let hex: String = fingerprint
+        .to_le_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    fs.file(&format!("{dir}/fingerprint/{kind}"), at, hex.as_bytes())
+        .file(
+            &format!("{dir}/fingerprint/{kind}.json"),
+            at,
+            aterm_json::to_string(json).unwrap().as_bytes(),
+        )
+        .file(&format!("{dir}/fingerprint/dep-{kind}"), at, b"d")
+        .file(&format!("{dir}/fingerprint/invoked.timestamp"), at, b"")
+        .file(&format!("{dir}/out/{package}-{folder}"), at, b"o");
+}
+
+/// A fingerprint's JSON as targo writes it: its own inputs, `deps` (`[pkg_id, name, public,
+/// hash]`) and `local`, which names the unit's own dep-info file and so its folder.
+fn targo_json(features: &str, deps: &[(u64, &str, u64)], folder: &str) -> aterm_json::Value {
+    targo_json_of(17, features, deps, folder)
+}
+
+/// [`targo_json`] of the source whose `path` hash is `path` (another version of a registry crate
+/// has another).
+fn targo_json_of(
+    path: u64,
+    features: &str,
+    deps: &[(u64, &str, u64)],
+    folder: &str,
+) -> aterm_json::Value {
+    aterm_json::json!({
+        "rustc": 7,
+        "features": features,
+        "declared_features": "[]",
+        "target": 11,
+        "profile": 13,
+        "path": path,
+        "deps": deps
+            .iter()
+            .map(|(id, name, hash)| aterm_json::json!([*id, *name, false, *hash]))
+            .collect::<Vec<_>>(),
+        "local": [{"CheckDepInfo": {
+            "dep_info": format!("debug/build/x/{folder}/fingerprint/dep-lib-x"),
+            "fingerprint": "mtime"
+        }}],
+        "rustflags": ["-Zthreads=4"],
+        "config": 19,
+        "compile_kind": 0,
+    })
+}
+
+/// A SECOND HASH NAMES THE FIRST INPUT THAT MOVED ([`SecondHashes::second_hash`]): the test unit of
+/// `app` built under a second hash differs from its first only in its dependency `mid`'s hash, and
+/// `mid`'s two builds only in theirs of `aterm-serde` (which `mid` names `serde`), whose two builds
+/// differ in their features: the walk follows each `deps` entry by the hash its hash file holds,
+/// not by its name, and names `aterm-serde`'s `features`. A unit whose own input moved is named by
+/// it though its dependencies moved too; a dependency added names the edge. NEGATIVE CONTROLS:
+/// the two units that differ only below a shared dependency name that dependency and not the
+/// crate between (`mid`); the first unit of its kind records nothing, though another unit of its
+/// package (its library) stands; `local`, which differs in every pair, is no cause; a unit of
+/// another kind, or of another source (another version of the package, its `path` another), is
+/// never the one compared, though written later, and a unit of its source alone is the first;
+/// of two others, the one written last is compared, though its hash is the smaller; and a
+/// dependency a cross target's unit takes from the host profile is gone unless the reader reads
+/// that profile too ([`SecondHashes::with_host`]).
+#[test]
+fn a_second_hash_names_the_first_input_that_moved() {
+    const A1: &str = "a1a1a1a1a1a1a1a1";
+    const A2: &str = "a2a2a2a2a2a2a2a2";
+    const ALIB: &str = "a3a3a3a3a3a3a3a3";
+    const M1: &str = "b1b1b1b1b1b1b1b1";
+    const M2: &str = "b2b2b2b2b2b2b2b2";
+    const S1: &str = "c1c1c1c1c1c1c1c1";
+    const S2: &str = "c2c2c2c2c2c2c2c2";
+    const SOLO: &str = "d1d1d1d1d1d1d1d1";
+    const AOLD: &str = "a5a5a5a5a5a5a5a5";
+    let mut fs = Fake::default();
+    let t = |mins: u64| now() - DAY + Duration::from_secs(mins * 60);
+    unit_with(
+        &mut fs,
+        "aterm-serde",
+        S1,
+        "lib-aterm_serde",
+        501,
+        &targo_json("[]", &[], S1),
+        t(1),
+    );
+    unit_with(
+        &mut fs,
+        "aterm-serde",
+        S2,
+        "lib-aterm_serde",
+        502,
+        &targo_json("[\"std\"]", &[], S2),
+        t(2),
+    );
+    unit_with(
+        &mut fs,
+        "mid",
+        M1,
+        "lib-mid",
+        601,
+        &targo_json("[]", &[(9, "serde", 501)], M1),
+        t(3),
+    );
+    unit_with(
+        &mut fs,
+        "mid",
+        M2,
+        "lib-mid",
+        602,
+        &targo_json("[]", &[(9, "serde", 502)], M2),
+        t(4),
+    );
+    unit_with(
+        &mut fs,
+        "app",
+        A1,
+        "test-lib-app",
+        701,
+        &targo_json("[]", &[(8, "mid", 601)], A1),
+        t(5),
+    );
+    // The library of `app`, written after its first test unit: another kind, never compared.
+    unit_with(
+        &mut fs,
+        "app",
+        ALIB,
+        "lib-app",
+        703,
+        &targo_json("[\"x\"]", &[(8, "mid", 601)], ALIB),
+        t(6),
+    );
+    // Another version of `app` (its source's `path` another), written after its first test
+    // unit: another package under its name, never compared.
+    unit_with(
+        &mut fs,
+        "app",
+        AOLD,
+        "test-lib-app",
+        705,
+        &targo_json_of(99, "[]", &[(8, "mid", 601)], AOLD),
+        t(6),
+    );
+    unit_with(
+        &mut fs,
+        "app",
+        A2,
+        "test-lib-app",
+        702,
+        &targo_json("[]", &[(8, "mid", 602)], A2),
+        t(7),
+    );
+    unit_with(
+        &mut fs,
+        "solo",
+        SOLO,
+        "lib-solo",
+        801,
+        &targo_json("[]", &[], SOLO),
+        t(8),
+    );
+    let reader = SecondHashes::new(&fs, Path::new(PROFILE));
+
+    let found = reader.second_hash("app", A2).expect("a second hash");
+    assert_eq!(
+        (found.hash.as_str(), found.other.as_str()),
+        (A2, A1),
+        "{found:?}"
+    );
+    assert_eq!(
+        found.moved,
+        Moved {
+            package: "aterm-serde".to_owned(),
+            input: "features".to_owned(),
+            detail: "\"[]\" -> \"[\\\"std\\\"]\"".to_owned(),
+        },
+        "the dependency whose own input moved, not `mid` between"
+    );
+    // The first of its kind: compared with nothing.
+    assert_eq!(reader.second_hash("solo", SOLO), None);
+    assert_eq!(
+        reader.second_hash("app", ALIB),
+        None,
+        "its library is the first of its kind"
+    );
+    assert_eq!(
+        reader.second_hash("app", AOLD),
+        None,
+        "the first of its source"
+    );
+    // The first input in order is the cause: a unit whose own features moved, whose dependency
+    // moved too, is named by its own.
+    unit_with(
+        &mut fs,
+        "app",
+        "a4a4a4a4a4a4a4a4",
+        "lib-app",
+        704,
+        &targo_json("[]", &[(8, "mid", 602)], "a4a4a4a4a4a4a4a4"),
+        t(9),
+    );
+    let reader = SecondHashes::new(&fs, Path::new(PROFILE));
+    let own = reader
+        .second_hash("app", "a4a4a4a4a4a4a4a4")
+        .expect("a second hash");
+    assert_eq!(
+        (own.other.as_str(), own.moved.package.as_str()),
+        (ALIB, "app")
+    );
+    assert_eq!(own.moved.input, "features");
+    // A dependency edge that moved names the edge on the unit that holds it.
+    unit_with(
+        &mut fs,
+        "solo",
+        "d0d0d0d0d0d0d0d0",
+        "lib-solo",
+        802,
+        &targo_json("[]", &[(9, "serde", 501)], "d0d0d0d0d0d0d0d0"),
+        t(10),
+    );
+    let reader = SecondHashes::new(&fs, Path::new(PROFILE));
+    let edge = reader
+        .second_hash("solo", "d0d0d0d0d0d0d0d0")
+        .expect("a second hash");
+    assert_eq!(
+        (
+            edge.moved.package.as_str(),
+            edge.moved.input.as_str(),
+            edge.moved.detail.as_str()
+        ),
+        ("solo", "deps", "serde added")
+    );
+    // `local` alone differs: no input moved but the unit's own folder.
+    unit_with(
+        &mut fs,
+        "solo",
+        "d3d3d3d3d3d3d3d3",
+        "lib-solo",
+        803,
+        &targo_json("[]", &[(9, "serde", 501)], "d3d3d3d3d3d3d3d3"),
+        t(11),
+    );
+    let reader = SecondHashes::new(&fs, Path::new(PROFILE));
+    let local = reader
+        .second_hash("solo", "d3d3d3d3d3d3d3d3")
+        .expect("a second hash");
+    assert_eq!(
+        local.other, "d0d0d0d0d0d0d0d0",
+        "the other written last (t10), not the greater hash (`d1…`, t8)"
+    );
+    assert_eq!(local.moved.input, "folder", "{local:?}");
+    // The unit of an output of a compile, in the layout that keeps one folder per unit.
+    assert_eq!(
+        folder_unit_of(
+            Path::new(LEAF),
+            &Path::new(PROFILE).join(format!("build/app/{A2}/out/app-{A2}"))
+        ),
+        Some(("debug".to_owned(), "app".to_owned(), A2.to_owned()))
+    );
+    assert_eq!(
+        folder_unit_of(
+            Path::new(LEAF),
+            &Path::new(PROFILE).join(format!("deps/app-{A2}"))
+        ),
+        None
+    );
+}
+
+/// A CROSS TARGET'S UNIT FOLLOWS A DEPENDENCY INTO THE HOST PROFILE ([`SecondHashes::with_host`]):
+/// `app`'s two builds for `x86_64-pc-windows-gnu` differ only in their proc-macro `derive`, which
+/// cargo builds for the host, under `debug` beside `x86_64-pc-windows-gnu/debug`, and whose two
+/// builds differ in their features: the reader of the cross profile with its host names
+/// `derive`'s `features`. NEGATIVE CONTROL: without the host profile the dependency is not found
+/// and only the edge is named.
+#[test]
+fn a_cross_targets_unit_follows_a_dependency_into_the_host_profile() {
+    const CROSS: &str = "/c/Users//me/ws/.cargo-build/x86_64-pc-windows-gnu/debug";
+    const X1: &str = "e1e1e1e1e1e1e1e1";
+    const X2: &str = "e2e2e2e2e2e2e2e2";
+    const H1: &str = "f1f1f1f1f1f1f1f1";
+    const H2: &str = "f2f2f2f2f2f2f2f2";
+    let mut fs = Fake::default();
+    let t = |mins: u64| now() - DAY + Duration::from_secs(mins * 60);
+    unit_in(
+        &mut fs,
+        PROFILE,
+        "derive",
+        H1,
+        "proc-macro-derive",
+        901,
+        &targo_json("[]", &[], H1),
+        t(1),
+    );
+    unit_in(
+        &mut fs,
+        PROFILE,
+        "derive",
+        H2,
+        "proc-macro-derive",
+        902,
+        &targo_json("[\"full\"]", &[], H2),
+        t(2),
+    );
+    unit_in(
+        &mut fs,
+        CROSS,
+        "app",
+        X1,
+        "lib-app",
+        911,
+        &targo_json("[]", &[(3, "derive", 901)], X1),
+        t(3),
+    );
+    unit_in(
+        &mut fs,
+        CROSS,
+        "app",
+        X2,
+        "lib-app",
+        912,
+        &targo_json("[]", &[(3, "derive", 902)], X2),
+        t(4),
+    );
+    let found = SecondHashes::new(&fs, Path::new(CROSS))
+        .with_host(Path::new(PROFILE))
+        .second_hash("app", X2)
+        .expect("a second hash");
+    assert_eq!(
+        (
+            found.other.as_str(),
+            found.moved.package.as_str(),
+            found.moved.input.as_str()
+        ),
+        (X1, "derive", "features"),
+        "{found:?}"
+    );
+    let alone = SecondHashes::new(&fs, Path::new(CROSS))
+        .second_hash("app", X2)
+        .expect("a second hash");
+    assert_eq!(
+        (alone.moved.package.as_str(), alone.moved.input.as_str()),
+        ("app", "deps"),
+        "{alone:?}"
+    );
+}
+
+/// Trust's receipt fixture, byte for byte: `FIXTURE` in targo-core's
+/// `src/tools/targo/crates/targo-core/src/compiler/build_receipt.rs` as DC-12b left it (with its
+/// `incremental` key, 493 bytes), which its test
+/// `a_finished_build_writes_a_receipt_of_every_unit_it_used_and_the_bytes_it_wrote` holds a real
+/// `at_finish` write to, under [`RECEIPT_NAME`]. Change neither without the other.
+const RECEIPT_FIXTURE: &[u8] = br#"{"began_ms":1794528000000,"built":{"debug":["1111111111111111"]},"incremental":{},"members":["receipt-member"],"output_bytes":4096,"profiles":{"aarch64-apple-darwin/debug":["3333333333333333"],"debug":["1111111111111111","2222222222222222"]},"receipt":1,"selection":{"compile_time_deps_only":false,"profile":"dev","roots":[{"args":[],"features":["default"],"kind":"host","mode":"build","package":"receipt-member","rustflags":[],"target":"lib:receipt_member"}],"workspace":"/w","wrapper":null}}"#;
+
+/// What that test holds this module's encoding of the fixture's run to (Trust's `USED`: the
+/// fixture without targo's own five keys).
+const RECEIPT_FIXTURE_USED: &str = r#"{"began_ms":1794528000000,"members":["receipt-member"],"profiles":{"aarch64-apple-darwin/debug":["3333333333333333"],"debug":["1111111111111111","2222222222222222"]}}"#;
+
+/// The file the fixture is kept under (Trust's `NAME`).
+const RECEIPT_NAME: &str = "a5fb627b7bb345bb.json";
+
+/// A receipt's bytes for `run` (`targo`'s keys beside the run's, with a selection of nothing),
+/// of a build that compiled nothing incrementally.
+fn receipt_bytes(run: &Used) -> Vec<u8> {
+    receipt_bytes_with(run, Some(&[]))
+}
+
+/// [`receipt_bytes`] of a build that compiled each unit of `incremental`'s profiles
+/// incrementally (as a plain build's units of a profile with incremental compilation on are);
+/// with no `incremental` key at all where `None` (a receipt written before Trust's DC-12b).
+fn receipt_bytes_with(run: &Used, incremental: Option<&[&str]>) -> Vec<u8> {
+    let mut v = run.value();
+    let o = v.as_object_mut().unwrap();
+    o.insert(
+        "receipt".to_owned(),
+        aterm_json::Value::from(RECEIPT_FORMAT),
+    );
+    o.insert(
+        "selection".to_owned(),
+        aterm_json::Value::Object(aterm_json::Map::new()),
+    );
+    if let Some(profiles) = incremental {
+        let mut by_profile = aterm_json::Map::new();
+        for profile in profiles {
+            let mut units = aterm_json::Map::new();
+            for hash in run.profiles.get(*profile).into_iter().flatten() {
+                units.insert(
+                    hash.clone(),
+                    aterm_json::Value::Array(vec![aterm_json::Value::from("aterm_grid-1a2b")]),
+                );
+            }
+            by_profile.insert((*profile).to_owned(), aterm_json::Value::Object(units));
+        }
+        o.insert(
+            "incremental".to_owned(),
+            aterm_json::Value::Object(by_profile),
+        );
+    }
+    aterm_json::to_vec(&v).unwrap()
+}
+
+/// `bytes` as the receipt `name` (sixteen hex digits) of `fs`'s build directory, written `at`.
+fn receipt(fs: &mut Fake, name: &str, at: SystemTime, bytes: &[u8]) {
+    fs.file(&format!("{LEAF}/{RECEIPTS}/{name}.json"), at, bytes);
+}
+
+/// A PLAIN BUILD'S RECEIPT IS A KEPT RUN (DC-12d): the receipt Trust's targo keeps
+/// ([`RECEIPT_FIXTURE`], the same bytes its own test writes) reads as the run of its three shared
+/// keys, which encode to exactly what Trust's test holds them to; kept in a build directory with
+/// no record, it is that directory's one kept run: the survey begins when it began, takes its
+/// members as the workspace's own and its units as used, so a quiet unit of a kind it names
+/// another unit of, written before it began, is superseded, and the units it names stay. A
+/// receipt of another selection that names that unit keeps it. NEGATIVE CONTROLS, each judged
+/// exactly as the build directory with no receipt (nothing superseded): no receipt; one of
+/// another format, with no selection, carrying a record's `schema`, torn, or naming a hash that
+/// is none; one longer than [`RECEIPT_MAX`] (the same receipt padded, which parses, so the bound
+/// alone refuses it, while one padded to the bound is read); one under a name that is no
+/// receipt's (a write's private `.tmp`, uppercase digits); a link in the receipt's place, and the
+/// receipts folder a link; and another selection's receipt written more than [`KEPT_FOR`] before
+/// the newest, which no longer keeps that unit.
+#[test]
+fn a_plain_builds_receipt_is_a_kept_run() {
+    assert_eq!(RECEIPT_FIXTURE.len(), 493);
+    let read = Receipt::of_bytes(RECEIPT_FIXTURE).expect("the fixture is a receipt");
+    assert_eq!(
+        read.incremental,
+        Some(BTreeSet::new()),
+        "its build compiled nothing incrementally"
+    );
+    let run = Used::of_receipt(RECEIPT_FIXTURE).expect("the fixture is a receipt");
+    assert_eq!(run, read.run);
+    assert_eq!(
+        aterm_json::to_string(&run.value()).unwrap(),
+        RECEIPT_FIXTURE_USED
+    );
+    assert_eq!(run.began_ms, 1_794_528_000_000);
+
+    const OTHER: &str = "9999999999999999";
+    let member = "receipt-member";
+    let lib = ["libreceipt_member-{h}.rlib", "libreceipt_member-{h}.rmeta"];
+    let began = UNIX_EPOCH + Duration::from_millis(run.began_ms);
+    let written = began + 10 * MINUTE;
+    let world = || {
+        let mut fs = Fake::default();
+        fs.file(
+            &format!("{PROFILE}/.cargo-build-lock"),
+            now() - 90 * DAY,
+            b"",
+        );
+        for hash in [OLD, OTHER] {
+            folder_unit(
+                &mut fs,
+                member,
+                hash,
+                "lib-receipt_member",
+                2,
+                &lib,
+                now() - 90 * DAY,
+            );
+        }
+        fs
+    };
+    let gone = |fs: &Fake| paths(&decide(&clone_survey(fs), now(), RECLAIM_STALE));
+    let bare = clone_survey(&world());
+    assert_eq!((bare.began, bare.profiles[0].used.clone()), (None, None));
+    assert_eq!(gone(&world()), Vec::new(), "no receipt: as before receipts");
+
+    let mut fs = world();
+    fs.file(
+        &format!("{LEAF}/{RECEIPTS}/{RECEIPT_NAME}"),
+        written,
+        RECEIPT_FIXTURE,
+    );
+    let s = clone_survey(&fs);
+    assert_eq!(s.began, Some(began));
+    assert_eq!(s.members, BTreeSet::from([member.to_owned()]));
+    assert_eq!(
+        s.profiles[0].used,
+        Some(BTreeSet::from([OLD.to_owned(), NEW.to_owned()]))
+    );
+    assert!(s.profiles[0].retired.is_empty());
+    assert_eq!(
+        gone(&fs),
+        superseded(&[(member, OTHER)]),
+        "a quiet unit of a kind the receipt names another unit of"
+    );
+
+    let other = Used {
+        began_ms: millis(began),
+        members: BTreeSet::from([member.to_owned()]),
+        profiles: BTreeMap::from([("debug".to_owned(), BTreeSet::from([OTHER.to_owned()]))]),
+    };
+    let mut both = fs.clone_tree();
+    receipt(
+        &mut both,
+        "00000000000000aa",
+        written,
+        &receipt_bytes(&other),
+    );
+    assert_eq!(
+        gone(&both),
+        Vec::new(),
+        "another selection's receipt keeps it"
+    );
+    let mut aged = fs.clone_tree();
+    receipt(
+        &mut aged,
+        "00000000000000aa",
+        written - KEPT_FOR - HOUR,
+        &receipt_bytes(&other),
+    );
+    assert_eq!(
+        gone(&aged),
+        superseded(&[(member, OTHER)]),
+        "a selection unbuilt for KEPT_FOR before the newest receipt is not read"
+    );
+
+    let fixture = std::str::from_utf8(RECEIPT_FIXTURE).unwrap();
+    let padded = |len: usize| {
+        let mut bytes = RECEIPT_FIXTURE.to_vec();
+        bytes.resize(len, b' ');
+        bytes
+    };
+    let mut fit = world();
+    receipt(&mut fit, "a5fb627b7bb345bb", written, &padded(RECEIPT_MAX));
+    assert_eq!(
+        gone(&fit),
+        superseded(&[(member, OTHER)]),
+        "padded to the bound"
+    );
+    let unread: Vec<(&str, Box<dyn Fn(&mut Fake) + '_>)> = vec![
+        (
+            "another format",
+            Box::new(|fs: &mut Fake| {
+                let bytes = fixture.replace(r#""receipt":1"#, r#""receipt":2"#);
+                receipt(fs, "a5fb627b7bb345bb", written, bytes.as_bytes());
+            }),
+        ),
+        (
+            "no selection",
+            Box::new(|fs: &mut Fake| {
+                let at = fixture.find(r#","selection""#).unwrap();
+                let bytes = format!("{}}}", &fixture[..at]);
+                receipt(fs, "a5fb627b7bb345bb", written, bytes.as_bytes());
+            }),
+        ),
+        (
+            "a record's schema",
+            Box::new(|fs: &mut Fake| {
+                let bytes = fixture.replacen('{', r#"{"schema":2,"#, 1);
+                receipt(fs, "a5fb627b7bb345bb", written, bytes.as_bytes());
+            }),
+        ),
+        (
+            "torn",
+            Box::new(|fs: &mut Fake| {
+                receipt(fs, "a5fb627b7bb345bb", written, &RECEIPT_FIXTURE[..300]);
+            }),
+        ),
+        (
+            "a hash that is none",
+            Box::new(|fs: &mut Fake| {
+                let bytes = fixture.replace("2222222222222222", "222222222222222G");
+                receipt(fs, "a5fb627b7bb345bb", written, bytes.as_bytes());
+            }),
+        ),
+        (
+            "longer than the bound",
+            Box::new(|fs: &mut Fake| {
+                receipt(fs, "a5fb627b7bb345bb", written, &padded(RECEIPT_MAX + 1));
+            }),
+        ),
+        (
+            "a write's private file",
+            Box::new(|fs: &mut Fake| {
+                fs.file(
+                    &format!("{LEAF}/{RECEIPTS}/.receipt-a5fb627b7bb345bb.tmp"),
+                    written,
+                    RECEIPT_FIXTURE,
+                );
+            }),
+        ),
+        (
+            "uppercase digits",
+            Box::new(|fs: &mut Fake| {
+                receipt(fs, "A5FB627B7BB345BB", written, RECEIPT_FIXTURE);
+            }),
+        ),
+        (
+            "a link in its place",
+            Box::new(|fs: &mut Fake| {
+                fs.file("/elsewhere/receipt.json", written, RECEIPT_FIXTURE);
+                fs.link(
+                    &format!("{LEAF}/{RECEIPTS}/{RECEIPT_NAME}"),
+                    written,
+                    "/elsewhere/receipt.json",
+                );
+            }),
+        ),
+        (
+            "the folder a link",
+            Box::new(|fs: &mut Fake| {
+                fs.file(
+                    &format!("/elsewhere/{RECEIPT_NAME}"),
+                    written,
+                    RECEIPT_FIXTURE,
+                );
+                fs.link(&format!("{LEAF}/{RECEIPTS}"), written, "/elsewhere");
+            }),
+        ),
+    ];
+    for (why, put) in unread {
+        let mut fs = world();
+        put(&mut fs);
+        let s = clone_survey(&fs);
+        assert_eq!(s, clone_survey(&world()), "{why}");
+        assert_eq!(gone(&fs), Vec::new(), "{why}");
+    }
+}
+
+/// AFTER TWO PLAIN BUILDS OF ONE SELECTION AT DIFFERENT COMMITS, NO UNIT THAT ONLY THE FIRST USED
+/// REMAINS (DC-12d, design §7's DC-12 exit, of one selection): the first build of a selection,
+/// two hours ago, used the test unit `OLD`, the library build [`USED_LIB`] and `libc`'s
+/// [`LIBC`]; a `-p` build of another selection, three hours ago, used `FRESH` and the library.
+/// The holder of the first build takes their receipts into the record and retires nothing. The
+/// second build of the first selection, ten minutes ago, used `NEW` in `OLD`'s place, and its
+/// receipt replaced the first's: its holder retires `OLD`, and `OLD`, written an hour and a half
+/// ago, goes under the calm window it is nowhere near quiet for. Every other unit stays: the
+/// ones the second build used, the other selection's `FRESH`, and `libc`'s other build, a
+/// dependency's. NEGATIVE CONTROLS: a receipt of another selection never dooms this one's units
+/// (that other selection's next build, which used `NEW` alone, retires its own `FRESH`, never the
+/// `OLD` the first selection's kept receipt still names); with no holder the record never took
+/// the receipts, and `OLD` waits the window; a receipt `targo` withdrew (a build that kept none)
+/// retires nothing; and a take of the same receipts again changes nothing.
+#[test]
+fn after_two_plain_builds_no_unit_only_the_first_used_remains() {
+    let grid = "aterm-grid";
+    let selection = "00000000000000a1";
+    let scoped = "00000000000000b2";
+    let mut fs = dev_checkout(first() + 20 * MINUTE);
+    folder_unit(
+        &mut fs,
+        grid,
+        FRESH,
+        "test-lib-aterm_grid",
+        2,
+        &["aterm_grid-{h}", "aterm_grid-{h}.d"],
+        now() - 3 * HOUR + MINUTE,
+    );
+    let build1 = ran(
+        first(),
+        &[grid],
+        &[(grid, OLD), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let build2 = ran(
+        second(),
+        &[grid],
+        &[(grid, NEW), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let other = ran(
+        now() - 3 * HOUR,
+        &[grid],
+        &[(grid, FRESH), (grid, USED_LIB)],
+    );
+    receipt(
+        &mut fs,
+        scoped,
+        now() - 3 * HOUR + 5 * MINUTE,
+        &receipt_bytes(&other),
+    );
+    receipt(
+        &mut fs,
+        selection,
+        first() + 30 * MINUTE,
+        &receipt_bytes(&build1),
+    );
+    let gone = |fs: &Fake| paths(&decide(&clone_survey(fs), now(), RECLAIM_STALE));
+    // A holder's end ([`crate::build_admit::hold::build_ended`]): the record takes the receipts.
+    let end = |fs: &mut Fake, at: SystemTime| {
+        let mut kept = Kept::read_on(fs, Path::new(LEAF)).map_or_else(Kept::default, |(_, k)| k);
+        let retired = kept.take_receipts(&Receipts::read_on(fs, Path::new(LEAF)), None);
+        if retired.is_some() {
+            keep(fs, &kept, at);
+        }
+        retired
+    };
+
+    assert_eq!(
+        end(&mut fs, first() + 31 * MINUTE),
+        Some(0),
+        "the first take retires nothing"
+    );
+    assert_eq!(record(&fs).receipts.len(), 2);
+    assert_eq!(gone(&fs), Vec::new());
+    let first_taken = fs.clone_tree();
+
+    receipt(
+        &mut fs,
+        selection,
+        second() + 5 * MINUTE,
+        &receipt_bytes(&build2),
+    );
+    let no_holder = fs.clone_tree();
+    assert_eq!(end(&mut fs, second() + 6 * MINUTE), Some(1));
+    assert_eq!(
+        record(&fs).retired.profiles,
+        BTreeMap::from([("debug".to_owned(), BTreeSet::from([OLD.to_owned()]))])
+    );
+    assert_eq!(
+        gone(&fs),
+        superseded(&[(grid, OLD)]),
+        "only the unit the first build alone used, at once"
+    );
+    assert_eq!(
+        end(&mut fs, second() + 7 * MINUTE),
+        None,
+        "the same receipts again"
+    );
+
+    let mut other_built = first_taken.clone_tree();
+    let other2 = ran(now() - 5 * MINUTE, &[grid], &[(grid, NEW)]);
+    receipt(
+        &mut other_built,
+        scoped,
+        now() - 4 * MINUTE,
+        &receipt_bytes(&other2),
+    );
+    assert_eq!(end(&mut other_built, now() - 3 * MINUTE), Some(1));
+    assert_eq!(
+        gone(&other_built),
+        superseded(&[(grid, FRESH)]),
+        "another selection's build retires its own unit, never this selection's OLD"
+    );
+
+    assert_eq!(
+        gone(&no_holder),
+        Vec::new(),
+        "no holder took the receipts: OLD waits"
+    );
+
+    let mut withdrawn = first_taken.clone_tree();
+    withdrawn
+        .nodes
+        .remove(Path::new(&format!("{LEAF}/{RECEIPTS}/{selection}.json")));
+    assert_eq!(end(&mut withdrawn, second() + 6 * MINUTE), Some(0));
+    assert_eq!(
+        gone(&withdrawn),
+        Vec::new(),
+        "a withdrawn receipt retires nothing"
+    );
+}
+
+/// A holder's end on `fs` at `at` ([`crate::build_admit::hold::build_ended`]): the record takes
+/// the receipts as they read now, and is kept where it changed.
+fn take_on(fs: &mut Fake, at: SystemTime) -> Option<usize> {
+    let mut kept = Kept::read_on(fs, Path::new(LEAF)).map_or_else(Kept::default, |(_, k)| k);
+    let retired = kept.take_receipts(&Receipts::read_on(fs, Path::new(LEAF)), None);
+    if retired.is_some() {
+        keep(fs, &kept, at);
+    }
+    retired
+}
+
+/// A SELECTION REBUILT IN ANOTHER VARIANT RETIRES NOTHING OF THE BUILD BEFORE ([`Receipt::same_variant`]):
+/// a plain build of a selection, two hours ago, compiled its member's units incrementally and
+/// used `OLD`; verify's main lane, which builds the same selection with `CARGO_INCREMENTAL=0`
+/// (no unit of it incremental, another hash for the member's unit), used `NEW` ten minutes ago,
+/// and its receipt replaced the plain build's. That take retires nothing, and `OLD` waits the
+/// window: the next plain build would use it again. NEGATIVE CONTROLS: the same two builds in one
+/// variant (both plain) retire `OLD` at once, as the exit test's do; and two receipts written
+/// before Trust's DC-12b (no `incremental` key), whose variants nobody knows, retire nothing.
+#[test]
+fn a_selection_rebuilt_in_another_variant_retires_nothing_of_the_one_before() {
+    let grid = "aterm-grid";
+    let selection = "00000000000000a1";
+    let plain = ran(
+        first(),
+        &[grid],
+        &[(grid, OLD), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let verify = ran(
+        second(),
+        &[grid],
+        &[(grid, NEW), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let gone = |fs: &Fake| paths(&decide(&clone_survey(fs), now(), RECLAIM_STALE));
+    let builds = |was: Option<&[&str]>, now_: Option<&[&str]>| {
+        let mut fs = dev_checkout(first() + 20 * MINUTE);
+        receipt(
+            &mut fs,
+            selection,
+            first() + 30 * MINUTE,
+            &receipt_bytes_with(&plain, was),
+        );
+        assert_eq!(take_on(&mut fs, first() + 31 * MINUTE), Some(0));
+        receipt(
+            &mut fs,
+            selection,
+            second() + 5 * MINUTE,
+            &receipt_bytes_with(&verify, now_),
+        );
+        let retired = take_on(&mut fs, second() + 6 * MINUTE);
+        (retired, gone(&fs))
+    };
+
+    assert_eq!(
+        builds(Some(&["debug"]), Some(&[])),
+        (Some(0), Vec::new()),
+        "a plain build, then verify's with CARGO_INCREMENTAL=0"
+    );
+    assert_eq!(
+        builds(Some(&[]), Some(&["debug"])),
+        (Some(0), Vec::new()),
+        "verify's, then a plain build"
+    );
+    assert_eq!(
+        builds(Some(&["debug"]), Some(&["debug"])),
+        (Some(1), superseded(&[(grid, OLD)])),
+        "one variant"
+    );
+    assert_eq!(
+        builds(None, None),
+        (Some(0), Vec::new()),
+        "receipts that do not say"
+    );
+}
+
+/// A RECEIPT THE READ LEFT OUT HOLDS BACK EVERY RETIREMENT ([`Receipts::whole`]): a selection's
+/// second build replaced its first's receipt, as in the exit test, but another receipt beside it
+/// was not read (longer than [`RECEIPT_MAX`], torn, or one past [`RECEIPTS_MAX`]): it may name
+/// `OLD`, so the take retires nothing and changes nothing, no run's units are spoken for
+/// ([`Receipts::name_all`]), and `OLD` waits the window. A retirement a whole read made earlier
+/// is held back too while a receipt is left unread, and goes ahead once none is. NEGATIVE
+/// CONTROL: with every receipt read, the same take retires `OLD` at once.
+#[test]
+fn a_receipt_the_read_left_out_holds_back_every_retirement() {
+    let grid = "aterm-grid";
+    let selection = "00000000000000a1";
+    let build1 = ran(
+        first(),
+        &[grid],
+        &[(grid, OLD), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let build2 = ran(
+        second(),
+        &[grid],
+        &[(grid, NEW), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let gone = |fs: &Fake| paths(&decide(&clone_survey(fs), now(), RECLAIM_STALE));
+    let mut fs = dev_checkout(first() + 20 * MINUTE);
+    receipt(
+        &mut fs,
+        selection,
+        first() + 30 * MINUTE,
+        &receipt_bytes(&build1),
+    );
+    assert_eq!(take_on(&mut fs, first() + 31 * MINUTE), Some(0));
+    receipt(
+        &mut fs,
+        selection,
+        second() + 5 * MINUTE,
+        &receipt_bytes(&build2),
+    );
+    let replaced = fs.clone_tree();
+
+    let mut oversized = receipt_bytes(&ran(second(), &[grid], &[(grid, OLD)]));
+    oversized.resize(RECEIPT_MAX + 1, b' ');
+    let mut many = replaced.clone_tree();
+    for n in 0..RECEIPTS_MAX {
+        receipt(
+            &mut many,
+            &format!("{:016x}", 0xc000 + n),
+            second() + 4 * MINUTE,
+            &receipt_bytes(&ran(second(), &[grid], &[(grid, USED_LIB)])),
+        );
+    }
+    let left_out: Vec<(&str, Fake)> = vec![
+        ("longer than the bound", {
+            let mut fs = replaced.clone_tree();
+            receipt(
+                &mut fs,
+                "00000000000000c3",
+                second() + 4 * MINUTE,
+                &oversized,
+            );
+            fs
+        }),
+        ("torn", {
+            let mut fs = replaced.clone_tree();
+            receipt(
+                &mut fs,
+                "00000000000000c3",
+                second() + 4 * MINUTE,
+                &receipt_bytes(&build1)[..40],
+            );
+            fs
+        }),
+        ("one past the most read", many),
+    ];
+    for (why, mut fs) in left_out {
+        let receipts = Receipts::read_on(&fs, Path::new(LEAF));
+        assert!(!receipts.whole(), "{why}");
+        assert!(!receipts.name_all(&build2), "{why}");
+        let before = record(&fs);
+        assert_eq!(take_on(&mut fs, second() + 6 * MINUTE), None, "{why}");
+        assert_eq!(record(&fs), before, "{why}: the record stands");
+        assert_eq!(gone(&fs), Vec::new(), "{why}");
+    }
+
+    let mut whole = replaced.clone_tree();
+    assert!(Receipts::read_on(&whole, Path::new(LEAF)).whole());
+    assert_eq!(take_on(&mut whole, second() + 6 * MINUTE), Some(1));
+    assert_eq!(
+        gone(&whole),
+        superseded(&[(grid, OLD)]),
+        "every receipt read"
+    );
+    receipt(
+        &mut whole,
+        "00000000000000c3",
+        second() + 7 * MINUTE,
+        &receipt_bytes(&build1)[..40],
+    );
+    assert_eq!(
+        gone(&whole),
+        Vec::new(),
+        "a retirement made earlier waits while a receipt is unread"
+    );
+    whole.nodes.remove(Path::new(&format!(
+        "{LEAF}/{RECEIPTS}/00000000000000c3.json"
+    )));
+    assert_eq!(gone(&whole), superseded(&[(grid, OLD)]));
+}
+
+/// A RECEIPT'S BUILD IS READ AS BEGINNING NO LATER THAN ITS FILE WAS WRITTEN
+/// ([`Receipts::read_on`]): a receipt whose `began_ms` is an hour after its file's write (a clock
+/// stepped back, or a file not targo's) is read as beginning at that write, so the survey begins
+/// no later, and a unit written in that hour is never judged as written before a kept run began.
+/// NEGATIVE CONTROL: a receipt that began before its write keeps its own time.
+#[test]
+fn a_receipts_build_is_read_as_beginning_no_later_than_its_file_was_written() {
+    let grid = "aterm-grid";
+    let written = now() - 2 * HOUR;
+    let read_with = |began: SystemTime| {
+        let mut fs = dev_checkout(written - DAY);
+        receipt(
+            &mut fs,
+            "00000000000000a1",
+            written,
+            &receipt_bytes(&ran(began, &[grid], &[(grid, NEW)])),
+        );
+        let receipts = Receipts::read_on(&fs, Path::new(LEAF));
+        (
+            receipts.runs["00000000000000a1"].run.began_ms,
+            clone_survey(&fs).began,
+        )
+    };
+    assert_eq!(
+        read_with(written + HOUR),
+        (millis(written), Some(written)),
+        "began after its write"
+    );
+    let before = written - 10 * MINUTE;
+    assert_eq!(
+        read_with(before),
+        (millis(before), Some(before)),
+        "began before its write"
+    );
+}
+
+/// THE RECEIPTS AGE THE RECORD'S KEPT RUNS AS A RUN'S END DOES ([`Kept::take_receipts`],
+/// [`KEPT_FOR`]): a verify run four days ago used `OLD` and [`USED_LIB`]; once the record takes
+/// the receipt of a build begun ten minutes ago, that run goes, and what it used and nothing kept
+/// names (`OLD`) is retired as of that build's begin. Where every later verify run hands its
+/// record to the receipts ([`Kept::take_receipts`] with a scope it covers), no run's end would
+/// otherwise ever age it, and the survey would begin four days ago for good. NEGATIVE CONTROL: a
+/// run that began a day ago stays, and the unit only it names is retired by nobody.
+#[test]
+fn the_receipts_age_the_records_kept_runs_as_a_runs_end_does() {
+    let grid = "aterm-grid";
+    let mut kept = Kept::default();
+    kept.end(
+        "verify old",
+        ran(now() - 4 * DAY, &[grid], &[(grid, OLD), (grid, USED_LIB)]),
+    );
+    kept.end("verify recent", ran(now() - DAY, &[grid], &[(grid, FRESH)]));
+    let build = ran(
+        now() - 10 * MINUTE,
+        &[grid],
+        &[(grid, NEW), (grid, USED_LIB)],
+    );
+    let receipts = Receipts {
+        runs: BTreeMap::from([(
+            "00000000000000a1".to_owned(),
+            Receipt {
+                run: build.clone(),
+                incremental: Some(BTreeSet::new()),
+            },
+        )]),
+        unread: 0,
+    };
+    assert_eq!(kept.take_receipts(&receipts, None), Some(1));
+    assert_eq!(
+        kept.runs.keys().cloned().collect::<Vec<_>>(),
+        vec!["verify recent".to_owned()]
+    );
+    assert_eq!(
+        kept.retired,
+        Used {
+            began_ms: build.began_ms,
+            members: BTreeSet::new(),
+            profiles: BTreeMap::from([("debug".to_owned(), BTreeSet::from([OLD.to_owned()]))]),
+        }
+    );
+}
+
+/// A TAKE THAT RETIRES NOTHING LEAVES WHAT THE LAST END RETIRED ([`Kept::take_receipts`]): a
+/// verify run's end retired `OLD`, for its run-end trim; a plain build's holder ending beside it,
+/// whose take only changes the record's receipt copies, keeps that retirement for the trim
+/// rather than emptying it. NEGATIVE CONTROL: a take that retires something replaces it.
+#[test]
+fn a_take_that_retires_nothing_leaves_what_the_last_end_retired() {
+    let grid = "aterm-grid";
+    let mut kept = Kept::default();
+    kept.end(SCOPE, ran(first(), &[grid], &[(grid, OLD)]));
+    kept.end(SCOPE, ran(second(), &[grid], &[(grid, NEW)]));
+    let retired = kept.retired.clone();
+    assert_eq!(retired.profiles["debug"], BTreeSet::from([OLD.to_owned()]));
+    let receipt_of = |used: Used| Receipt {
+        run: used,
+        incremental: Some(BTreeSet::new()),
+    };
+    let mut receipts = Receipts {
+        runs: BTreeMap::from([(
+            "00000000000000a1".to_owned(),
+            receipt_of(ran(first(), &[grid], &[(grid, FRESH)])),
+        )]),
+        unread: 0,
+    };
+    assert_eq!(kept.take_receipts(&receipts, None), Some(0));
+    assert_eq!(kept.retired, retired, "the copies alone changed");
+    receipts.runs.insert(
+        "00000000000000a1".to_owned(),
+        receipt_of(ran(now() - MINUTE, &[grid], &[(grid, USED_LIB)])),
+    );
+    assert_eq!(kept.take_receipts(&receipts, None), Some(1));
+    assert_eq!(
+        kept.retired.profiles["debug"],
+        BTreeSet::from([FRESH.to_owned()]),
+        "a take that retired the copy's unit"
+    );
+}
+
+/// A CHANGE TO THE RECORD HOLDS ITS LOCK FROM ITS READ TO ITS WRITE ([`Kept::update`],
+/// [`USED_LOCK`]): while another holds the lock, a change does not read, change or write the
+/// record (it ends with the lock's wait, here none), so no change is made from a read another's
+/// write then replaces; once the lock is let go the same change is kept. NEGATIVE CONTROL: a
+/// change that answers nothing writes nothing.
+#[test]
+fn a_change_to_the_record_holds_its_lock_from_its_read_to_its_write() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("stale-record-lock-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let leaf = dir.path();
+    let run = || ran(first(), &["aterm-grid"], &[("aterm-grid", OLD)]);
+    let held = crate::lock::lock_file_within(&leaf.join(USED_LOCK), Duration::ZERO).unwrap();
+    let changed = std::cell::Cell::new(false);
+    let refused = Kept::update_within(leaf, Duration::ZERO, |kept| {
+        changed.set(true);
+        Some(kept.end(SCOPE, run()))
+    });
+    assert_eq!(
+        refused.map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        !changed.get(),
+        "nothing read or changed under another's lock"
+    );
+    assert!(!leaf.join(USED).exists(), "nothing written");
+    drop(held);
+    assert_eq!(
+        Kept::update_within(leaf, Duration::ZERO, |_| None::<usize>).unwrap(),
+        None
+    );
+    assert!(!leaf.join(USED).exists(), "a change that answers nothing");
+    assert_eq!(
+        Kept::update_within(leaf, Duration::ZERO, |kept| Some(kept.end(SCOPE, run()))).unwrap(),
+        Some(0)
+    );
+    assert_eq!(Kept::read(leaf).runs[SCOPE], run());
 }

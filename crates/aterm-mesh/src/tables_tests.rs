@@ -45,6 +45,11 @@ struct Fake {
     /// The tables the stand-in does not take, as a vault whose Commons policy excludes them:
     /// their records are refused, and an `Inventory` is given none ([`Self::exclude`]).
     excludes: Mutex<BTreeSet<Digest>>,
+    /// Held across each ingest's look and append, as the real store holds its state lock across
+    /// its whole ingest: two exchanges that deliver one record at once (one this Mac started, one
+    /// it answers) then append it once, so its egress steps past the one delivered copy and
+    /// publishes none ([`Stores`]: an id that enters through ingest is never published again).
+    ingesting: Mutex<()>,
 }
 
 /// Every stand-in store file is read and written under this, in this process: a store's own writes
@@ -118,6 +123,7 @@ impl Fake {
             moved: Condvar::new(),
             refuses: AtomicBool::new(false),
             excludes: Mutex::new(BTreeSet::new()),
+            ingesting: Mutex::new(()),
         })
     }
 
@@ -300,6 +306,7 @@ impl Fake {
 
 impl Stores for Fake {
     fn ingest_table(&self, table: Digest, kind: Kind, wires: &[Vec<u8>]) -> Vec<Verdict> {
+        let _ingest = lock(&self.ingesting);
         if lock(&self.excludes).contains(&table) {
             return vec![
                 Verdict::Refused("the stand-in does not take this table".to_owned());
@@ -330,6 +337,7 @@ impl Stores for Fake {
     }
 
     fn ingest_members(&self, records: &[Vec<u8>]) -> Vec<Verdict> {
+        let _ingest = lock(&self.ingesting);
         records
             .iter()
             .map(|record| {

@@ -14,8 +14,9 @@ models`). Binding a model to the Rust it describes belongs to the crate that own
 Tier-1 conformance test there, and a refinement proof once gap 10 closes. A checker spec is about
 compiled `aterm-spec` functions: the engine (`derive`, `interp`, `verify`, `check`, `xref`) and
 its helpers (`host`, `rng`, `wait`, `walk`). The models and their tests live in the
-`crates/aterm-models-<domain>` crates, the sweep and `spec-check` in `crates/aterm-models`, and
-the link-time `registry` in `crates/aterm-spec-anchor`.
+`crates/aterm-models-<domain>` crates, the sweep in `crates/aterm-models`, `spec-check` and the
+source-spec closure in `crates/aterm-spec-closure`, and the link-time `registry` in
+`crates/aterm-spec-anchor`.
 
 ## 0. Notation used in the statements
 

@@ -5390,6 +5390,11 @@ impl crate::App {
                 self.session_status.owe_look(id);
             }
             let grid = (resize_probe.lifetime, resize_probe.ordinal);
+            // The reader's arm of the composer, published with the verdict it was read with.
+            let composer = self.session_status.agent_reading(id).1.map_or(
+                aterm_messages::presence::ComposerState::Unknown,
+                |reading| reading.composer,
+            );
             let moved = match (step.publish, stamp) {
                 (Some((word, detail, subject, reader)), Some(stamp)) => {
                     let (moved, wake) = {
@@ -5403,6 +5408,7 @@ impl crate::App {
                         }
                         timeline.set_gauges(step.gauges);
                         timeline.note_grid(grid, now);
+                        timeline.set_composer(composer);
                         let moved = timeline.publish_agent(word, detail, subject, reader, stamp);
                         timeline.slog_mut().note_frame(step.turn.keys, read_moves);
                         let at = timeline.slog().now();
@@ -5654,12 +5660,14 @@ impl crate::App {
             for session in self.pool.iter() {
                 crate::claude_footer::stop_session(session.id, Some(&session.ctx.timeline));
                 crate::codex_rollout_tap::stop_session(session.id, &session.ctx.timeline);
-                footers |= session
+                let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clear_claude_footer();
+                    .unwrap_or_else(|p| p.into_inner());
+                // The reader reads nothing any more, so its composer reads `-` as before.
+                timeline.set_composer(aterm_messages::presence::ComposerState::Unknown);
+                footers |= timeline.clear_claude_footer();
             }
             cleared || footers
         };
@@ -5841,11 +5849,16 @@ impl crate::App {
             return Err(format!("no such session {session}"));
         };
         let enabled = self.config.tab_status_or_default();
-        let composer = self
-            .session_status
-            .agent_reading(session)
-            .1
-            .map_or("-", |reading| reading.composer.word());
+        // The current-state record's composer: the stream's while its `state` stands, else the
+        // screen reader's.
+        let composer = pooled
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent()
+            .composer
+            .word();
         let hold = u8::from(pooled.ctx.fabric.hold().is_some());
         let hold_advisory = pooled
             .ctx

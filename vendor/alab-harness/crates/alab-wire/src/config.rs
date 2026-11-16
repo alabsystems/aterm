@@ -141,6 +141,7 @@ pub struct Config {
     contracts: Vec<Contract>,
     env: EnvNames,
     stream: bool,
+    c3_child_tracking: bool,
 }
 
 impl Config {
@@ -196,6 +197,7 @@ impl Config {
             contracts: Self::DEFAULT_CONTRACTS.to_vec(),
             env: EnvNames::default(),
             stream: true,
+            c3_child_tracking: false,
         })
     }
 
@@ -247,6 +249,23 @@ impl Config {
     #[must_use]
     pub const fn streams(&self) -> bool {
         self.stream
+    }
+
+    /// Declare that this caller supplies the negotiated C3 child lifecycle:
+    /// `before_spawn` before every fresh attempt, native observations after
+    /// spawn and on each tick, and `child_ended` after consuming its current
+    /// original wait handle's terminal event. This defaults off and affects
+    /// only contract 3; it changes no scopes, C4 child words or stream behavior.
+    #[must_use]
+    pub const fn with_c3_child_tracking(mut self) -> Self {
+        self.c3_child_tracking = true;
+        self
+    }
+
+    /// Whether the caller declared the C3 lifecycle hooks.
+    #[must_use]
+    pub const fn c3_child_tracking(&self) -> bool {
+        self.c3_child_tracking
     }
 
     /// The harness id: its roster row, atpkg package and repository.

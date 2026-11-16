@@ -199,7 +199,14 @@ fn tiny_and_large_record_parts_coalesce_without_changing_the_wire() {
 #[test]
 fn an_oversized_record_reply_is_rejected_before_any_header() {
     let large = large_record(crate::text::MAX_VALUE);
-    let reply = records_reply(vec![large; 65], false, None);
+    let reply = records_reply(
+        crate::membership_log::store::Missing {
+            records: vec![large; 65],
+            more: false,
+        },
+        false,
+        None,
+    );
     let mut sink = Sink::new();
     let error = write_reply_to(&mut sink, &reply, None, HANG, HANG).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -209,7 +216,14 @@ fn an_oversized_record_reply_is_rejected_before_any_header() {
 
 #[test]
 fn the_header_and_every_record_chunk_share_one_absolute_deadline() {
-    let reply = records_reply(vec![large_record(WRITE_CHUNK); 3], false, None);
+    let reply = records_reply(
+        crate::membership_log::store::Missing {
+            records: vec![large_record(WRITE_CHUNK); 3],
+            more: false,
+        },
+        false,
+        None,
+    );
     let mut sink = Sink::new();
     sink.step = Duration::from_millis(4);
     let error =
@@ -252,6 +266,44 @@ fn partial_and_interrupted_writes_keep_bytes_and_io_failures() {
                 .kind(),
             expected
         );
+    }
+}
+
+#[test]
+fn envelope_and_conflict_replies_keep_their_head_etag_and_body() {
+    let held = Held {
+        seq: 17,
+        signer: [0; 32],
+        head: [0xab; 32],
+        parented: false,
+        handoff: Vec::new(),
+        bytes: Arc::new(b"envelope body".to_vec()),
+        alab: false,
+    };
+    for (reply, status, body) in [
+        (envelope_reply(&held), "200 OK", &held.bytes[..]),
+        (
+            Reply::conflict_with_head(&held, "conflict"),
+            "409 Conflict",
+            &b"conflict\n"[..],
+        ),
+    ] {
+        let mut sink = Sink::new();
+        write_reply_to(&mut sink, &reply, None, HANG, HANG).unwrap();
+        let split = sink
+            .bytes
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        let header = std::str::from_utf8(&sink.bytes[..split]).unwrap();
+        assert!(header.starts_with(&format!("HTTP/1.1 {status}\r\n")));
+        assert!(header.lines().any(|line| line == "ETag: \"17\""));
+        assert!(
+            header
+                .lines()
+                .any(|line| line == format!("X-Aterm-Vault-Head: {}", "ab".repeat(32)))
+        );
+        assert_eq!(&sink.bytes[split + 4..], body);
     }
 }
 

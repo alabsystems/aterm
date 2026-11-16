@@ -42,6 +42,21 @@ use std::sync::{Arc, OnceLock};
 /// What [`Log::heads_digest`] hashes ahead of the heads.
 const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
 
+/// SHA-256 of [`HEADS_DIGEST_MAGIC`] followed by `heads`, which the caller hands sorted: the one
+/// formula of [`Log::heads_digest`] and of each candidate [`Log::down_set_named`] hashes. `bytes`
+/// is left holding what was hashed.
+fn heads_digest_into<'h>(
+    bytes: &mut Vec<u8>,
+    heads: impl IntoIterator<Item = &'h RecordId>,
+) -> [u8; 32] {
+    bytes.clear();
+    bytes.extend_from_slice(HEADS_DIGEST_MAGIC);
+    for id in heads {
+        bytes.extend_from_slice(id);
+    }
+    digest(bytes)
+}
+
 /// The heads digest a records store that holds no genesis states
 /// ([`store::Store::records_digest`]): [`HEADS_DIGEST_MAGIC`] with no head after it, which no
 /// log's digest ([`Log::heads_digest`]) equals, since every log has at least one head.
@@ -52,6 +67,7 @@ pub fn empty_heads_digest() -> [u8; 32] {
 
 pub mod admission;
 pub mod budgets;
+mod down_set;
 pub mod entries;
 mod epochs;
 mod eval;
@@ -74,6 +90,7 @@ pub use budgets::{
     AUTOMATIC_KEYED_STOP, Author, Authoring, Budget, Class, Fill, LEGACY_RECORDS, MAX_HELD_RECORDS,
     MAX_KEYED_RECORDS, MAX_WEIGHED_RECORDS, RecordBudgets, RecordCounts,
 };
+pub use down_set::{DownSetSearch, NamedBy};
 pub use entries::{
     CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
 };
@@ -1948,12 +1965,10 @@ impl Log {
     /// as the records digest its applied state was read from.
     #[must_use]
     pub fn heads_digest(&self) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(HEADS_DIGEST_MAGIC.len() + self.heads.len() * 32);
-        buf.extend_from_slice(HEADS_DIGEST_MAGIC);
-        for id in &self.heads {
-            buf.extend_from_slice(id);
-        }
-        digest(&buf)
+        heads_digest_into(
+            &mut Vec::with_capacity(HEADS_DIGEST_MAGIC.len() + self.heads.len() * 32),
+            &self.heads,
+        )
     }
 
     /// A draft by `actor` that follows the heads: its sequence one past `actor`'s highest held

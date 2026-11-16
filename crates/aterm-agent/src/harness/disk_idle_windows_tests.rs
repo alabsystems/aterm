@@ -27,11 +27,7 @@ fn mkdirs(p: PathBuf) -> PathBuf {
 }
 
 fn shouted(p: &Path) -> PathBuf {
-    PathBuf::from(
-        aterm_sysprobe::paths::plain(p)
-            .to_string_lossy()
-            .to_uppercase(),
-    )
+    PathBuf::from(aterm_path::plain(p).to_string_lossy().to_uppercase())
 }
 
 fn two_drives() -> Table {
@@ -107,6 +103,7 @@ fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
             in_use: None,
             bytes: 8192,
             bytes_partial: false,
+            deps_entries: None,
             died: super::super::target::Died::default(),
         });
     }
@@ -128,8 +125,8 @@ fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
     let clear = assess(&t, &cx, &fences);
     assert!(clear.is_ok(), "{clear:?}");
     assert_eq!(
-        clear.map(|f| aterm_sysprobe::paths::windows_key(&f.checkout)),
-        Ok(aterm_sysprobe::paths::windows_key(&repo))
+        clear.map(|f| aterm_path::windows_key(&f.checkout)),
+        Ok(aterm_path::windows_key(&repo))
     );
 
     let why = "tab 2 reported no working directory this window can place, so any checkout \
@@ -309,7 +306,7 @@ fn clause_4b_keeps_only_the_candidate_a_short_spelled_working_directory_is_in() 
         let reported = aterm_sysprobe::process_cwd(pid).expect("its working directory");
         drop(child);
         assert_eq!(
-            aterm_sysprobe::paths::short_spelled(&reported).is_some(),
+            aterm_path::short_spelled(&reported).is_some(),
             short_spelled,
             "PREMISE: the child reports the spelling it was started in: {reported:?}"
         );
@@ -335,7 +332,7 @@ fn a_short_spelled_session_cwd_is_opened_only_on_a_local_volume() {
             long.display()
         )
     });
-    let key = aterm_sysprobe::paths::windows_key;
+    let key = aterm_path::windows_key;
     assert_eq!(key(&short), None, "PREMISE: the key refuses {short:?}");
     let table = aterm_sysprobe::volumes::table();
     for spelling in [&short, &long] {
@@ -396,7 +393,7 @@ fn the_walks_start_at_the_paths_own_drive() {
     let links = mkdirs(tmp.path().join("links"));
     atpkg::platform::atomic_symlink(&real, &links.join("tool")).expect("a junction");
     let table = aterm_sysprobe::volumes::table();
-    let key = |p: &Path| aterm_sysprobe::paths::windows_key(p);
+    let key = |p: &Path| aterm_path::windows_key(p);
     let canonical = std::fs::canonicalize(&real).expect("canonical");
     let through = resolve_local(&links.join("tool"), &table).expect("resolved");
     assert_eq!(key(&through), key(&canonical), "{through:?}");

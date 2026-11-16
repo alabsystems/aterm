@@ -198,6 +198,8 @@ pub enum OpenAppRequest<'a> {
         /// Prefer the left pane of the active tab; a tab with no room for it opens a tab.
         split: bool,
     },
+    /// Show the navigator as window chrome.
+    NavigatorDock,
     /// Focus or create the Settings view at `route`.
     Settings {
         /// Absolute Settings route; `/` is the default landing route.
@@ -335,13 +337,13 @@ pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
     })
 }
 
-/// Parse `open app` arguments (`about`, `system-state`, `navigator [split]`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
+/// Parse `open app` arguments (`about`, `system-state`, `navigator [split|dock]`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
 pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     reject_line_break(rest, "open payload")?;
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <allocation [split]|mail|about|system-state|workers|tables|navigator [split]|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|tables|navigator [split|dock]|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
@@ -355,6 +357,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
         Some("workers") if remainder(input).is_empty() => Ok(OpenAppRequest::Workers),
         Some("tables") if remainder(input).is_empty() => Ok(OpenAppRequest::Tables),
+        Some("navigator") if remainder(input) == "dock" => Ok(OpenAppRequest::NavigatorDock),
         Some("navigator") if matches!(remainder(input), "" | "split") => {
             Ok(OpenAppRequest::Navigator {
                 split: remainder(input) == "split",
@@ -384,7 +387,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         }
         Some(_) => Err(ParseError::UnknownApp),
         None => Err(ParseError::Usage(
-            "open app <allocation [split]|mail|about|system-state|workers|tables|navigator [split]|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|tables|navigator [split|dock]|settings [route]|markdown <uri>|editor <uri>>",
         )),
     }
 }

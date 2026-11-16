@@ -399,18 +399,14 @@ fn a_use_in_the_kernels_spelling_is_placed_on_its_version() {
     );
     let live = entry(&versions, "2.1.3");
     let held = entry(&versions, "2.1.0");
-    let kernel = PathBuf::from(
-        aterm_sysprobe::paths::plain(&held)
-            .to_string_lossy()
-            .to_uppercase(),
-    );
+    let kernel = PathBuf::from(aterm_path::plain(&held).to_string_lossy().to_uppercase());
     assert!(!kernel.starts_with(&held), "two spellings of one path");
     let calls = std::cell::Cell::new(0usize);
     let scan = |dirs: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
         calls.set(calls.get() + 1);
         let asked = dirs
             .iter()
-            .any(|d| aterm_sysprobe::paths::is_under(&kernel, d) == Some(true));
+            .any(|d| aterm_path::is_under(&kernel, d) == Some(true));
         Ok(PathScan {
             users: asked
                 .then(|| PathUse {
@@ -510,7 +506,7 @@ fn a_version_used_through_a_short_spelling_keeps_that_version_alone() {
         drop(child.stdin.take());
         let _ = child.wait();
         assert_eq!(
-            aterm_sysprobe::paths::short_spelled(&reported).is_some(),
+            aterm_path::short_spelled(&reported).is_some(),
             short_spelled,
             "PREMISE: the child reports the spelling it was started in: {reported:?}"
         );

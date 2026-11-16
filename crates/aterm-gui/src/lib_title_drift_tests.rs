@@ -306,7 +306,7 @@ fn an_8_3_cwd_change_reaches_the_disk_boards_speller() {
             folder.display()
         )
     });
-    let short = aterm_sysprobe::paths::plain(&short).into_owned();
+    let short = aterm_path::plain(&short).into_owned();
     let reported = short.to_str().expect("text").replace('\\', "/");
     let mut app = App::headless_for_test();
     let sid = 0x83_0000_0001;
@@ -339,8 +339,8 @@ fn an_8_3_cwd_change_reaches_the_disk_boards_speller() {
     };
     assert_eq!(said, short, "the spelling the tab reports");
     assert_eq!(
-        aterm_sysprobe::paths::windows_key(&long),
-        aterm_sysprobe::paths::windows_key(&folder),
+        aterm_path::windows_key(&long),
+        aterm_path::windows_key(&folder),
         "spelled long: {long:?}"
     );
 }

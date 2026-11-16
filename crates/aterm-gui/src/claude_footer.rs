@@ -7435,11 +7435,71 @@ fn press_passes(row: &aterm_agent::harness::upgrade_drive::Row) -> bool {
     row.agent.presses() && matches!(row.aside.as_str(), AGENT_OFF | AUTOPILOT_OFF)
 }
 
+/// Whether the composer drawn in `rows` holds typed text, the caret at `cursor` and `dim` saying
+/// whether a row's first composer glyph is dim (Claude Code's placeholder, [`glyph_dim`]): read
+/// as the fenced write reads it ([`aterm_agent::harness::upgrade::composer_is_empty`]), so a
+/// draft this reads is one the write would refuse. An empty composer, its placeholder and a
+/// screen that draws no composer hold none.
+fn draft_in(rows: &[String], cursor: (usize, usize), dim: impl Fn(usize) -> bool) -> bool {
+    let Some((caret, _)) = aterm_phase::phase::composer_draft(rows) else {
+        return false;
+    };
+    !aterm_agent::harness::upgrade::composer_is_empty(rows, Some(cursor), dim(caret))
+}
+
+/// Whether `t`'s live screen holds a draft in its composer, read as the fenced write reads it
+/// ([`draft_in`]); `None` while it is scrolled back or mid-frame.
+fn draft_shown(t: &aterm_core::terminal::Terminal) -> Option<bool> {
+    if t.grid().display_offset() > 0 || crate::frame_unfinished_now(t) {
+        return None;
+    }
+    let rows: Vec<String> = (0..usize::from(t.rows()))
+        .map(|r| crate::claude_lights::row_text(t, r))
+        .collect();
+    let cursor = t.cursor();
+    Some(draft_in(
+        &rows,
+        (usize::from(cursor.row), usize::from(cursor.col)),
+        |row| {
+            let cells = u16::try_from(row)
+                .ok()
+                .and_then(|row| t.grid().row_at_screen(row));
+            glyph_dim(|col| {
+                let col = u16::try_from(col).ok()?;
+                cells.and_then(|cells| cells.get(col)).map(|c| c.flags())
+            })
+        },
+    ))
+}
+
+/// Whether the composer's first glyph is dim, `flags(col)` the composer row's cell flags at
+/// `col`: the glyph at [`aterm_agent::supervise::screen::COMPOSER_COL`], or, where the program
+/// draws its own caret over it (`inverse`, as Claude Code draws its suggestion's first glyph), the
+/// glyph after it, as the fenced write reads the same cells
+/// ([`aterm_agent::supervise::screen::composer_glyph_cell`]). Read at the caret alone, a
+/// suggestion's inverse first glyph reads plain, and the suggestion as a draft.
+fn glyph_dim(flags: impl Fn(usize) -> Option<aterm_core::grid::CellFlags>) -> bool {
+    use aterm_agent::supervise::screen::COMPOSER_COL;
+    use aterm_core::grid::CellFlags;
+    let glyph = match flags(COMPOSER_COL) {
+        Some(first) if first.contains(CellFlags::INVERSE) => flags(
+            COMPOSER_COL
+                + if first.contains(CellFlags::WIDE) {
+                    2
+                } else {
+                    1
+                },
+        ),
+        first => first,
+    };
+    glyph.is_some_and(|f| f.contains(CellFlags::DIM))
+}
+
 /// What a press of a Claude Code tab's ⬆️ would wait for now on `t`'s live screen, read as the
 /// press's own lane reads it ([`press_wait`]); `None` where the screen is not read (scrolled
 /// back, mid-frame).
 pub(crate) fn press_wait_on(t: &aterm_core::terminal::Terminal) -> Option<&'static str> {
-    let draft = crate::harness_host::draft_shown(t)?;
+    let draft = draft_shown(t)?;
     let rows: Vec<String> = (0..usize::from(t.rows()))
         .map(|r| crate::claude_lights::row_text(t, r))
         .collect();

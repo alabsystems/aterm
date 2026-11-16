@@ -10,6 +10,7 @@
 
 mod support;
 
+mod agent_words;
 mod brief_budget;
 mod carry;
 mod claimed_boxes;
@@ -33,6 +34,7 @@ mod conformance_turn;
 mod descriptions;
 mod discipline;
 mod fold_laws;
+mod harness_fold;
 mod harness_turn;
 mod journal_codec;
 mod journal_view;

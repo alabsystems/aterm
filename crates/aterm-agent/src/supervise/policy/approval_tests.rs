@@ -2353,6 +2353,305 @@ fn trust_roots_are_read_from_the_config_spelling() {
     assert!(!held("/private/tmp/other") && !held("/opt/xy"));
 }
 
+/// ON WINDOWS A TRUST ROOT MAY NAME A WINDOWS FOLDER: a drive or share folder, `~\` or `~/` under
+/// a Windows home (a verbatim one too), `\` and `/` both separators and a glob in the last name,
+/// each held as Windows compares names. CONTROL: a folder beside a root, above it, on another
+/// drive, and one only a common prefix ties to it are held by none; a glob anywhere but the last
+/// name and a relative spec make no root, as on unix.
+#[cfg(windows)]
+#[test]
+fn windows_trust_roots_are_read_from_the_config_spelling() {
+    let home = Path::new(r"\\?\C:\Users\Owner");
+    let roots = roots_from_config(
+        &[
+            r"~\proj*",
+            "~/notes",
+            r"D:\work\",
+            r"\\server\share\team",
+            r"C:\a\*\b",
+            r"C:\lab*",
+            "relative",
+        ]
+        .map(String::from),
+        Some(home),
+    );
+    let labels: Vec<&str> = roots.iter().map(ScratchRoot::label).collect();
+    assert_eq!(
+        labels,
+        [
+            r"C:\Users\Owner\proj*",
+            r"C:\Users\Owner\notes",
+            r"D:\work",
+            r"\\server\share\team",
+            r"C:\lab*",
+        ]
+    );
+    let held = |p: &str| {
+        let comps = folder_components(p).expect("a folder");
+        roots.iter().any(|r| r.holds(&comps))
+    };
+    for inside in [
+        r"c:\users\owner\PROJ-b2\sub",
+        "C:/Users//Owner/notes",
+        r"d:\WORK\x",
+        r"\\SERVER\Share\team\y",
+        r"C:\Lab7",
+    ] {
+        assert!(held(inside), "{inside}");
+    }
+    for outside in [
+        r"C:\Users\Owner",
+        r"C:\Users\Owner\notes2",
+        r"C:\Users\Other\proj",
+        r"E:\work\x",
+        r"\\server\share\other",
+        r"C:\a\x\b",
+    ] {
+        assert!(!held(outside), "{outside}");
+    }
+}
+
+/// The measured folder-trust dialog, its folder row spelled `folder` as Claude Code on Windows
+/// draws its working folder.
+#[cfg(windows)]
+fn windows_trust_rows(folder: &str) -> Vec<String> {
+    lines(CAP_TRUST)
+        .into_iter()
+        .map(|row| {
+            if row == " /private/tmp/claude-502/scratch/work1" {
+                format!(" {folder}")
+            } else {
+                row
+            }
+        })
+        .collect()
+}
+
+/// A scratch folder for the Windows trust-dialog tests, spelled as a process spells its working
+/// folder there (a drive folder, no verbatim prefix), with `Users\u` (the home) and
+/// `Users\u\proj` and `Users\u\proj2` in it.
+#[cfg(windows)]
+fn windows_trust_world() -> (aterm_tempfile::TempDir, PathBuf) {
+    let tmp = aterm_tempfile::tempdir().expect("a scratch folder");
+    let base = std::fs::canonicalize(tmp.path()).expect("resolved");
+    let base = aterm_path::plain(&base).into_owned();
+    for folder in [r"Users\u\proj", r"Users\u\proj2"] {
+        std::fs::create_dir_all(base.join(folder)).expect("a folder");
+    }
+    (tmp, base)
+}
+
+/// A session in `cwd` under `approve = "safe"` and the trust roots `roots`, its home `home`,
+/// its machine looked at live.
+#[cfg(windows)]
+fn windows_trust_ctx(cwd: &str, home: &Path, roots: &[String]) -> ApprovalCtx {
+    let mut c = ApprovalCtx::new(
+        PathBuf::from(cwd),
+        Some(home.to_path_buf()),
+        502,
+        None,
+        std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+    );
+    c.approve = Approve::Safe;
+    c.set_trust_roots(roots, 502);
+    c
+}
+
+/// ON WINDOWS THE FOLDER-TRUST DIALOG READS A WINDOWS FOLDER: the folder Claude Code draws
+/// (`C:\Users\u\proj`) is the session's folder however either is cased or separated, and it is
+/// answered under the safe rule where a trust root holds it or it is the folder the session's
+/// starter trusted, its row the guard. CONTROLS: a folder outside every root (beside the root,
+/// and one a name's common prefix ties to it) is escalated as under no trust root, and a
+/// dialog for another folder than the session's is escalated as not its folder.
+#[cfg(windows)]
+#[test]
+fn a_windows_trust_dialog_is_answered_as_windows_compares_its_folder() {
+    let (_tmp, base) = windows_trust_world();
+    let home = base.join(r"Users\u");
+    let (home_s, proj) = (
+        home.to_string_lossy().into_owned(),
+        home.join("proj").to_string_lossy().into_owned(),
+    );
+    let at = |cwd: &str, roots: &[String]| windows_trust_ctx(cwd, &home, roots);
+    let rows = windows_trust_rows(&proj);
+    for (cwd, root) in [
+        (proj.clone(), format!(r"{home_s}\pro*")),
+        (proj.to_uppercase(), format!(r"{home_s}\pro*")),
+        (
+            proj.clone(),
+            format!("{}/Proj", home_s.to_lowercase().replace('\\', "/")),
+        ),
+        (proj.clone(), r"~\proj".to_string()),
+    ] {
+        let d = on_screen(&rows, &at(&cwd, std::slice::from_ref(&root)));
+        let Decision::Approve {
+            rule_id,
+            guard,
+            subject,
+            ..
+        } = &d
+        else {
+            panic!("{cwd} under {root}: {d:?}");
+        };
+        assert_eq!(*rule_id, RULE_TRUST_DIALOG, "{cwd} under {root}");
+        assert_eq!(subject, &proj);
+        let m = aterm_observe::row_matcher(guard).expect("compiles");
+        assert_eq!(
+            rows.iter().filter(|r| m.matches(r)).collect::<Vec<_>>(),
+            [&format!(" {proj}")]
+        );
+    }
+    let mut starter = at(&proj, &[]);
+    starter.trusted_cwd = Some(PathBuf::from(proj.to_lowercase()));
+    assert_eq!(
+        approved(&on_screen(&rows, &starter)),
+        Some(RULE_TRUST_DIALOG)
+    );
+    for root in [
+        format!(r"{home_s}\proj2"),
+        format!(r"{home_s}\other*"),
+        format!(r"{home_s}\pr"),
+    ] {
+        let d = on_screen(&rows, &at(&proj, std::slice::from_ref(&root)));
+        assert!(reason(&d).contains("under no trust root"), "{root}: {d:?}");
+    }
+    let d = on_screen(
+        &rows,
+        &at(&format!(r"{home_s}\proj2"), &[format!(r"{home_s}\pro*")]),
+    );
+    assert!(reason(&d).contains("not the session's cwd"), "{d:?}");
+}
+
+/// ON WINDOWS THE FOLDER-TRUST DIALOG JUDGES WHERE ITS FOLDER LEADS: a process keeps the spelling
+/// of its working folder it was handed, a junction's included, and Claude Code draws that
+/// spelling; what it then trusts and loads is where the link leads. A junction under a trust root
+/// that leads out of every root is escalated as under no trust root, naming where it leads. And
+/// the dialogs of folders the judgment cannot place are escalated, never trusted: a session whose
+/// folder is an 8.3 short spelling, a name ending in a dot or a space, a verbatim spelling; and
+/// the judgment keeps the verbatim folders `proj.` and `proj ` apart from `proj`, so a root that
+/// names `proj` trusts neither. CONTROLS: a junction under the root that leads to a folder under
+/// it is trusted (the judgment is where it leads, not that it is a link); the long spelling of the
+/// short-spelled folder is trusted; `proj` itself, verbatim, is trusted by its root.
+#[cfg(windows)]
+#[test]
+fn a_windows_trust_dialog_judges_where_its_folder_leads() {
+    let (_tmp, base) = windows_trust_world();
+    let home = base.join(r"Users\u");
+    let home_s = home.to_string_lossy().into_owned();
+    // The home itself as a root: it holds every folder under it.
+    let under_home = [home_s.clone()];
+    let ask = |cwd: &str, roots: &[String]| {
+        on_screen(
+            &windows_trust_rows(cwd),
+            &windows_trust_ctx(cwd, &home, roots),
+        )
+    };
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).expect("a folder outside the root");
+    let (out_link, in_link) = (home.join("linked"), home.join("alias"));
+    for (link, to) in [(&out_link, &outside), (&in_link, &home.join("proj"))] {
+        atpkg::platform::atomic_symlink(to, link).expect("a junction");
+        assert!(
+            std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()),
+            "std reads a junction as a link"
+        );
+    }
+    let d = ask(&out_link.to_string_lossy(), &under_home);
+    assert!(
+        reason(&d).contains("under no trust root")
+            && reason(&d).contains(&outside.to_string_lossy().to_uppercase()),
+        "a junction out of the root: {d:?}"
+    );
+    assert_eq!(
+        approved(&ask(&in_link.to_string_lossy(), &under_home)),
+        Some(RULE_TRUST_DIALOG),
+        "CONTROL: a junction to a folder under the root"
+    );
+
+    let long = home.join("a folder with a long name");
+    std::fs::create_dir(&long).expect("a long-named folder");
+    let Some(short) = aterm_sysprobe::short_spelling(&long) else {
+        aterm_uds::host::could_not_run(format!(
+            "the scratch volume generates no 8.3 short name for {}",
+            long.display()
+        ));
+    };
+    let short = short.to_string_lossy().into_owned();
+    assert_eq!(
+        approved(&ask(&long.to_string_lossy(), &under_home)),
+        Some(RULE_TRUST_DIALOG),
+        "CONTROL: the long spelling"
+    );
+    let d = ask(&short, &under_home);
+    assert!(
+        approved(&d).is_none(),
+        "an 8.3 short spelling {short}: {d:?}"
+    );
+    for unplaced in [format!(r"{home_s}\proj."), format!(r"{home_s}\proj ")] {
+        let d = ask(&unplaced, &under_home);
+        assert!(approved(&d).is_none(), "{unplaced:?}: {d:?}");
+    }
+    let d = ask(&format!(r"\\?\{home_s}\proj."), &under_home);
+    assert!(approved(&d).is_none(), "a verbatim dialog folder: {d:?}");
+    // Verbatim, `proj.` is a folder of its own, which the judgment keeps apart from `proj`.
+    let roots = roots_from_config(&[format!(r"{home_s}\proj")], Some(&home));
+    let rule = |folder: String| trust_folder_rule(Approve::Safe, &roots, None, Path::new(&folder));
+    assert_eq!(rule(format!(r"\\?\{home_s}\proj.")), None);
+    assert_eq!(rule(format!(r"\\?\{home_s}\proj ")), None);
+    assert_eq!(
+        rule(format!(r"\\?\{home_s}\proj")),
+        Some(RULE_TRUST_DIALOG),
+        "CONTROL: `proj` itself, verbatim"
+    );
+}
+
+/// ON WINDOWS NO TRUST ROOT HOLDS A FOLDER WHOSE WAY TELLS NAMES APART BY CASE: in a directory
+/// that does (WSL makes every one so, and one made in it takes it), `proj` and `PROJ` are two
+/// folders, which the judgment, folding case as Windows compares names elsewhere, cannot tell
+/// apart; so a root that names `proj` trusts neither, the dialog escalated naming that directory.
+/// CONTROL: the same root over the same names in a directory that folds case trusts `PROJ`, the
+/// one folder it names there.
+#[cfg(windows)]
+#[test]
+fn a_windows_trust_dialog_under_a_case_telling_directory_is_escalated() {
+    let (_tmp, base) = windows_trust_world();
+    let home = base.join(r"Users\u");
+    for (dir, tells) in [(base.join("exact"), true), (base.join("folded"), false)] {
+        std::fs::create_dir(&dir).expect("the directory");
+        if tells {
+            aterm_sysprobe::set_case_sensitive_dir(&dir, true).expect("it tells case");
+        }
+        std::fs::create_dir(dir.join("proj")).expect("proj");
+        let upper = dir.join("PROJ");
+        assert_eq!(
+            std::fs::create_dir(&upper).is_ok(),
+            tells,
+            "PROJ beside proj"
+        );
+        let root = [dir.join("proj").to_string_lossy().into_owned()];
+        for cwd in [upper.clone(), dir.join("proj")] {
+            let cwd = cwd.to_string_lossy().into_owned();
+            let d = on_screen(
+                &windows_trust_rows(&cwd),
+                &windows_trust_ctx(&cwd, &home, &root),
+            );
+            if tells {
+                assert!(
+                    reason(&d).contains("tells names apart by case")
+                        && reason(&d).contains(&*dir.to_string_lossy()),
+                    "{cwd}: {d:?}"
+                );
+            } else {
+                assert_eq!(
+                    approved(&d),
+                    Some(RULE_TRUST_DIALOG),
+                    "CONTROL {cwd}: {d:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_rest_of_an_rm_breaker_line_must_read() {
     for line in [
@@ -4065,7 +4364,6 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
         &default_secrets(home),
         home,
         Start::Unplaced,
-        &|_| false,
         LeadingDot::Any,
         &unlisted,
     )
@@ -4253,7 +4551,6 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
             &default_secrets(Some(home)),
             Some(home),
             Start::Known(&work),
-            &|_| false,
             LeadingDot::Any,
             &met_nothing,
         ),
@@ -8785,15 +9082,17 @@ fn decline_on(rows: &[String], text: &str) -> Result<Decision, String> {
 
 /// A decline's own words, typed into the refusal, can read to the box reader as a kept grant
 /// ("without asking", "always"): the refusal that holds exactly the decline's text is still the
-/// decline's, and Enter submits it. Measured in `lab disk-ask` (worker, 2026-10-26): the worker's
-/// first dry run, declined with [`DISK_WORKER_FIRST_BASH`] typed in, escalated "the box has no
-/// refusal at option 4" and the worker waited on the box.
+/// decline's, and Enter submits it. Measured on 2026-10-26: a session's first dry run, declined
+/// with the first sample's remedy typed in, escalated "the box has no refusal at option 4" and
+/// the session waited on the box.
 #[test]
 fn a_decline_whose_words_read_as_a_kept_grant_is_still_submitted() {
     let first_bash = decline_text(
         "this command",
-        DISK_WORKER_SHELL_UNREAD,
-        DISK_WORKER_FIRST_BASH,
+        "aterm cannot read your Bash tool's shell startup yet: Claude Code writes its shell \
+         snapshot only once its Bash tool has run a command",
+        "Run `pwd` alone first, which Claude Code runs without asking, then run this command \
+         again; if you already ran `pwd`, keep it and name it in your report",
     );
     let always = decline_text(
         "this command",
@@ -11437,296 +11736,9 @@ fn the_lab_boxes_are_answered_as_measured() {
     }
 }
 
-/// A disk-free worker's context ([`ApprovalCtx::disk_worker`]) over `base`.
-fn disk_worker(base: ApprovalCtx) -> ApprovalCtx {
-    ApprovalCtx {
-        disk_worker: true,
-        ..base
-    }
-}
-
-/// `d` as [`RULE_DISK_WORKER`]'s decline: the refusal it amends, by index.
-fn fenced_out(d: &Decision) -> usize {
-    match d {
-        Decision::Decline {
-            rule_id,
-            refusal,
-            text,
-            ..
-        } => {
-            assert_eq!(*rule_id, RULE_DISK_WORKER, "{d:?}");
-            assert_eq!(text, DISK_WORKER_DECLINE, "{d:?}");
-            *refusal
-        }
-        _ => panic!("expected the disk-free worker's decline, got {d:?}"),
-    }
-}
-
-/// A DISK-FREE WORKER'S BOXES ARE ITS FENCE: at `safe` and at full power alike, a read is
-/// approved as for every session and `aterm harness disk` (any verb, by name or absolute path,
-/// piped only into reads) and a System State read (`aterm ctl … sys`) under [`RULE_DISK_WORKER`]; every other Bash command (an `rm`, a
-/// worktree's removal, a `kill`, a write by redirect or `tee`, an `aterm harness disk` joined to
-/// an `rm`) is declined with [`DISK_WORKER_DECLINE`] on the box's `No`. CONTROL: an `aterm` of
-/// another verb or by a relative path is declined so, and a read of a secret beside aterm's
-/// command or a glob among its words with the proof that failed; aterm's own command reads no
-/// secret under `~/Library`, which a `cat` does.
-#[test]
-fn a_disk_workers_bash_boxes_pass_only_reads_and_aterm_harness_disk() {
-    for (level, base) in [("safe", ctx()), ("all", full())] {
-        let worker = disk_worker(base);
-        for read in [
-            "ls -la ~/.cargo",
-            "du -sh /usr/share/man",
-            "aterm ctl @self status",
-        ] {
-            let d = on_screen(&bash_box(&[read], None), &worker);
-            assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{level}: {read}: {d:?}");
-        }
-        for ours in [
-            "aterm harness disk free ~/.cargo/registry/cache",
-            "aterm harness disk",
-            "aterm harness disk why",
-            "aterm harness disk free --dry-run ~/Library/Caches/pip ~/.npm/_cacache",
-            "/Applications/aterm.app/Contents/MacOS/aterm harness disk free ~/.cargo/git",
-            "aterm harness disk free ~/.cargo/registry/cache 2>&1 | tail -5",
-            "aterm harness disk && aterm harness disk free ~/.npm/_cacache",
-            "aterm ctl @self sys disk scope=aterm",
-            "aterm ctl @self sys procs scope=global top=16",
-            "aterm ctl sys why",
-        ] {
-            let rows = bash_box(&[ours], None);
-            let d = on_screen(&rows, &worker);
-            let (rule, choice, guard, subject, unproven) = approval(&d);
-            assert_eq!(rule, RULE_DISK_WORKER, "{level}: {ours}");
-            assert_eq!(*choice, Choice::Digit(1), "{level}: {ours}");
-            assert_eq!(unproven, None, "{level}: {ours}");
-            assert_eq!(subject, ours, "{level}");
-            assert_eq!(
-                guarded(guard, &rows),
-                [format!("   {ours}")],
-                "{level}: {ours}"
-            );
-        }
-        for theirs in [
-            "rm -rf ~/x",
-            "git worktree remove foo",
-            "git stash drop",
-            "kill 4242",
-            "mv ~/.cargo/registry /tmp/r",
-            "aterm harness disk free x; rm -rf y",
-            "aterm harness disk free x && git worktree remove foo",
-            "aterm harness disk free x > /tmp/freed.txt",
-            "aterm harness disk | tee /tmp/disk.txt",
-            "aterm harness disk free $(rm -rf ~/y)",
-            "aterm harness accounts",
-            "./aterm harness disk free ~/.npm",
-            "env aterm harness disk free ~/.npm",
-            "aterm ctl @self sys disk > /tmp/sys.txt",
-            "aterm ctl @self send hello",
-        ] {
-            let d = on_screen(&bash_box(&[theirs], None), &worker);
-            assert_eq!(fenced_out(&d), 1, "{level}: {theirs}: the `No`");
-        }
-        // Reads and aterm's verb whose proof fails (a secret read beside them, a glob among
-        // aterm's words) are declined with that reason, not the fence's, whose remedy is the verb
-        // they hold.
-        for (unproven, why) in [
-            (
-                "aterm harness disk free ~/.npm; cat ~/.ssh/id_ed25519",
-                "secret",
-            ),
-            ("cat ~/Library/Caches/pip/x", "secret"),
-            ("aterm harness disk free ~/.npm/*", "glob"),
-        ] {
-            let d = on_screen(&bash_box(&[unproven], None), &worker);
-            let (refusal, text) = unproven_out(&d);
-            assert_eq!(refusal, 1, "{level}: {unproven}: the `No`");
-            assert!(
-                text.contains("aterm could not prove it") && text.contains(why),
-                "{level}: {unproven}: {text}"
-            );
-        }
-    }
-}
-
-/// `d` as [`RULE_DISK_WORKER`]'s decline of a command that is only reads and aterm's verbs but was
-/// not proven: the refusal it amends, by index, and its text, which is not [`DISK_WORKER_DECLINE`].
-fn unproven_out(d: &Decision) -> (usize, &str) {
-    match d {
-        Decision::Decline {
-            rule_id,
-            refusal,
-            text,
-            ..
-        } => {
-            assert_eq!(*rule_id, RULE_DISK_WORKER, "{d:?}");
-            assert!(text.starts_with(DECLINE_PREFIX), "{d:?}");
-            assert!(!text.contains(DISK_WORKER_DECLINE), "{d:?}");
-            (*refusal, text)
-        }
-        _ => panic!("expected the disk-free worker's decline, got {d:?}"),
-    }
-}
-
-/// A DISK-FREE WORKER'S UNPROVEN READ IS DECLINED WITH ITS REAL REASON. Claude Code writes the
-/// shell snapshot the fence proves a command against only once its Bash tool has run one, and
-/// removes it when its session ends, so a worker started where no running session ran one finds
-/// none, and its first boxes cannot be proven. Before this they were declined with the fence's own
-/// text, which names `aterm harness disk free` as the way, so the worker was told to use the very
-/// verb it had just been refused (`lab disk-ask` unanswered and exhausted: its dry run declined),
-/// and a worker with no other session about could free nothing. Now its dry run, a System State
-/// read, the verb and a plain read are declined with [`DISK_WORKER_SHELL_UNREAD`] and the remedy
-/// [`DISK_WORKER_FIRST_BASH`] (`pwd`, which Claude Code runs without a box). Another unread shell
-/// startup is declined with its own reason, and no `pwd`. CONTROL: an `rm` is declined with the
-/// fence's text whatever the shell; with a snapshot read the same boxes are approved.
-#[test]
-fn a_disk_workers_unproven_read_is_declined_with_its_real_reason() {
-    let no_snapshot = format!(
-        "{}zsh in /Users/_owner/.claude/shell-snapshots: the Bash tool's shell startup is unknown",
-        crate::supervise::policy::shell_startup::NO_SNAPSHOT
-    );
-    let prefixed = "the worker's `CLAUDE_CODE_SHELL_PREFIX` puts the person's own shell code \
-                    before every command the Bash tool runs";
-    let first_bash = decline_text(
-        "this command",
-        DISK_WORKER_SHELL_UNREAD,
-        DISK_WORKER_FIRST_BASH,
-    );
-    assert!(first_bash.contains("Run `pwd` alone first"), "{first_bash}");
-    let ours = [
-        ("aterm harness disk free --dry-run", RULE_DISK_WORKER),
-        ("aterm ctl @self sys disk scope=aterm", RULE_DISK_WORKER),
-        ("aterm harness disk free ~/.npm/_cacache", RULE_DISK_WORKER),
-        ("ls ~/.cargo", RULE_READ_ONLY),
-    ];
-    for (level, base) in [("safe", ctx as fn() -> ApprovalCtx), ("all", full)] {
-        let unwritten = ApprovalCtx {
-            shell: Err(no_snapshot.clone()),
-            ..disk_worker(base())
-        };
-        let other = ApprovalCtx {
-            shell: Err(prefixed.to_string()),
-            ..disk_worker(base())
-        };
-        for (cmd, _) in ours {
-            let rows = bash_box(&[cmd], None);
-            let d = on_screen(&rows, &unwritten);
-            assert_eq!(unproven_out(&d), (1, first_bash.as_str()), "{level}: {cmd}");
-            let d = on_screen(&rows, &other);
-            let (refusal, text) = unproven_out(&d);
-            assert_eq!(refusal, 1, "{level}: {cmd}");
-            assert!(
-                text.contains("aterm could not prove it") && !text.contains("pwd"),
-                "{level}: {cmd}: another unread startup says its own reason: {text}"
-            );
-        }
-        let rm = bash_box(&["rm -rf ~/.npm/_cacache"], None);
-        assert_eq!(fenced_out(&on_screen(&rm, &unwritten)), 1, "{level}");
-        assert_eq!(fenced_out(&on_screen(&rm, &other)), 1, "{level}");
-        let read = disk_worker(base());
-        assert!(read.shell.is_ok(), "a test build's shell reads as modelled");
-        for (cmd, rule) in ours {
-            let d = on_screen(&bash_box(&[cmd], None), &read);
-            assert_eq!(approved(&d), Some(rule), "{level}: {cmd}: {d:?}");
-        }
-    }
-}
-
-/// A disk-free worker's `aterm harness disk free` of two long paths, which Claude Code 2.1.311 drew
-/// on two gutter rows (measured in `lab disk-ask` worker, 2026-10-26), is fenced: read as lines,
-/// its second row is a command of its own. Its refusal says so and how to fit one row, not that
-/// the worker remove only through the verb it ran; the same paths on one row pass, and a wrapped
-/// command that is no read and no aterm verb even read as one line keeps the fence's text.
-#[test]
-fn a_disk_workers_verb_on_wrapped_rows_is_declined_with_why_and_its_remedy() {
-    let wrapped = decline_text("this command", DISK_WORKER_WRAPPED, DISK_WORKER_ONE_ROW);
-    let two = bash_box(
-        &[
-            "│ aterm harness disk free /private/tmp/at.lab/runs/w/scratch/home/ballast",
-            "│ /private/tmp/at.lab/runs/w/scratch/home/work/beta/target",
-        ],
-        None,
-    );
-    let one = bash_box(
-        &["aterm harness disk free ~/ballast ~/work/beta/target"],
-        None,
-    );
-    let rm = bash_box(&["│ rm -rf ~/ballast", "│ ~/work/beta/target"], None);
-    for (level, base) in [("safe", ctx as fn() -> ApprovalCtx), ("all", full)] {
-        let worker = disk_worker(base());
-        assert_eq!(
-            unproven_out(&on_screen(&two, &worker)),
-            (1, wrapped.as_str()),
-            "{level}"
-        );
-        assert_eq!(
-            approved(&on_screen(&one, &worker)),
-            Some(RULE_DISK_WORKER),
-            "{level}"
-        );
-        assert_eq!(fenced_out(&on_screen(&rm, &worker)), 1, "{level}");
-    }
-}
-
-/// A disk-free worker's every other permission box is declined on its `No`: a file write, an
-/// edit, the rm circuit breaker its bypass rules would approve on scratch, and a box in a bypass
-/// session. CONTROL: under `approve = "none"` every box stays the owner's; the folder-trust
-/// dialog is decided as for every session.
-#[test]
-fn a_disk_workers_other_boxes_are_declined_on_their_no() {
-    let write = phase_fixtures::screen(phase_fixtures::BOX_WRITE_CREATE_2_1_309);
-    let edit = lines(CAP_EDIT);
-    for (name, rows) in [("write", &write), ("edit", &edit)] {
-        for (level, base) in [("safe", ctx()), ("all", full())] {
-            let d = on_screen(rows, &disk_worker(base));
-            assert_eq!(fenced_out(&d), 2, "{name} {level}: option 3 is its `No`");
-        }
-        let d = on_screen(rows, &disk_worker(none(ctx())));
-        assert!(reason(&d).contains("approve = \"none\""), "{name}: {d:?}");
-    }
-    let scratch = rm_box("S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"");
-    assert_eq!(
-        approved(&on_screen(&scratch, &bypass())),
-        Some(RULE_RM_BREAKER),
-        "an ordinary bypass session's breaker on scratch"
-    );
-    let d = on_screen(&scratch, &disk_worker(bypass()));
-    assert!(
-        matches!(
-            d,
-            Decision::Decline {
-                rule_id: RULE_DISK_WORKER,
-                ..
-            }
-        ),
-        "{d:?}"
-    );
-    let d = on_screen(
-        &bash_box(&["aterm harness disk free ~/.npm"], None),
-        &disk_worker(bypass()),
-    );
-    assert!(
-        matches!(
-            d,
-            Decision::Decline {
-                rule_id: RULE_DISK_WORKER,
-                ..
-            }
-        ),
-        "{d:?}"
-    );
-    let trust = lines(CAP_TRUST);
-    let worker = disk_worker(ctx());
-    assert_eq!(
-        on_screen(&trust, &worker),
-        on_screen(&trust, &ctx()),
-        "the trust dialog"
-    );
-}
-
 /// AN ORDINARY SESSION DECIDES AS BEFORE: its `rm` box is handed to a person at `safe` and
 /// pressed at full power, and `aterm harness disk free` is no read it approves. CONTROL: the
-/// same boxes of a disk-free worker are declined and approved under [`RULE_DISK_WORKER`].
+/// same `rm` box reads apart at the two levels, so the box reader and both rules are live.
 #[test]
 fn an_ordinary_sessions_rm_box_decides_as_before() {
     let rm = bash_box(&["rm -rf ~/x"], None);
@@ -11735,19 +11747,6 @@ fn an_ordinary_sessions_rm_box_decides_as_before() {
     assert_eq!(approved(&on_screen(&rm, &full())), Some(RULE_ALLOW_ONCE));
     let ours = bash_box(&["aterm harness disk free ~/.npm/_cacache"], None);
     assert!(reason(&on_screen(&ours, &ctx())).contains("aterm harness"));
-    let mut steps: Vec<super::super::trace::TraceStep> = Vec::new();
-    let reading = aterm_phase::read(Some("claude"), &rm, None);
-    let d = decide_traced(&reading, &rm, &disk_worker(ctx()), &mut steps);
-    assert_eq!(fenced_out(&d), 1);
-    let last = super::super::trace::deciding(&steps).expect("a deciding step");
-    assert_eq!(
-        (last.check, last.rule),
-        ("disk-worker", Some(RULE_DISK_WORKER))
-    );
-    assert_eq!(
-        approved(&on_screen(&ours, &disk_worker(ctx()))),
-        Some(RULE_DISK_WORKER)
-    );
 }
 
 /// A credit-claim worker's context ([`ApprovalCtx::claim_worker`]) over `base`.

@@ -1042,3 +1042,375 @@ fn a_load_flip_at_a_present_keeps_the_page_for_a_client() {
         "a screen reader keeps the page through the flip"
     );
 }
+
+/// A present nobody asked for moves the EMA and may count toward a clear, but never toward a
+/// set: three costly ones leave the latch clear and the run where it was, while the same three
+/// asked for set it; one between asked costly presents neither counts nor breaks their run;
+/// under a shed, past the dwell, cheap ones clear it.
+///
+/// NEGATIVE CONTROL: the ask ignored (`} else if ask == PresentAsk::Asked {` made `} else {`):
+/// "three costly presents nobody asked for set nothing" failed (the third flipped).
+/// NEGATIVE CONTROL: an unasked present resets the set run (`else { self.perf_run = 0; }` after
+/// the asked arm): "an unasked present neither counts nor resets" failed (left 0, right 1).
+#[test]
+fn an_unasked_present_may_clear_the_shed_but_never_set_it() {
+    use super::PresentAsk::{Asked, Unasked};
+    let fi = Duration::from_millis(16);
+    let costly = 2 * fi.as_nanos() as u64;
+    let cheap = 1_000_000_u64;
+    let t0 = Instant::now();
+    let at = |frame: u64| t0 + fi * u32::try_from(frame).expect("a small frame count");
+
+    let mut app = App::headless_for_test();
+    for frame in 0..u64::from(PERF_HYSTERESIS_FRAMES) {
+        assert!(
+            !app.note_present_cost_as(costly, fi, at(frame), Unasked),
+            "three costly presents nobody asked for set nothing"
+        );
+    }
+    assert!(
+        !app.perf_reduced && app.perf_run == 0,
+        "…and leave the set run at zero"
+    );
+    assert_eq!(
+        app.present_cost_ema_ns,
+        Some(costly as f64),
+        "they still move the EMA"
+    );
+    for k in 0..u64::from(PERF_HYSTERESIS_FRAMES) {
+        let frame = u64::from(PERF_HYSTERESIS_FRAMES) + k;
+        assert_eq!(
+            app.note_present_cost_as(costly, fi, at(frame), Asked),
+            k + 1 == u64::from(PERF_HYSTERESIS_FRAMES),
+            "the same three asked for: only the third flips"
+        );
+    }
+    assert!(app.perf_reduced, "the same three asked for set it");
+
+    let mut app = App::headless_for_test();
+    assert!(!app.note_present_cost_as(costly, fi, at(0), Asked));
+    assert!(!app.note_present_cost_as(cheap, fi, at(1), Unasked));
+    assert_eq!(
+        app.perf_run, 1,
+        "an unasked present neither counts nor resets"
+    );
+    assert!(!app.note_present_cost_as(costly, fi, at(2), Asked));
+    assert!(
+        app.note_present_cost_as(costly, fi, at(3), Asked),
+        "an unasked present between asked costly ones breaks no run: the third asked sets"
+    );
+    let shed_at = app.perf_flip_at.expect("the latch records its flip");
+    let past = shed_at + crate::app_render::PERF_SHED_DWELL_MIN;
+    // The EMA stands at 28.125 ms after the shed (32 ms, 1 ms, 32 ms, 32 ms at PERF_EMA_ALPHA
+    // 0.5). The first cheap sample brings it to 14.5625 ms, still over 0.8·fi (12.8 ms), so the
+    // run under it starts at the second, and its PERF_HYSTERESIS_FRAMES-th sample, the
+    // (PERF_HYSTERESIS_FRAMES + 1)-th cheap one, clears the latch.
+    let clears = u64::from(PERF_HYSTERESIS_FRAMES) + 1;
+    for k in 1..=clears {
+        assert_eq!(
+            app.note_present_cost_as(
+                cheap,
+                fi,
+                past + fi * u32::try_from(k).expect("a small frame count"),
+                Unasked
+            ),
+            k == clears,
+            "cheap presents nobody asked for, past the dwell: the run under budget clears"
+        );
+    }
+    assert!(!app.perf_reduced, "an unasked present may clear the shed");
+}
+
+/// Whether three costly presents of the headless window, judged as the redraw judges them,
+/// set the shed: a window touched within its attention or not (`attended`), resting or not,
+/// each present carrying content or not.
+fn three_costly_presents_shed(attended: bool, resting: bool, content: bool) -> bool {
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    let t0 = Instant::now() + crate::window_rest::ATTENTION;
+    let mut ws = app.windows.get_mut(&wid).expect("the headless window");
+    if !attended {
+        assert!(
+            ws.rest
+                .settle_attended(t0, Some(crate::window_rest::ATTENTION))
+        );
+    }
+    if resting {
+        assert!(ws.rest.settle(t0, Some(Duration::from_secs(2))));
+    }
+    assert_eq!(
+        ws.person_here(),
+        attended && !resting,
+        "fixture: who is here"
+    );
+    drop(ws);
+    let fi = Duration::from_millis(16);
+    let present = super::SuccessfulPresentWindowOutcome {
+        frame_interval: fi,
+        offscreen: false,
+        content_presented: content,
+    };
+    for frame in 0..PERF_HYSTERESIS_FRAMES {
+        app.judge_window_present(wid, 2 * fi.as_nanos() as u64, present, t0 + fi * frame);
+    }
+    app.perf_reduced
+}
+
+/// A present is asked for by the content it carried or by a person in its window: costly
+/// presents of an attended window, and an unattended window's output frames, set the shed; an
+/// unattended or resting window's still frames do not.
+///
+/// NEGATIVE CONTROL: the ask is `person_here` alone (`present.content_presented ||` dropped):
+/// "an unattended window's output frame is judged" failed.
+/// NEGATIVE CONTROL: the ask is always `Asked` (its condition made `true`): "a lapsed window's
+/// still frames never set the shed" failed.
+#[test]
+fn a_present_is_asked_by_its_content_or_a_person_here() {
+    assert!(
+        three_costly_presents_shed(true, false, false),
+        "an attended window's still frames are judged"
+    );
+    assert!(
+        three_costly_presents_shed(false, false, true),
+        "an unattended window's output frame is judged"
+    );
+    assert!(
+        !three_costly_presents_shed(false, false, false),
+        "a lapsed window's still frames never set the shed"
+    );
+    assert!(
+        !three_costly_presents_shed(true, true, false),
+        "a resting window's still frames never set the shed"
+    );
+}
+
+/// A raw flip that changes whether the shed applies asks every window for one frame; one that
+/// changes no policy (`motion = "full"`, `load_adaptive_motion = false`) is logged and counted
+/// and asks none of a window that shows no native page.
+///
+/// NEGATIVE CONTROL: the settle on every raw flip (`if shed != shed_before` made always
+/// true): "a flip under motion = \"full\" asks no frame" failed (left (false, 1), right
+/// (false, 0)).
+#[test]
+fn a_flip_that_changes_no_policy_asks_no_frame() {
+    let fi = Duration::from_millis(16);
+    let present = super::SuccessfulPresentWindowOutcome {
+        frame_interval: fi,
+        offscreen: false,
+        content_presented: true,
+    };
+    let flip = |motion: &str, adaptive: bool| {
+        let mut app = App::headless_for_test();
+        app.config.motion = Some(motion.into());
+        app.config.load_adaptive_motion = Some(adaptive);
+        let asks = crate::frame_asks_for_test(&app);
+        let t0 = Instant::now();
+        let flips: Vec<bool> = (0..PERF_HYSTERESIS_FRAMES)
+            .map(|frame| {
+                app.judge_window_present(
+                    crate::WindowId(0),
+                    2 * fi.as_nanos() as u64,
+                    present,
+                    t0 + fi * frame,
+                )
+            })
+            .collect();
+        assert_eq!(
+            flips,
+            [false, false, true],
+            "{motion}: the third present flips"
+        );
+        assert!(app.perf_reduced, "{motion}: the raw latch is shed");
+        (
+            app.load_shed_active(),
+            crate::frame_asks_for_test(&app) - asks,
+        )
+    };
+    assert_eq!(
+        flip("full", true),
+        (false, 0),
+        "a flip under motion = \"full\" asks no frame"
+    );
+    assert_eq!(
+        flip("auto", false),
+        (false, 0),
+        "a flip with adaptive motion off asks no frame"
+    );
+    assert_eq!(
+        flip("auto", true),
+        (true, 1),
+        "a flip that sheds asks every window once"
+    );
+}
+
+/// A raw flip that changes no policy still changes what a native page draws, because the page
+/// reads the raw latch: under `motion = "full"`, the window showing Settings loses its compiled
+/// native frame and is asked for exactly one frame of its own, and no ask goes to every window.
+///
+/// NEGATIVE CONTROL: no settle on a flip that left the shed as it was (`judge_window_present`'s
+/// `else { self.settle_raw_latch_flip(); }` removed): "a raw flip drops the native page's
+/// compiled frame" failed (the frame was kept).
+#[test]
+fn a_flip_that_changes_no_policy_repaints_the_native_page_that_reads_it() {
+    let wid = crate::WindowId(0);
+    let mut app = App::headless_for_test();
+    app.config.motion = Some("full".into());
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::CursorMotion));
+    let stamp = app
+        .native_ui_compile_stamp(wid)
+        .expect("fixture: the Settings page compiles");
+    let compiled = app
+        .compiled_native_ui(wid)
+        .expect("fixture: the Settings page's frame");
+    app.windows
+        .get_mut(&wid)
+        .expect("the headless window")
+        .native_ui_compiled = Some(crate::app_native::NativeCompiledFrame {
+        stamp,
+        phase: crate::app_native::NativeCompiledPhase::Presented,
+        compiled,
+    });
+    let own = app.windows[&wid].redraw_requests_for_test.get();
+    let all = crate::redraw_all_requests_on_this_thread();
+    let fi = Duration::from_millis(16);
+    let present = super::SuccessfulPresentWindowOutcome {
+        frame_interval: fi,
+        offscreen: false,
+        content_presented: true,
+    };
+    let t0 = Instant::now();
+    let flips: Vec<bool> = (0..PERF_HYSTERESIS_FRAMES)
+        .map(|frame| {
+            app.judge_window_present(wid, 2 * fi.as_nanos() as u64, present, t0 + fi * frame)
+        })
+        .collect();
+    assert_eq!(
+        flips,
+        [false, false, true],
+        "fixture: the third present flips"
+    );
+    assert!(
+        !app.load_shed_active(),
+        "fixture: under motion = \"full\" the shed does not apply"
+    );
+    assert_ne!(
+        app.native_ui_compile_stamp(wid),
+        Ok(stamp),
+        "premise: the page's compile stamp reads the raw latch"
+    );
+    assert!(
+        app.windows[&wid].native_ui_compiled.is_none(),
+        "a raw flip drops the native page's compiled frame"
+    );
+    assert_eq!(
+        (
+            app.windows[&wid].redraw_requests_for_test.get() - own,
+            crate::redraw_all_requests_on_this_thread() - all,
+        ),
+        (1, 0),
+        "a raw flip asks the window showing a native page for one frame, and no ask goes to \
+         every window"
+    );
+}
+
+/// A window nobody attends applies the load-shed fade's end, never its middle: while a fade
+/// runs, an attended window applies the App's envelope bit for bit, still fading, and a lapsed
+/// one 0 under the shed and 1 once it clears; under `motion = "full"` and with adaptive motion
+/// off both apply 1.
+///
+/// NEGATIVE CONTROL: the seam returned the App's envelope for every window
+/// (`window_shed_envelope`'s `ws.person_here()` made `ws.person_here() || true`): "a lapsed
+/// window applies the shed fade's end" failed (left 0.5555555, right 0.0).
+#[test]
+fn an_unattended_window_applies_the_fades_end() {
+    use crate::motion::MotionMode;
+    use crate::window_rest::ATTENTION;
+    use aterm_effects::companion::shed_envelope_transitioning;
+    let wid = crate::WindowId(0);
+    let fi = Duration::from_millis(16);
+    let mut app = App::headless_for_test();
+    let t0 = Instant::now();
+    let attend = |app: &mut App, here: bool, at: Instant| {
+        let rest = &mut app.windows.get_mut(&wid).expect("the headless window").rest;
+        if here {
+            let _ = rest.touch(at);
+        } else {
+            let _ = rest.settle_attended(at + ATTENTION, Some(ATTENTION));
+        }
+        assert_eq!(rest.attended(), here, "fixture: attended or lapsed");
+    };
+    for frame in 0..PERF_HYSTERESIS_FRAMES {
+        app.note_present_cost(30_000_000, fi, t0 + fi * frame);
+    }
+    let shed_at = app.perf_flip_at.expect("fixture: the latch shed");
+    let auto = MotionMode::Auto;
+    let mid = shed_at + Duration::from_millis(200);
+    let app_env = app.effective_shed_envelope(auto, mid);
+    assert!(
+        shed_envelope_transitioning(true, app_env),
+        "fixture: the App's envelope is mid-fade"
+    );
+    attend(&mut app, true, mid);
+    let here = app.window_shed_envelope(wid, auto, mid);
+    assert_eq!(
+        here.to_bits(),
+        app_env.to_bits(),
+        "an attended window applies the App's envelope bit for bit"
+    );
+    assert!(shed_envelope_transitioning(true, here), "…and still fades");
+    attend(&mut app, false, mid);
+    let lapsed = app.window_shed_envelope(wid, auto, mid);
+    assert_eq!(lapsed, 0.0, "a lapsed window applies the shed fade's end");
+    assert!(
+        !shed_envelope_transitioning(true, lapsed),
+        "…which owes no further frame"
+    );
+
+    for mode_case in ["full", "adaptive-off"] {
+        if mode_case == "full" {
+            app.config.motion = Some("full".into());
+        } else {
+            app.config.motion = Some("auto".into());
+            app.config.load_adaptive_motion = Some(false);
+        }
+        let mode = app.config.motion_mode();
+        for here in [true, false] {
+            attend(&mut app, here, mid);
+            assert_eq!(
+                app.window_shed_envelope(wid, mode, mid),
+                1.0,
+                "{mode_case}: attended={here} applies no shed"
+            );
+        }
+    }
+    app.config.motion = Some("auto".into());
+    app.config.load_adaptive_motion = Some(true);
+
+    let past = shed_at + crate::app_render::PERF_SHED_DWELL_MIN;
+    let mut cleared = None;
+    for k in 1..=8_u32 {
+        if app.note_present_cost(0, fi, past + fi * k) {
+            cleared = Some(past + fi * k);
+            break;
+        }
+    }
+    let cleared = cleared.expect("fixture: cheap presents past the dwell clear the latch");
+    let rising = cleared + Duration::from_millis(100);
+    let app_env = app.effective_shed_envelope(auto, rising);
+    assert!(
+        !app.load_shed_active() && shed_envelope_transitioning(false, app_env),
+        "fixture: the App's envelope is mid fade-in"
+    );
+    attend(&mut app, false, rising);
+    assert_eq!(
+        app.window_shed_envelope(wid, auto, rising),
+        1.0,
+        "a lapsed window applies the clear fade's end"
+    );
+    attend(&mut app, true, rising);
+    assert_eq!(
+        app.window_shed_envelope(wid, auto, rising).to_bits(),
+        app_env.to_bits(),
+        "an attended window rises with the App"
+    );
+}

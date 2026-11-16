@@ -430,11 +430,9 @@ impl Rig {
     }
 }
 
-fn working() -> Body {
-    Body::State {
-        state: State::Working,
-        composer: None,
-    }
+/// A record of a kind the grant `state` covers and this aterm does not apply yet.
+fn goal() -> Body {
+    Body::Goal { text: None }
 }
 
 fn title() -> Body {
@@ -456,7 +454,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let opened = first.open(ONE);
     assert_eq!(opened.epoch, crate::control_auth::process_instance_id());
     assert_eq!((opened.acked, opened.sent), (0, 0));
-    assert_eq!(first.record(1, working()), (1, None));
+    assert_eq!(first.record(1, goal()), (1, None));
     assert_eq!(first.record(2, Body::Beat), (2, None));
     assert_eq!(first.record(3, title()), (3, None));
     drop(first);
@@ -481,7 +479,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
         "a resent record is applied once"
     );
     assert_eq!(resent.dropped, before.dropped + 2);
-    assert_eq!(again.record(4, working()), (4, None), "acked+1 is taken");
+    assert_eq!(again.record(4, goal()), (4, None), "acked+1 is taken");
     assert_eq!(rig.state(ONE).acked, 4);
 
     // A new epoch (another aterm instance) starts `in` at 0 and keeps what was acknowledged;
@@ -512,7 +510,7 @@ fn a_stream_resends_from_acked_and_drops_what_was_applied() {
     let fresh = stranger.open(ONE);
     assert_eq!((fresh.acked, fresh.sent), (0, 0));
     assert_eq!(
-        stranger.record(1, working()),
+        stranger.record(1, goal()),
         (1, None),
         "its first record is not a resend"
     );
@@ -689,15 +687,12 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
         resets_ms: None,
     };
     assert_eq!(client.record(6, wall), (6, Some("scope".to_string())));
-    assert_eq!(client.record(7, working()), (7, None));
+    assert_eq!(client.record(7, goal()), (7, None));
     assert_eq!(rig.state(ONE).unapplied, 1, "the granted record was taken");
 
     // The budget: the burst is 500 at one instant. The two lines over the bound spent none of
     // it, and neither does a resend; five records did.
-    assert_eq!(
-        client.record(7, working()),
-        (7, Some("applied".to_string()))
-    );
+    assert_eq!(client.record(7, goal()), (7, Some("applied".to_string())));
     let burst = u64::from(RATE_BURST);
     for seq in 8..=burst + 2 {
         assert_eq!(client.record(seq, Body::Beat), (seq, None));
@@ -724,13 +719,13 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
     // record dropped in between took nothing of what had come back.
     rig.service.clock.store(1_019, Ordering::Release);
     assert_eq!(
-        client.record(over + 1, working()),
+        client.record(over + 1, goal()),
         (over + 1, Some("rate".to_string()))
     );
     rig.service.clock.store(1_020, Ordering::Release);
-    assert_eq!(client.record(over + 2, working()), (over + 2, None));
+    assert_eq!(client.record(over + 2, goal()), (over + 2, None));
     assert_eq!(
-        client.record(over + 3, working()),
+        client.record(over + 3, goal()),
         (over + 3, Some("rate".to_string()))
     );
     // A sender a little over the rate (a record every 19 ms) keeps nearly all of them.
@@ -740,7 +735,7 @@ fn records_over_the_bound_the_budget_or_the_scope_are_acked_dropped() {
             .clock
             .store(1_020 + step * 19, Ordering::Release);
         let seq = over + 3 + step;
-        match client.record(seq, working()) {
+        match client.record(seq, goal()) {
             (acked, None) if acked == seq => taken += 1,
             (acked, Some(why)) if acked == seq && why == "rate" => {}
             other => panic!("record {seq}: {other:?}"),
@@ -765,18 +760,69 @@ fn a_line_past_the_bound_is_discarded_as_it_arrives() {
         client.write_all(b"\nnext\n").expect("the line after it");
     });
     let mut lines = super::Lines::new(Vec::new());
-    assert!(matches!(lines.next(&server), super::Line::Over));
+    // A tick is no line: the reader's clock runs beside the bytes.
+    let line = |lines: &mut super::Lines| loop {
+        match lines.next(&server) {
+            super::Line::Tick => {}
+            line => return line,
+        }
+    };
+    assert!(matches!(line(&mut lines), super::Line::Over));
     assert!(
         lines.buffer.capacity() <= 2 * (LINE_MAX + super::CHUNK),
         "{} bytes held for a line of {RUN}",
         lines.buffer.capacity()
     );
-    match lines.next(&server) {
+    match line(&mut lines) {
         super::Line::Whole(line) => assert_eq!(line, b"next"),
         _ => panic!("the line after the long one is whole"),
     }
     writer.join().expect("the writer");
-    assert!(matches!(lines.next(&server), super::Line::Ended));
+    assert!(matches!(line(&mut lines), super::Line::Ended));
+}
+
+/// The reader's tick is a deadline over its whole wait, not over one read: a peer that keeps
+/// sending bytes with no newline, each well inside the tick, still has its claim looked at. While
+/// the claim stands on its connection the stream stays open; once the claim is placed on another
+/// connection the stream closes, though no line was ever completed and no read ever timed out.
+#[test]
+fn bytes_with_no_newline_do_not_put_off_the_look_at_the_claim() {
+    let rig = Rig::new(1);
+    let mut dripper = rig.claimant(ONE, "state");
+    let id = dripper.id();
+    dripper.open(ONE);
+    let drip = Duration::from_millis(20);
+    assert!(
+        drip * 4 < super::TICK,
+        "each byte arrives well inside a tick"
+    );
+
+    // The claim stands: several ticks of dripping close nothing.
+    let until = Instant::now() + super::TICK * 4;
+    while Instant::now() < until {
+        dripper.stream.write_all(b" ").expect("the stream is open");
+        std::thread::sleep(drip);
+    }
+    assert!(
+        !rig.service.released(id),
+        "a dripping claimant keeps its stream"
+    );
+    assert_eq!(rig.lanes.census().streams, 1);
+
+    // The claim leaves for another connection while the drip goes on.
+    let handle = rig.service.handle(ONE);
+    place(&handle, 4, &[Duty::State], u64::MAX - 9, running()).expect("a claim placed elsewhere");
+    let deadline = Instant::now() + SETTLE;
+    while !rig.service.released(id) {
+        assert!(
+            Instant::now() < deadline,
+            "a stream whose claim left stayed open behind bytes with no newline"
+        );
+        // The write fails once the stream closed; that is the end the loop waits for.
+        let _ = dripper.stream.write_all(b" ");
+        std::thread::sleep(drip);
+    }
+    rig.lanes_free();
 }
 
 /// A `stream` verb is served or refused here, never forwarded to a sibling and never a wait;
@@ -909,25 +955,24 @@ fn a_stream_verb_is_never_relayed_and_a_full_pool_keeps_the_claim() {
 }
 
 /// A `seq` past `acked+1` closes the stream with nothing acknowledged, where the next `seq`
-/// does not; so does a line that is no record; and a claim placed on another connection closes it, where a renewal on its own
-/// connection does not. The new claim outlives the closed connection.
+/// does not. A line within the bound that is no record does not close it: it is record
+/// `acked+1`, acknowledged `dropped=refused:usage`, so the harness's resend from `acked` never
+/// brings it back and the record behind it arrives. A claim placed on another connection closes
+/// the stream, where a renewal on its own connection does not; the new claim outlives the closed
+/// connection.
 #[test]
 fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     let rig = Rig::new(2);
     let mut gapped = rig.claimant(ONE, "state");
     let id = gapped.id();
     gapped.open(ONE);
-    assert_eq!(gapped.record(1, working()), (1, None));
-    assert_eq!(
-        gapped.record(2, working()),
-        (2, None),
-        "acked+1 keeps it open"
-    );
+    assert_eq!(gapped.record(1, goal()), (1, None));
+    assert_eq!(gapped.record(2, goal()), (2, None), "acked+1 keeps it open");
     gapped.send(
         &Record {
             seq: 4,
             ms: 0,
-            body: working(),
+            body: goal(),
         }
         .line()
         .expect("a record line"),
@@ -937,35 +982,49 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     rig.ended(id);
     assert_eq!(rig.state(ONE).acked, 2, "the gapped record was not taken");
 
-    // A line that is no record has no number to acknowledge: it closes the stream too, and
-    // takes no sequence number, so the record after it is still the next one.
-    for (line, acked) in [
-        ("", 2),
-        ("not a record", 2),
-        (r#"{"k":"state","seq":3,"ms":0}"#, 2),
+    // A line that is no record takes the next number and is dropped, on a stream that stays
+    // open: the records sent behind it are taken, and a reopened stream stands past it.
+    let mut stray = rig.claimant(ONE, "state");
+    let id = stray.id();
+    assert_eq!(stray.open(ONE).acked, 2);
+    let usage = Some("refused:usage".to_string());
+    for (seq, line) in [
+        (3, ""),
+        (4, "not a record"),
+        // A known kind without its required field: the codec reads no record, whatever `seq`
+        // the line carries.
+        (5, r#"{"k":"state","seq":9,"ms":0}"#),
     ] {
-        let mut stray = rig.claimant(ONE, "state");
-        let id = stray.id();
-        assert_eq!(stray.open(ONE).acked, acked);
-        stray.send(line);
-        stray.send("\n");
-        assert_eq!(
-            stray.line(),
-            "<EOF>",
-            "{line:?} is closed, not acknowledged"
-        );
-        rig.ended(id);
-        let state = rig.state(ONE);
-        assert_eq!((state.acked, state.dropped), (acked, 0), "{line:?}");
+        assert_eq!(stray.raw(line), (seq, usage.clone()), "{line:?}");
     }
+    assert_eq!(stray.record(6, goal()), (6, None), "the record behind them");
+    let state = rig.state(ONE);
+    assert_eq!((state.acked, state.dropped, state.unapplied), (6, 3, 3));
+    drop(stray);
+    rig.ended(id);
+    // The harness's resend: it keeps what is above the `acked` it is told, so the unread lines
+    // are not sent again; were one sent again it would be a new record, not a closed stream.
+    let mut back = rig.claimant(ONE, "state");
+    let id = back.id();
+    assert_eq!(
+        back.open(ONE).acked,
+        6,
+        "past the lines that were no record"
+    );
+    // A gap still closes, with the unread lines counted in what it is a gap from.
+    back.send(r#"{"k":"beat","seq":8,"ms":0}"#);
+    back.send("\n");
+    assert_eq!(back.line(), "<EOF>");
+    rig.ended(id);
+    assert_eq!(rig.state(ONE).acked, 6);
 
     let mut moved = rig.claimant(ONE, "state");
     let id = moved.id();
-    assert_eq!(moved.open(ONE).acked, 2);
+    assert_eq!(moved.open(ONE).acked, 6);
     // A renewal in place, on the stream's own connection, changes nothing.
     let handle = rig.service.handle(ONE);
     place(&handle, 4, &[Duty::State], id, running()).expect("a renewal in place");
-    assert_eq!(moved.record(3, working()), (3, None));
+    assert_eq!(moved.record(7, goal()), (7, None));
     // The claim placed on another connection: the stream ends at its next look.
     let elsewhere = u64::MAX - 7;
     place(&handle, 4, &[Duty::State], elsewhere, running()).expect("a claim placed elsewhere");
@@ -982,7 +1041,7 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
         Some(elsewhere),
         "the closed stream's connection released only its own claim"
     );
-    assert_eq!(meta.stream.as_ref().map(|state| state.acked), Some(3));
+    assert_eq!(meta.stream.as_ref().map(|state| state.acked), Some(7));
 }
 
 /// `title`, an unknown kind and the known kinds this aterm does not apply yet (a `claim`
@@ -1002,7 +1061,7 @@ fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
         client.raw(r#"{"k":"hx99-later","seq":2,"ms":0,"run":"rm -rf /"}"#),
         (2, None)
     );
-    assert_eq!(client.record(3, working()), (3, None));
+    assert_eq!(client.record(3, goal()), (3, None));
     let claim = Body::Claim {
         child: None,
         scope: None,
@@ -1030,3 +1089,7 @@ fn title_unknown_and_unapplied_records_are_acked_and_counted_in_meta() {
     // The other session counted nothing.
     assert!(rig.meta(TWO).contains(quiet), "{}", rig.meta(TWO));
 }
+
+/// The `state` record and the current-state record it feeds.
+#[path = "control_stream_state_tests.rs"]
+mod state;

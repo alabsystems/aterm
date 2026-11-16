@@ -203,11 +203,13 @@ impl Manager {
     fn of(record: &TaskRecord, store: &Store) -> Self {
         let sid = record.from.clone();
         let here = || {
-            store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .by_sid(&SessionId::new(&sid))
-                .is_some()
+            SessionId::parse(&sid).is_some_and(|id| {
+                store
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .by_sid(&id)
+                    .is_some()
+            })
         };
         match &record.manager_node {
             Some(node) => Self::There {

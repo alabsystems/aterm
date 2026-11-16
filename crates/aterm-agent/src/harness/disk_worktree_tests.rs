@@ -25,8 +25,8 @@ use atpkg::build_cache::Unused;
 use atpkg::build_cache::retired::{self, Git as _, GitCli, UNWRITTEN};
 
 use super::{
-    BUILD_DIR_EVERY, Done, Facts, Hooks, OpenSession, RECORDS_QUIET, Schedule, SessionSeen, pins,
-    step,
+    BUILD_DIR_EVERY, Done, Facts, Hooks, OpenSession, RECORDS_QUIET, STEP_EVERY, Schedule,
+    SessionSeen, pins, step,
 };
 use crate::harness::disk::Refusal;
 use crate::harness::disk::idle::SessionCwd;
@@ -255,6 +255,12 @@ struct Setup {
     /// The pass lock is lost as the first build directory's intent goes on record. The step may
     /// then stop short, which [`run`] lets it.
     lock_lost_at_intent: bool,
+    /// Why the custody writes wait, as the home volume reads under its emergency line; `None`:
+    /// they run.
+    custody: Option<String>,
+    /// What the step put on record of each worktree, carried from one run to the next as a
+    /// host's schedule carries it.
+    said: RefCell<BTreeMap<PathBuf, String>>,
 }
 
 /// One step over what discovery finds in the scratch home (and `setup.extra`), with the real
@@ -349,7 +355,8 @@ fn run(s: &Scratch, setup: &Setup) -> (Done, Vec<String>) {
         }
         lines
     };
-    let mut said = BTreeMap::new();
+    let mut said = setup.said.borrow_mut();
+    let custody = || setup.custody.clone().map_or(Ok(()), Err);
     // Judging may take half the wall: the step's own split leaves each phase a one-minute hang
     // detector.
     let (done, _) = step(
@@ -367,13 +374,14 @@ fn run(s: &Scratch, setup: &Setup) -> (Done, Vec<String>) {
             unused: &unused,
             free: &free,
             agh: &agh,
-            said: &mut said,
+            said: &mut *said,
             remove_build: &mut |wt, leave, record| {
                 atpkg::build_cache::reclaim_merged_worktree_with_processes(
                     &s.home, wt, now, leave, record, &probe,
                 )
             },
             starts: &starts,
+            custody: &custody,
         },
     );
     if !setup.lock_lost_at_intent {
@@ -395,6 +403,8 @@ struct Host {
     state: PathBuf,
     transcripts: PathBuf,
     now: i64,
+    /// The home volume's emergency line in bytes: `u64::MAX` reads every volume under it.
+    emergency: u64,
 }
 
 impl Host {
@@ -403,6 +413,7 @@ impl Host {
             state: s.home.join("state"),
             transcripts: s.transcripts(),
             now: i64::try_from(unix_ms(s.now) / 1000).expect("in range"),
+            emergency: 0,
         }
     }
 
@@ -421,6 +432,13 @@ impl Host {
             roster: None,
             starts: &[],
             record: None,
+            lines: aterm_capacity::floor::Lines {
+                warn: 0,
+                floor: 0,
+                target: 0,
+                emergency: self.emergency,
+                files_emergency: 0,
+            },
         }
     }
 
@@ -929,7 +947,7 @@ fn auto_free_gib_zero_removes_no_worktree() {
             .is_err(),
         "no ledger row"
     );
-    assert!(schedule.due(Instant::now()), "the step stays due");
+    assert!(schedule.due(Instant::now(), || false), "the step stays due");
 }
 
 /// [`scratch`] with origins: the submodule's commit cloned into a bare `astream-origin.git`, which
@@ -1336,6 +1354,291 @@ fn a_failed_push_still_removes_the_pinned_worktree_and_is_owed() {
             .expect("the owed file")
             .is_empty()
     );
+}
+
+/// A GONE SESSION'S WORKTREE WAITS BELOW THE EMERGENCY LINE, AND GOES ABOVE IT (DC-06d): while
+/// the home volume reads under its emergency line, a worktree whose session is gone with an edit
+/// and an untracked file stays across two steps, its tree and git's own files for it as they
+/// were, with no ref of it in its checkout or at its origin, no owed file written, and one
+/// `deferred` row on record for both steps; the merged, clean control goes in the first, since
+/// its removal pins nothing. The first step once the volume reads above the line pins it,
+/// removes it and pushes its snapshot, which holds the edit and the file at its origin.
+/// NEGATIVE CONTROLS: a step that pinned below the line fails the empty `pins_of`; one that
+/// journalled each step's deferral fails the single row; one that never took the worktree up
+/// again fails `went`.
+#[test]
+fn a_gone_sessions_worktree_waits_below_the_emergency_line_and_goes_above_it() {
+    let s = scratch_with_origin();
+    let merged = s.wt("merged");
+    let orphan = s.wt("orphan");
+    std::fs::write(orphan.join("Cargo.toml"), "[workspace] # edited\n").expect("edited");
+    std::fs::write(orphan.join("notes.txt"), "notes\n").expect("written");
+    let as_was = standing(&orphan);
+    let mut setup = Setup {
+        owed: Some(owed_file(&s)),
+        custody: Some("its volume reads under its emergency line".to_owned()),
+        ..Setup::default()
+    };
+    let mut rows = Vec::new();
+    for at in 0..2 {
+        let (done, more) = run(&s, &setup);
+        rows.extend(more);
+        if at == 0 {
+            assert!(went(&done, &merged), "the merged control goes: {done:#?}");
+        }
+        assert!(!went(&done, &orphan), "it waits: {done:#?}");
+        assert_eq!(
+            done.deferred.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            vec![&orphan],
+            "{done:#?}"
+        );
+        assert!(done.waits() && done.removed.iter().all(|r| r.pins.is_none()));
+        assert_eq!(standing(&orphan), as_was, "nothing of it was written");
+        assert!(
+            pins_of(&s.checkout(), "orphan").is_empty(),
+            "no pin below the line"
+        );
+        assert!(
+            pins_of(&origin(&s), "orphan").is_empty(),
+            "no push below the line"
+        );
+        assert!(
+            owed_file(&s).symlink_metadata().is_err(),
+            "no owed file below the line"
+        );
+    }
+    let deferred: Vec<Value> = worktree_rows(&rows)
+        .into_iter()
+        .filter(|r| r["action"].as_str() == Some(crate::harness::disk::WORKTREE_DEFERRED))
+        .collect();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "one deferred row for both steps: {rows:#?}"
+    );
+    assert_eq!(
+        deferred[0]["path"].as_str(),
+        Some(&*orphan.to_string_lossy())
+    );
+    assert_eq!(
+        deferred[0]["text"].as_str(),
+        Some("its volume reads under its emergency line")
+    );
+    setup.custody = None;
+    let (done, _) = run(&s, &setup);
+    assert!(went(&done, &orphan), "taken up above the line: {done:#?}");
+    assert!(!done.waits(), "{done:#?}");
+    let pin = pins_of(&origin(&s), "orphan");
+    assert_eq!(pin.len(), 1, "its snapshot is at its origin: {pin:?}");
+    assert_eq!(pin, pins_of(&s.checkout(), "orphan"));
+    let at = &pin[0].0;
+    assert_eq!(
+        out(&origin(&s), &["show", &format!("{at}:Cargo.toml")]),
+        "[workspace] # edited"
+    );
+    assert_eq!(
+        out(&origin(&s), &["show", &format!("{at}:notes.txt")]),
+        "notes"
+    );
+}
+
+/// A SECOND WAIT IS RECORDED AGAIN (DC-06d): a gone session's worktree deferred below the
+/// emergency line, with its `deferred` row on record, is resumed by a session before a step that
+/// reads the volume above the line reaches it, so that step keeps it as live; once the session is
+/// gone again and the volume reads under the line again, the step defers it with a second
+/// `deferred` row, since the step above the line ended the first wait. A step under the line
+/// after that writes no third. NEGATIVE CONTROL: a step above the line that left the first wait
+/// on record (cleared only where its worktree goes) writes no second row.
+#[test]
+fn a_second_wait_after_the_volume_read_above_the_line_is_recorded_again() {
+    let s = scratch_with_origin();
+    let orphan = s.wt("orphan");
+    std::fs::write(orphan.join("notes.txt"), "notes\n").expect("written");
+    let under = Some("its volume reads under its emergency line".to_owned());
+    let deferred_rows = |rows: &[String]| {
+        worktree_rows(rows)
+            .into_iter()
+            .filter(|r| {
+                r["action"].as_str() == Some(crate::harness::disk::WORKTREE_DEFERRED)
+                    && r["path"].as_str() == Some(&*orphan.to_string_lossy())
+            })
+            .count()
+    };
+    let mut setup = Setup {
+        owed: Some(owed_file(&s)),
+        custody: under.clone(),
+        ..Setup::default()
+    };
+    let (done, rows) = run(&s, &setup);
+    assert_eq!(done.deferred.len(), 1, "{done:#?}");
+    assert_eq!(deferred_rows(&rows), 1, "{rows:#?}");
+
+    setup.custody = None;
+    setup.cwds = vec![orphan.clone()];
+    let (done, rows) = run(&s, &setup);
+    assert!(
+        !went(&done, &orphan) && done.deferred.is_empty(),
+        "{done:#?}"
+    );
+    assert_eq!(deferred_rows(&rows), 0, "{rows:#?}");
+
+    setup.custody = under;
+    setup.cwds = Vec::new();
+    let (done, rows) = run(&s, &setup);
+    assert_eq!(done.deferred.len(), 1, "{done:#?}");
+    assert_eq!(
+        deferred_rows(&rows),
+        1,
+        "the second wait is recorded: {rows:#?}"
+    );
+    let (_, rows) = run(&s, &setup);
+    assert_eq!(deferred_rows(&rows), 0, "once for each wait: {rows:#?}");
+    assert!(orphan.is_dir() && pins_of(&s.checkout(), "orphan").is_empty());
+}
+
+/// THE SCHEDULE TAKES WAITING WRITES UP AT THE FIRST LOOK ABOVE THE LINE (DC-06d): a run that
+/// left writes waiting is due before its hour only where the look reads the volume above the
+/// line, and a run that the wait made due while a fresh reading is under the line stands down;
+/// one that left none is due only at its hour, and the volume is not asked of it. A run that
+/// stopped short keeps the wait the run before it left, since it may not have reached those
+/// writes; a run that went through, or that stopped short with no wait before it, leaves none.
+/// NEGATIVE CONTROLS: a `due` without the wait's clause fails the early due; a `stands_down`
+/// that ignored the hour stands down at it; a `ran` that set the wait from its own run alone
+/// fails the kept wait.
+#[test]
+fn the_schedule_takes_waiting_writes_up_at_the_first_look_above_the_line() {
+    let t0 = Instant::now();
+    let soon = t0 + Duration::from_secs(60);
+    let hour = t0 + STEP_EVERY;
+    let unasked = || -> bool { panic!("the volume is not asked") };
+
+    let mut fresh = Schedule::new();
+    assert!(fresh.due(t0, unasked) && !fresh.stands_down(t0, unasked));
+    fresh.ran(t0, None, false);
+    assert!(!fresh.due(soon, unasked), "no wait: due at its hour only");
+    assert!(fresh.due(hour, unasked));
+    assert!(!fresh.stands_down(soon, unasked));
+
+    let mut waits = Schedule::new();
+    waits.ran(t0, None, true);
+    assert!(!waits.due(soon, || false), "under the line it waits");
+    assert!(waits.due(soon, || true), "the first look above the line");
+    assert!(waits.due(hour, unasked), "its hour needs no reading");
+    assert!(
+        waits.stands_down(soon, || true),
+        "a fresh reading under the line"
+    );
+    assert!(
+        !waits.stands_down(soon, || false),
+        "a fresh reading above it"
+    );
+    assert!(
+        !waits.stands_down(hour, unasked),
+        "its hour runs whatever the volume reads"
+    );
+
+    let reached = Some(PathBuf::from("/wt/b"));
+    waits.ran(t0, reached.clone(), false);
+    assert!(waits.due(soon, || true), "stopped short, the wait stands");
+    waits.ran(t0, None, false);
+    assert!(!waits.due(soon, unasked), "went through: no wait");
+    waits.ran(t0, reached, false);
+    assert!(
+        !waits.due(soon, unasked),
+        "stopped short with no wait before"
+    );
+}
+
+/// A RUN THE WAIT MADE DUE STANDS DOWN UNDER THE LINE (DC-06d): the host's own step, its
+/// schedule left waiting by a run a minute ago and its emergency line above anything the volume
+/// can read, does nothing: a merged, clean worktree stays and the ledger gets no row. The same
+/// step with the line at zero removes it. NEGATIVE CONTROL: without the stand-down the first
+/// step removes the merged worktree, whose removal pins nothing.
+#[test]
+fn a_run_the_wait_made_due_stands_down_under_the_line() {
+    use crate::harness::disk::Config;
+
+    let s = scratch();
+    let c = s.wt("c");
+    let mut host = Host::of(&s);
+    let waiting = || {
+        let mut schedule = Schedule::new();
+        schedule.ran(Instant::now(), None, true);
+        schedule
+    };
+    host.emergency = u64::MAX;
+    let done = host.step(&s, Config::default(), &mut waiting());
+    assert!(done.removed.is_empty() && done.kept.is_empty(), "{done:#?}");
+    assert!(s.listed(&c), "it stays");
+    assert!(host.ledger().is_empty(), "no row: {:#?}", host.ledger());
+
+    host.emergency = 0;
+    let done = host.step(&s, Config::default(), &mut waiting());
+    assert!(went(&done, &c), "{done:#?}");
+}
+
+/// OWED PUSHES WAIT BELOW THE EMERGENCY LINE (DC-06d): a push owed since its origin was down,
+/// due again with the origin back, is not tried while the home volume reads under its emergency
+/// line: two steps there push nothing, say why it waits, and put one `deferred` push row on
+/// record; the first step above the line pushes it. NEGATIVE CONTROLS: a round that pushed below
+/// the line fails the empty `pins_of` at origin; one that journalled each step's wait fails the
+/// single row.
+#[test]
+fn owed_pushes_wait_below_the_emergency_line() {
+    let s = scratch_with_origin();
+    let wt = s.wt("offline");
+    std::fs::write(wt.join("work.rs"), "// work\n").expect("written");
+    git(&wt, &["add", "work.rs"]);
+    git(&wt, &["commit", "-qm", "work"]);
+    let gone = s.home.join("gone.git");
+    git(
+        &s.checkout(),
+        &["remote", "set-url", "origin", &gone.to_string_lossy()],
+    );
+    let mut setup = Setup {
+        owed: Some(owed_file(&s)),
+        ..Setup::default()
+    };
+    let (done, _) = run(&s, &setup);
+    assert!(went(&done, &wt) && done.owed.len() == 1, "{done:#?}");
+    git(
+        &s.checkout(),
+        &["remote", "set-url", "origin", &origin(&s).to_string_lossy()],
+    );
+    setup.now = Some(s.now + Duration::from_secs(2 * 60 * 60));
+    setup.custody = Some("its volume reads under its emergency line".to_owned());
+    let mut rows = Vec::new();
+    for _ in 0..2 {
+        let (done, more) = run(&s, &setup);
+        rows.extend(more);
+        assert_eq!(
+            (done.pushed, done.owed.len()),
+            (0, 1),
+            "nothing pushed below the line: {done:#?}"
+        );
+        assert_eq!(
+            done.pushes_deferred.as_deref(),
+            Some("its volume reads under its emergency line")
+        );
+        assert!(pins_of(&origin(&s), "offline").is_empty());
+    }
+    let waits: Vec<&String> = rows
+        .iter()
+        .filter(|r| {
+            r.contains(crate::harness::disk::WORKTREE_PUSH_ROW_KIND)
+                && r.contains("\"action\":\"deferred\"")
+        })
+        .collect();
+    assert_eq!(
+        waits.len(),
+        1,
+        "one deferred push row for both steps: {rows:#?}"
+    );
+    setup.custody = None;
+    let (done, _) = run(&s, &setup);
+    assert_eq!((done.pushed, done.owed.len()), (1, 0), "{done:#?}");
+    assert!(done.pushes_deferred.is_none());
+    assert_eq!(pins_of(&origin(&s), "offline").len(), 1);
 }
 
 /// A LIVE SESSION'S WORKTREE IS LEFT ALONE: an hour and ten minutes after the last write, a
@@ -1938,7 +2241,7 @@ fn auto_free_gib_zero_or_an_unreadable_disk_table_keeps_every_build_directory() 
     assert!(done.kept.is_empty(), "nothing was judged: {done:#?}");
     assert!(artifact.is_file(), "the floor is zero");
     assert!(ledger.symlink_metadata().is_err(), "no ledger row");
-    assert!(schedule.due(Instant::now()), "the step stays due");
+    assert!(schedule.due(Instant::now(), || false), "the step stays due");
 
     let toml = s.home.join("aterm.toml");
     std::fs::write(&toml, "disk = 3\n").expect("written");

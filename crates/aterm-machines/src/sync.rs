@@ -34,6 +34,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 pub mod cost;
+mod fleet_retry;
 pub mod repository_refresh;
 pub use cost::Spent;
 
@@ -1838,9 +1839,8 @@ impl Item for Synced<'_> {
                 .ports
                 .apply_steward_standby_server()
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
-            // A join that fails ends the row, and with it this pass's hold on the converge lock:
-            // the starter's runner retry tries again within seconds, backing off to minutes
-            // (`aterm_secrets::converge::RunnerRetry`), never a wait inside the pass.
+            // A failed attempt ends its row. The admitted pass retries beside its repository
+            // work (`fleet_retry`); once the pass ends its starter owns any remaining retry.
             Kind::Fleet => match self.ports.sync_fleet() {
                 Ok(FleetDone::Synced(said)) => said,
                 Ok(FleetDone::Blocked(why)) => {
@@ -2025,6 +2025,14 @@ const BASE_NOT_INSTALLED: &str = "a pass re-lays the base layer from the install
 /// A run's items.
 type Items<'a> = Vec<Box<dyn Item + 'a>>;
 
+/// Independent phases of one admitted pass. The repository phase may run beside fleet retry;
+/// credential publication follows both, so it includes every producer's newly raised needs.
+struct SyncItems<'a> {
+    local: Items<'a>,
+    repositories: Items<'a>,
+    publication: Items<'a>,
+}
+
 /// The store lock a base layer holds while its items run ([`Base::held`]).
 type Held = Option<Box<dyn std::any::Any>>;
 
@@ -2164,7 +2172,7 @@ fn sync_items<'a>(
     mode: Mode,
     work: aterm_secrets::converge::RepositoryWork,
     execution: Option<repository_refresh::Execution>,
-) -> Items<'a> {
+) -> SyncItems<'a> {
     let mut items: Items<'a> = [
         Kind::Peers,
         Kind::Vault,
@@ -2189,22 +2197,26 @@ fn sync_items<'a>(
         items.insert(0, fabric);
     }
     items.push(Box::new(Synced::new(Kind::Awake, ports, trigger, mode)));
+    let mut repositories: Items<'a> = Vec::new();
     if let Some(prerequisites) = ports.repository_prerequisites() {
-        items.push(prerequisites);
+        repositories.push(prerequisites);
     }
-    let mut repositories = Synced::new(Kind::OwedClone, ports, trigger, mode);
-    repositories.repository_execution = execution.clone();
-    repositories.repository_work = work;
-    items.push(Box::new(repositories));
+    let mut acquisition = Synced::new(Kind::OwedClone, ports, trigger, mode);
+    acquisition.repository_execution = execution.clone();
+    acquisition.repository_work = work;
+    repositories.push(Box::new(acquisition));
     let mut tuning = Synced::new(Kind::CloneTuning, ports, trigger, mode);
     tuning.repository_execution = execution.clone();
-    items.push(Box::new(tuning));
+    repositories.push(Box::new(tuning));
     let mut refresh = Synced::new(Kind::RefreshRepositories, ports, trigger, mode);
     refresh.repository_execution = execution;
     refresh.repository_work = work;
-    items.push(Box::new(refresh));
-    items.push(Box::new(Synced::new(Kind::Requests, ports, trigger, mode)));
-    items
+    repositories.push(Box::new(refresh));
+    SyncItems {
+        local: items,
+        repositories,
+        publication: vec![Box::new(Synced::new(Kind::Requests, ports, trigger, mode))],
+    }
 }
 
 /// Why a pass did not run ([`converge`]).
@@ -2318,6 +2330,24 @@ fn run_pass(
     job: repository_refresh::Job,
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Pass, Stop> {
+    run_pass_waiting(
+        ports,
+        trigger,
+        mode,
+        job,
+        on_row,
+        &mut fleet_retry::LiveWait::default(),
+    )
+}
+
+fn run_pass_waiting(
+    ports: &dyn Ports,
+    trigger: Trigger,
+    mode: Mode,
+    job: repository_refresh::Job,
+    on_row: &mut dyn FnMut(&ItemReport),
+    wait: &mut dyn fleet_retry::Wait,
+) -> Result<Pass, Stop> {
     if !ports.own_account() {
         return Err(Stop::Refused(
             "run in your own login and home directory".to_owned(),
@@ -2366,6 +2396,7 @@ fn run_pass(
         not_own_account: None,
     };
     let mut file = FileJournal::under(&state);
+    let repository_journal = file.clone();
     let mut read_only = aterm_converge::ReadOnly;
     let journal: &mut dyn aterm_converge::Journal = match mode {
         Mode::Apply => &mut file,
@@ -2399,7 +2430,37 @@ fn run_pass(
         ports.log(&format!("converge vault subscriber: {line}"));
     }
     let items = sync_items(ports, trigger, mode, work, execution);
-    rows.extend(aterm_converge::run_scoped(&items, mode, scope, journal, on_row).map_err(refused)?);
+    let mut fleet_failed_at = None;
+    rows.extend(
+        aterm_converge::run_scoped(&items.local, mode, scope, journal, &mut |row| {
+            if matches!(row.id.as_str(), FLEET | NODE | FABRIC) && row.outcome.is_failure() {
+                fleet_failed_at.get_or_insert_with(|| wait.now_ms());
+            }
+            on_row(row);
+        })
+        .map_err(refused)?,
+    );
+    let repositories = if mode == Mode::Apply
+        && let Some(failed_at) = fleet_failed_at
+    {
+        fleet_retry::Retry {
+            ports,
+            trigger,
+            scope,
+            failed_at,
+            journal: repository_journal,
+        }
+        .during(&items.repositories, &mut rows, on_row, wait)
+        .map_err(Stop::Refused)?
+    } else {
+        aterm_converge::run_scoped(&items.repositories, mode, scope, journal, on_row)
+            .map_err(refused)?
+    };
+    rows.extend(repositories);
+    rows.extend(
+        aterm_converge::run_scoped(&items.publication, mode, scope, journal, on_row)
+            .map_err(refused)?,
+    );
     if mode == Mode::Plan {
         return Ok(Pass {
             due,

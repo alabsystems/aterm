@@ -689,7 +689,6 @@ fn the_artifacts_name_their_kinds_and_bind_what_they_declare() {
 
 #[test]
 fn code_names_round_trip_and_other_names_name_nothing() {
-    assert_eq!(MomentumCode::ALL.len(), 3);
     for &code in MomentumCode::ALL {
         assert_eq!(MomentumCode::from_name(code.name()), Some(code));
         assert_eq!(MomentumCode::from_name(code.artifact_name()), Some(code));

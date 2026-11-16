@@ -483,6 +483,8 @@ struct BaseDoc {
     rings: Vec<RingDoc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proc_starts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_cpu_accounting: Option<String>,
     #[serde(default)]
     gaps: Vec<GapDoc>,
     #[serde(default)]
@@ -514,6 +516,8 @@ struct LineDoc {
     r: Vec<(u8, u32, u16, u32, f64, f64, f64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     p: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_cpu_accounting: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     gaps: Vec<GapDoc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -608,6 +612,9 @@ pub(super) fn base_json(strip: &SavedStrip, generation: u64) -> Option<String> {
             .map(|slot| strip.ring(slot).map(RingDoc::of).unwrap_or_default())
             .collect(),
         proc_starts: strip.proc_starts,
+        scope_cpu_accounting: strip
+            .scope_cpu_accounting
+            .map(|_| "process_counter_growth_v1".into()),
         gaps: strip.time_gaps.iter().map(gap_doc).collect(),
         events: strip.strip_events.iter().map(event_doc).collect(),
         spans: strip.situation.iter().map(span_doc).collect(),
@@ -639,6 +646,9 @@ pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
         clean_stop: doc.clean_stop,
         caps: caps_of(doc.caps),
         proc_starts: doc.proc_starts,
+        scope_cpu_accounting: (doc.scope_cpu_accounting.as_deref()
+            == Some("process_counter_growth_v1"))
+        .then_some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
         time_gaps: doc.gaps.into_iter().filter_map(gap_of).collect(),
         strip_events: doc.events.into_iter().filter_map(event_of).collect(),
         situation: doc.spans.into_iter().filter_map(span_of).collect(),
@@ -669,6 +679,9 @@ pub(super) fn line_json(line: &StripLine, generation: u64) -> Option<String> {
             .map(|&(slot, a)| (slot, a.tau_ms, a.n, a.over_ms, a.mean, a.min, a.max))
             .collect(),
         p: line.proc_starts,
+        scope_cpu_accounting: line
+            .scope_cpu_accounting
+            .map(|_| "process_counter_growth_v1".into()),
         gaps: line.time_gaps.iter().map(gap_doc).collect(),
         events: line.strip_events.iter().map(event_doc).collect(),
         s: line.spans.iter().map(span_doc).collect(),
@@ -702,6 +715,9 @@ pub(super) fn line_of(text: &str) -> Option<(u64, StripLine)> {
             })
             .collect(),
         proc_starts: doc.p,
+        scope_cpu_accounting: (doc.scope_cpu_accounting.as_deref()
+            == Some("process_counter_growth_v1"))
+        .then_some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS),
         time_gaps: doc.gaps.into_iter().filter_map(gap_of).collect(),
         strip_events: doc.events.into_iter().filter_map(event_of).collect(),
         spans: doc.s.into_iter().filter_map(span_of).collect(),

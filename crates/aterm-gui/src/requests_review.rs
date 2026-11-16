@@ -1040,10 +1040,11 @@ enum Tab {
 
 /// Tab `sid` of `store` as [`Tab`] reads it; `None` where this Mac no longer hosts it.
 fn tab_of(store: &Store, sid: &str) -> Option<Tab> {
+    let id = SessionId::parse(sid)?;
     let handle = store
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .by_sid(&SessionId::new(sid))
+        .by_sid(&id)
         .cloned()?;
     let lineage = {
         let timeline = handle
@@ -1137,7 +1138,7 @@ fn keep(after: &str, actor: ExitActor, by: &str, store: &Store, hands: &Hands<'_
     let sessions: Vec<u64> = {
         let sessions = store.read().unwrap_or_else(|p| p.into_inner());
         tabs.iter()
-            .filter_map(|sid| sessions.by_sid(&SessionId::new(sid)))
+            .filter_map(|sid| SessionId::parse(sid).and_then(|id| sessions.by_sid(&id)))
             .map(|handle| handle.local_id)
             .collect()
     };
@@ -1234,8 +1235,8 @@ fn reply(after: &str, actor: &ExitActor, by: &str, store: &Store, hands: &Hands<
             _ => None,
         };
         own.into_iter().chain(open_tabs).find_map(|sid| {
-            sessions
-                .by_sid(&SessionId::new(&sid))
+            SessionId::parse(&sid)
+                .and_then(|id| sessions.by_sid(&id))
                 .map(|h| h.ctx.clone())
         })
     };

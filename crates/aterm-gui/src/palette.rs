@@ -256,6 +256,7 @@ pub(crate) struct PaletteLive {
     pub maximized: bool,
     /// Whether the front tab is split (Close Pane vs Close Tab).
     pub front_tab_split: bool,
+    pub navigator_shown: bool,
     /// Whether the focused pane records its screen, so Rewind can open on it.
     pub can_rewind: bool,
     /// Whether the front window's glow is recorded, so Record Keys Not Echoed… can grant.
@@ -588,6 +589,14 @@ impl PaletteState {
                 }
                 MenuAction::Zoom => {
                     row.label = Cow::Borrowed(crate::menu::zoom_title(live.maximized));
+                }
+                MenuAction::ToggleNavigator => {
+                    row.label = Cow::Borrowed(if live.navigator_shown {
+                        "Hide Navigator"
+                    } else {
+                        "Show Navigator"
+                    });
+                    row.enabled = live.agents.any_window;
                 }
                 MenuAction::CloseTab => {
                     row.label = Cow::Borrowed(crate::menu::close_row_title(live.front_tab_split));
@@ -1253,6 +1262,7 @@ fn accel(mods: MenuMods, key: &str) -> String {
         MenuMods::Command => "\u{2318}",
         MenuMods::CommandShift => "\u{21e7}\u{2318}",
         MenuMods::CommandControl => "\u{2303}\u{2318}",
+        MenuMods::CommandOption => "⌥⌘",
     };
     format!("{m}{}", key.to_uppercase())
 }

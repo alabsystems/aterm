@@ -97,6 +97,14 @@ impl Computed {
             Self::Kept => &[aterm_file::retain::SEEN],
         }
     }
+
+    /// Whether these columns read this Mac's machine as the session's roster names it: only
+    /// `lab/machines`' `=here` does, so of the catalog tables' files only `lab/machines` reads
+    /// the roster.
+    #[must_use]
+    pub const fn reads_here(self) -> bool {
+        matches!(self, Self::Machines)
+    }
 }
 
 /// A fold of other files' projections (§2, "Views across Macs").
@@ -444,7 +452,7 @@ pub const LINKS: Type = Type {
 /// `lab/machines`: the lab's Macs, the registry's `machine` rows.
 pub const MACHINES: Type = Type {
     name: "lab/machines",
-    about: "the lab's Macs: label, status, role, hardware",
+    about: "the lab's machines: label, status, role, hardware",
     class: Class::Owner,
     store: Store::Table {
         family: &att::REGISTRY,
@@ -459,7 +467,7 @@ pub const MACHINES: Type = Type {
 /// inert.
 pub const LOGINS: Type = Type {
     name: "ai/logins",
-    about: "each Mac's logins: which account, its state, how it was proved and last tried",
+    about: "each machine's logins: which account, its state, how it was proved and last tried",
     class: Class::Mac,
     store: Store::Journal(&LOGIN),
     computed: Computed::Kept,
@@ -470,7 +478,7 @@ pub const LOGINS: Type = Type {
 /// journal ring's `usage` rows.
 pub const USAGE: Type = Type {
     name: "ai/usage",
-    about: "each Mac's latest reading of each account's windows, walls and sessions",
+    about: "each machine's latest reading of each account's windows, walls and sessions",
     class: Class::Mac,
     store: Store::Journal(&journal::USAGE),
     computed: Computed::Kept,
@@ -481,7 +489,7 @@ pub const USAGE: Type = Type {
 /// journal's closed vocabulary.
 pub const EVENTS: Type = Type {
     name: "ai/events",
-    about: "what each Mac saw while it used the accounts, in a closed vocabulary",
+    about: "what each machine saw while it used the accounts, in a closed vocabulary",
     class: Class::Mac,
     store: Store::Journal(&EV),
     computed: Computed::Kept,
@@ -492,7 +500,7 @@ pub const EVENTS: Type = Type {
 /// file 6). The first derived file: nobody writes it.
 pub const LIMITS: Type = Type {
     name: "ai/limits",
-    about: "each account's windows and walls, folded from every Mac's readings",
+    about: "each account's windows and walls, folded from every machine's readings",
     class: Class::Derived,
     store: Store::View(Fold::Limits),
     computed: Computed::None,

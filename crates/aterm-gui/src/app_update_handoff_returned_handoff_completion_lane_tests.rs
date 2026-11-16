@@ -118,6 +118,7 @@ fn park_one_attempt(
         teardown: crate::DeferredHandoffTeardown::None,
         commit_drain_started: None,
         commit_flush: None,
+        table_flush: None,
         held_commit: None,
         revoked_by_activity: false,
     });
@@ -259,6 +260,7 @@ fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
         teardown: crate::DeferredHandoffTeardown::None,
         commit_drain_started: None,
         commit_flush: None,
+        table_flush: None,
         held_commit: None,
         revoked_by_activity: true,
     });

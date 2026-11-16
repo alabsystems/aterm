@@ -354,19 +354,39 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
     }
 }
 
-/// `run`, a verb or a sync at `places`, telling every running window on this machine once it
-/// changed what a raise of fleet access is asked over ([`crate::fleet_access::Basis`]): a level
-/// stated (`access`), one a leave or another fleet's key removed, and the fleet left, joined or
-/// changed. A window's lock then reads the level again and drops a raise it had pending. It is
-/// told whether or not `run` ran to its end. A unit test runs the verbs themselves and posts
-/// nothing.
+/// `run`, a verb or a sync at `places`, telling every running window of the state home it
+/// changed ([`announced_home`]) once it changed what a raise of fleet access is asked over
+/// ([`crate::fleet_access::Basis`]): a level stated (`access`), one a leave or another fleet's
+/// key removed, and the fleet left, joined or changed. A window's lock then reads the level
+/// again and drops a raise it had pending. It is told whether or not `run` ran to its end. A
+/// unit test that runs the verbs themselves posts nothing; one that runs this, or a test that
+/// runs the `aterm` binary, under a scratch home posts for that home, which no window of another
+/// home hears ([`crate::fleet_access::changed`]).
 fn announcing<R>(places: &Places, run: impl FnOnce() -> R) -> R {
-    let before = crate::fleet_access::basis(&places.state);
+    let home = announced_home(places);
+    let before = crate::fleet_access::basis(home);
     let ran = run();
-    if crate::fleet_access::basis(&places.state) != before {
-        crate::fleet_access::announce();
+    if crate::fleet_access::basis(home) != before {
+        crate::fleet_access::announce(home);
     }
     ran
+}
+
+/// The state home whose fleet access [`announcing`] watches and announces a change of: the one
+/// a verb at `places` keeps its fleet state in.
+fn announced_home(places: &Places) -> &Path {
+    &places.state
+}
+
+/// The notification a fleet verb run in this process posts once it changed what a raise is
+/// asked over (`announcing`), or `None` where this process names no state or config folder. A
+/// window's law holds the name its status item hears to this one.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn announced_here() -> Option<std::ffi::CString> {
+    Places::here()
+        .ok()
+        .map(|places| crate::fleet_access::changed(announced_home(&places)))
 }
 
 /// `aterm fleet name`: this machine's fleet name, its temporary alias and its node. It writes

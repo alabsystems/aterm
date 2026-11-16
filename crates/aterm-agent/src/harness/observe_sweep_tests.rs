@@ -471,6 +471,8 @@ fn one_clis_places_and_the_account_each_runs_on() {
 }
 
 /// A Claude Code profile of `email` whose `organizationType` is `organization`.
+// Read only by the unix-only test below.
+#[cfg(unix)]
 fn planned(email: &str, organization: &str) -> String {
     format!(
         r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"11111111-2222-3333-4444-555555555555","organizationType":"{organization}"}}}}"#
@@ -478,6 +480,8 @@ fn planned(email: &str, organization: &str) -> String {
 }
 
 /// `path`'s modification time set to `at`, Unix seconds.
+// Read only by the unix-only test below.
+#[cfg(unix)]
 fn dated(path: &Path, at: i64) {
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at.unsigned_abs());
     fs::File::options()

@@ -285,7 +285,8 @@ enum Transition {
 /// the target becomes the current job.
 fn end_during_transition(transition: Transition) -> (Answer, Vec<(i32, i32)>) {
     use crate::session_store::{ExitActor, ExitReason};
-    use aterm_vitals::left::{self, Ctx, Facts, Lin, LiveTab, Marks};
+    use aterm_process_facts::left::{Facts, Lin, Marks};
+    use aterm_vitals::left::{self, Ctx, LiveTab};
 
     let store = crate::session_store::new_store();
     let mut handle = crate::session_store::test_handle_on(7, -1);

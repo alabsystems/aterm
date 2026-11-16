@@ -71,6 +71,7 @@ const fn keys(noun: Noun) -> Option<&'static [(&'static str, &'static str)]> {
         ]),
         Noun::Intent => Some(&[
             ("at_secs", "number"),
+            ("closable", "boolean"),
             ("grant", "string|null"),
             ("id", "string"),
             ("identity", "string"),

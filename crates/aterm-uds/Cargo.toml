@@ -9,26 +9,15 @@ license.workspace = true
 repository.workspace = true
 description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. The Windows side is direct ws2_32/kernel32/bcrypt FFI."
 
-# Dependency-free on every platform (the Windows side is raw FFI) so the
-# whole transport stays auditable in one small crate, but for one first-party
-# declaration crate on Unix, aterm-vitals' pure types, and aterm-sysprobe's
-# readers: `KERN_PROCARGS2`'s (`procargs`, re-exported) on Unix and Windows,
-# and its path rule and process reader on Windows; and on Unix astream-sys
-# (zero dependencies), whose owner-only rule `private_file` admits by and whose
-# boot reader names this boot, and aterm-durable (std plus astream-sys), which
-# finishes an `atomic_file` write on Unix and Windows; and aterm-dirfd's Unix
-# descriptor-relative system calls, which bind private transactions to their locks.
+# Transport and process readers use OS FFI with first-party observation and I/O
+# helpers. Plain process values and folding rules live in aterm-process-facts;
+# this crate supplies their native reads and keeps process custody.
 [dependencies]
 # Quiet placement for process-lifetime test roots, including short socket roots. The
 # allocator is dependency-free; its reverse edge to this crate is test-only.
 aterm-tempfile = { workspace = true }
-# aterm-vitals: the program check's reading and verdict types
-# (`program_check`), the services' reading and fold (`services`) and the
-# leftover judge's facts (`left`), which this crate's readers fill, and the
-# jobs engine's backed-up count (`jobs::HELD_AT_ONCE`), which
-# `process::HeldNow::backed_up` reads. A pure model crate with no
-# dependencies of its own.
-aterm-vitals = { workspace = true }
+# Shared observation values and the count rule, without statistical judgments.
+aterm-process-facts = { workspace = true }
 # aterm-stamp: the running binary's identity record, read at run time for the
 # build the LAN broker's hello names (`lan::hello_build`) where the front door set
 # none. No dependencies of its own, and a constant version.
@@ -85,6 +74,10 @@ astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # Shared native final-exec attributes; no resource admission or policy receipt.
 trust-exec-policy = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Native service integration keeps the upper restart identity and policy controls.
+aterm-vitals = { workspace = true }
+
 [dev-dependencies]
 aterm-bench = { path = "../aterm-bench" }
 # The relocated watcher tests use the shared one-minute hang detector and wait helpers.
@@ -120,25 +113,11 @@ harness = false
 name = "spawn_cost"
 harness = false
 
-# What the spawn lock costs a spawn and a kept-out socket's creation under a spawn-heavy load:
-# a benchmark run by hand (`targo --unverified bench -p aterm-uds --bench spawn_lock_cost`),
-# never a gate.
-[[bench]]
-name = "spawn_lock_cost"
-harness = false
-
 # Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
 [[bench]]
 name = "dmg_acceptance"
 harness = false
 test = false
 
-# Manual measurement of watcher scheduling over pending files; no timing gate.
-[[bench]]
-name = "watch_debounce_cost"
-harness = false
-
-# Manual native directory-registration work measurement; no timing gate.
-[[bench]]
-name = "watch_directory_cost"
-harness = false
+[target.'cfg(windows)'.dev-dependencies]
+aterm-path = { workspace = true }

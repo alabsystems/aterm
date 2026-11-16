@@ -9,8 +9,9 @@ fn argv(words: &[&str]) -> Vec<String> {
 
 /// The roster: every vendor row that keeps a yolo policy spells its posture in full — never
 /// the word itself as a flag (claude and agy refuse it), every flag and marker safe to embed,
-/// its own flags among its markers, and the exact expansions from each vendor's `--help`. kimi,
-/// grok and muse keep none: their harnesses' `run` sets the default (HX-09b, HX-10d, HX-13a).
+/// its own flags among its markers, and the exact expansions from each vendor's `--help`. kimi
+/// and grok keep none: their harnesses' `run` sets the default (HX-09b, HX-10d). muse keeps its
+/// own until muse-alab leads `muse` (HX-13c, after HX-13).
 #[test]
 fn every_row_spells_its_yolo_policy_in_full() {
     assert_eq!(flags_of("claude"), &["--dangerously-skip-permissions"]);
@@ -19,12 +20,23 @@ fn every_row_spells_its_yolo_policy_in_full() {
         flags_of("codex"),
         &["--dangerously-bypass-approvals-and-sandbox"]
     );
+    assert_eq!(
+        flags_of("muse"),
+        &[
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+        ]
+    );
+    assert_eq!(policy_of("muse").after, &["exec", "resume"]);
+    assert!(policy_of("muse").skip.contains(&"skills"));
     let kept: Vec<&str> = crate::vendor_direct::VENDORS
         .iter()
         .filter(|row| policy_of(row.program) != Policy::NONE)
         .map(|row| row.program)
         .collect();
-    assert_eq!(kept, ["claude", "codex", "agy", "codex-old"]);
+    assert_eq!(kept, ["claude", "codex", "agy", "muse", "codex-old"]);
     for row in crate::vendor_direct::VENDORS {
         let p = policy_of(row.program);
         if !kept.contains(&row.program) {
@@ -39,6 +51,13 @@ fn every_row_spells_its_yolo_policy_in_full() {
         }
         for marker in p.markers {
             assert!(is_shell_safe_marker(marker), "{} {marker}", row.program);
+        }
+        for word in p.after.iter().chain(p.skip.iter()) {
+            assert!(
+                crate::selfupdate::is_shell_safe_verb(word),
+                "{} {word}",
+                row.program
+            );
         }
     }
     assert_eq!(policy_of("ay"), Policy::NONE);
@@ -92,7 +111,7 @@ fn the_word_rules_admit_flags_and_markers_only() {
 }
 
 /// By the flag: in place, every occurrence, only ahead of `--`, never a
-/// flag twice.
+/// flag twice, and behind muse's session words wherever `--yolo` stood.
 #[test]
 fn the_flag_expands_in_place_and_never_twice() {
     assert_eq!(
@@ -124,9 +143,48 @@ fn the_flag_expands_in_place_and_never_twice() {
             "x"
         ]))
     );
+    let muse_exec = Launch::Flag(argv(&[
+        "exec",
+        "--disable-approval",
+        "--disable-sandbox",
+        "--trust-workspace",
+        "--disable-request-user-input",
+        "x",
+    ]));
+    assert_eq!(decide("muse", &argv(&["exec", "--yolo", "x"])), muse_exec);
+    assert_eq!(decide("muse", &argv(&["--yolo", "exec", "x"])), muse_exec);
+    assert_eq!(
+        decide("muse", &argv(&["--yolo", "exec", "--yolo", "x"])),
+        muse_exec
+    );
+    assert_eq!(
+        decide("muse", &argv(&["--disable-sandbox", "--yolo"])),
+        Launch::Flag(argv(&[
+            "--disable-sandbox",
+            "--disable-approval",
+            "--trust-workspace",
+            "--disable-request-user-input",
+        ]))
+    );
     assert_eq!(
         decide("claude", &argv(&["--yolo", "--", "--yolo"])),
         Launch::Flag(argv(&["--dangerously-skip-permissions", "--", "--yolo"]))
+    );
+    for args in [
+        argv(&["--yolo", "--model", "exec", "exec", "x"]),
+        argv(&["--model", "exec", "--yolo", "exec", "x"]),
+    ] {
+        let mut expected = argv(&["--model", "exec", "exec"]);
+        expected.extend(flags_of("muse").iter().map(|f| (*f).to_string()));
+        expected.push("x".to_string());
+        assert_eq!(decide("muse", &args), Launch::Flag(expected));
+    }
+    assert_eq!(
+        decide(
+            "muse",
+            &argv(&["--new-option", "value", "--yolo", "exec", "x"])
+        ),
+        Launch::AsTyped
     );
     assert_eq!(
         decide("codex", &argv(&["--new-option", "value", "--yolo"])),
@@ -225,8 +283,8 @@ fn codex_permission_configs_keep_the_typed_posture() {
     }
 }
 
-/// By default: injected at the front, and never over a decided posture, a
-/// self-update verb, or past `--`-only noise.
+/// By default: injected at the front (behind muse's session words), and
+/// never over a decided posture, a skipped word, or past `--`-only noise.
 #[test]
 fn the_default_injects_unless_the_posture_is_decided() {
     assert_eq!(
@@ -243,6 +301,28 @@ fn the_default_injects_unless_the_posture_is_decided() {
             "--dangerously-bypass-approvals-and-sandbox",
             "exec",
             "fix it"
+        ]))
+    );
+    assert_eq!(
+        decide("muse", &argv(&["exec", "fix it"])),
+        Launch::Default(argv(&[
+            "exec",
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+            "fix it"
+        ]))
+    );
+    assert_eq!(
+        decide("muse", &argv(&["--", "--yolo"])),
+        Launch::Default(argv(&[
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+            "--",
+            "--yolo"
         ]))
     );
     for (program, args) in [
@@ -282,6 +362,15 @@ fn the_default_injects_unless_the_posture_is_decided() {
         ("codex", argv(&["--model", "--", "resume", "thread-id"])),
         ("agy", argv(&["--mode", "plan"])),
         ("agy", argv(&["--sandbox"])),
+        ("muse", argv(&["--approval-mode", "on-request"])),
+        ("muse", argv(&["--sandbox-network", "restricted"])),
+        ("muse", argv(&["--disable-write"])),
+        ("muse", argv(&["-c", "approval_mode=\"on-request\""])),
+        ("muse", argv(&["resume", "session-id"])),
+        ("muse", argv(&["skills", "list"])),
+        ("muse", argv(&["usage"])),
+        ("muse", argv(&["auth", "login"])),
+        ("muse", argv(&["exec", "--disable-approval", "x"])),
         ("claude", argv(&["update"])),
         ("claude", argv(&["update", "--help"])),
         ("claude", argv(&["install", "latest"])),
@@ -334,6 +423,29 @@ fn the_default_injects_unless_the_posture_is_decided() {
         expected.extend(args.iter().cloned());
         assert_eq!(decide("codex", &args), Launch::Default(expected));
     }
+    for args in [
+        argv(&["--model", "exec", "exec", "x"]),
+        argv(&["--model=exec", "exec", "x"]),
+    ] {
+        let word = args.len() - 2;
+        let mut expected = args[..=word].to_vec();
+        expected.extend(flags_of("muse").iter().map(|f| (*f).to_string()));
+        expected.push("x".to_string());
+        assert_eq!(decide("muse", &args), Launch::Default(expected));
+    }
+    assert_eq!(
+        decide("muse", &argv(&["--model", "opus", "resume", "session-id"])),
+        Launch::AsTyped
+    );
+    assert_eq!(
+        decide("muse", &argv(&["--yolo"])),
+        Launch::Flag(argv(&[
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+        ]))
+    );
 }
 
 /// The echoes: distinct labels for asked and defaulted, every word quoted.

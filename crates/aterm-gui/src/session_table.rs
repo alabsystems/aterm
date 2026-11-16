@@ -138,7 +138,7 @@ impl TitleFrom {
 pub(crate) struct Row {
     /// The session's ID, the durable one (LT-D10).
     pub(crate) sid: SessionId,
-    /// Its `exits` row id: the end's unix µs, rising within one process.
+    /// Its `exits` row id: an ordering cursor: the end's unix µs, or one above the highest id held.
     pub(crate) id: u64,
     /// Wall ms of the end.
     pub(crate) ended_ms: u64,
@@ -182,6 +182,9 @@ pub(crate) struct Row {
 /// What the table's index keeps of a row: what `exits`, a listing and the budget read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RowHead {
+    /// Identity of this indexed write, independent of its exit cursor. A stat keeps it alive
+    /// so a replacement cannot reuse its identity while that stat is in flight.
+    generation: Arc<()>,
     pub(crate) sid: SessionId,
     pub(crate) id: u64,
     pub(crate) ended_ms: u64,
@@ -204,6 +207,7 @@ pub(crate) struct RowHead {
 impl Row {
     fn head(&self, bytes: u64) -> RowHead {
         RowHead {
+            generation: Arc::new(()),
             sid: self.sid.clone(),
             id: self.id,
             ended_ms: self.ended_ms,
@@ -302,9 +306,7 @@ impl Row {
     /// (`TaskRecord::settle_result`): `None` for one that does not read, or names no session.
     pub(crate) fn decode(text: &str, tasks: Option<&Path>) -> Option<Self> {
         let file: RowFile = aterm_toml::from_str(text).ok()?;
-        if !crate::keeper_link::valid_sid(&file.sid) {
-            return None;
-        }
+        let sid = SessionId::parse(&file.sid)?;
         let task = file.task.as_deref().and_then(|row| {
             let now_ms = aterm_time::unix_millis().unwrap_or(0);
             let mut task = TaskRecord::from_carry_row(row, tasks, Instant::now(), now_ms)?;
@@ -312,7 +314,7 @@ impl Row {
             Some(task)
         });
         Some(Self {
-            sid: SessionId::new(&file.sid),
+            sid,
             id: file.id,
             ended_ms: file.ended_ms,
             opened_ms: file.opened_ms,
@@ -499,6 +501,14 @@ pub(crate) fn row_at_close(sid: &SessionId, ended: &Ended, at: &AtClose) -> Row 
         task.line = task.line.as_deref().map(crate::survey::redact);
     }
     let tab = ended.tab.as_ref();
+    let launch = crate::harness_host::take_last_launch(sid.as_str()).map(|mut launch| {
+        launch.argv = launch
+            .argv
+            .iter()
+            .map(|word| crate::survey::redact(word))
+            .collect();
+        launch
+    });
     Row {
         sid: sid.clone(),
         id: 0,
@@ -522,7 +532,7 @@ pub(crate) fn row_at_close(sid: &SessionId, ended: &Ended, at: &AtClose) -> Row 
             .is_some_and(|task| task.told.told_end(task.entered)),
         task,
         totals: tab.map(|tab| tab.totals.clone()).unwrap_or_default(),
-        launch: crate::harness_host::take_last_launch(sid.as_str()),
+        launch,
         trimmed: Vec::new(),
     }
 }
@@ -712,7 +722,8 @@ struct State {
 }
 
 impl State {
-    fn index(&mut self, head: RowHead) {
+    fn index(&mut self, mut head: RowHead) {
+        head.generation = Arc::new(());
         let key = head.sid.as_str().to_owned();
         if let Some(old) = self.heads.remove(&key) {
             self.order.remove(&(old.id, key.clone()));
@@ -783,6 +794,8 @@ enum Job {
     /// Write again each row still in hand, bring the folder's writes to disk, and answer whether
     /// every row is on disk.
     Flush(mpsc::Sender<bool>),
+    /// A loaded table runs a deferred sweep on its worker, never on the window's thread.
+    AfterLoad(Box<dyn FnOnce() + Send>),
 }
 
 /// The table's state, shared with its worker.
@@ -888,17 +901,17 @@ impl Shared {
             .unwrap_or(0);
         let low = |state: &State| -> Vec<String> {
             state
-                .heads
-                .values()
-                .filter(|head| head.id <= floor)
-                .map(|head| head.sid.as_str().to_owned())
+                .order
+                .iter()
+                .take_while(|(id, _)| *id <= floor)
+                .map(|(_, sid)| sid.clone())
                 .collect()
         };
         // The rows of these already on disk, read before the lock is taken.
         let read = low(&self.lock());
         let on_disk: HashMap<String, Row> = read
             .into_iter()
-            .filter_map(|sid| Some((sid.clone(), self.row(&SessionId::new(&sid))?)))
+            .filter_map(|sid| Some((sid.clone(), self.row(&sid)?)))
             .collect();
         let mut state = self.lock();
         state.last_id = state.last_id.max(floor);
@@ -938,26 +951,27 @@ impl Shared {
     /// Session `sid`'s row, whole: the one in hand, else its file. A row file the loaded index
     /// does not hold (another process on this state root wrote it since the load) is indexed as
     /// it is read; a head whose file went is dropped ([`Self::forget`]).
-    fn row(&self, sid: &SessionId) -> Option<Row> {
+    fn row(&self, sid: &str) -> Option<Row> {
         {
             let state = self.lock();
-            if state.dropping.contains(sid.as_str()) {
+            if state.dropping.contains(sid) {
                 return None;
             }
-            if let Some(row) = state.rows.get(sid.as_str()) {
+            if let Some(row) = state.rows.get(sid) {
                 return Some(row.clone());
             }
         }
-        let text = match std::fs::read_to_string(self.path_of(sid.as_str())?) {
+        let text = match std::fs::read_to_string(self.path_of(sid)?) {
             Ok(text) => text,
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    self.forget(sid.as_str());
+                    self.forget(sid);
                 }
                 return None;
             }
         };
-        let row = Row::decode(&text, self.tasks.as_deref()).filter(|row| row.sid == *sid)?;
+        let row =
+            Row::decode(&text, self.tasks.as_deref()).filter(|row| row.sid.as_str() == sid)?;
         self.adopt(&row, text.len());
         Some(row)
     }
@@ -981,18 +995,41 @@ impl Shared {
 
     /// Drop the head of `sid` where its file is gone though this process holds no write or
     /// removal of it: another process on this state root removed the row. A write of this
-    /// process's holds its row in hand until its rename landed ([`Self::write`]), so the file is
-    /// looked at under the lock.
+    /// process's holds its row in hand until its rename landed ([`Self::write`]). Stat outside
+    /// the lock and recheck the indexed generation before dropping it.
     fn forget(&self, sid: &str) {
         let Some(path) = self.path_of(sid) else {
             return;
         };
+        self.forget_if(sid, || !path.exists());
+    }
+
+    fn forget_if(&self, sid: &str, missing: impl FnOnce() -> bool) {
+        let eligible = |state: &State| {
+            state.loaded && !state.rows.contains_key(sid) && !state.dropping.contains(sid)
+        };
+        let generation = {
+            let state = self.lock();
+            if !eligible(&state) {
+                return;
+            }
+            state
+                .heads
+                .get(sid)
+                .map(|head| Arc::clone(&head.generation))
+        };
+        let Some(generation) = generation else {
+            return;
+        };
+        if !missing() {
+            return;
+        }
         let mut state = self.lock();
-        if state.loaded
-            && state.heads.contains_key(sid)
-            && !state.rows.contains_key(sid)
-            && !state.dropping.contains(sid)
-            && !path.exists()
+        if eligible(&state)
+            && state
+                .heads
+                .get(sid)
+                .is_some_and(|head| Arc::ptr_eq(&head.generation, &generation))
         {
             state.unindex(sid);
         }
@@ -1002,6 +1039,10 @@ impl Shared {
     /// row file it does not hold, and drop each head whose file went ([`Self::row`],
     /// [`Self::forget`]). Other processes on this state root write and remove rows there.
     fn refresh(&self) {
+        self.refresh_at(std::time::SystemTime::now());
+    }
+
+    fn refresh_at(&self, now: std::time::SystemTime) {
         let Some(dir) = self.dir.as_deref() else {
             return;
         };
@@ -1009,7 +1050,7 @@ impl Shared {
         // A folder whose time is recent is listed again even where it reads the same: a volume
         // with a coarse clock gives two changes within one tick the same time.
         let aged = moved
-            .and_then(|at| at.elapsed().ok())
+            .and_then(|at| now.duration_since(at).ok())
             .is_some_and(|age| age > MTIME_TICK);
         if aged && self.lock().listed == moved {
             return;
@@ -1045,12 +1086,12 @@ impl Shared {
             )
         };
         for sid in new {
-            let _ = self.row(&SessionId::new(&sid));
+            let _ = self.row(&sid);
         }
         for sid in went {
             self.forget(&sid);
         }
-        self.lock().listed = moved;
+        self.lock().listed = if aged { moved } else { None };
     }
 
     /// Put `row`, as `edit` changes it, in hand for the worker to write, keeping its id and its
@@ -1060,9 +1101,11 @@ impl Shared {
             return false;
         }
         let mut state = self.lock();
-        let Some(bytes) = state.heads.get(row.sid.as_str()).map(|head| head.bytes) else {
+        let Some(head) = state.heads.get(row.sid.as_str()) else {
             return false;
         };
+        row.id = head.id;
+        let bytes = head.bytes;
         state.index(row.head(bytes));
         state.rows.insert(row.sid.as_str().to_owned(), row);
         true
@@ -1093,11 +1136,10 @@ impl Shared {
                 .collect()
         };
         for (sid, told) in told {
-            let sid = SessionId::new(&sid);
             if let Some(row) = self.row(&sid)
                 && self.amend(row, Self::tells(told))
             {
-                self.write(sid.as_str());
+                self.write(&sid);
             }
         }
     }
@@ -1120,6 +1162,7 @@ impl Shared {
                 self.retain();
             }
             Job::Retain => self.retain(),
+            Job::AfterLoad(then) => then(),
             #[cfg(test)]
             Job::Drop(head) => self.drop_files(std::slice::from_ref(&head)),
             Job::Flush(ack) => {
@@ -1530,7 +1573,7 @@ impl SessionTable {
                 }
             }
         }
-        if let Some(row) = self.shared.row(sid)
+        if let Some(row) = self.shared.row(sid.as_str())
             && self.shared.amend(row, Shared::tells(told))
         {
             self.send(Job::Write(sid.as_str().to_owned()));
@@ -1554,8 +1597,8 @@ impl SessionTable {
         }
     }
 
-    /// Run `then` once the launch's load has ended: at once where it has, else on the table's
-    /// worker as the load ends. A one-shot sweep of the tasks directory goes through here, so it
+    /// Run `then` on the disk table's worker once its load has ended (inline for a memory table).
+    /// A one-shot sweep of the tasks directory goes through here, so it
     /// does not run while every result is held ([`ResultKeeps::holds`]) and keep for good what no
     /// row names.
     pub(crate) fn when_loaded(&self, then: impl FnOnce() + Send + 'static) {
@@ -1566,12 +1609,20 @@ impl SessionTable {
                 return;
             }
         }
-        then();
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(jobs) = jobs.as_mut() {
+            Shared::enqueue(jobs, Job::AfterLoad(Box::new(then)));
+        } else {
+            // With no state directory there is no disk-table worker. Tests use this memory
+            // table with a tasks directory; a real launch with no state keeps no task files.
+            drop(jobs);
+            then();
+        }
     }
 
     /// Session `sid`'s row, whole: the one in hand, else its file.
     pub(crate) fn row(&self, sid: &SessionId) -> Option<Row> {
-        self.shared.row(sid)
+        self.shared.row(sid.as_str())
     }
 
     /// Session `sid`'s head: the index's while its row is in hand or its file stands, else read
@@ -1623,8 +1674,23 @@ impl SessionTable {
     }
 
     /// Whether session `sid` has a row.
+    // Read only by `control::hosts_or_keeps` (unix), the fleet drive gate in
+    // `control::drive_admission` (`any(unix, test)`) and tests.
+    #[cfg(any(unix, test))]
     pub(crate) fn holds(&self, sid: &SessionId) -> bool {
         self.head(sid).is_some()
+    }
+
+    /// The tab IDs of the ended sessions whose rows this table indexes that begin `prefix`, for
+    /// a typed prefix of an ended tab's ID ([`crate::control`]'s request reading).
+    pub(crate) fn sids_beginning(&self, prefix: &str) -> Vec<String> {
+        self.shared
+            .lock()
+            .heads
+            .keys()
+            .filter(|sid| aterm_types::tab_id::is_tab_id(sid) && sid.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 
     /// Whether the launch's load ended within `wait`.
@@ -1703,11 +1769,18 @@ impl SessionTable {
     /// whose write failed, then bring the folder's renames to disk: the quit's last act on the
     /// table, and an update's before its process exits. Whether every row landed.
     pub(crate) fn flush(&self) -> bool {
+        self.flush_started()
+            .recv_timeout(FLUSH_WAIT)
+            .unwrap_or(false)
+    }
+
+    /// Queue the durability barrier without waiting on the window's thread.
+    pub(crate) fn flush_started(&self) -> mpsc::Receiver<bool> {
         let (ack, acked) = mpsc::channel();
-        if !self.send(Job::Flush(ack)) {
-            return true;
+        if !self.send(Job::Flush(ack.clone())) {
+            let _ = ack.send(true);
         }
-        acked.recv_timeout(FLUSH_WAIT).unwrap_or(false)
+        acked
     }
 }
 

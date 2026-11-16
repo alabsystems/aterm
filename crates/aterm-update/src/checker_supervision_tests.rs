@@ -85,25 +85,32 @@ fn a_wake_during_network_settling_remains_pending() {
             },
         );
         assert_eq!(seen.get(), 2, "settling cannot acknowledge a later post");
-        assert_eq!(wake.wait_past(seen.get(), Duration::ZERO), during_settle);
+        assert_eq!(wake.posts() != seen.get(), during_settle);
         assert_eq!(cadence.failures(), 0);
         assert!(failures.success().is_none());
         assert!(woke_at.is_some());
     }
 }
 
+/// The watchdog retires a checker inside its day-long wait on an armed wake (one leg for the
+/// day): the loop binds its wake to the watch, so the retirement nudges it out at once, and posts
+/// nothing.
+/// MUTANT: `run_checker` not binding its wake (`wake_on_retire`): the waiter sleeps out its day
+/// and the hang detector trips; a retirement that posts: the post count reads 1.
 #[test]
 fn a_checker_retired_inside_its_wait_exits_without_a_network_wake() {
     static WATCH: CheckerWatch = CheckerWatch::new();
     static WAKE: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
+    assert!(WAKE.arm());
     let generation = WATCH.register(1_000);
-    let retired = AtomicBool::new(false);
-    WAKE.set_network_probe(Box::new(move || {
-        if !retired.swap(true, Ordering::AcqRel) {
-            assert!(WATCH.supersede(generation).is_some());
-        }
-        false
-    }));
+    std::thread::spawn(move || {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the checker enters its wait",
+            || (!WAKE.legs().is_empty()).then_some(()),
+        );
+        assert!(WATCH.supersede(generation).is_some());
+    });
     let mut loop_args = args(Arc::new(|| Some(source())));
     loop_args.pause = Some(Duration::from_secs(86_400));
     loop_args.wake = &WAKE;

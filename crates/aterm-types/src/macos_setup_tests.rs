@@ -251,6 +251,23 @@ fn accessibility_is_needed_only_while_a_sign_out_is_managed() {
 }
 
 #[test]
+fn init_requires_confirmation_of_network_and_administrator_setup() {
+    assert_eq!(
+        Access::ALL
+            .into_iter()
+            .filter(|access| access.requires_confirmation())
+            .collect::<Vec<_>>(),
+        [
+            Access::LocalNetwork,
+            Access::NameRule,
+            Access::SpotlightScope,
+            Access::NetworkAuth,
+            Access::NetworkHelper,
+        ]
+    );
+}
+
+#[test]
 fn only_settled_rows_count_and_only_people_and_failures_draw_attention() {
     for standing in [
         Standing::InPlace,

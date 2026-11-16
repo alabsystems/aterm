@@ -2817,14 +2817,6 @@ type BehindFn = dyn Fn(&str, u64) -> Behind + Send + Sync;
 type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
 /// Type a text into a tab, the step's word back ([`Acts::disk_resume`]): `(sid, text)`.
 type DiskResumeFn = dyn Fn(&str, &str) -> String + Send + Sync;
-/// Type or release the `disk-free@v1` line owed a tab, the step's word back ([`Acts::disk_free`]):
-/// `(sid, owed, unfit, held)`, `unfit` naming why the session may not be asked, `held` what holds
-/// the line at this turn break ([`IdlePoint::held`]'s word, or [`LINE_HELD`] for a line the loop
-/// holds in custody: a wait, the line kept owed).
-type DiskFreeFn =
-    dyn Fn(&str, &crate::disk_board::AskOwed, AskWord, AskWord) -> String + Send + Sync;
-/// A word [`DiskFreeFn`] is handed: why a session may not be asked, or what holds its line.
-type AskWord = Option<&'static str>;
 /// A relaunch snapshot read ([`Acts::snapshot`]): the snapshot, or what its refusal says of the tab.
 type SnapshotFn = dyn Fn(&str) -> Result<Snapshot, SnapshotRefusal> + Send + Sync;
 type ScopedFn = dyn Fn(&str) -> Option<crate::harness_claim::Scoped> + Send + Sync;
@@ -3357,67 +3349,25 @@ pub(crate) enum HostNote {
         free_gib: u64,
         floor_gib: u64,
         hogs: Vec<String>,
-        /// What the ask to free space (`disk-free@v1`) did ([`disk_ask::owner_said`]).
-        asked: Option<String>,
     },
     /// A `[disk]` value aterm cannot read turns every removal off.
-    DiskLowCleanupOff {
-        free_gib: u64,
-        floor_gib: u64,
-        asked: Option<String>,
-    },
+    DiskLowCleanupOff { free_gib: u64, floor_gib: u64 },
     /// The volume is at or above the floor.
     DiskPlenty,
     /// `aterm.toml` does not say what the owner meant by a `[disk]` removal knob.
     DiskSettingsOff { notes: Vec<String> },
     /// A pass of the disk watch freed `bytes` (`went`: the largest of what went, each a line, biggest first).
     DiskFreed { bytes: u64, went: Vec<String> },
-    /// The HOME volume is full and only the owner can free it.
+    /// The home volume is at its emergency line and aterm's passes could free no more: one
+    /// record an episode, which asks no one to act.
     DiskFull {
         free: Option<u64>,
         freed: u64,
         hogs: Vec<String>,
         cause: crate::message_reporters::DiskFullCause,
-        thresholds: aterm_agent::harness::disk::Thresholds,
-        /// What the ask to free space (`disk-free@v1`) did ([`disk_ask::owner_said`]).
-        asked: Option<String>,
     },
-    /// The volume is back above the emergency line: the alert ends.
+    /// The volume is back above the emergency line: the episode ends.
     DiskFullOver,
-    /// The home volume is filling (the design's §8.5): a crossing of its `floor` is projected at
-    /// `rate_bps` in `eta_s`, or it is short, and `needed`: only its owner can still act now
-    /// ([`aterm_agent::harness::disk::ask::owner_needed`]). `projected_only`: a crossing is
-    /// projected and the volume is not short, which the `disk.filling` entry says. `said`: what
-    /// the asks and the worker did.
-    DiskFilling {
-        needed: bool,
-        projected_only: bool,
-        free: u64,
-        floor: u64,
-        rate_bps: Option<u64>,
-        eta_s: Option<i64>,
-        said: Option<String>,
-    },
-    /// No crossing is projected and the owner is not needed: the entry and the alert end.
-    DiskFillingOver,
-    /// Start the home volume's disk worker on the main thread with `task`, in `folder`
-    /// ([`aterm_agent::harness::disk::ask::worker_step`]); what the spawn did goes back to the
-    /// next disk look.
-    DiskWorker { task: String, folder: PathBuf },
-    /// The disk worker `sid` ran out of its time: its task fails `why=expired` and its Autopilot
-    /// goes Off, so Land types nothing more into it.
-    DiskWorkerExpired { sid: String },
-    /// A disk worker this process moved to over, either way, once: Messages keeps how it ended. It
-    /// has no `sid` where it never started; `volume` is the volume it ran for.
-    DiskWorkerOver {
-        sid: Option<String>,
-        volume: String,
-        why: String,
-        rose: u64,
-        target_met: Option<bool>,
-        removed: u64,
-        report: Vec<String>,
-    },
     /// Start a worker that claims `offer`, a free credit Claude Code offers the account of the
     /// supervised session `sid` (`[harness] claim_credits`, [`credit_claim::step`]): its try is
     /// already recorded.
@@ -3860,8 +3810,6 @@ pub(crate) struct Acts {
     pub(crate) notice_stands: Arc<NoticeStandsFn>,
     /// The disk resume ([`WorkerIdle::at_idle`]).
     pub(crate) disk_resume: Arc<DiskResumeFn>,
-    /// The ask to free disk space ([`WorkerIdle::at_idle`], `harness_disk_ask.rs`).
-    pub(crate) disk_free: Arc<DiskFreeFn>,
     /// The disk board the worker reads its session's episode from ([`disk_withholds`], [`disk_owed`]) and spends the resume on ([`disk_resume_stepped`]).
     pub(crate) disk_board: &'static Shelf,
     /// The jobs board the worker reads its agent's background calls from ([`WorkerIdle::background_jobs`], the stall canary's evidence).
@@ -6025,7 +5973,6 @@ impl IdleHost for WorkerIdle {
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some_and(|at| at <= Instant::now())
             || (self.on() && disk_owed(self.hooks.acts.disk_board, &self.sid).is_some())
-            || (self.on() && disk_ask_owed(self.hooks.acts.disk_board, &self.sid).is_some())
             || (self.on()
                 && host_carries_relaunch(self.agent)
                 && with_kept_of(&self.kept, |k| k.carry_asked))
@@ -6441,26 +6388,6 @@ impl IdleHost for WorkerIdle {
         Some((format!("upgrade step={step}"), kind))
     }
 
-    /// Whether a line of the ask to free space is owed this session, which its loop may offer at a
-    /// break of the agent's own background work ([`IdleHost::fact_owed`]).
-    fn fact_owed(&self) -> bool {
-        self.on()
-            && !self.beside()
-            && disk_ask_owed(self.hooks.acts.disk_board, &self.sid).is_some()
-    }
-
-    /// The ask's line at a settled break of the agent's own background work, where its turn is
-    /// over and only a shell or a monitor it left runs on ([`IdleHost::at_background_fact`]): the
-    /// same step as at an idle point ([`Self::disk_free_step`]), under the same guards. A session
-    /// whose turns end with its own background work still running (a manager awaiting its
-    /// workers) reads busy for hours, and its line would otherwise be handed on undelivered.
-    fn at_background_fact(&self, point: IdlePoint) -> Option<HostStep> {
-        if !self.on() || self.beside() || self.program_check_stuck() {
-            return None;
-        }
-        self.disk_free_step(point)
-    }
-
     /// The agent rests at a point its loop's guard withheld from this worker
     /// ([`IdleHost::at_withheld_point`]: a limit episode, a wall, the loop's own act in flight).
     fn at_withheld_point(&self, wake: bool) -> Option<String> {
@@ -6838,16 +6765,10 @@ impl IdleHost for WorkerIdle {
     }
 
     /// The loop decided a turn break, whether or not this worker wants a step there
-    /// ([`IdleHost::turn_break`]): the ask to free space (`disk-free@v1`) seats a session at
-    /// every disk look as its worker found it at its last turn break, so the finding is made here,
-    /// once per decided turn break, not only where a line is owed and the worker steps
-    /// ([`Self::idle_point`]). Otherwise a session found unfit once stayed unfit in every later
-    /// episode after it was fit again, and one never owed a line was never found unfit at all.
-    /// The finding reads the session's records ([`Self::disk_free_unfit`]), so the wait's later
-    /// looks at the same point, which would find the same, are not told.
-    fn turn_break(&self, theirs: Option<Guard>) {
+    /// ([`IdleHost::turn_break`]): the look at the session's work is made here, once per decided
+    /// turn break; the wait's later looks at the same point are not told.
+    fn turn_break(&self, _theirs: Option<Guard>) {
         if self.on() {
-            self.disk_ask_found(theirs);
             self.work_look(WorkLook::Break, Instant::now());
         }
     }
@@ -6861,11 +6782,8 @@ impl IdleHost for WorkerIdle {
         self.credit_claim_step();
     }
 
-    /// The usage tap at a busy read, once per [`BUSY_TAP_S`] at most. The session works again,
-    /// so what its last turn break found of it (`finished`, `taskless`) no longer bars the ask to
-    /// free space from seating it ([`disk_ask_busy`]).
+    /// The usage tap at a busy read, once per [`BUSY_TAP_S`] at most.
     fn busy_tap(&self) {
-        disk_ask_busy(self.hooks.acts.disk_board, &self.sid);
         if let Some(word) = self.tap_step(TapAt::Busy) {
             aterm_log::info!("harness @{}: usage tap mid-turn: {word}", self.sid);
         }
@@ -7112,41 +7030,13 @@ impl IdleHost for WorkerIdle {
                 k.account.lagged = 0;
             }
         });
-        // The episode's wall is published as the loop dates it ([`IdleHost::limit_wall`], told
-        // right after this), and taken down with the episode.
-        if !open {
-            disk_ask_walled(self.hooks.acts.disk_board, &self.sid, None);
-        }
-    }
-
-    /// The loop's open limit episode holds its wall to `reset_unix` ([`IdleHost::limit_wall`]),
-    /// told as it opens and whenever a later notice moves it: the ask to free space holds the
-    /// session out of its seats, and waits for it rather than running out, until the wall is
-    /// spent where the loop takes it so, that reset plus the loop's grace
-    /// ([`crate::disk_board::Board::walls`]). Where the loop knows no reset, the transcript's
-    /// dates it, as the loop's own judgement falls back to it; with neither, the wall holds until
-    /// the episode closes.
-    fn limit_wall(&self, reset_unix: Option<i64>) {
-        let reset = reset_unix.or_else(|| self.limit_until().and_then(|r| i64::try_from(r).ok()));
-        let grace =
-            i64::try_from(aterm_agent::harness::upgrade_drive::LIMIT_GRACE_S).unwrap_or(i64::MAX);
-        let wall = crate::disk_board::Wall {
-            until_s: reset.map(|r| r.saturating_add(grace)),
-        };
-        disk_ask_walled(self.hooks.acts.disk_board, &self.sid, Some(wall));
     }
 
     /// The lasting withhold the loop's last decided turn break holds the session at
-    /// ([`IdleHost::lasting_hold`]): the ask to free space holds the session out of its seats
-    /// while it stands ([`crate::disk_board::Board::withholds`]), as it does at a usage-limit wall.
+    /// ([`IdleHost::lasting_hold`]): a sign-in wall is recorded for the agent that keeps its
+    /// account by its own store's login ([`Self::note_muse_wall`]).
     fn lasting_hold(&self, hold: Option<aterm_agent::supervise::Lasting>) {
         use aterm_agent::supervise::Lasting;
-        let withhold = hold.map(|hold| match hold {
-            Lasting::Credits { lifts_unix } => crate::disk_board::Withhold::Credits {
-                until_s: lifts_unix,
-            },
-            Lasting::Wall { wire } => crate::disk_board::Withhold::Wall { wire },
-        });
         // Muse Code alone keeps its account by the login its own store names; the pooled CLIs'
         // sign-in walls reach their rows through the accounts' own upkeep.
         let records_its_wall = match self.agent {
@@ -7166,7 +7056,6 @@ impl IdleHost for WorkerIdle {
         {
             self.note_muse_wall();
         }
-        disk_ask_withheld(self.hooks.acts.disk_board, &self.sid, withhold);
     }
 
     /// The loop's next try ([`IdleHost::waiting`]), told to the window, which shows it beside an
@@ -7719,10 +7608,8 @@ impl IdleHost for WorkerIdle {
         });
     }
 
-    /// This session's limit ended with no sign-in that took ([`IdleHost::limit_over`]): its
-    /// wall holds it from the ask to free space no more.
+    /// This session's limit ended with no sign-in that took ([`IdleHost::limit_over`]).
     fn limit_over(&self) {
-        disk_ask_walled(self.hooks.acts.disk_board, &self.sid, None);
         (self.hooks.note)(HostNote::LimitOver {
             sid: self.sid.clone(),
         });
@@ -8871,18 +8758,6 @@ impl WorkerIdle {
                 });
             }
         }
-        // Whether the ask to free space may seat this session, as of this turn break: the look
-        // nominates none the board names unfit, and one owed a line is released, at no
-        // election's cost. A session the loop's own guards hold for someone else for as long as
-        // they keep it (the person's own exchange, a manager's wait: `IdlePoint::theirs`) is
-        // unfit too, as no later turn break of theirs would take the line; one a person's grace
-        // alone holds keeps its line owed for a later turn break, as the occupancy door's does.
-        // The loop told the finding at the turn break's decision, before it asked whether this
-        // worker wants a step there ([`IdleHost::turn_break`]); it is made again as the act reads
-        // it, as the line may come owed at a later look of the wait.
-        if let Some(step) = self.disk_free_step(point) {
-            return Some(step);
-        }
         laps::lap("disk");
         if with_kept_of(&self.kept, |k| k.account.reset_owed.is_some())
             && let Some(seat) = (self.hooks.acts.account_seat)()
@@ -8914,38 +8789,6 @@ impl WorkerIdle {
                 typed: None,
                 repeat: false,
             })
-        })
-    }
-
-    /// The ask to free space's step at a turn break `point` describes: an idle point
-    /// ([`Self::idle_point`]) or a break of the agent's own background work where its turn is over
-    /// ([`IdleHost::at_background_fact`]). The finding is made first ([`Self::disk_ask_found`]),
-    /// then a line owed is stepped ([`Acts::disk_free`]), held by the loop's guards and by a line
-    /// it holds in custody ([`LINE_HELD`]); `Some` where it was typed.
-    fn disk_free_step(&self, point: IdlePoint) -> Option<HostStep> {
-        let unfit = self.disk_ask_found(point.theirs);
-        let owed = disk_ask_owed(self.hooks.acts.disk_board, &self.sid)?;
-        let held = point
-            .held
-            .map(Guard::word)
-            .or_else(|| point.line_held.map(|_| LINE_HELD));
-        let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit, held);
-        if !step.starts_with("wait:") {
-            disk_ask_stepped(self.hooks.acts.disk_board, &self.sid);
-        }
-        aterm_log::info!(
-            "harness @{}: {} step={step}",
-            self.sid,
-            aterm_agent::harness::disk::ask::RULE_DISK_FREE
-        );
-        (step == "typed").then(|| HostStep {
-            line: format!(
-                "{} step={step}",
-                aterm_agent::harness::disk::ask::RULE_DISK_FREE
-            ),
-            moved: true,
-            typed: Some(aterm_agent::supervise::policy::turn_end::HostTurn::Fact),
-            repeat: false,
         })
     }
 
@@ -9568,33 +9411,6 @@ impl WorkerIdle {
             | credit_claim::Stepped::Covered
             | credit_claim::Stepped::NothingDue => {}
         }
-    }
-
-    /// Why the session may not be asked to free disk space (`disk-free@v1`): its Autopilot is
-    /// off, its task finished or landed, or nobody gave it one. Landing is no bar: a landing
-    /// session still works in its checkout.
-    fn disk_free_unfit(&self) -> Option<&'static str> {
-        if self.autopilot() == Autopilot::Off {
-            Some("autopilot-off")
-        } else if self.finished() == Some(true) {
-            Some("finished")
-        } else if self.taskless() {
-            Some("taskless")
-        } else {
-            None
-        }
-    }
-
-    /// Why the ask to free space may not seat this session as of the turn break it rests at
-    /// ([`Self::disk_free_unfit`], or `theirs`: the person's own exchange or a manager's wait,
-    /// [`IdlePoint::theirs`]), written to the board every disk look reads ([`disk_ask_fit`]).
-    fn disk_ask_found(&self, theirs: Option<Guard>) -> Option<&'static str> {
-        let found = crate::disk_board::Unfit {
-            own: self.disk_free_unfit(),
-            theirs: theirs.map(Guard::word),
-        };
-        disk_ask_fit(self.hooks.acts.disk_board, &self.sid, found);
-        found.bars(false)
     }
 
     /// Why the disk resume is owed no longer, by the gates a continuation keeps.
@@ -12556,6 +12372,8 @@ pub(crate) fn take_last_launch(sid: &str) -> Option<crate::restore::AgentRestore
 
 /// One row of a seamless update's last launches (`SessionHandoff::last_launches`): session
 /// `sid` on its first line, and `launch` after it as the layout writes an agent's.
+// Read only by [`last_launch_rows`] (`any(unix, test)`) and the unix-only seamless tests.
+#[cfg(any(unix, test))]
 pub(crate) fn last_launch_row(sid: &str, launch: &crate::restore::AgentRestore) -> Option<String> {
     let launch = aterm_toml::to_string(launch).ok()?;
     Some(format!("{sid}\n{launch}"))
@@ -12574,6 +12392,8 @@ pub(crate) fn read_last_launch_row(row: &str) -> Option<(String, crate::restore:
 /// The rows of [`LAST_LAUNCH`] of sessions `sids`, for a seamless update's manifest to carry
 /// ([`last_launch_row`]): the successor keeps them ([`adopt_last_launches`]), so a session that
 /// ends there keeps in its row the launch of an agent that exited here.
+// Read only by `SessionHandoff::from_store` (`any(unix, test)`).
+#[cfg(any(unix, test))]
 pub(crate) fn last_launch_rows<'a>(sids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let last = LAST_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(last) = last.as_ref() else {
@@ -15282,16 +15102,6 @@ const _: () = {
     assert!(
         lost_mib(DISK_FIRST_LOOK) < margin_mib,
         "the first disk look loses more than a pass's margin above the floor"
-    );
-    // A look takes over what an ended host left of its sessions as it begins, before its pass
-    // (`disk_ask::before_pass`), so the pass's own time, which can outlast a tick, is not
-    // counted here: a successor's first look begins `DISK_FIRST_LOOK` after it starts, and a
-    // take-over a contended lease lock skipped there is made at the step after that pass.
-    assert!(
-        (DISK_FIRST_LOOK.as_millis() + DISK_TICK.as_millis())
-            <= aterm_agent::harness::disk::ask::ADOPT_MS as u128,
-        "a seamless update's successor begins a look, and takes its sessions' pick over, before \
-         other hosts hand it on (disk-free@v1)"
     );
 };
 /// The startup deadline ([`look_at_startups`]).
@@ -21282,7 +21092,7 @@ fn board_sessions(store: &Store, sids: &[String]) -> Vec<(u64, String)> {
     let guard = store.read().unwrap_or_else(PoisonError::into_inner);
     sids.iter()
         .filter_map(|sid| {
-            let h = guard.by_sid(&aterm_session::SessionId::new(sid))?;
+            let h = guard.by_sid(&aterm_session::SessionId::parse(sid)?)?;
             Some((h.local_id, sid.clone()))
         })
         .collect()
@@ -21291,7 +21101,7 @@ fn board_sessions(store: &Store, sids: &[String]) -> Vec<(u64, String)> {
 /// The process group `sid`'s program is published for (`None`: no such session, or none resolved yet).
 fn foreground_of(store: &Store, sid: &str) -> Option<i64> {
     let guard = store.read().unwrap_or_else(PoisonError::into_inner);
-    let h = guard.by_sid(&aterm_session::SessionId::new(sid))?;
+    let h = guard.by_sid(&aterm_session::SessionId::parse(sid)?)?;
     let pgid = h
         .ctx
         .timeline
@@ -21307,7 +21117,7 @@ pub(crate) fn offered_now(store: &Store, sid: &str) -> Option<bool> {
     let ctx = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .map(|h| Arc::clone(&h.ctx))?;
     let leader = ctx
         .timeline
@@ -21324,7 +21134,7 @@ fn scoped_now(store: &Store, sid: &str) -> Option<crate::harness_claim::Scoped> 
     store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .and_then(|h| {
             h.ctx
                 .meta
@@ -21346,12 +21156,13 @@ fn scoped_restart_now(
     account: Option<&accounts_pool::LoginEnv>,
     model: Option<&str>,
 ) -> bool {
-    let Some(ctx) = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx))
-    else {
+    let Some(ctx) = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx))
+    }) else {
         return false;
     };
     let Some(before) = scoped_now(store, sid) else {
@@ -21419,11 +21230,13 @@ fn reprove_claims_now(store: &Store) {
 
 /// [`Acts::self_idle`], live.
 fn self_idle_now(store: &Store, sid: &str, pid: u32, start: &str) -> bool {
-    let ctx = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx));
+    let ctx = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx))
+    });
     ctx.is_some_and(|ctx| crate::self_claim::idle_now(&ctx, pid, start))
 }
 
@@ -21431,7 +21244,7 @@ fn self_copy_now(store: &Store, sid: &str) -> Option<self_claimed::Copy> {
     let ctx = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .map(|h| Arc::clone(&h.ctx))?;
     crate::self_claim::live_copy(&ctx)
 }
@@ -21441,7 +21254,7 @@ fn launch_of(store: &Store, sid: &str) -> Option<i64> {
     let h = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .cloned()?;
     let started = h.ctx.launch.started()?;
     (h.ctx.human_input.seq() == started.seq)
@@ -21455,7 +21268,7 @@ fn holds(store: &Store, sid: &str, group: i32) -> Option<bool> {
     let h = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .cloned()?;
     if h.state == SessionState::Exited {
         return Some(false);
@@ -21487,7 +21300,7 @@ fn end_asked(store: &Store, sid: &str, group: i32, began_wall_ms: Option<u64>) -
     let h = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .cloned()?;
     end_asked_of(&h.ctx, group, began_wall_ms)
 }
@@ -21532,7 +21345,7 @@ fn driven(store: &Store, sid: &str) -> Option<u64> {
     let h = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .cloned()?;
     h.ctx
         .typed
@@ -21542,8 +21355,8 @@ fn driven(store: &Store, sid: &str) -> Option<u64> {
 /// Whether `sid` is still open (not closed, not exited).
 fn open(store: &Store, sid: &str) -> bool {
     let guard = store.read().unwrap_or_else(PoisonError::into_inner);
-    guard
-        .by_sid(&aterm_session::SessionId::new(sid))
+    aterm_session::SessionId::parse(sid)
+        .and_then(|id| guard.by_sid(&id))
         .is_some_and(|h| h.state != SessionState::Exited)
 }
 
@@ -21556,7 +21369,7 @@ fn still_wanted(store: &Store, sid: &str, group: i32) -> bool {
 fn still_supervisable(store: &Store, sid: &str) -> bool {
     let ctx = {
         let guard = store.read().unwrap_or_else(PoisonError::into_inner);
-        let Some(h) = guard.by_sid(&aterm_session::SessionId::new(sid)) else {
+        let Some(h) = aterm_session::SessionId::parse(sid).and_then(|id| guard.by_sid(&id)) else {
             return false;
         };
         if h.state == SessionState::Exited {
@@ -21582,13 +21395,15 @@ const NO_HOST_SLEEP: &str = "none";
 fn hosted_body(sock: &str, store: &Store, job: &WorkerJob) -> BodyEnd {
     let mut ctl = HostCtl::as_harness(Endpoint::Socket(sock.to_string()));
     let activity_store = store.clone();
-    let activity_sid = aterm_session::SessionId::new(&job.sid);
+    let activity_sid = aterm_session::SessionId::parse(&job.sid);
     ctl.continuation = Some(Arc::new(move |reason, wait_ms| {
-        let ctx = activity_store
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .by_sid(&activity_sid)
-            .map(|s| Arc::clone(&s.ctx));
+        let ctx = activity_sid.as_ref().and_then(|id| {
+            activity_store
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .by_sid(id)
+                .map(|s| Arc::clone(&s.ctx))
+        });
         if let Some(ctx) = ctx {
             let native = ctx
                 .meta
@@ -21805,8 +21620,6 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let fact_store = store.clone();
     let resume_sock = sock.clone();
     let disk_store = store.clone();
-    let free_sock = sock.clone();
-    let free_store = store.clone();
     let left_store = store.clone();
     let home = aterm_primer::home_dir();
     let place = home.clone().zip(harness_state());
@@ -21941,9 +21754,6 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
                     aterm_agent::harness::agent_image::Lane::DiskResume,
                 ),
             )
-        }),
-        disk_free: Arc::new(move |sid, owed, unfit, held| {
-            disk_ask::act(&free_store, &free_sock, sid, owed, unfit, held)
         }),
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
@@ -22241,11 +22051,13 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
                 // Every other restart re-applies the login its process had; the tap's logins
                 // ride in `o.usage_tap` (`tap::Armed::lone_for`), as every relaunch line's do.
                 Restart::Memory => {
-                    let ctx = restart_store
-                        .read()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .by_sid(&aterm_session::SessionId::new(sid))
-                        .map(|handle| Arc::clone(&handle.ctx));
+                    let ctx = aterm_session::SessionId::parse(sid).and_then(|id| {
+                        restart_store
+                            .read()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .by_sid(&id)
+                            .map(|handle| Arc::clone(&handle.ctx))
+                    });
                     let Some(ctx) = ctx else {
                         return RestartSaid::step("wait:session-ended");
                     };
@@ -22313,7 +22125,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
             let handle = exit_owner_store
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
-                .by_sid(&aterm_session::SessionId::new(sid))
+                .by_sid(&aterm_session::SessionId::parse(sid)?)
                 .cloned()?;
             Some(task_exit::publish(
                 &handle.ctx,
@@ -22740,12 +22552,13 @@ fn work_read_live(
 /// directory ([`work_read_live`]).
 fn session_folders(store: &Store, sid: &str) -> (Option<PathBuf>, Option<PathBuf>) {
     use crate::cwd_native::ReportedCwd as _;
-    let Some(h) = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .cloned()
-    else {
+    let Some(h) = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .cloned()
+    }) else {
         return (None, None);
     };
     let rollout = h
@@ -22778,12 +22591,13 @@ fn work_put_live(
     group: i32,
     record: Option<aterm_agent::harness::work_record::WorkRecord>,
 ) {
-    let Some(h) = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .cloned()
-    else {
+    let Some(h) = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .cloned()
+    }) else {
         return;
     };
     let record = record.map(|record| aterm_agent::harness::work_record::WorkRecord {
@@ -23164,12 +22978,13 @@ fn task_fact_live(
     sid: &str,
     word: Option<aterm_agent::supervise::occupancy::FactWord>,
 ) -> aterm_agent::supervise::occupancy::NoteOutcome {
-    let Some(h) = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .cloned()
-    else {
+    let Some(h) = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .cloned()
+    }) else {
         return aterm_agent::supervise::occupancy::NoteOutcome::NoTask;
     };
     let fence = h.ctx.fabric.fence_wait();
@@ -23214,7 +23029,7 @@ fn startup_mark_named(
     let h = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .cloned()?;
     let said = match mark {
         StartupMark::Stalled { hold }
@@ -26378,7 +26193,7 @@ fn screen_account_wall(store: &Store, sid: &str, snap: &Snapshot) -> Option<Scre
     let handle = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))?
+        .by_sid(&aterm_session::SessionId::parse(sid)?)?
         .clone();
     let term = handle.term.try_lock().ok()?;
     if term.frame_unfinished_at(Instant::now()) {
@@ -27388,7 +27203,7 @@ static DISK_POKED: AtomicBool = AtomicBool::new(false);
 fn screen_rows_now(store: &Store, sid: &str) -> Option<Vec<String>> {
     let handle = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
-        g.by_sid(&aterm_session::SessionId::new(sid))?.clone()
+        g.by_sid(&aterm_session::SessionId::parse(sid)?)?.clone()
     };
     let t = handle.term.try_lock().ok()?;
     let rows = usize::from(t.rows());
@@ -27406,7 +27221,7 @@ fn screen_rows_now(store: &Store, sid: &str) -> Option<Vec<String>> {
 pub(crate) fn live_screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
     let handle = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
-        g.by_sid(&aterm_session::SessionId::new(sid))?.clone()
+        g.by_sid(&aterm_session::SessionId::parse(sid)?)?.clone()
     };
     let t = crate::term_lock_whole_when(
         &handle.term,
@@ -27530,15 +27345,17 @@ fn disk_tabs_busy(busy: &[u64]) -> Option<String> {
     })
 }
 
-/// The look's remover ([`disk_look`]'s one).
-fn disk_remover(
+/// The look's remover ([`disk_look_pass`]'s one, a budget page's and an entry-bound look's),
+/// over the harness state folder `state`, whose first-run holds it keeps.
+fn disk_remover<'a>(
     judge: aterm_agent::harness::disk::Judge,
-    store: &Store,
+    state: &'a Path,
+    store: &'a Store,
 ) -> impl FnMut(&aterm_agent::harness::disk::Row) -> std::io::Result<aterm_agent::harness::disk::Removed>
-+ '_ {
++ 'a {
     aterm_agent::harness::disk::remover(
         judge,
-        harness_state().map(|state| aterm_agent::harness::first_exec::holds_dir(&state)),
+        Some(aterm_agent::harness::first_exec::holds_dir(state)),
         move || disk_sessions_now(store),
     )
 }
@@ -27563,7 +27380,7 @@ fn working_dirs(store: &Store, sids: &[String]) -> Vec<std::path::PathBuf> {
     let handles: Vec<_> = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
         sids.iter()
-            .filter_map(|sid| g.by_sid(&aterm_session::SessionId::new(sid)).cloned())
+            .filter_map(|sid| g.by_sid(&aterm_session::SessionId::parse(sid)?).cloned())
             .collect()
     };
     let mut dirs: Vec<std::path::PathBuf> = handles
@@ -27679,8 +27496,9 @@ static DISK_PRIVATE_SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 static DISK_BUDGET_BEGAN: Mutex<Option<i64>> = Mutex::new(None);
 /// Whether this process read the record of the last sizing yet ([`disk_budget_record`]).
 static DISK_BUDGET_READ: AtomicBool = AtomicBool::new(false);
-/// Whether a sizing, or a page of the budget's pass, runs on its thread now
-/// ([`disk_budget_look`], [`disk_budget_spawn`]): one at a time.
+/// Whether a sizing, a page of the budget's pass or a look of the entry-bound pass runs on its
+/// thread now ([`disk_budget_look`], [`disk_budget_spawn`], [`disk_bound_spawn`]): one at a
+/// time.
 static DISK_BUDGET_SIZING: AtomicBool = AtomicBool::new(false);
 /// The last sizing this process knows of ([`disk_budget_known`]): what a look reads to tell
 /// whether the volume is over its cap, neither the record each minute nor the board, which no
@@ -27707,40 +27525,54 @@ static DISK_BUDGET_RUN: Mutex<DiskBudgetRun> = Mutex::new(DiskBudgetRun {
 /// removal ([`DiskBudgetHold::lock_for`]) and reads no measure while it stands, so it stops
 /// before its next removal.
 static DISK_BUDGET_YIELD: AtomicBool = AtomicBool::new(false);
-/// The page a look prepared ([`disk_budget_pass_look`]), started once that look's ask step let
-/// its pass lock go ([`disk_budget_spawn`]): a page started while the look held the lock would
-/// find it held and stand down.
+/// The page a look prepared ([`disk_budget_pass_look`]), started once that look's pass let its
+/// pass lock go ([`disk_budget_spawn`]): a page started while the look held the lock would find
+/// it held and stand down.
 static DISK_BUDGET_NEXT: Mutex<Option<DiskBudgetPage>> = Mutex::new(None);
-/// Whether a budget page runs on its thread now: no look adopts [`DISK_BUDGET_DONE`] meanwhile,
-/// as the page may take that lock back before its next removal.
-static DISK_BUDGET_PAGE: AtomicBool = AtomicBool::new(false);
-/// The pass lock a budget page ran under, and the bytes it freed under it that no look has yet
-/// taken for the ask's step: the next look that runs while no page does adopts both
-/// ([`disk_look_pass`]), so another instance's look reads a pass running until the step has
-/// recorded them.
-struct DiskBudgetDone {
-    lock: aterm_agent::harness::disk::reserve::PassLock,
-    freed: u64,
-}
-static DISK_BUDGET_DONE: Mutex<Option<DiskBudgetDone>> = Mutex::new(None);
+/// When this process last started a look of the entry-bound pass, unix seconds
+/// ([`disk_bound_spawn`]): one an hour ([`disk_bound_due`]).
+static DISK_BOUND_BEGAN: Mutex<Option<i64>> = Mutex::new(None);
+/// The look of the entry-bound pass a look prepared ([`disk_bound_look`]), started where a
+/// budget page is ([`disk_budget_spawn`]) at a look that prepared none.
+static DISK_BOUND_NEXT: Mutex<Option<DiskBoundPage>> = Mutex::new(None);
+/// The discovery cursor of its own the entry-bound pass's looks advance ([`disk_bound_page`]).
+static DISK_BOUND_CURSOR: Mutex<aterm_agent::harness::disk::discover::Cursor> =
+    Mutex::new(aterm_agent::harness::disk::discover::Cursor::new());
+/// A look that admits no entry-bound pass stands: a pressure pass is due at it, an agent's
+/// demand or a fill projection stands, or removal is off
+/// (`aterm_agent::harness::disk::budget::bound_admitted`). An entry-bound look asks it before
+/// its removal, each removal of a build cache's sweep and its rows
+/// ([`DiskBudgetHold::lock_for`]), so it stops before the next.
+static DISK_BOUND_YIELD: AtomicBool = AtomicBool::new(false);
 
-/// The pass lock a budget page holds, and what it freed under it ([`disk_budget_page`]): taken
-/// before the page's first removal and not before ([`Self::lock_for`]), so a page that walks
-/// and finds nothing to take holds no lock while it walks, and parked at the page's end for the
-/// next look ([`Self::park`]).
+/// The pass lock a budget page holds ([`disk_budget_page`]): taken before the page's first
+/// removal and not before ([`Self::lock_for`]), so a page that walks and finds nothing to take
+/// holds no lock while it walks, and let go as the page ends, so no pass of this instance or
+/// another waits on a page that is over. A look of the entry-bound pass holds it the same way
+/// ([`disk_bound_page`], `bound`).
 #[derive(Default)]
 struct DiskBudgetHold {
     lock: Option<aterm_agent::harness::disk::reserve::PassLock>,
-    freed: u64,
+    /// The entry-bound pass holds it: the look that stops it is one that admits no entry-bound
+    /// pass ([`DISK_BOUND_YIELD`]), which the budget's cap does not decide.
+    bound: bool,
 }
 
 impl DiskBudgetHold {
     /// Hold the pass lock at `path` for the removal about to be made: refused while a look that
-    /// admits no budget pass stands ([`DISK_BUDGET_YIELD`]), else the one this page holds, one
-    /// an earlier page parked that no look adopted ([`DISK_BUDGET_DONE`], with what it freed), or
+    /// admits no budget pass stands ([`DISK_BUDGET_YIELD`]; for the entry-bound pass, one that
+    /// admits no entry-bound pass, [`DISK_BOUND_YIELD`]), else the one this page holds, or
     /// one taken now. `Err` says why not, and the removal is not made.
     fn lock_for(&mut self, path: &Path) -> Result<(), String> {
-        if DISK_BUDGET_YIELD.load(Ordering::SeqCst) {
+        if self.bound {
+            if DISK_BOUND_YIELD.load(Ordering::SeqCst) {
+                return Err(
+                    "a look that admits no entry-bound pass stands (a pressure pass due, an \
+                     agent's demand, a fill projection, or removal off)"
+                        .to_owned(),
+                );
+            }
+        } else if DISK_BUDGET_YIELD.load(Ordering::SeqCst) {
             return Err(
                 "a look that admits no budget pass stands (a pressure pass due, an agent's \
                  demand, a fill projection, or the budget off)"
@@ -27748,15 +27580,6 @@ impl DiskBudgetHold {
             );
         }
         if self.lock.is_some() {
-            return Ok(());
-        }
-        let parked = DISK_BUDGET_DONE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(done) = parked {
-            self.lock = Some(done.lock);
-            self.credit(done.freed);
             return Ok(());
         }
         match aterm_agent::harness::disk::reserve::take_pass(path) {
@@ -27769,24 +27592,6 @@ impl DiskBudgetHold {
                 "the pass lock {} could not be taken: {e}",
                 path.display()
             )),
-        }
-    }
-
-    /// `bytes` freed under the lock.
-    fn credit(&mut self, bytes: u64) {
-        self.freed = self.freed.saturating_add(bytes);
-    }
-
-    /// The lock, and what was freed under it, for the next look to adopt ([`DISK_BUDGET_DONE`]);
-    /// nothing where the page took no lock.
-    fn park(self) {
-        if let Some(lock) = self.lock {
-            *DISK_BUDGET_DONE
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(DiskBudgetDone {
-                lock,
-                freed: self.freed,
-            });
         }
     }
 }
@@ -27992,7 +27797,7 @@ struct DiskBudgetPage {
 /// (`aterm_agent::harness::disk::budget::pass_admitted`), the last sizing reads the home volume
 /// over its cap (`budget::over`), the run has a page left for that sizing (`budget::Run`), and
 /// no sizing or page runs now: [`disk_look`] starts it on a thread of its own once the look's
-/// ask step is done ([`disk_budget_spawn`]). [`disk_look_pass`] calls it from a look that runs
+/// pass has returned ([`disk_budget_spawn`]). [`disk_look_pass`] calls it from a look that runs
 /// no pressure pass.
 fn disk_budget_pass_look(at: &DiskBudgetAt<'_>) {
     use aterm_agent::harness::disk::budget;
@@ -28050,21 +27855,143 @@ fn disk_budget_pass_look(at: &DiskBudgetAt<'_>) {
         .unwrap_or_else(PoisonError::into_inner) = Some(job);
 }
 
+/// One look of the entry-bound pass, as its thread runs it ([`disk_bound_page`]).
+struct DiskBoundPage {
+    state: PathBuf,
+    home: PathBuf,
+    table: aterm_sysprobe::volumes::Table,
+    cwds: Vec<PathBuf>,
+    agents: Vec<u32>,
+    store: Store,
+    config: aterm_agent::harness::disk::Config,
+    room: Option<u64>,
+    now: i64,
+    key: aterm_sysprobe::volumes::VolumeKey,
+}
+
+/// What a look read that decides whether it prepares a look of the entry-bound pass
+/// ([`disk_bound_due`]).
+#[derive(Debug, Clone, Copy)]
+struct DiskBoundAsk {
+    /// This process is the account's own disk watch.
+    owner: bool,
+    /// An agent's demand stands.
+    demand: bool,
+    /// A fill projection stands.
+    projected: bool,
+    /// `[disk] auto_free_gib`: 0 turns every removal off.
+    auto_free_gib: u64,
+    /// The look named its volume and read its free space.
+    measured: bool,
+    /// A sizing, a budget page or an entry-bound look runs now, or this look prepared a budget
+    /// page: the three walk the same trees, so never at once.
+    busy: bool,
+}
+
+/// Whether a look at unix second `now` prepares a look of the entry-bound pass: it admits one
+/// (`aterm_agent::harness::disk::budget::bound_admitted`: at any `disk=` level, the budget off
+/// too) on a volume it measured, nothing that walks the same trees runs or was prepared, and
+/// an hour has passed since this process started the last (`began`, `budget::due`).
+fn disk_bound_due(ask: DiskBoundAsk, began: Option<i64>, now: i64) -> bool {
+    use aterm_agent::harness::disk::budget;
+    budget::bound_admitted(ask.owner, ask.demand, ask.projected, ask.auto_free_gib)
+        && ask.measured
+        && !ask.busy
+        && budget::due(began, now)
+}
+
+/// Prepare one look of the entry-bound pass ([`disk_bound_page`]) where one is due
+/// ([`disk_bound_due`]): [`disk_look`] starts it on a thread of its own once the look's ask step
+/// is done ([`disk_budget_spawn`]). [`disk_look_pass`] calls it after
+/// [`disk_budget_pass_look`], from a look that runs no pressure pass: a budget page goes first.
+fn disk_bound_look(at: &DiskBudgetAt<'_>) {
+    let busy = DISK_BUDGET_SIZING.load(Ordering::SeqCst)
+        || DISK_BUDGET_NEXT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+    let began = *DISK_BOUND_BEGAN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let ask = DiskBoundAsk {
+        owner: at.owner,
+        demand: at.demand,
+        projected: at.projected,
+        auto_free_gib: at.config.auto_free_gib,
+        measured: at.key.is_some() && at.free.is_some(),
+        busy,
+    };
+    let Some(key) = at.key.filter(|_| disk_bound_due(ask, began, at.now)) else {
+        return;
+    };
+    let job = DiskBoundPage {
+        state: at.state.to_path_buf(),
+        home: at.home.to_path_buf(),
+        table: at.table.clone(),
+        cwds: at.cwds.to_vec(),
+        agents: at.agents.to_vec(),
+        store: Arc::clone(at.store),
+        config: at.config,
+        room: at.room,
+        now: at.now,
+        key: key.clone(),
+    };
+    *DISK_BOUND_NEXT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(job);
+}
+
+/// Start the look of the entry-bound pass a look prepared ([`disk_bound_look`]) on a thread of
+/// its own ([`disk_bound_page`]), under the flag a budget page runs under: one sizing, budget
+/// page or entry-bound look at a time. The hour is counted from here ([`DISK_BOUND_BEGAN`]): a look that stands down, is cut short or
+/// cannot start waits it, and one dropped before it got here is prepared again at the next
+/// look.
+fn disk_bound_spawn(job: DiskBoundPage) {
+    if DISK_BUDGET_SIZING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    *DISK_BOUND_BEGAN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(job.now);
+    let spawned = std::thread::Builder::new()
+        .name(format!("{THREAD_PREFIX}disk-bound"))
+        .spawn(move || {
+            let _quiet = aterm_sysprobe::quiet_errors();
+            let _ = caught(
+                "the entry-bound pass",
+                "it runs again within the hour",
+                || disk_bound_page(&job),
+            );
+            DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
+        });
+    if let Err(e) = spawned {
+        DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
+        aterm_log::warn!("harness disk watch: the entry-bound pass could not start: {e}");
+    }
+}
+
 /// Start the page a look prepared ([`disk_budget_pass_look`]) on a thread of its own
 /// ([`disk_budget_page`]) where no sizing or page runs now: [`disk_look`] calls it once the
-/// look's ask step let its pass lock go, and returns at once.
+/// look's pass let its pass lock go, and returns at once. Where the look prepared no budget
+/// page, the look of the entry-bound pass it prepared starts instead ([`disk_bound_spawn`]).
 fn disk_budget_spawn() {
+    let bound = DISK_BOUND_NEXT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
     let Some(job) = DISK_BUDGET_NEXT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take()
     else {
+        if let Some(job) = bound {
+            disk_bound_spawn(job);
+        }
         return;
     };
     if DISK_BUDGET_SIZING.swap(true, Ordering::SeqCst) {
         return;
     }
-    DISK_BUDGET_PAGE.store(true, Ordering::SeqCst);
     let spawned = std::thread::Builder::new()
         .name(format!("{THREAD_PREFIX}disk-budget"))
         .spawn(move || {
@@ -28077,11 +28004,9 @@ fn disk_budget_spawn() {
             if ran.is_none() {
                 disk_budget_ran(job.sizing.sized_unix, job.page, false);
             }
-            DISK_BUDGET_PAGE.store(false, Ordering::SeqCst);
             DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
         });
     if let Err(e) = spawned {
-        DISK_BUDGET_PAGE.store(false, Ordering::SeqCst);
         DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
         aterm_log::warn!("harness disk watch: the rebuildable budget's pass could not start: {e}");
     }
@@ -28107,7 +28032,7 @@ fn disk_live_ids(store: &Store) -> Vec<String> {
 
 /// Whether an aterm instance other than this process is listed on this machine, or the list
 /// could not be read whole: its sessions' builds are not this window's to read, so it runs no
-/// budget pass (`aterm disk watch` reads every instance's).
+/// budget pass and no entry-bound pass (`aterm disk watch` reads every instance's).
 fn disk_other_instances() -> bool {
     let me = std::process::id();
     match aterm_ctl::local_instances_complete() {
@@ -28136,8 +28061,8 @@ fn disk_budget_live(store: &Store) -> aterm_agent::harness::disk::budget::Live {
 /// macOS), then tier 1, 2 and 3 rows of what no live session keeps ([`disk_budget_tick`]), each
 /// stopping at the volume's free target, and before any removal once a look that admits no
 /// budget pass stands ([`DISK_BUDGET_YIELD`]). The pass lock is taken before the first removal
-/// and not before ([`DiskBudgetHold`]), and goes with what was freed under it to
-/// [`DISK_BUDGET_DONE`] for the next look. One log line; no note, alert or banner.
+/// and not before ([`DiskBudgetHold`]), and let go as the page ends. One log line; no note,
+/// alert or banner.
 fn disk_budget_page(job: &DiskBudgetPage) {
     use aterm_agent::harness::cli::BudgetEnd;
     use aterm_agent::harness::disk::{self, budget};
@@ -28204,7 +28129,8 @@ fn disk_budget_page(job: &DiskBudgetPage) {
             (end, swept.saturating_add(paged))
         }
     };
-    hold.park();
+    // The page's removals are over: its pass lock goes now, not at the next look.
+    drop(hold);
     disk_budget_ran(sized_unix, page, matches!(end, BudgetEnd::Unfinished));
     aterm_log::info!(
         "harness disk watch: budget pass page {page} ({} over a cap of {}): {} back; {}",
@@ -28220,8 +28146,7 @@ fn disk_budget_page(job: &DiskBudgetPage) {
 /// first of the shortfall (what the entries put on record so far were sized at, against what
 /// free space was short of the volume's free target before the sweep: a snapshot that holds the
 /// blocks keeps free space from moving), of the pass lock ([`DiskBudgetHold::lock_for`], which a
-/// look that admits no budget pass refuses) and of the free target. What it freed, credited to
-/// `hold`.
+/// look that admits no budget pass refuses) and of the free target. What it freed.
 #[cfg(target_os = "macos")]
 fn disk_budget_sweep(
     job: &DiskBudgetPage,
@@ -28259,7 +28184,6 @@ fn disk_budget_sweep(
         },
     );
     let (freed, went) = disk_swept(&pass.swept, &pass.sized);
-    hold.credit(freed);
     if freed > 0 {
         disk_fill_credit(
             &job.key.spelled(),
@@ -28285,7 +28209,7 @@ fn disk_budget_sweep(
 /// projection and the sessions' working directories as `live` read them, the window's remover,
 /// and the run's own cursor; the pass lock asked of `hold` once its rows are planned, before
 /// anything is journalled or removed, and no measure read once a look that admits no budget
-/// pass stands ([`DISK_BUDGET_YIELD`]). How it ended, and what it freed, credited to `hold`.
+/// pass stands ([`DISK_BUDGET_YIELD`]). How it ended, and what it freed.
 fn disk_budget_tick(
     job: &DiskBudgetPage,
     live: &aterm_agent::harness::disk::budget::Live,
@@ -28355,7 +28279,7 @@ fn disk_budget_tick(
         job.config,
         &page_of,
         &mut take,
-        &mut disk_remover(judge, &job.store),
+        &mut disk_remover(judge, &job.state, &job.store),
         &mut measure,
         &mut cursor,
     );
@@ -28375,8 +28299,180 @@ fn disk_budget_tick(
         disk::volume_of(home, &job.table).ok().map(|r| r.free),
         started.elapsed(),
     );
-    hold.credit(freed);
     (tick.end, freed)
+}
+
+/// ONE LOOK OF THE ENTRY-BOUND PASS ([`disk_bound_spawn`]'s thread), at any `disk=` level,
+/// while this window is the only aterm instance listed ([`disk_other_instances`]) and what keeps
+/// its sessions' builds reads whole ([`disk_budget_live`]): one idle build directory whose
+/// `deps/` holds the entry bound or more is emptied by tier 3's remover under every check tier
+/// 3 makes, a build cache over the bound gets its own sweep ([`disk_bound_sweep`]), and a
+/// directory that stays gets its `entry-bound` row
+/// (`aterm_agent::harness::cli::disk_tick_bound`). The pass lock is taken before the first
+/// removal, row or memo write and not before ([`DiskBudgetHold`]), is refused once a look that
+/// admits no entry-bound pass stands ([`DISK_BOUND_YIELD`]), and let go as the look ends, so no
+/// pass of this instance or another waits on a look that is over. One log line where it did anything or could
+/// not run; no note, alert or banner.
+fn disk_bound_page(job: &DiskBoundPage) {
+    use aterm_agent::harness::cli::{self, DiskTick};
+    use aterm_agent::harness::disk;
+    if disk_other_instances() {
+        aterm_log::info!(
+            "harness disk watch: no entry-bound pass: another aterm instance is listed, or the \
+             list could not be read whole, so what its sessions build is not this window's to \
+             read"
+        );
+        return;
+    }
+    let live = disk_budget_live(&job.store);
+    if live.blind() {
+        aterm_log::info!(
+            "harness disk watch: no entry-bound pass: what this window's sessions build could \
+             not be read whole"
+        );
+        return;
+    }
+    let home = job.home.as_path();
+    let lock_path = disk::reserve::pass_lock_for(home);
+    // Shared by the pass lock's asks and the build caches' sweep, which stamps its own hour
+    // under the lock this look holds.
+    let hold = std::cell::RefCell::new(DiskBudgetHold {
+        bound: true,
+        ..DiskBudgetHold::default()
+    });
+    let roots = disk_roots(
+        &job.cwds,
+        &job.agents,
+        home,
+        disk::discover::running_claude_census(Some(home)),
+    );
+    let transcripts = home.join(".claude").join("projects");
+    let links = cli::default_link_dirs(home);
+    let free = disk::volume_of(home, &job.table).ok().map(|r| r.free);
+    let look = cli::DiskLook {
+        state: &job.state,
+        volume: home,
+        free,
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: Some(&transcripts),
+        now: job.now,
+        room: job.room,
+        table: Some(&job.table),
+        demand: None,
+        projected: None,
+        session_cwds: &live.cwds,
+        session_cwd_unknown: live.cwd_unknown.as_deref(),
+        link_dirs: &links,
+    };
+    let judge = disk::Judge {
+        now: job.now,
+        threshold_days: job.config.target_stale_days,
+        device: disk::target::dev_of(home),
+        volume: disk::target::VolumeGuid::of_key(&job.key),
+    };
+    let bound = cli::BoundLook {
+        live: &live,
+        processes: &disk::discover::scan_processes,
+    };
+    let mut cursor = std::mem::take(
+        &mut *DISK_BOUND_CURSOR
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    let started = Instant::now();
+    let mut take = || hold.borrow_mut().lock_for(&lock_path);
+    let ticked = cli::disk_tick_bound(
+        &look,
+        job.config,
+        &bound,
+        &mut take,
+        &mut disk_remover(judge, &job.state, &job.store),
+        &mut cursor,
+        &mut |take| {
+            #[cfg(target_os = "macos")]
+            {
+                disk_bound_sweep(job, &hold, &lock_path, take)
+            }
+            // The build caches' own sweep is the daily upkeep's, which only macOS runs.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = take;
+                None
+            }
+        },
+    );
+    *DISK_BOUND_CURSOR
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = cursor;
+    crate::disk_board::SHELF.tally_freed(&disk_pass_removals(&ticked.tick));
+    let removed = match &ticked.tick {
+        DiskTick::Reclaimed(done, _) => done.freed_bytes,
+        DiskTick::Plenty => 0,
+    };
+    let freed = removed.saturating_add(ticked.swept);
+    disk_fill_credit(
+        &job.key.spelled(),
+        freed,
+        free,
+        disk::volume_of(home, &job.table).ok().map(|r| r.free),
+        started.elapsed(),
+    );
+    // The look's removals are over: its pass lock goes now, not at the next look.
+    drop(hold);
+    if !ticked.taken.is_empty() || ticked.rows > 0 || ticked.swept > 0 {
+        aterm_log::info!(
+            "harness disk watch: entry-bound pass: {} build director{} emptied, {} entry-bound \
+             row(s) written, {} back",
+            ticked.taken.len(),
+            if ticked.taken.len() == 1 { "y" } else { "ies" },
+            ticked.rows,
+            disk::human_bytes(freed),
+        );
+    }
+    if let Some(why) = &ticked.stood_down {
+        aterm_log::info!("harness disk watch: entry-bound pass stood down: {why}");
+    }
+}
+
+/// The build caches' own sweep for a look of the entry-bound pass ([`disk_bound_page`]): the
+/// managed-cache sweep, under the pass lock `hold` holds and its own stamp
+/// (`cache_maintenance::claim_held_early`, which leaves the daily turn its day), each removal
+/// asked of `take` first. `None` where it ran none: `[disk] dead_build_dirs` is off, the home's
+/// checkouts could not be placed, the pass lock was refused, or a sweep, daily or early, was
+/// stamped within the hour. The bytes it freed otherwise.
+#[cfg(target_os = "macos")]
+fn disk_bound_sweep(
+    job: &DiskBoundPage,
+    hold: &std::cell::RefCell<DiskBudgetHold>,
+    lock_path: &Path,
+    take: &mut aterm_agent::harness::cli::Take<'_>,
+) -> Option<u64> {
+    if !job.config.dead_build_dirs {
+        return None;
+    }
+    let placing = aterm_agent::harness::disk::discover::placing_of(&job.home, &job.table)?;
+    take().ok()?;
+    let held = hold.borrow();
+    let claimed =
+        cache_maintenance::claim_held_early(lock_path.parent()?, job.now, held.lock.as_ref()?);
+    drop(held);
+    match claimed {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            aterm_log::warn!("harness disk watch: the entry-bound pass ran no cache sweep: {e}");
+            return None;
+        }
+    }
+    let pass = disk_sweep_journalled(&job.state, job.now, &crate::disk_board::SHELF, |record| {
+        atpkg::build_cache::reclaim_home_watched(
+            atpkg::build_cache::ReclaimAfter::CALM,
+            Some(&placing),
+            &mut |path, why| take().is_ok() && record(path, why),
+        )
+    });
+    Some(disk_swept(&pass.swept, &pass.sized).0)
 }
 
 /// The log line for a look below the warning line, or with an agent's demand waiting, in a
@@ -28411,10 +28507,55 @@ fn disk_private_said(said: &Mutex<Option<String>>, line: Option<String>) -> Opti
     line
 }
 
-/// One look of the disk watch over `cwds` and `agents` (off the host thread): the ask's take-over
-/// of what an ended host left of this process's sessions ([`disk_ask::before_pass`]), the pass,
-/// the ask's step over what it left ([`disk_ask::after_look`]), then the budget page the pass
-/// prepared, once the step let the look's pass lock go ([`disk_budget_spawn`]).
+/// WHAT A LOOK OF THE DISK WATCH STANDS ON, apart from the sessions its store names: the folders
+/// it reads and writes, the volume it measures, the clock its pass cadence counts, where it
+/// searches for build directories, and what this process keeps from one look to the next.
+/// [`disk_look`] hands [`disk_look_on`] the product's, read as the look begins. A test hands
+/// it scratch folders, a reading it names and a board of its own, so what it shows is shown of
+/// the look the product runs, not of a copy.
+///
+/// Not on the ground: the budget's sizing and pages, the room and fill meters and the worktree
+/// step's hour are this process's own, and the managed build caches a look sweeps are those of
+/// the account this process runs as (`atpkg::build_cache`). Each runs only in the owner's own
+/// watch ([`Self::private`] is `None`); the sweeps where `[disk] dead_build_dirs` grants them,
+/// and the sizing and the daily maintenance on a look nothing presses.
+#[derive(Clone, Copy)]
+struct DiskGround<'a> {
+    /// The account's home, whose volume the look measures and frees.
+    home: &'a Path,
+    /// The harness state folder: the ledger is `<state>/disk.jsonl`.
+    state: &'a Path,
+    /// The `aterm.toml` whose `[disk]` table the look reads.
+    config: Option<&'a Path>,
+    /// The mount table, read as the look began.
+    table: &'a aterm_sysprobe::volumes::Table,
+    /// The home volume's figures, read now: as the look begins, before a removal and after a
+    /// pass.
+    measure: &'a (dyn Fn() -> Option<aterm_sysprobe::volumes::Reading> + Sync),
+    /// Why this process is not the owner's disk watch, where it is not ([`disk_private`]).
+    private: Option<DiskPrivate>,
+    /// Unix seconds as the look began: what its rows are dated.
+    now: i64,
+    /// The clock the pass cadence counts ([`disk_pass_due`], [`disk_pass_ran`]).
+    clock: &'a dyn Fn() -> Instant,
+    /// Where a pass searches for build directories ([`disk_roots`]), over the folders and the
+    /// agents it reaches.
+    roots: &'a dyn Fn(&[PathBuf], &[u32]) -> aterm_agent::harness::disk::discover::Roots,
+    /// The board the look publishes to and keeps its episode on.
+    board: &'a Shelf,
+    /// The runs of short looks, and the search's place between passes.
+    runs: &'a DiskRuns,
+    /// The last pass ([`disk_pass_due`]).
+    last_pass: &'a Mutex<Option<DiskPass>>,
+    /// Whether the watch was poked since its last look that measured the volume.
+    poked: &'a AtomicBool,
+    /// The emergency's wait ([`aterm_agent::harness::disk::cadence::Emergency`]).
+    emergency: &'a Mutex<aterm_agent::harness::disk::cadence::Emergency>,
+}
+
+/// One look of the disk watch over `cwds` and `agents` (off the host thread), on the product's
+/// own ground ([`DiskGround`]): this account's home and state folder, its `aterm.toml`, the
+/// home volume as the kernel reads it now, and this process's board and runs.
 fn disk_look(
     sids: &[String],
     cwds: &[std::path::PathBuf],
@@ -28423,33 +28564,62 @@ fn disk_look(
     store: &Store,
     note: &NoteFn,
 ) {
+    let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
+        let _ = DISK_RUNS.admit(false, &crate::disk_board::SHELF);
+        return;
+    };
+    let config = crate::app_config::config_path();
+    let table = aterm_sysprobe::volumes::table();
+    let measure = || aterm_agent::harness::disk::volume_of(&home, &table).ok();
+    let clock = Instant::now;
+    let roots = |reach: &[PathBuf], agents: &[u32]| {
+        let running = aterm_agent::harness::disk::discover::running_claude_census(Some(&home));
+        disk_roots(reach, agents, &home, running)
+    };
+    let ground = DiskGround {
+        home: &home,
+        state: &state,
+        config: config.as_deref(),
+        table: &table,
+        measure: &measure,
+        private: disk_private(&home),
+        now: aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
+        clock: &clock,
+        roots: &roots,
+        board: &crate::disk_board::SHELF,
+        runs: &DISK_RUNS,
+        last_pass: &DISK_LAST_PASS,
+        poked: &DISK_POKED,
+        emergency: &DISK_EMERGENCY,
+    };
+    disk_look_on(&ground, sids, cwds, agents, seen, store, note);
+}
+
+/// One look of the disk watch on `ground`: the pass, then the budget page the pass prepared,
+/// once the pass let the look's pass lock go ([`disk_budget_spawn`]). That is all a look does:
+/// it elects no session, types no line and starts no worker.
+fn disk_look_on(
+    ground: &DiskGround<'_>,
+    sids: &[String],
+    cwds: &[std::path::PathBuf],
+    agents: &[u32],
+    seen: &[(String, aterm_phase::disk_full::DiskFull)],
+    store: &Store,
+    note: &NoteFn,
+) {
     // A page an earlier look prepared and did not start (it ended in a panic first) was that
-    // look's.
+    // look's, and so was a look of the entry-bound pass.
     *DISK_BUDGET_NEXT
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
-    disk_ask::before_pass(sids, store);
-    let mut looked = disk_ask::Looked::default();
-    disk_look_pass(sids, cwds, agents, seen, store, note, &mut looked);
-    disk_ask::after_look(&looked, sids, store, note);
-    drop(looked);
+    *DISK_BOUND_NEXT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+    // What an earlier build's disk ask left in the state folder goes: no build reads it now:
+    // two lstat calls where nothing is left.
+    let _ = aterm_agent::harness::disk::retire_ask_files(ground.state);
+    disk_look_pass(ground, sids, cwds, agents, seen, store, note);
     disk_budget_spawn();
-}
-
-/// What aterm itself freed at this look (`bytes`, ended now), for the ask's step to record
-/// ([`disk_ask::Looked::reclaimed`]): no asked session's rise counts it.
-fn disk_reclaimed(looked: &mut disk_ask::Looked, bytes: u64) {
-    if bytes == 0 {
-        return;
-    }
-    looked
-        .reclaimed
-        .push(aterm_agent::harness::disk::ask::Reclaimed {
-            ended_ms: aterm_time::unix_millis()
-                .and_then(|ms| i64::try_from(ms).ok())
-                .unwrap_or(0),
-            bytes,
-        });
 }
 
 /// The sessions `store` holds, as the worktree step reads them: each handle live while it is
@@ -28478,41 +28648,43 @@ fn disk_worktree_roster(store: &Store) -> Vec<aterm_agent::harness::disk::worktr
 /// session uses goes, with its merged branch, and so does one whose session is gone, its commits
 /// and edits pinned on refs first: after an hour of quiet where every build of it was a session
 /// `store` holds as exited, else after seven days. A merged, clean, quiet worktree outside an
-/// agent's shape stays and gives back its shared build directories. What it freed is this
-/// look's; the worktrees that went are one log line and the build directories that went another.
+/// agent's shape stays and gives back its shared build directories.
+/// The worktrees that went are one log line and the build directories that went another.
+/// While the home volume reads under the emergency line of `lines` (the look's) nothing is
+/// pinned or pushed, and a step that left such writes waiting runs again at the first look that
+/// reads the volume above it (DC-06d).
 #[cfg(target_os = "macos")]
 fn disk_worktree_look(
     home: &Path,
     state: &Path,
     now: i64,
-    config: aterm_agent::harness::disk::Config,
+    (config, lines): (
+        aterm_agent::harness::disk::Config,
+        aterm_capacity::floor::Lines,
+    ),
     table: &aterm_sysprobe::volumes::Table,
-    looked: &mut disk_ask::Looked,
     store: &Store,
 ) {
     use aterm_agent::harness::disk::{reserve, worktree};
     let mut schedule = DISK_WORKTREES
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if config.auto_free_gib == 0 || !schedule.due(Instant::now()) {
+    let clear = || aterm_agent::harness::cli::disk_custody_room(home, &lines).is_ok();
+    if config.auto_free_gib == 0 || !schedule.due(Instant::now(), clear) {
         return;
     }
     let lock_path = reserve::pass_lock_for(home);
-    let mut taken = None;
-    let lock: &reserve::PassLock = match looked.pass_lock.as_ref() {
-        Some(adopted) => adopted,
-        None => match reserve::take_pass(&lock_path) {
-            Ok(Some(lock)) => taken.insert(lock),
-            Ok(None) => return,
-            Err(e) => {
-                aterm_log::warn!(
-                    "harness disk watch: the pass lock {} could not be taken ({e}); the worktree \
-                     step is deferred",
-                    lock_path.display()
-                );
-                return;
-            }
-        },
+    let lock = match reserve::take_pass(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(e) => {
+            aterm_log::warn!(
+                "harness disk watch: the pass lock {} could not be taken ({e}); the worktree \
+                 step is deferred",
+                lock_path.display()
+            );
+            return;
+        }
     };
     let cwds: Vec<PathBuf> = DISK_ALL_CWDS
         .lock()
@@ -28546,12 +28718,12 @@ fn disk_worktree_look(
         roster: Some(&roster),
         starts: &starts,
         record: record.as_deref(),
+        lines,
     };
     let done = aterm_agent::harness::cli::disk_worktree_step(&look, config, &mut schedule, &|| {
         lock.validate_for(&lock_path).is_ok()
     });
-    drop(taken);
-    disk_reclaimed(looked, done.freed());
+    drop(lock);
     if !done.removed.is_empty() {
         aterm_log::info!(
             "harness disk watch: removed {} worktree(s) ({}), {} back",
@@ -28582,39 +28754,32 @@ fn disk_worktree_look(
     }
 }
 
-/// The look's pass ([`disk_look`]): what it read for the ask goes in `looked`.
+/// The look's pass ([`disk_look_on`]) on `ground`. The pass lock it runs under is taken once a
+/// pass is due and let go as it returns, on every path.
 fn disk_look_pass(
+    ground: &DiskGround<'_>,
     sids: &[String],
     cwds: &[std::path::PathBuf],
     agents: &[u32],
     seen: &[(String, aterm_phase::disk_full::DiskFull)],
     store: &Store,
     note: &NoteFn,
-    looked: &mut disk_ask::Looked,
 ) {
-    let board = &crate::disk_board::SHELF;
-    let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
-        let _ = DISK_RUNS.admit(false, board);
-        return;
-    };
-    // A budget page's pass lock, and what it freed, are this look's to hand the ask's step,
-    // unless a page runs now: it may take them back before its next removal.
-    let budget_done = if DISK_BUDGET_PAGE.load(Ordering::SeqCst) {
-        None
-    } else {
-        DISK_BUDGET_DONE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    };
-    if let Some(done) = budget_done {
-        looked.pass_lock = Some(done.lock);
-        disk_reclaimed(looked, done.freed);
-    }
+    let DiskGround {
+        home,
+        state,
+        table,
+        measure,
+        private,
+        now,
+        board,
+        runs,
+        ..
+    } = *ground;
     // Every look reads the recorded dangling links again, whatever its pass then does.
     board.keep_dangling(Vec::new());
-    let config_path = crate::app_config::config_path();
-    let reading = aterm_agent::harness::cli::disk_config_read(config_path.as_deref());
+    let config_path = ground.config;
+    let reading = aterm_agent::harness::cli::disk_config_read(config_path);
     {
         let mut said = DISK_NOTES_SAID
             .lock()
@@ -28633,7 +28798,6 @@ fn disk_look_pass(
     }
     let faults = if reading.off_by_fault {
         config_path
-            .as_deref()
             .and_then(|path| {
                 aterm_types::dirs::read_aterm_config_text(path)
                     .ok()
@@ -28646,28 +28810,23 @@ fn disk_look_pass(
     };
     note(disk_settings_note(&reading, &faults));
     use aterm_agent::harness::disk::Level;
-    let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
-    let table = aterm_sysprobe::volumes::table();
-    let measure = || aterm_agent::harness::disk::volume_of(&home, &table).ok();
     let stats = measure();
     let free = stats.as_ref().map(|s| s.free);
     let total = stats.as_ref().map(|s| s.total);
-    let room = stats.as_ref().map(|r| disk_room_after(&state, r, now));
+    let room = stats.as_ref().map(|r| disk_room_after(state, r, now));
     let thresholds = reading.thresholds_with(total, room);
     let level = thresholds.level(free, stats.as_ref().and_then(|s| s.files_free));
     // The fill ring reads every look, whatever the pass then does: a projection that stands
-    // presses the pass as a short volume does (the design's §8.2).
+    // presses the pass as a short volume does, above its floor too.
     let projected = stats
         .as_ref()
         .and_then(|r| disk_fill_observe(r, now, thresholds.short_below()));
-    let private = disk_private(&home);
-    looked.thresholds = Some(thresholds);
-    looked.private = private.is_some();
     if private.is_none() {
-        disk_budget_record(&state);
+        disk_budget_record(state);
     }
     disk_publish_look(
-        &table,
+        board,
+        table,
         stats.as_ref().map(|r| crate::disk_board::VolumeRow {
             reading: r.clone(),
             thresholds,
@@ -28682,16 +28841,16 @@ fn disk_look_pass(
             .unwrap_or_else(PoisonError::into_inner)
             .clone(),
         &reading,
-        &state,
+        state,
         now,
     );
-    let reserve = aterm_agent::harness::disk::reserve::path_for(&home);
-    let reserve_look = |looked: &mut disk_ask::Looked| {
+    let reserve = aterm_agent::harness::disk::reserve::path_for(home);
+    let reserve_look = || {
         if private.is_some() {
             return;
         }
         match aterm_agent::harness::cli::disk_reserve_look(
-            &state,
+            state,
             &reserve,
             level,
             free,
@@ -28703,7 +28862,6 @@ fn disk_look_pass(
             | aterm_agent::harness::cli::ReserveMove::StillRefused => {}
             moved => {
                 if let aterm_agent::harness::cli::ReserveMove::Released(bytes) = &moved {
-                    disk_reclaimed(looked, *bytes);
                     if let Some(r) = stats.as_ref() {
                         disk_fill_credit(
                             &r.key.spelled(),
@@ -28725,14 +28883,14 @@ fn disk_look_pass(
     // large as the emergency line once the room is, waits until the look has read its sessions'
     // screens, so a resume the recovered volume admits is not held behind it.
     if level == Level::Emergency {
-        reserve_look(looked);
+        reserve_look();
     }
-    disk_sightings(board, seen, level, free, &state, now);
+    disk_sightings(board, seen, level, free, state, now);
     if level != Level::Emergency {
-        reserve_look(looked);
+        reserve_look();
     }
     if level == Level::Unknown {
-        let _ = DISK_RUNS.admit(false, board);
+        let _ = runs.admit(false, board);
         return;
     }
     let reading = aterm_agent::harness::cli::DiskReading {
@@ -28748,10 +28906,10 @@ fn disk_look_pass(
         ..reading
     };
     let config = reading.config;
-    let poked = DISK_POKED.swap(false, Ordering::SeqCst);
+    let poked = ground.poked.swap(false, Ordering::SeqCst);
     let home_key = stats.as_ref().map(|r| r.key.clone());
     let adopted = home_key.as_ref().and_then(|k| {
-        let b = crate::disk_board::SHELF.board_lock();
+        let b = board.board_lock();
         if b.watched { b.adopt(k) } else { None }
     });
     let demand = adopted.as_ref().map(|(need, _)| *need);
@@ -28766,6 +28924,16 @@ fn disk_look_pass(
         ),
         Ordering::SeqCst,
     );
+    // So does a look of the entry-bound pass, which the budget's cap does not decide.
+    DISK_BOUND_YIELD.store(
+        !aterm_agent::harness::disk::budget::bound_admitted(
+            private.is_none(),
+            demand.is_some(),
+            projected.is_some(),
+            config.auto_free_gib,
+        ),
+        Ordering::SeqCst,
+    );
     let budget_at = DiskBudgetAt {
         owner: private.is_none(),
         demand: demand.is_some(),
@@ -28773,9 +28941,9 @@ fn disk_look_pass(
         config,
         key: home_key.as_ref(),
         free,
-        state: &state,
-        home: &home,
-        table: &table,
+        state,
+        home,
+        table,
         cwds,
         agents,
         store,
@@ -28793,15 +28961,16 @@ fn disk_look_pass(
     {
         let pressed = config.below_warn(free) || projected.is_some();
         if private.is_none() && demand.is_none() && !pressed {
-            disk_worktree_look(&home, &state, now, config, &table, looked, store);
+            disk_worktree_look(home, state, now, (config, thresholds.lines()), table, store);
         }
     }
     // Every look of the owner's watch reads the episode's end, the looks that run no pass too, so
     // a volume read back out of its emergency ends its wait and memo before the next one opens.
     if private.is_none() {
         aterm_agent::harness::cli::disk_emergency_look(
-            &state,
-            &mut DISK_EMERGENCY
+            state,
+            &mut ground
+                .emergency
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             level,
@@ -28809,7 +28978,7 @@ fn disk_look_pass(
             thresholds.emergency,
         );
     }
-    if !DISK_RUNS.admit(
+    if !runs.admit(
         (config.below_warn(free) || demand.is_some() || projected.is_some())
             && config.auto_free_gib > 0
             && private.is_none(),
@@ -28818,7 +28987,7 @@ fn disk_look_pass(
         #[cfg(target_os = "macos")]
         {
             let placing = (private.is_none() && table.complete)
-                .then(|| aterm_agent::harness::disk::discover::placing_of(&home, &table))
+                .then(|| aterm_agent::harness::disk::discover::placing_of(home, table))
                 .flatten();
             let eligible = cache_maintenance::eligible(
                 &config,
@@ -28832,14 +29001,14 @@ fn disk_look_pass(
                 Instant::now(),
                 eligible,
                 || {
-                    let lock = aterm_agent::harness::disk::reserve::pass_lock_for(&home);
+                    let lock = aterm_agent::harness::disk::reserve::pass_lock_for(home);
                     let dir = lock.parent().ok_or_else(|| {
                         std::io::Error::other("cache maintenance has no pass-lock directory")
                     })?;
                     cache_maintenance::claim(dir, now)
                 },
                 || {
-                    let pass = disk_sweep_journalled(&state, now, board, |record| {
+                    let pass = disk_sweep_journalled(state, now, board, |record| {
                         atpkg::build_cache::reclaim_home_watched(
                             atpkg::build_cache::ReclaimAfter::CALM,
                             placing.as_ref(),
@@ -28847,7 +29016,6 @@ fn disk_look_pass(
                         )
                     });
                     let (freed, went) = disk_swept(&pass.swept, &pass.sized);
-                    disk_reclaimed(looked, freed);
                     if freed > 0 {
                         aterm_log::info!(
                             "harness disk watch: daily managed-cache maintenance reclaimed {} \
@@ -28861,36 +29029,43 @@ fn disk_look_pass(
                     let _ = atpkg::build_cache::holders::measure_home(
                         aterm_agent::harness::disk::HOLDERS_DAILY_BUDGET,
                     );
+                    // After the look's worktree step, the stale branch names: each goes once
+                    // the commits it alone names are pinned under refs/orphans/ and pushed.
+                    let names = aterm_agent::harness::cli::disk_refs_journalled(
+                        &state,
+                        &home,
+                        now,
+                        &|| true,
+                    );
+                    if !names.pruned.is_empty() {
+                        aterm_log::info!(
+                            "harness disk watch: daily upkeep pruned {} stale branch name(s), \
+                             pinning {} under refs/orphans/ first",
+                            names.pruned.len(),
+                            names.pinned.len()
+                        );
+                    }
                 },
             );
             if let Err(error) = result {
                 aterm_log::warn!("harness disk watch: daily cache maintenance deferred: {error}");
             }
         }
-        if let Some(told) = disk_look_without_pass(&reading, free, &DISK_RUNS) {
+        if let Some(told) = disk_look_without_pass(&reading, free, runs) {
             note(told);
         }
         let cause = if let Some(private) = private {
             DiskFullCause::Private(private)
         } else if config.auto_free_gib == 0 {
-            looked.done = Some(aterm_agent::harness::disk::ask::Done::CleanupOff);
             DiskFullCause::CleanupOff {
                 fault: reading.off_by_fault,
             }
         } else {
-            // Only a volume truly out of inodes: free bytes at or above a `warn` set below the
-            // floor is no sign aterm is done.
-            looked.done = stats
-                .as_ref()
-                .and_then(|s| s.files_free)
-                .is_some_and(|f| f < thresholds.files_emergency)
-                .then_some(aterm_agent::harness::disk::ask::Done::Inodes);
             DiskFullCause::Inodes
         };
         disk_alert(
             board,
             level,
-            &thresholds,
             free,
             0,
             &[],
@@ -28905,20 +29080,13 @@ fn disk_look_pass(
             projected.is_some(),
             config.cap_used_gib,
         ) {
-            disk_budget_look(
-                config.cap_used_gib,
-                &state,
-                cwds,
-                agents,
-                &home,
-                &table,
-                now,
-            );
+            disk_budget_look(config.cap_used_gib, state, cwds, agents, home, table, now);
         }
         disk_budget_pass_look(&budget_at);
+        disk_bound_look(&budget_at);
         return;
     }
-    let started = Instant::now();
+    let started = (ground.clock)();
     // A pressing projection runs passes on a short volume's cadence: at once when it first
     // stands, then every `DISK_PASS_EVERY`.
     let pass_level = if projected.is_some() && level < Level::Short {
@@ -28943,11 +29111,13 @@ fn disk_look_pass(
         poked,
         demand: demand.is_some(),
     };
-    let due = DISK_EMERGENCY
+    let due = ground
+        .emergency
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .due(
-            &mut DISK_LAST_PASS
+            &mut ground
+                .last_pass
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             &look,
@@ -28955,72 +29125,50 @@ fn disk_look_pass(
         );
     if !due {
         #[cfg(target_os = "macos")]
-        disk_worktree_look(&home, &state, now, config, &table, looked, store);
+        disk_worktree_look(home, state, now, (config, thresholds.lines()), table, store);
         // Back above the floor with no pass due: the run of short passes
         // ends, and with it the owner's low-disk line.
         if reading.at_or_above_floor(free)
-            && let Some(told) = disk_look_without_pass(&reading, free, &DISK_RUNS)
+            && let Some(told) = disk_look_without_pass(&reading, free, runs)
         {
             note(told);
         }
         disk_episode_after(board, level, 0, &[]);
         if level != Level::Emergency {
-            disk_alert(
-                board,
-                level,
-                &thresholds,
-                free,
-                0,
-                &[],
-                DiskFullCause::Spent,
-                note,
-            );
+            disk_alert(board, level, free, 0, &[], DiskFullCause::Spent, note);
         }
         disk_budget_pass_look(&budget_at);
+        disk_bound_look(&budget_at);
         return;
     }
-    // A budget page running now stops before its next removal, and a lock one parked since this
-    // look began is this look's.
+    // A budget page or a look of the entry-bound pass running now stops before its next
+    // removal.
     DISK_BUDGET_YIELD.store(true, Ordering::SeqCst);
-    if looked.pass_lock.is_none() {
-        let parked = DISK_BUDGET_DONE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(done) = parked {
-            looked.pass_lock = Some(done.lock);
-            disk_reclaimed(looked, done.freed);
+    DISK_BOUND_YIELD.store(true, Ordering::SeqCst);
+    let lock_path = aterm_agent::harness::disk::reserve::pass_lock_for(home);
+    // Held until this pass ends.
+    let _pass_lock = match aterm_agent::harness::disk::reserve::take_pass(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            aterm_log::info!(
+                "harness disk watch: another pass holds {}; this look runs none",
+                lock_path.display()
+            );
+            disk_episode_after(board, level, 0, &[]);
+            return;
         }
-    }
-    let lock_path = aterm_agent::harness::disk::reserve::pass_lock_for(&home);
-    // Held until the ask's step records what this pass freed ([`disk_ask::after_look`]); a
-    // budget page's lock this look adopted is already that.
-    if looked.pass_lock.is_none() {
-        looked.pass_lock = match aterm_agent::harness::disk::reserve::take_pass(&lock_path) {
-            Ok(Some(lock)) => Some(lock),
-            Ok(None) => {
-                aterm_log::info!(
-                    "harness disk watch: another pass holds {}; this look runs none",
-                    lock_path.display()
-                );
-                looked.contended = true;
-                disk_episode_after(board, level, 0, &[]);
-                return;
-            }
-            Err(e) => {
-                aterm_log::warn!(
-                    "harness disk watch: the pass lock {} could not be taken ({e}); the pass \
-                     is deferred",
-                    lock_path.display()
-                );
-                looked.contended = true;
-                disk_episode_after(board, level, 0, &[]);
-                return;
-            }
-        };
-    }
+        Err(e) => {
+            aterm_log::warn!(
+                "harness disk watch: the pass lock {} could not be taken ({e}); the pass is \
+                 deferred",
+                lock_path.display()
+            );
+            disk_episode_after(board, level, 0, &[]);
+            return;
+        }
+    };
     let short = config.below_auto_floor(free);
-    let placing = aterm_agent::harness::disk::discover::placing_of(&home, &table);
+    let placing = aterm_agent::harness::disk::discover::placing_of(home, table);
     // Known producer receipts are independent of broad discovery's 128-result budget. Keep
     // them on the existing background pressure cadence even while a session is supervised.
     // Below the floor the shared cache joins them: its stale parts of a profile in use have no
@@ -29032,9 +29180,9 @@ fn disk_look_pass(
     {
         let at = Instant::now();
         let goal = demand.unwrap_or(0).max(config.pressure_target_bytes());
-        let pass = disk_sweep_journalled(&state, now, board, |record| {
+        let pass = disk_sweep_journalled(state, now, board, |record| {
             atpkg::build_cache::reclaim_beside_sessions(
-                &home,
+                home,
                 std::time::SystemTime::now(),
                 short,
                 placing.as_ref(),
@@ -29044,7 +29192,6 @@ fn disk_look_pass(
             )
         });
         let (freed, went) = disk_swept(&pass.swept, &pass.sized);
-        disk_reclaimed(looked, freed);
         let after = if went.is_empty() {
             free
         } else {
@@ -29064,7 +29211,7 @@ fn disk_look_pass(
     } else {
         (free, 0, false)
     };
-    let started = Instant::now();
+    let started = (ground.clock)();
     let demand_cwds: Vec<std::path::PathBuf> = adopted.map(|(_, cwds)| cwds).unwrap_or_default();
     let demand_only = sids.is_empty();
     // Above the floor a pressing projection runs the disk pass, whose fences (no lock, no process
@@ -29073,7 +29220,7 @@ fn disk_look_pass(
         let after = atpkg::build_cache::ReclaimAfter::by_floor(short);
         let goal = config.pressure_target_bytes();
         let journalled = if config.dead_build_dirs {
-            disk_sweep_journalled(&state, now, board, |record| {
+            disk_sweep_journalled(state, now, board, |record| {
                 atpkg::build_cache::reclaim_home_watched(
                     after,
                     placing.as_ref(),
@@ -29093,7 +29240,6 @@ fn disk_look_pass(
             unrecorded,
         } = journalled;
         let (freed, went) = disk_swept(&swept, &sized);
-        disk_reclaimed(looked, freed);
         let after = measure();
         if let Some(key) = home_key.as_ref() {
             disk_fill_credit(
@@ -29101,7 +29247,7 @@ fn disk_look_pass(
                 freed,
                 free,
                 after.as_ref().map(|s| s.free),
-                started.elapsed(),
+                (ground.clock)().saturating_duration_since(started),
             );
         }
         let kept = disk_kept_lines(&swept);
@@ -29140,7 +29286,6 @@ fn disk_look_pass(
         disk_alert(
             board,
             level_after,
-            &thresholds,
             free_after,
             freed,
             &[],
@@ -29159,6 +29304,7 @@ fn disk_look_pass(
         );
         disk_episode_after(board, level_after, freed, &went);
         disk_pass_ran(
+            ground.last_pass,
             started,
             free,
             went.is_empty()
@@ -29168,6 +29314,7 @@ fn disk_look_pass(
             !went.is_empty(),
         );
         disk_pass_summary(
+            board,
             home_key.as_ref(),
             after.as_ref().map(|s| s.free),
             (if went.is_empty() { Vec::new() } else { vec![1] }, false),
@@ -29179,26 +29326,24 @@ fn disk_look_pass(
         if level_after == Level::Unknown {
             return;
         }
-        match DISK_RUNS.pass(!went.is_empty(), after.as_ref().map(|s| s.free), config) {
+        match runs.pass(!went.is_empty(), after.as_ref().map(|s| s.free), config) {
             DiskOutcome::Plenty => note(HostNote::DiskPlenty),
             DiskOutcome::Short => {}
             DiskOutcome::Low { free_gib, .. } => note(HostNote::DiskLow {
                 free_gib,
                 floor_gib: config.auto_free_gib,
                 hogs: Vec::new(),
-                asked: disk_ask::owner_said(),
             }),
         }
         return;
     }
-    let running = aterm_agent::harness::disk::discover::running_claude_census(Some(&home));
     let mut reach: Vec<std::path::PathBuf> = cwds.to_vec();
     for cwd in demand_cwds {
         if !reach.contains(&cwd) {
             reach.push(cwd);
         }
     }
-    let mut roots = disk_roots(&reach, agents, &home, running);
+    let mut roots = (ground.roots)(&reach, agents);
     roots.skip_home_children = demand_only;
     let transcripts = home.join(".claude").join("projects");
     let cwd_unknown = disk_cwd_unknown(
@@ -29208,15 +29353,15 @@ fn disk_look_pass(
             .clone(),
     );
     let look = aterm_agent::harness::cli::DiskLook {
-        state: &state,
-        volume: &home,
+        state,
+        volume: home,
         free,
         targets: &[],
         discover: Some(&roots),
         transcripts: Some(&transcripts),
         now,
         room,
-        table: Some(&table),
+        table: Some(table),
         demand,
         projected,
         session_cwds: &DISK_ALL_CWDS
@@ -29226,12 +29371,12 @@ fn disk_look_pass(
             .map(|(_, cwd)| cwd.clone())
             .collect::<Vec<_>>(),
         session_cwd_unknown: cwd_unknown.as_deref(),
-        link_dirs: &aterm_agent::harness::cli::default_link_dirs(&home),
+        link_dirs: &aterm_agent::harness::cli::default_link_dirs(home),
     };
     let judge = aterm_agent::harness::disk::Judge {
         now,
         threshold_days: config.target_stale_days,
-        device: aterm_agent::harness::disk::target::dev_of(&home),
+        device: aterm_agent::harness::disk::target::dev_of(home),
         volume: home_key
             .as_ref()
             .and_then(aterm_agent::harness::disk::target::VolumeGuid::of_key),
@@ -29239,7 +29384,7 @@ fn disk_look_pass(
     // LOOKING admits only one disk pass. Keep the selection hint between those passes,
     // without holding a state lock while discovery or removal touches the filesystem.
     let mut cursor = std::mem::take(
-        &mut *DISK_RUNS
+        &mut *runs
             .discovery
             .lock()
             .unwrap_or_else(PoisonError::into_inner),
@@ -29247,11 +29392,11 @@ fn disk_look_pass(
     let tick = aterm_agent::harness::cli::disk_tick_paged(
         &look,
         config,
-        &mut disk_remover(judge, store),
+        &mut disk_remover(judge, state, store),
         &mut || measure().map(|s| s.free),
         &mut cursor,
     );
-    *DISK_RUNS
+    *runs
         .discovery
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = cursor;
@@ -29263,10 +29408,10 @@ fn disk_look_pass(
         aterm_agent::harness::cli::DiskTick::Reclaimed(_, hogs) => hogs,
         aterm_agent::harness::cli::DiskTick::Plenty => &[],
     };
-    let hogs: Vec<String> = left.iter().map(|h| h.line(Some(&home))).collect();
+    let hogs: Vec<String> = left.iter().map(|h| h.line(Some(home))).collect();
     let glass: Vec<String> = left
         .iter()
-        .map(|h| h.line_within(Some(&home), crate::message_reporters::DISK_LOW_HOG_CHARS))
+        .map(|h| h.line_within(Some(home), crate::message_reporters::DISK_LOW_HOG_CHARS))
         .collect();
     let freed = matches!(&tick, aterm_agent::harness::cli::DiskTick::Reclaimed(done, _)
         if !done.removed.is_empty());
@@ -29299,14 +29444,20 @@ fn disk_look_pass(
     }
     let took_whole = matches!(&tick, aterm_agent::harness::cli::DiskTick::Reclaimed(done, _)
         if done.went().idle_whole > 0);
-    let after = free_after_pass(freed, free, || measure().map(|s| s.free));
     let freed_bytes = match &tick {
         aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => done.freed_bytes,
         aterm_agent::harness::cli::DiskTick::Plenty => 0,
     };
-    disk_reclaimed(looked, freed_bytes);
+    let reclaimed = pass_reclaimed(&tick);
+    let after = free_after_pass(reclaimed, free, || measure().map(|s| s.free));
     if let Some(key) = home_key.as_ref() {
-        disk_fill_credit(&key.spelled(), freed_bytes, free, after, started.elapsed());
+        disk_fill_credit(
+            &key.spelled(),
+            freed_bytes,
+            free,
+            after,
+            (ground.clock)().saturating_duration_since(started),
+        );
     }
     let went: Vec<String> = match &tick {
         aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => {
@@ -29338,7 +29489,7 @@ fn disk_look_pass(
     let files_after = measured_after.as_ref().and_then(|s| s.files_free);
     let level_after = thresholds.level(after, files_after);
     if let Some(r) = measured_after {
-        crate::disk_board::publish(|b| {
+        board.publish(|b| {
             b.measured(crate::disk_board::VolumeRow {
                 level: thresholds.level(Some(r.free), r.files_free),
                 thresholds,
@@ -29350,12 +29501,11 @@ fn disk_look_pass(
             });
         });
     }
-    let freed_any = freed || swept > 0;
+    let freed_any = reclaimed || swept > 0;
     // The episode already holds what the sweep freed, and the alert adds the episode's.
     disk_alert(
         board,
         level_after,
-        &thresholds,
         after,
         freed_bytes,
         &glass,
@@ -29376,13 +29526,14 @@ fn disk_look_pass(
             aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => Some(done),
             aterm_agent::harness::cli::DiskTick::Plenty => None,
         };
-        let mut emergency = DISK_EMERGENCY
+        let mut emergency = ground
+            .emergency
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let (Some(key), Some(total)) = (home_key.as_ref(), total) {
             let volume = key.spelled();
             let at = aterm_agent::harness::cli::EmergencyAt {
-                state: &state,
+                state,
                 now,
                 level: pass_level,
                 volume: &volume,
@@ -29396,6 +29547,7 @@ fn disk_look_pass(
         }
     }
     disk_pass_ran(
+        ground.last_pass,
         started,
         free,
         !freed_any
@@ -29421,6 +29573,7 @@ fn disk_look_pass(
     let ran_out = matches!(&tick, aterm_agent::harness::cli::DiskTick::Reclaimed(done, _)
         if done.ran_out());
     disk_pass_summary(
+        board,
         home_key.as_ref(),
         after,
         (tiers, ran_out),
@@ -29432,7 +29585,7 @@ fn disk_look_pass(
     if level_after == Level::Unknown {
         return;
     }
-    match DISK_RUNS.pass(freed_any, after, config) {
+    match runs.pass(freed_any, after, config) {
         DiskOutcome::Plenty => note(HostNote::DiskPlenty),
         DiskOutcome::Short => {}
         DiskOutcome::Low {
@@ -29453,16 +29606,16 @@ fn disk_look_pass(
                 free_gib,
                 floor_gib: config.auto_free_gib,
                 hogs: glass,
-                asked: disk_ask::owner_said(),
             });
         }
     }
 }
 
-/// The board's rows of one look (`crate::disk_board`), and what the look read for the
+/// `board`'s rows of one look (`crate::disk_board`), and what the look read for the
 /// rebuildable budget: the cap as its `reading` has it, and the home volume where this process
 /// is the account's own watch, the one that sizes it (`crate::disk_board::Board::budget_look`).
 fn disk_publish_look(
+    board: &Shelf,
     table: &aterm_sysprobe::volumes::Table,
     home: Option<crate::disk_board::VolumeRow>,
     sessions: &[(u64, std::path::PathBuf)],
@@ -29475,7 +29628,9 @@ fn disk_publish_look(
         .filter(|r| r.reclaimed_here)
         .map(|r| r.reading.key.spelled());
     let (mut rows, map) = disk_look_rows(table, home, sessions, reading, state, now);
-    crate::disk_board::publish(|b| {
+    // The budget pass's memo is a few numbers; read before the board's lock, as the rows are.
+    let unmet = aterm_agent::harness::disk::budget::load(state);
+    board.publish(|b| {
         for old in std::mem::take(&mut b.volumes) {
             if rows.len() >= crate::disk_board::MAX_VOLUMES {
                 break;
@@ -29488,6 +29643,7 @@ fn disk_publish_look(
         b.volumes = rows;
         b.sessions = map;
         b.budget_look(reading.config.cap_used_gib, sized_on);
+        b.budget_pass_look(reading.config.auto_free_gib > 0, unmet);
     });
 }
 
@@ -29545,9 +29701,9 @@ fn disk_look_rows(
 }
 
 /// Whether the working directory `cwd` is one the board cannot place for its 8.3 short names alone
-/// (`C:\Users\ANDREW~1\x`: [`aterm_sysprobe::paths::short_spelled`]).
+/// (`C:\Users\ANDREW~1\x`: [`aterm_path::short_spelled`]).
 pub(crate) fn disk_short_spelled(cwd: &Path) -> bool {
-    cfg!(windows) && aterm_sysprobe::paths::short_spelled(cwd).is_some()
+    cfg!(windows) && aterm_path::short_spelled(cwd).is_some()
 }
 
 /// A session's 8.3 directory spelled long, onto `shelf` (`crate::disk_board::Board::spelled`).
@@ -29946,24 +30102,6 @@ fn disk_fill_credit(
     disk_fill(key, |fill| fill.credit(counted, before, after, pass_ms));
 }
 
-/// What volume `key`'s fill ring reads for the ask at `free` bytes against `floor` on a volume of
-/// `total`: the crossing it projects ([`aterm_agent::harness::disk::fill::Fill::crossing`]), and
-/// whether the ring is cold.
-pub(crate) fn disk_fill_ask(
-    key: &str,
-    free: u64,
-    floor: u64,
-    total: u64,
-) -> (Option<aterm_agent::harness::disk::fill::Projection>, bool) {
-    let fills = DISK_FILLS.lock().unwrap_or_else(PoisonError::into_inner);
-    fills
-        .iter()
-        .find(|(k, _)| k == key)
-        .map_or((None, true), |(_, fill)| {
-            (fill.crossing(free, floor, Some(total)), fill.cold())
-        })
-}
-
 #[cfg(test)]
 use aterm_agent::harness::disk::cadence::{
     EMERGENCY_DROP as DISK_EMERGENCY_DROP, LOW_EVERY as DISK_LOW_EVERY,
@@ -29993,32 +30131,39 @@ fn disk_pass_due(
     aterm_agent::harness::disk::cadence::due(last, now, level, free, poked, room)
 }
 
-/// The cadence after a pass at `level` that `freed` something or not, the last one's `before` ([`DiskPass::low_every`]).
+/// The cadence after a pass at `level` that `freed` something or not, the last one's `before`
+/// ([`DiskPass::every`]), free space where the last pass measured it.
 #[cfg(test)]
-fn disk_low_every(
+fn disk_every(
     level: aterm_agent::harness::disk::Level,
     freed: bool,
     before: Option<&DiskPass>,
 ) -> Duration {
-    aterm_agent::harness::disk::cadence::low_every(level, freed, before)
+    aterm_agent::harness::disk::cadence::every(level, freed, before, before.and_then(|b| b.free))
 }
 
-/// A pass that started at `at` in a look that measured `free` at `level` ran.
+/// A pass that started at `at` in a look that measured `free` at `level` ran: `last` is the
+/// watch's last pass from now.
 fn disk_pass_ran(
+    last: &Mutex<Option<DiskPass>>,
     at: Instant,
     free: Option<u64>,
     fruitless: bool,
     level: aterm_agent::harness::disk::Level,
     freed: bool,
 ) {
-    let mut last = DISK_LAST_PASS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
     aterm_agent::harness::disk::cadence::ran(&mut last, at, free, fruitless, level, freed);
 }
 
-/// What a pass did, on the board for `await sys` to answer from (`crate::disk_board::PassSummary`).
+/// What a pass did, on `board` for `await sys` to answer from (`crate::disk_board::PassSummary`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the board the summary goes on and what one pass measured, freed and left: a \
+              struct for them would be built at each call and read once"
+)]
 fn disk_pass_summary(
+    board: &Shelf,
     key: Option<&aterm_sysprobe::volumes::VolumeKey>,
     free_after: Option<u64>,
     (tiers, ran_out): (Vec<u8>, bool),
@@ -30046,7 +30191,7 @@ fn disk_pass_summary(
         left: left.to_vec(),
         ended_at_unix: crate::disk_board::unix_now(),
     };
-    crate::disk_board::publish(|b| b.last_pass = Some(summary));
+    board.publish(|b| b.last_pass = Some(summary));
 }
 
 /// The short episode's freed figures with this pass's `freed` bytes and `went` lines added (the episode adds them itself at [`disk_episode_after`]).
@@ -30324,15 +30469,11 @@ fn disk_full_cause(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the board whose episode keeps the alert, the look's reading and the alert's \
-              own words: a struct for them would be built at each call and read once"
-)]
+/// Tell the window of a look at `level`: at the emergency line, the episode's record
+/// ([`HostNote::DiskFull`]) with what the episode freed; out of it after one, its end.
 fn disk_alert(
     board: &Shelf,
     level: aterm_agent::harness::disk::Level,
-    thresholds: &aterm_agent::harness::disk::Thresholds,
     free: Option<u64>,
     freed: u64,
     hogs: &[String],
@@ -30366,8 +30507,6 @@ fn disk_alert(
             freed: total_freed,
             hogs: hogs.to_vec(),
             cause,
-            thresholds: *thresholds,
-            asked: disk_ask::owner_said(),
         });
     } else if was {
         note(HostNote::DiskFullOver);
@@ -30386,74 +30525,6 @@ fn disk_owed(board: &Shelf, sid: &str) -> Option<String> {
         .owed
         .get(sid)
         .map(|(text, _)| text.clone())
-}
-
-/// The `disk-free@v1` line owed tab `sid`, if one is.
-fn disk_ask_owed(board: &Shelf, sid: &str) -> Option<crate::disk_board::AskOwed> {
-    board.board_lock().asks.get(sid).cloned()
-}
-
-/// Why tab `sid` may not be asked to free space as of the turn break it rests at (nothing: it
-/// may), for the look's seats.
-fn disk_ask_fit(board: &Shelf, sid: &str, found: crate::disk_board::Unfit) {
-    let mut b = board.board_lock();
-    if found == crate::disk_board::Unfit::default() {
-        b.unfit.remove(sid);
-    } else {
-        b.unfit.insert(sid.to_owned(), found);
-    }
-}
-
-/// Tab `sid` works again (a busy read): what its worker found of the session itself at its last
-/// turn break no longer holds, as it was given something to do ([`crate::disk_board::Unfit::own`]);
-/// whose it is holds on. The loop's lasting withholds stand as its loop told them
-/// ([`IdleHost::lasting_hold`]): a break of the agent's own background work reads busy too and
-/// works past no wall it stands at, so the loop alone says when a wall's hold is over.
-fn disk_ask_busy(board: &Shelf, sid: &str) {
-    let mut b = board.board_lock();
-    let Some(found) = b.unfit.get_mut(sid) else {
-        return;
-    };
-    found.own = None;
-    if found.theirs.is_none() {
-        b.unfit.remove(sid);
-    }
-}
-
-/// Tab `sid`'s loop opened a limit episode at a usage-limit wall (`Some`) or closed it (`None`):
-/// the ask to free space holds it out of its seats while the wall holds
-/// ([`crate::disk_board::Board::walls`]).
-fn disk_ask_walled(board: &Shelf, sid: &str, wall: Option<crate::disk_board::Wall>) {
-    let mut b = board.board_lock();
-    match wall {
-        Some(wall) => {
-            b.walls.insert(sid.to_owned(), wall);
-        }
-        None => {
-            b.walls.remove(sid);
-        }
-    }
-}
-
-/// Tab `sid`'s loop decided its last turn break held by a lasting withhold (`Some`) or none
-/// (`None`): the ask to free space holds it out of its seats while it holds
-/// ([`crate::disk_board::Board::withholds`]).
-fn disk_ask_withheld(board: &Shelf, sid: &str, withhold: Option<crate::disk_board::Withhold>) {
-    let mut b = board.board_lock();
-    match withhold {
-        Some(withhold) => {
-            b.withholds.insert(sid.to_owned(), withhold);
-        }
-        None => {
-            b.withholds.remove(sid);
-        }
-    }
-}
-
-/// The ask's step at tab `sid` ended other than in a wait: owed no more until the lease names it
-/// again.
-fn disk_ask_stepped(board: &Shelf, sid: &str) {
-    board.board_lock().asks.remove(sid);
 }
 
 /// The resume's step at tab `sid` ended `typed` (or tries ran out): owed no more.
@@ -30561,10 +30632,16 @@ fn disk_look_without_pass(
             Some(HostNote::DiskLowCleanupOff {
                 free_gib,
                 floor_gib,
-                asked: disk_ask::owner_said(),
             })
         }
     }
+}
+
+/// Whether a pass freed anything: a tier's row went, or it counted bytes that are no row of
+/// `removed` (the outside caches its last step takes, `aterm_agent::harness::disk::free::pass`).
+fn pass_reclaimed(tick: &aterm_agent::harness::cli::DiskTick) -> bool {
+    matches!(tick, aterm_agent::harness::cli::DiskTick::Reclaimed(done, _)
+        if !done.removed.is_empty() || done.freed_bytes > 0)
 }
 
 /// The free figure a pass left the volume at.
@@ -31638,11 +31715,13 @@ pub(crate) fn store_hooks(store: &Store) -> StoreHooks {
 /// [`Hooks::needs`], live.
 pub(crate) fn store_needs(store: &Store, sid: &str, needs: &[String], entry: &str) -> bool {
     let told = crate::needs::HarnessNeeds::told(needs, entry).map(Arc::new);
-    let found = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx));
+    let found = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx))
+    });
     let Some(ctx) = found else {
         return false;
     };
@@ -31665,7 +31744,7 @@ pub(crate) fn needs_told_of(store: &Store, sid: &str) -> Option<(Vec<String>, St
     let ctx = store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .map(|h| Arc::clone(&h.ctx))?;
     let standing = ctx
         .meta
@@ -31689,11 +31768,13 @@ pub(crate) fn store_land_held(
     sid: &str,
     held: Option<aterm_agent::harness::acts::LandHeld>,
 ) -> bool {
-    let found = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx.timeline));
+    let found = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx.timeline))
+    });
     let Some(timeline) = found else {
         return false;
     };
@@ -31712,11 +31793,13 @@ pub(crate) fn store_land_said(
     said: Option<&aterm_agent::harness::hold_said::HoldSaid>,
 ) -> bool {
     use aterm_agent::harness::hold_said::{HoldSaid, ITEM_BYTES};
-    let found = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx.timeline));
+    let found = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx.timeline))
+    });
     let Some(timeline) = found else {
         return false;
     };
@@ -31749,11 +31832,13 @@ pub(crate) fn store_land_receipt(
     sid: &str,
     receipt: Option<&aterm_agent::harness::acts::LandReceipt>,
 ) -> bool {
-    let found = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx.timeline));
+    let found = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx.timeline))
+    });
     let Some(timeline) = found else {
         return false;
     };
@@ -31781,11 +31866,13 @@ pub(crate) fn store_land_receipt(
 
 /// Live [`Hooks::log_usage`] implementation recording `mark - usage h5=<pct> d7=<pct>` on tab `sid`.
 pub(crate) fn log_usage(store: &Store, sid: &str, h5: Option<u32>, d7: Option<u32>) {
-    let found = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .map(|h| Arc::clone(&h.ctx.timeline));
+    let found = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .map(|h| Arc::clone(&h.ctx.timeline))
+    });
     let Some(timeline) = found else {
         return;
     };
@@ -31860,7 +31947,7 @@ fn timeline_of(
     store
         .read()
         .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
+        .by_sid(&aterm_session::SessionId::parse(sid)?)
         .map(|h| Arc::clone(&h.ctx.timeline))
 }
 
@@ -31916,7 +32003,6 @@ impl Acts {
             release_notice: Arc::new(|_, _| None),
             notice_stands: Arc::new(|_| false),
             disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
-            disk_free: Arc::new(|_, _, _, _| "wait:inert".to_string()),
             disk_board: {
                 static INERT: Shelf = Shelf::new();
                 &INERT
@@ -32318,10 +32404,6 @@ impl HostHandle {
             .running
     }
 }
-
-#[path = "harness_disk_ask.rs"]
-mod disk_ask;
-pub(crate) use disk_ask::draft_shown;
 
 #[path = "harness_credit_claim.rs"]
 pub(crate) mod credit_claim;

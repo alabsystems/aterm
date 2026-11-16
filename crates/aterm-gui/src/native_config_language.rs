@@ -1022,6 +1022,20 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "navigator",
+        "Navigator",
+        ConfigSchemaKind::Table,
+        &["navigator", "dock", "sidebar", "sessions"],
+        false,
+    ),
+    manual(
+        crate::prefs::EDIT_NAVIGATOR_DOCK,
+        "Show the navigator in new windows",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["navigator", "dock", "sidebar", "sessions", "window"],
+        true,
+    ),
+    manual(
         "swarm",
         "Swarm participation",
         ConfigSchemaKind::Table,
@@ -2392,6 +2406,12 @@ fn manual_default_shown(key: &str) -> Option<String> {
     Some(match key {
         crate::prefs::EDIT_AMACS_DEFAULT_EDITOR => config.amacs.config.default_editor.to_string(),
         "keeper.enabled" => config.keeper_enabled().to_string(),
+        crate::prefs::EDIT_NAVIGATOR_DOCK => crate::app_window::docks_by_default(
+            config.navigator_dock(),
+            false,
+            &crate::converge_lane::env_set,
+        )
+        .to_string(),
         "fleet.watch" => config.fleet_watch_enabled().to_string(),
         "session_log.journal" => config.session_log_journal().to_string(),
         "session_log.clause" => config.session_log_clause().to_string(),
@@ -5864,6 +5884,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "claude_footer.card" => {
             " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by ALab claude harness` (`ALab` a link to alab.systems), and under Autopilot off the same card in white; every row under the line stays Claude Code's own — glass only; false leaves the card bare · read live"
         }
+        crate::prefs::EDIT_NAVIGATOR_DOCK => {
+            " · default true, false in a scratch world (`ATERM_STATE_HOME` set) or under `CI`, and never headless · read when a window opens or is restored; on, the window starts with the navigator's list in a 30-cell column beside the terminal, the window that much wider at the grid it had, unless its saved layout says it was hidden or the window it came from hid it; a maximized or full-screen window, or one its screen cannot hold wider, gets it inside once its restore settles where the terminal keeps 80 columns beside it, each program resized once; off, no window starts with it · View ▸ Show Navigator shows or hides it in one window"
+        }
         "keeper.enabled" => {
             " · default true · read at launch; on, a window of an app bundle starts this build's PTY keeper if none runs, every terminal is registered with it, and a launch after a crash or kill reattaches the shells it held; off: `aterm keeper stop` ends the one running · macOS only"
         }
@@ -5874,7 +5897,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's program name (`detail=`: the wrapper's own name when the wrapper's flags are not known, and for a listed tool one known subcommand word; only a program that ran or a shell builtin is named, so a word that ran nothing, such as a secret typed at a prompt, is never kept) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's other arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `aterm ctl @<sid> log` and `aterm ctl @<sid> brief` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
-            " · default deck: in each window that shows System Resources, a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip, the widest thing on the row (blocks of 1 s, 10 s, 1 min, 10 min and 1 h, up to 6 h where the strip has the room, 4 h, 6 min or 1 min on a narrower one, cold to hot, 0 to 100% of that resource's max, the live now cell at the left in the strip's own colours, older and wider cells to its right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity keyed once over the bars, and at the bar's end, where it fits, this Mac's amount in the row's unit with the row's maximum, else the machine's maxima in the key (aterm's and the tab's amounts are in the close-up); Folded, or Full where `stats_deck_size` says so; every other window shows the sill; the first window aterm opens shows System Resources, and View ▸ Show System Resources Here gives it to a window or takes it away · sill: thin lanes in every window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
+            " · default deck: in each window that shows System Resources, a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip, the widest thing on the row (blocks of 1 s, 10 s, 1 min, 10 min and 1 h, up to 6 h where the strip has the room, 4 h, 6 min or 1 min on a narrower one, cold to hot, 0 to 100% of that resource's max, the live now cell at the left in the strip's own colours, older and wider cells to its right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity keyed once over the bars, and at the bar's end, where it fits, this Mac's amount in the row's unit with the row's maximum, else the machine's maxima in the key (aterm's and the tab's amounts are in the close-up); Folded, or Full where `stats_deck_size` says so; under the table, two fixed bands: Disk Custody, how aterm manages and tracks the disk (the volume's used space as rebuildable, costly to make again and kept, with the budget's cap and the warn, clean and emergency lines; three weeks of used space with each removal marked; what aterm freed today and the disk journal's newest entry; who holds the disk, a filled mark for a session at work and a hollow one for a session gone; and what the budget's next pass does), a record that asks nothing of you, whose parts give way in a fixed order on a narrow window and where a press or a rest opens the Disk close-up; then Network State; every other window shows the sill; the first window aterm opens shows System Resources, and View ▸ Show System Resources Here gives it to a window or takes it away · sill: thin lanes in every window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
         }
         "sys.stats_deck_size" => {
             " · default auto: the Deck stays Folded, two blocks of four rows in 62 pt, however tall the window · full: always Full, a header line and a row per resource in about 100 pt, which takes whole terminal rows · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows · View ▸ Deck Size picks one · read live"

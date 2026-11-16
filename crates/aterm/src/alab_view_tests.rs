@@ -67,13 +67,13 @@ fn a_registry_mailbox_names_its_own_login() {
 }
 
 /// One materializer pass over this stand-in home's shared files, as the process that owns the
-/// Commons runtime runs one after its stores grow.
+/// Commons runtime runs one after its stores grow: it projects each file whose key moved.
 fn materialize(paths: &Paths, config: &Path) -> Vec<aterm_db::file::materialize::Outcome> {
     aterm_db::file::materialize::pass(
         paths,
         config,
         None,
-        &aterm_db::file::materialize::Pass::now(true),
+        &aterm_db::file::materialize::Pass::now(),
     )
 }
 

@@ -14,7 +14,7 @@ use alab_policy::vocab::{Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 38, "0.38");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 39, "0.39");
 
 /// The glyphs Claude Code's spinner cycles through, plus the static ones it leaves mid-thought.
 const SPINNERS: &[char] = &['✢', '✽', '✻', '✶', '✳', '✧', '✦', '⚡', '·', '*'];

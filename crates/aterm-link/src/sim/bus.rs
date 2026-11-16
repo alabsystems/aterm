@@ -349,6 +349,9 @@ struct ConnState {
     read: u64,
     /// The refusals for the rate in [`ConnState::out`], each until its client reads past it.
     rate_marks: VecDeque<RateMark>,
+    /// It asked for origin stamps (`Request::OriginStamps`): each delivery it is handed from
+    /// then on carries its record's origin after the body ([`origin_at`], [`put_stamped`]).
+    origins: bool,
 }
 
 impl ConnState {
@@ -366,6 +369,7 @@ impl ConnState {
             fence_asked: false,
             read: 0,
             rate_marks: VecDeque::new(),
+            origins: false,
         }
     }
 
@@ -852,6 +856,14 @@ pub(crate) enum ArmMutant {
     /// A log whose identity sidecar no longer reads is minted a fresh id holding no record, as
     /// a log set aside is ([`Broker::lose_identity`]).
     RemintForgetsTheRecords,
+    /// `Request::OriginStamps` refused as not simulated, as every model before
+    /// ATERM-KI-1114-1414 answered it.
+    OriginStampsRefused,
+    /// A stamped delivery names the origin of the record after it, where there is one.
+    OriginOfTheNextRecord,
+    /// A record carried below the retention base is handed with no origin trailer, as if the
+    /// held store kept no origin.
+    HeldRecordsUnstamped,
     /// A failed full flush is consumed but succeeds: nothing is poisoned ([`State::full_flush`]).
     NeverPoisons,
     /// The reopen of a run whose full flush failed keeps its identity, as a clean one does.
@@ -2257,9 +2269,18 @@ impl State {
                 });
                 at = off + 1;
             }
+            let origins: Vec<Option<(u64, u64)>> = frames
+                .iter()
+                .map(|frame| match frame {
+                    Response::Delivery { offset, .. } => {
+                        origin_at(&self.log, self.ret.base, self.mutant, *offset)
+                    }
+                    _ => None,
+                })
+                .collect();
             if let Some(c) = self.conns.get_mut(&id) {
-                for frame in &frames {
-                    put(&mut c.out, frame);
+                for (frame, origin) in frames.iter().zip(origins) {
+                    put_stamped(&mut c.out, frame, origin.filter(|_| c.origins));
                 }
                 c.sub = Some((head.max(cursor), filter));
             }
@@ -2578,12 +2599,21 @@ impl State {
             holds,
             held_total,
             rate_pending,
+            log,
+            ret,
+            mutant,
             ..
         } = self;
         let Some(c) = conns.get_mut(&conn) else {
             return;
         };
         for r in responses {
+            let origin = match r {
+                Response::Delivery { offset, .. } if c.origins => {
+                    origin_at(log, ret.base, *mutant, *offset)
+                }
+                _ => None,
+            };
             // A settle's ack names the durable head, no record: the reorder count reads none.
             let settle = settles && matches!(r, Response::PublishAck { .. });
             let ack_of = match r {
@@ -2603,7 +2633,7 @@ impl State {
                     && holds.as_mut().is_some_and(|rng| rng.chance(1, 3)));
             if hold {
                 let mut frame = VecDeque::new();
-                put(&mut frame, r);
+                put_stamped(&mut frame, r, origin);
                 c.held.push_back(Held {
                     ack_of,
                     frame: Vec::from(frame),
@@ -2612,7 +2642,7 @@ impl State {
                 });
                 *held_total += 1;
             } else {
-                put(&mut c.out, r);
+                put_stamped(&mut c.out, r, origin);
                 c.mark_rate(rate);
                 settled |= settle;
             }
@@ -3064,7 +3094,8 @@ impl State {
                 },
                 // astream's whole set, as its `Hello` says it: the broker times, the stats, the burst
                 // marks, the relay and the fresh publish are asked for by no bridge, and answered
-                // here as not simulated.
+                // here as not simulated; the origin stamps, which `REQUEST_RELAY` names too, are
+                // served (`Request::OriginStamps`).
                 requests: Some(
                     astream_broker::REQUEST_RETIRE
                         | astream_broker::REQUEST_FRESH_PUBLISH
@@ -3154,6 +3185,14 @@ impl State {
             Request::GapNotices => {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.gaps = true;
+                }
+                vec![self.mark(head, String::new())]
+            }
+            // ORIGIN STAMPS (astream's `Request::OriginStamps`): answered at the head, and each
+            // delivery handed to this connection from then on carries its record's origin.
+            Request::OriginStamps if self.mutant != ArmMutant::OriginStampsRefused => {
+                if let Some(c) = self.conns.get_mut(&conn) {
+                    c.origins = true;
                 }
                 vec![self.mark(head, String::new())]
             }
@@ -3764,6 +3803,50 @@ fn put(out: &mut VecDeque<u8>, resp: &Response) {
     out.extend(bytes);
 }
 
+/// [`put`], a delivery carrying `origin` after its body where it is `Some` (astream's
+/// `append_delivery_frame_stamped`: `[ORIGIN_TAG, producer_le_8, seq_le_8]`, which
+/// `proto::decode_delivery_origin` reads).
+fn put_stamped(out: &mut VecDeque<u8>, resp: &Response, origin: Option<(u64, u64)>) {
+    let (
+        Response::Delivery {
+            offset,
+            subject,
+            body,
+        },
+        Some((producer, seq)),
+    ) = (resp, origin)
+    else {
+        return put(out, resp);
+    };
+    let mut payload = astream_broker::proto::encode_delivery(*offset, subject, body);
+    payload.push(astream_broker::brecord::ORIGIN_TAG);
+    payload.extend_from_slice(&producer.to_le_bytes());
+    payload.extend_from_slice(&seq.to_le_bytes());
+    let mut bytes = Vec::new();
+    astream_broker::proto::write_frame(&mut bytes, &payload).expect("a frame to memory");
+    out.extend(bytes);
+}
+
+/// THE ORIGIN a delivery of the record at `off` carries to a connection that asked for stamps
+/// (astream's `queue_delivery_maybe_stamped`, `(rec.producer_id, rec.producer_seq)`): its key,
+/// `(0, 0)` for a record no producer keyed. The log never shrinks, so a record carried below
+/// the base keeps its key at its offset, as astream's held store keeps a record whole.
+fn origin_at(log: &[Rec], base: u64, mutant: ArmMutant, off: u64) -> Option<(u64, u64)> {
+    if mutant == ArmMutant::HeldRecordsUnstamped && off < base {
+        return None;
+    }
+    let key = |at: u64| {
+        usize::try_from(at)
+            .ok()
+            .and_then(|i| log.get(i))
+            .map(|rec| rec.key.unwrap_or((0, 0)))
+    };
+    let next = (mutant == ArmMutant::OriginOfTheNextRecord)
+        .then(|| key(off + 1))
+        .flatten();
+    next.or_else(|| key(off))
+}
+
 /// DIAL the world's broker for process `p`.
 pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
     let stream = dial_stream(p)?;
@@ -3843,16 +3926,18 @@ impl Read for SimStream {
                         s.seen_before_ack += 1;
                     }
                     let rec = s.log[usize::try_from(off).unwrap_or(0)].clone();
+                    let origin = origin_at(&s.log, s.ret.base, s.mutant, off);
                     s.note_event(|| Event::Deliver(self.conn));
                     if let Some(c) = s.conns.get_mut(&self.conn) {
                         c.sub = Some((off + 1, filter));
-                        put(
+                        put_stamped(
                             &mut c.out,
                             &Response::Delivery {
                                 offset: off,
                                 subject: rec.subject,
                                 body: rec.body,
                             },
+                            origin.filter(|_| c.origins),
                         );
                     }
                     out_empty = false;

@@ -685,7 +685,7 @@ fn the_transcripts_fence_sees_through_a_linked_claude_folder() {
 
     let row = std::fs::canonicalize(&session).expect("canonical");
     assert_eq!(
-        aterm_sysprobe::paths::is_under(&row, &root),
+        aterm_path::is_under(&row, &root),
         Some(false),
         "the key alone reads the row beside the linked root"
     );
@@ -1876,7 +1876,7 @@ fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
 
 #[test]
 fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
-    use aterm_sysprobe::paths::is_under;
+    use aterm_path::is_under;
     let tmp = Tmp::new("idle-cwd-on");
     let dir = tmp.path().join("work");
     std::fs::create_dir_all(&dir).expect("work");
@@ -1993,54 +1993,71 @@ fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
     }
 }
 
-/// THE DISK'S LINES ARE ATERM'S OWN WORDS: the resume after `ENOSPC` and the ask to free space
-/// are pasted through a fenced `turn`, which a person's key between the paste and the Enter
-/// leaves unsent in the composer (`turn … reason=person typed=0 pasted=<n>`); the hosted loop
-/// reads either as the harness's own (`Composer::Own`: asked about, never sent), never as a
-/// person's draft it enters once their grace is out.
-/// NEGATIVE CONTROL: `upgrade::OWN_HEADS` without `RESUME_HEAD` and `ask::LINE_HEAD`, and each
-/// line reads as a person's draft.
+/// THE DISK'S LINE IS ATERM'S OWN WORDS: the resume after `ENOSPC` is pasted through a fenced
+/// `turn`, which a person's key between the paste and the Enter leaves unsent in the composer
+/// (`turn … reason=person typed=0 pasted=<n>`); the hosted loop reads it as the harness's own
+/// (`Composer::Own`: asked about, never sent), never as a person's draft it enters once their
+/// grace is out.
+/// NEGATIVE CONTROL: `upgrade::OWN_HEADS` without `RESUME_HEAD`, and the line reads as a
+/// person's draft.
 #[test]
 fn the_disks_lines_left_in_the_composer_are_aterms_own_words() {
     let named = [
         "~/aterm's builds 2.0 GiB".to_owned(),
         "$HOME/trust 1.0 GiB".to_owned(),
     ];
-    let mut texts = vec![
+    let texts = [
         resume_text("ENOSPC", 0, &[]),
         resume_text("EDQUOT", 3 << 30, &[]),
         resume_text("ENOSPC", 3 << 30, &named),
     ];
-    let holders = [Hog {
-        built_s_ago: None,
-        path: PathBuf::from("/Users//u/aterm/target"),
-        bytes: 40 << 30,
-        bytes_partial: false,
-        why: "cargo build output".to_owned(),
-        serves: Some(PathBuf::from("/Users//u/aterm")),
-    }];
-    for (mount, done, holders) in [
-        ("/System/Volumes/Data", ask::Done::Spent, &holders[..]),
-        ("/", ask::Done::Inodes, &[][..]),
-    ] {
-        texts.push(ask::line(&ask::Line {
-            mount: Path::new(mount),
-            total: 1000 << 30,
-            free: 18 << 30,
-            floor: 25 << 30,
-            emergency: false,
-            done,
-            holders,
-            checkout: Some(Path::new("/Users//u/aterm")),
-            shared: false,
-            home: Some(Path::new("/Users//u")),
-            projected: None,
-        }));
-    }
     for text in &texts {
         assert!(
             crate::harness::upgrade::own_words(text) && crate::harness::upgrade::own_draft(text),
             "{text}"
         );
     }
+}
+
+/// What an earlier build's disk ask left goes: the lease and its lock. NEGATIVE CONTROLS: the
+/// `disk-worker` folder an earlier build's worker ran in stays, empty or not (a shell a cold
+/// restart brought back may stand in it); a link in a lease's place stays and its target is
+/// untouched; a file of another name stays.
+#[test]
+fn the_retired_asks_files_go_and_nothing_else() {
+    let tmp = Tmp::new("retire-ask");
+    let state = tmp.path().join("state");
+    let worker = state.join("disk-worker");
+    std::fs::create_dir_all(&worker).unwrap();
+    for name in RETIRED_ASK_FILES {
+        std::fs::write(state.join(name), b"{}").unwrap();
+    }
+    std::fs::write(state.join("disk.jsonl"), b"{}\n").unwrap();
+    let mut went = retire_ask_files(&state);
+    went.sort();
+    let mut want: Vec<PathBuf> = RETIRED_ASK_FILES.iter().map(|n| state.join(n)).collect();
+    want.sort();
+    assert_eq!(went, want);
+    assert!(state.join("disk.jsonl").exists(), "the ledger stays");
+    assert!(worker.is_dir(), "the worker's folder stays");
+    assert_eq!(
+        retire_ask_files(&state),
+        Vec::<PathBuf>::new(),
+        "nothing left to go"
+    );
+
+    let notes = worker.join("notes.md");
+    std::fs::write(&notes, b"a worker's words").unwrap();
+    #[cfg(unix)]
+    {
+        let target = tmp.path().join("elsewhere.json");
+        std::fs::write(&target, b"kept").unwrap();
+        std::os::unix::fs::symlink(&target, state.join(RETIRED_ASK_FILES[0])).unwrap();
+        assert_eq!(retire_ask_files(&state), Vec::<PathBuf>::new());
+        assert!(std::fs::symlink_metadata(state.join(RETIRED_ASK_FILES[0])).is_ok());
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept");
+    }
+    #[cfg(not(unix))]
+    assert_eq!(retire_ask_files(&state), Vec::<PathBuf>::new());
+    assert_eq!(std::fs::read(&notes).unwrap(), b"a worker's words");
 }

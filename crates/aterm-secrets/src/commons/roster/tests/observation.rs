@@ -1859,6 +1859,123 @@ fn a_pending_epoch_cannot_hit_cached_historical_absence() {
     assert!(log.get(parent.id()).is_none(), "the parent has not arrived");
 }
 
+/// Twenty Commons epochs of one held log, each wrapped to this device, read twice: the second
+/// read answers each as the first did and unwraps none of their keys, since the kept answers hold
+/// every epoch of the held log ([`KeptHistory`]). Once the log holds another record, each is
+/// unwrapped again, and what is kept for this vault and device is the new log's twenty answers
+/// alone.
+///
+/// NEGATIVE CONTROLS, each run on 2026-11-15: the 16-entry FIFO the kept answers replaced (the
+/// parent's `historical_from_lease`, verbatim) fails the second read's assertion (left: 20,
+/// right: 0: read in order, each epoch's answer was pushed out before it was asked again); a
+/// `KeptHistory::keep` that moves a vault's generation without dropping its answers serves the
+/// old log's after the log moved (left: 1, right: 20: only the first epoch missed); one that keeps
+/// a vault's answers for each generation apart fails the last count (left: 40, right: 20); a
+/// `KeptHistory::answer` that leaves the generation out of its lookup fails the read after the
+/// log moved (left: 0, right: 20).
+#[test]
+fn a_second_read_of_twenty_epochs_unwraps_none() {
+    use crate::membership_log::{
+        Body, EpochAudience, Inserted, Log,
+        history::{HistoryView, UNWRAPS},
+    };
+    use std::cell::Cell;
+
+    const EPOCHS: u64 = 20;
+    let vault = Vault::new();
+    let identity = client::machine_identity(&vault.paths).unwrap();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let (mut log, _) = client::trusted_commons_log(&vault.paths, vault.bootstrap.trust())
+        .unwrap()
+        .unwrap();
+    let request = vault.bootstrap.request().unwrap();
+    let actor = request.binding().actor();
+    let incarnation = *request.binding().incarnation();
+    let mut keys = Vec::new();
+    vault.bootstrap.device().with_seed(|seed| {
+        for n in 0..EPOCHS {
+            let (draft, key) = log
+                .draft_epoch(&actor, 100 + n, EpochAudience::Commons, 2 + n)
+                .unwrap();
+            let epoch = draft.sign(seed, incarnation).unwrap();
+            assert_eq!(log.insert(epoch.clone()).unwrap(), Inserted::Held);
+            let wrap = log
+                .draft_wrap(&actor, 100 + n, *epoch.id(), &key, identity.recipient())
+                .unwrap()
+                .sign(seed, incarnation)
+                .unwrap();
+            assert_eq!(log.insert(wrap).unwrap(), Inserted::Held);
+            keys.push((*epoch.id(), *key));
+        }
+    });
+    let kept = || KeptHistory::kept(access.trust, identity.recipient().0);
+    // One read of every epoch under `log`'s held records: each epoch's generation and key, and how
+    // many keys the read unwrapped. Each epoch asks the kept answers once.
+    let read = |log: &Log| {
+        let view = HistoryView::new(log);
+        let lease = view.lease_complete().unwrap();
+        let (unwraps, asks) = (UNWRAPS.with(Cell::get), KEY_CACHE_ASKS.with(Cell::get));
+        let answers: Vec<(u64, [u8; 32])> = keys
+            .iter()
+            .map(|(basis, key)| {
+                let past = access
+                    .historical_from_lease(&identity, *basis, &lease)
+                    .unwrap()
+                    .expect("CONTROL: the log names the writers of each epoch");
+                let opened = past.with_key(&vault.journal, |key| *key).unwrap();
+                assert_eq!(&opened, key, "CONTROL: each epoch opens to its own key");
+                (past.generation(), opened)
+            })
+            .collect();
+        let asked = KEY_CACHE_ASKS.with(Cell::get) - asks;
+        assert_eq!(
+            asked,
+            keys.len(),
+            "CONTROL: every epoch asks the kept answers"
+        );
+        (answers, UNWRAPS.with(Cell::get) - unwraps)
+    };
+
+    let (first, unwrapped) = read(&log);
+    assert_eq!(
+        unwrapped,
+        keys.len(),
+        "CONTROL: the first read unwraps each epoch"
+    );
+    let (second, unwrapped) = read(&log);
+    assert_eq!(
+        unwrapped, 0,
+        "a second read under the same held log unwraps none of its epochs"
+    );
+    assert_eq!(second, first, "a kept answer is the answer read");
+
+    vault.bootstrap.device().with_seed(|seed| {
+        let record = log
+            .draft(
+                &actor,
+                100 + EPOCHS,
+                Body::Name {
+                    name: "member".into(),
+                },
+            )
+            .sign(seed, incarnation)
+            .unwrap();
+        assert_eq!(log.insert(record).unwrap(), Inserted::Held);
+    });
+    let (moved, unwrapped) = read(&log);
+    assert_eq!(
+        unwrapped,
+        keys.len(),
+        "a log that holds another record unwraps each epoch again"
+    );
+    assert_eq!(moved, first);
+    assert_eq!(
+        kept(),
+        keys.len(),
+        "the kept answers are the moved log's alone"
+    );
+}
+
 /// A batch asks whether this device holds each basis as [`Bootstrap::historicals`] answers it, in
 /// order, and takes no key to answer: it asks nothing of the kept keys, a basis the log opens is
 /// noted as opened in the log the vault's memo keeps, and the next ask unwraps no key again.

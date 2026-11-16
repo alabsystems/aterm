@@ -509,7 +509,11 @@ fn dirs_resolve_follows_a_lane_s_environment() {
     #[cfg(target_os = "linux")]
     assert_eq!(dirs.state, st.join("aterm").join("agh"));
     assert_eq!(dirs.journal(), dirs.state.join("journal"));
-    assert_eq!(dirs.grants(), dirs.state.join("grants-v2"));
+    assert_eq!(
+        dirs.grants(),
+        dirs.state
+            .join(format!("grants-v{}", agh::git::grant::GRANT_VERSION))
+    );
     assert_eq!(dirs.needs(), dirs.state.join("needs"));
     let plain = config::Dirs::resolve(home, None, None).expect("the home's defaults");
     assert_eq!(plain.config, home.join(".config").join("aterm").join("agh"));

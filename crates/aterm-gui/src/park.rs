@@ -5,4 +5,4 @@
 //! below this crate so the fabric endpoint's waits (`aterm-gui-fabric`) slice
 //! the same way the dispatcher's do.
 
-pub(crate) use aterm_control::park::{Lane, Woke, park};
+pub(crate) use aterm_control::park::{Lane, Woke, park, park_on_slot};

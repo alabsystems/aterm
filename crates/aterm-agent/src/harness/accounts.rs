@@ -146,7 +146,7 @@ pub(super) use sync_commit::EARLY_ROSTER as SYNC_COMMIT_EARLY_ROSTER;
 pub(super) use sync_commit::REFUSE_BEFORE_INTENT as SYNC_COMMIT_REFUSE;
 #[cfg(any(test, debug_assertions))]
 pub use sync_commit::paused_before_receipt_for_test;
-pub(super) use sync_commit::{FleetTarget, SyncTarget, usage_target};
+pub(super) use sync_commit::{Admits, FleetTarget, SyncTarget, usage_target};
 
 #[path = "accounts_directory.rs"]
 mod directory;
@@ -5352,6 +5352,121 @@ pub fn note_served_back(
         out.push(Event::new(at, Kind::Auth, label).because(Auth::Ok.as_str()));
     }
     out
+}
+
+/// WHAT SHOWS A LOGIN LIVE HERE AFTER ITS SIGN-OUT WAS RECORDED ([`adopt_login`]), read from files
+/// that hold no credential (`login_adoption::live_login_here`): never the network, a process run
+/// or the keychain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LoginEvidence {
+    /// A sign-in of it succeeded then: the `/login` command's own success row in a
+    /// conversation on its login.
+    SignedIn(i64),
+    /// Its login served then: the model's answer, written then, to a request that began after
+    /// the sign-out in a conversation on its login, whose usage-tap reading's API time grew
+    /// past a baseline taken after the sign-out, with a rate-limit figure.
+    Served(i64),
+}
+
+impl LoginEvidence {
+    /// When what it shows happened (Unix seconds).
+    #[must_use]
+    pub const fn at(self) -> i64 {
+        match self {
+            Self::SignedIn(at) | Self::Served(at) => at,
+        }
+    }
+
+    /// Its words in the log.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::SignedIn(_) => "a login made in a tab",
+            Self::Served(_) => "its login served a tab",
+        }
+    }
+}
+
+/// Why [`adopt_login`] left a row's word as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAdopted {
+    /// The word on record for the row's login is not signed out: nothing to lift.
+    NotSignedOut,
+    /// The sign-out on record carries no time, so no evidence can be shown newer than it.
+    Undated,
+    /// The evidence is no newer than the sign-out recorded then.
+    NotAfter(i64),
+    /// The evidence is dated after now: a clock apart, which proves nothing.
+    Future,
+    /// The record holds a word later than the evidence.
+    LaterWord,
+}
+
+impl NotAdopted {
+    /// Its words in the log.
+    #[must_use]
+    pub fn words(self) -> String {
+        match self {
+            Self::NotSignedOut => "its login is not signed out on record".to_owned(),
+            Self::Undated => "its sign-out on record has no time".to_owned(),
+            Self::NotAfter(struck) => format!("not after its sign-out at {struck}"),
+            Self::Future => "dated after now".to_owned(),
+            Self::LaterWord => "its record holds a later word".to_owned(),
+        }
+    }
+}
+
+/// THE ONE WRITER THAT ADOPTS A LOGIN A PERSON MADE OR A TAB WAS SERVED BY (plan package
+/// FL-174): `row`'s sign-out on record is retired by
+/// `evidence` dated after it, whoever read the evidence and whether or not any tab is supervised.
+/// The record is a belief and a served turn is a fact, so evidence of service outranks a recorded
+/// sign-out older than it, and nothing else: the word must read signed out for this row's login
+/// ([`Account::current_auth`], the record half of [`signed_out_here`]), carry its time, and be
+/// strictly older than the evidence, which is not dated after `now`. Served evidence lifts the
+/// word alone ([`note_served_back`]: the login's renewal, notice and lifetime stand); a sign-in
+/// is a new login ([`note_signed_back`]). Both clear the pending sign-in task and the failed or
+/// blocked attempt the sign-out led to, and both stamp the word at the evidence's own time, so
+/// two processes that fold the same evidence agree: the second finds the word no longer signed
+/// out, and a sign-out recorded after the evidence stands against it.
+///
+/// Whose login the evidence is of is the caller's to prove before this is called (the profile of
+/// the login place names the row's address; `login_adoption::live_login_here`). Return its events
+/// from the enclosing transaction.
+///
+/// # Errors
+/// [`NotAdopted`]: nothing changed.
+pub fn adopt_login(
+    state: &mut State,
+    logins: &mut Logins,
+    row: &Row,
+    evidence: LoginEvidence,
+    now: i64,
+) -> Result<Vec<Event>, NotAdopted> {
+    let label = row.label.as_str();
+    let Some(account) = state.accounts.get(label) else {
+        return Err(NotAdopted::NotSignedOut);
+    };
+    if account.current_auth(row) != Auth::SignedOut {
+        return Err(NotAdopted::NotSignedOut);
+    }
+    let Some(struck) = account.auth_at else {
+        return Err(NotAdopted::Undated);
+    };
+    let at = evidence.at();
+    if at <= struck {
+        return Err(NotAdopted::NotAfter(struck));
+    }
+    if at > now {
+        return Err(NotAdopted::Future);
+    }
+    let events = match evidence {
+        LoginEvidence::Served(_) => note_served_back(state, logins, label, at),
+        LoginEvidence::SignedIn(_) => note_signed_back(state, logins, label, at),
+    };
+    if events.is_empty() {
+        return Err(NotAdopted::LaterWord);
+    }
+    Ok(events)
 }
 
 /// Record a verified sign-in, including refreshed metadata on an existing binding.

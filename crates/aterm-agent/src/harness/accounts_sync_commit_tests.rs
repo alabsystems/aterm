@@ -141,7 +141,7 @@ fn oversized_stored_receipt_refuses_before_auxiliary_effects() {
         },
         plan,
         &[],
-        None,
+        (None, Admits::EveryPlan),
         || {
             invoked.set(true);
             Ok(())
@@ -221,15 +221,20 @@ fn stale_before_images_never_publish_a_new_pending_receipt() {
                 edit();
             }
             let called = std::cell::Cell::new(false);
-            let result = bed
-                .store
-                .publish_plan_scoped(&held, scope, plan, &[], None, || {
+            let result = bed.store.publish_plan_scoped(
+                &held,
+                scope,
+                plan,
+                &[],
+                (None, Admits::EveryPlan),
+                || {
                     called.set(true);
                     if during_auxiliary {
                         edit();
                     }
                     Ok(())
-                });
+                },
+            );
             assert!(
                 result.is_err(),
                 "{role:?}, auxiliary={during_auxiliary}, matches_after={matches_after}"

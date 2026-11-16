@@ -766,3 +766,77 @@ fn headless_capture_hands_no_neighbor_rows_before_rainbow_kitty_owns_the_frame()
         assert_eq!(actual, marker, "the witnesses' rows are the real ones");
     }
 }
+
+/// A frame of a window nobody attends arms no fade hold: drawn 0.2 s into a load-shed fade, an
+/// attended window's frame (a single pane through the redraw onto a scripted surface, a split's
+/// through `redraw_compose`) holds the effect lane for the fade, marked the fade's, and a
+/// lapsed window's frame holds nothing.
+///
+/// NEGATIVE CONTROL: the seam off (`window_shed_envelope`'s `ws.person_here()` made
+/// `ws.person_here() || true`): "split=false: a lapsed window's frame arms no fade hold" failed
+/// (left Some(Instant { .. }), right None). The attended arm is the law's non-vacuity: it shows
+/// a headless frame reaches the fade site.
+#[test]
+fn an_unattended_frame_arms_no_fade_hold() {
+    use crate::window_rest::ATTENTION;
+    for split in [false, true] {
+        for attended in [true, false] {
+            let (mut app, wid) = pet_app("auto", split);
+            app.config.load_adaptive_motion = Some(true);
+            let mut ws = app.windows.get_mut(&wid).expect("the window");
+            ws.os_window_for_test = true;
+            // The single pane's redraw presents only to a surface; the split's test entry
+            // composes without one.
+            ws.present = Some(crate::PresentTarget::Cpu {
+                surface: crate::present::CpuSurface::Scripted(Default::default()),
+            });
+            let at = Instant::now() + ATTENTION;
+            if !attended {
+                assert!(
+                    ws.rest.settle_attended(at, Some(ATTENTION)),
+                    "fixture: lapsed"
+                );
+            }
+            drop(ws);
+            let shed = at - Duration::from_millis(200);
+            for frame in 0..3_u32 {
+                app.note_present_cost(
+                    30_000_000,
+                    Duration::from_millis(16),
+                    shed - Duration::from_millis(16) * (2 - frame),
+                );
+            }
+            assert_eq!(
+                app.perf_flip_at,
+                Some(shed),
+                "fixture: the latch shed 0.2 s before"
+            );
+            assert!(
+                aterm_effects::companion::shed_envelope_transitioning(
+                    true,
+                    app.effective_shed_envelope(app.config.motion_mode(), at)
+                ),
+                "fixture: the App's envelope is mid-fade"
+            );
+            if split {
+                let ws = &app.windows[&wid];
+                let (rows, cols) = (usize::from(ws.rows), usize::from(ws.cols));
+                let _ = app.redraw_compose(wid, rows, cols, false, false, None, 0, at);
+            } else {
+                app.redraw_window_at(wid, at);
+            }
+            let ws = &app.windows[&wid];
+            if attended {
+                assert!(
+                    ws.deco_anim_until.is_some() && ws.deco_hold_by_fade,
+                    "split={split}: an attended window's frame holds the lane for the fade"
+                );
+            } else {
+                assert_eq!(
+                    ws.deco_anim_until, None,
+                    "split={split}: a lapsed window's frame arms no fade hold"
+                );
+            }
+        }
+    }
+}

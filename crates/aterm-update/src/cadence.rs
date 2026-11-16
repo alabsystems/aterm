@@ -5,8 +5,6 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(test)]
-use crate::check_wake::{SLEEP_GAP, is_wake_gap};
 pub(crate) use crate::check_wake::{
     Waited, WakeSignal, is_network_unreachable, sleep_watching_for_wake,
 };

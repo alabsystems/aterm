@@ -121,36 +121,53 @@ fn the_tab_lane_lights_at_two_tabs_and_moves_nothing_else() {
     }
 }
 
-/// A split front tab's CPU lane is the whole tab's: as long as all tabs' (aterm itself idles,
-/// so both are claude's 1 core and cargo's 2), where the focused pane alone falls short.
 #[test]
-fn a_split_tabs_lane_is_the_whole_tab() {
+fn reported_cpu_growth_draws_no_capacity_lane_or_scoped_hit() {
     let snap = crate::stats_deck::tests::split_tab(7, 8);
-    let fill = |panes: Vec<u64>, ink: fn(&DeckInput<'_>) -> aterm_vitals::ink::Rgb| {
+    let render = |snap: &Snapshot, panes: Vec<u64>| {
         let i = DeckInput {
             tab_panes: panes,
             tab_count: 2,
-            ..input(&snap)
+            ..input(snap)
         };
-        let want = rgba(ink(&i), 0xFF);
-        let (prims, _) = sill_paint(&GEOM, &i);
-        prims
-            .windows(2)
-            .find_map(|w| match w {
-                [DrawPrim::ClipPush { w, .. }, DrawPrim::Panel { fill, .. }] if *fill == want => {
-                    Some(*w)
-                }
-                _ => None,
-            })
-            .expect("the lane's fill")
+        sill_paint(&GEOM, &i)
     };
-    let tab = |i: &DeckInput<'_>| i.inks.tab;
-    let all = fill(vec![8, 7], |i| i.inks.aterm);
-    assert!(all > 1.0, "{all}");
-    assert_eq!(fill(vec![8, 7], tab), all);
-    assert_eq!(fill(vec![7, 8], tab), all);
-    let focused = fill(vec![8], tab);
-    assert!(focused < all, "CONTROL: {focused} vs {all}");
+    for panes in [vec![8, 7], vec![7, 8], vec![8]] {
+        let (prims, hits) = render(&snap, panes.clone());
+        let cpu_hits: Vec<_> = hits
+            .iter()
+            .filter(|h| h.instrument() == Instrument::Cpu)
+            .collect();
+        assert_eq!(cpu_hits.len(), 2, "the core tiles and machine lane");
+        assert!(cpu_hits.iter().all(|h| h.bar() == Bar::Global));
+        for bar in [Bar::Aterm, Bar::Tab] {
+            assert!(
+                hits.iter()
+                    .any(|h| h.instrument() == Instrument::Memory && h.bar() == bar)
+            );
+        }
+        for reported in [0.0, 1000.0] {
+            let mut changed = snap.clone();
+            changed.aterm.as_mut().unwrap().cores = TrendView::flat(reported);
+            for tab in &mut changed.tabs {
+                tab.scope.cores = TrendView::flat(reported);
+            }
+            let (new_prims, new_hits) = render(&changed, panes.clone());
+            assert_eq!(new_hits, hits);
+            assert_eq!(
+                format!("{new_prims:?}"),
+                format!("{prims:?}"),
+                "reported process growth cannot change bounded CPU ink"
+            );
+        }
+        let mut busy = snap.clone();
+        busy.global.cores = TrendView::flat(10.0);
+        assert_ne!(
+            format!("{:?}", render(&busy, panes).0),
+            format!("{prims:?}"),
+            "CONTROL: independently sampled machine CPU changes its lane"
+        );
+    }
 }
 
 #[test]
@@ -594,7 +611,7 @@ impl SillFrame {
 /// Owner scene `o` as the Sill reads it. [`owner_scene`] fills the deck's rows
 /// (`Snapshot::resources`) and leaves the scope views the Sill's lanes read (the machine's
 /// and aterm's, the front tab's, and the CPU's busy cores) at their defaults, which draw
-/// every scene's CPU lanes as empty grooves; this fills them from the same rows' figures,
+/// empty machine CPU and scoped memory grooves; this fills them from the same rows' figures,
 /// so the Sill says what the band over it says. Each is a still reading (a flat trend), as
 /// the scenes' cores are: no lane rises or falls, so no frame draws a ghost or a glow.
 fn sill_scene(o: Owner) -> Snapshot {
@@ -707,9 +724,9 @@ fn inked(prims: &[DrawPrim]) -> Vec<(usize, [f32; 4])> {
 ///   and its bottom line on the card's rows at 1× as at 2×. And no region that answers the
 ///   pointer reaches past the frame's sides: a folded column's pressure cap and ◢, with
 ///   their regions, are in the frame like everything else. Nothing is let past.
-/// - `TAB`: the Tab lane draws, and answers the pointer in each column the frame has, only
-///   with two or more tabs and only where the card holds its row; elsewhere the columns
-///   place nothing in that row.
+/// - `TAB`: Memory and Disk's Tab lanes draw, and answer the pointer, only with two or more
+///   tabs and only where the card holds their row; elsewhere the columns place nothing in
+///   that row. CPU has no scoped lanes or scoped pointer regions.
 /// - `FOLD`: the columns present follow [`Fold::of`] at the Sill's width: the CPU column,
 ///   the memory and disk columns' lanes where the law keeps them, and where it folds one,
 ///   only its pressure cap or its ◢, and only while the scene has one; and each region
@@ -804,14 +821,19 @@ fn sill_faults(snap: &Snapshot, f: &SillFrame) -> Vec<String> {
     let columns = f
         .hits
         .iter()
-        .find(|h| h.instrument() == Instrument::Cpu && h.bar() == Bar::Aterm)
-        .map(|h| h.rect.0);
+        .filter(|h| h.instrument() == Instrument::Cpu && h.bar() == Bar::Global)
+        .map(|h| h.rect.0)
+        .max_by(f32::total_cmp);
     if let Some(columns) = columns {
+        let tab_ink = lit
+            && [Instrument::Memory, Instrument::Disk]
+                .into_iter()
+                .any(|i| at(i, Bar::Aterm) > 0);
         let in_row = boxes
             .iter()
             .filter(|(_, b)| b[0] >= columns - 1.0 && b[3] > tab_top)
             .count();
-        if lit != (in_row > 0) {
+        if tab_ink != (in_row > 0) {
             faults.push(format!(
                 "TAB: {in_row} prim(s) placed in the Tab lane's row under y {tab_top} with {} \
                  tab(s) on a {card_h} px card",
@@ -837,7 +859,13 @@ fn sill_faults(snap: &Snapshot, f: &SillFrame) -> Vec<String> {
     let memory = fold.memory && snap.mem.is_some();
     let disk = fold.disk && snap.volume.is_some();
     let want = [
-        (Instrument::Cpu, Bar::Aterm, 1),
+        (
+            Instrument::Cpu,
+            Bar::Global,
+            1 + usize::from(snap.cpu.is_some()),
+        ),
+        (Instrument::Cpu, Bar::Aterm, 0),
+        (Instrument::Cpu, Bar::Tab, 0),
         (Instrument::Memory, Bar::Aterm, usize::from(memory)),
         (
             Instrument::Memory,
@@ -1062,7 +1090,7 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
     );
 
     // CONTROLS. The frame the controls spoil holds, and its lanes are inked: the hot-hard
-    // scene's CPU column draws aterm's and the tab's cores.
+    // scene's memory column draws aterm's and the tab's footprints.
     let snap = sill_scene(Owner::HotHard);
     let inks = dark_inks();
     let window = SillWindow {
@@ -1085,7 +1113,7 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
                 })
                 .count()
         };
-        assert_eq!(fills(&good), 2, "the CPU and memory lanes in {ink:?}");
+        assert_eq!(fills(&good), 1, "the memory lane in {ink:?}");
         let bare = sill_frame_at(&owner_scene(Owner::HotHard), inks, window, window.geom());
         assert_eq!(
             fills(&bare),
@@ -1143,8 +1171,8 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
     assert_eq!(laws(&faults), ["TAB"], "CONTROL: {faults:#?}");
     assert_eq!(
         faults.len(),
-        4,
-        "three columns' lanes and their ink: {faults:#?}"
+        3,
+        "two scoped columns' lanes and their ink: {faults:#?}"
     );
 
     // A Tab lane drawn where the card does not hold it: a 9 px card's three 1× lanes (a

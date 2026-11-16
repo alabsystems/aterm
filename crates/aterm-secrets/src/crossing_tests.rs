@@ -99,3 +99,70 @@ fn a_mark_is_stored_and_stays() {
     std::fs::write(mark.path(), b"").expect("truncated");
     assert!(mark.stored().expect("readable"));
 }
+
+/// A version-2 bound reads back, and only exactly it does: a format past 1, every number a
+/// positive decimal with no leading zero that fits its field.
+///
+/// NEGATIVE CONTROL (in the test): each near miss (format 1 or 0 in version 2, a version-1
+/// bound with a capacity, a leading zero, a capacity past `u64`, a missing or extra word) is no
+/// bound.
+#[test]
+fn vault_fence_a_version_two_bound_reads_back_and_nothing_near_it_does() {
+    for bound in [
+        RecordsBound::of(4_096, false).at_format(FORMAT_TWO),
+        RecordsBound::of(16_384, true).at_format(7),
+        RecordsBound {
+            bytes: u64::MAX,
+            ..RecordsBound::of(1, true).at_format(u32::MAX)
+        },
+    ] {
+        assert_eq!(RecordsBound::parse(&bound.value()), Some(bound));
+    }
+    assert_eq!(
+        RecordsBound::of(4_096, true).at_format(FORMAT_TWO).value(),
+        format!("2 4096 {FORMAT_ONE_BYTES} 2 crossed")
+    );
+    for near in [
+        "2 4096 67108864 1 crossed",
+        "2 4096 67108864 0 crossed",
+        "2 4096 67108864 02 crossed",
+        "2 4096 067108864 2 crossed",
+        "2 4096 0 2 crossed",
+        "2 4096 18446744073709551616 2 crossed",
+        "2 4096 67108864 4294967296 crossed",
+        "2 4096 67108864 crossed",
+        "2 4096 67108864 2 crossed extra",
+        "2 4096 67108864 2  crossed",
+        "1 4096 67108864 crossed",
+        "1 4096 67108864 2 crossed",
+        "3 4096 67108864 2 crossed",
+    ] {
+        assert_eq!(RecordsBound::parse(near), None, "{near:?}");
+    }
+}
+
+/// Two stores of the format mark at once never lower it: each reads the mark and writes under
+/// one lock, so the store of the lower format finds the higher one there, or is overwritten by it.
+///
+/// NEGATIVE CONTROL: with the read and the write unlocked (as first built), the mark ended at 2
+/// after stores of 3 and 2 at once in round 0 (`left: 2, right: 3`); the wire review's probe saw
+/// it lowered in 1468 of 3000 rounds.
+#[cfg(unix)]
+#[test]
+fn vault_fence_two_format_stores_at_once_never_lower_the_mark() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    for round in 0..200 {
+        let mark = FormatMark::at(root.path().join(format!("records-{round}.format")));
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for format in [3, FORMAT_TWO] {
+                let (mark, barrier) = (&mark, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    mark.store(format).expect("stored");
+                });
+            }
+        });
+        assert_eq!(mark.stored().expect("readable"), 3, "round {round}");
+    }
+}

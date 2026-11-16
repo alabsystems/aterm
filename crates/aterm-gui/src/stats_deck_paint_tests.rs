@@ -625,11 +625,9 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     s
 }
 
-/// The cause engine's facts on RD's 10:32 scene (`explain::fixtures`) after
-/// four of its windows, so the Deck's clause holds: Spotlight, after start-up
-/// (RD §4.1), the troubled scenes' CPU cause, with the open episode and the
-/// split it stands on, its one tab the scenes' front tab. Read once: a sweep
-/// draws thousands of scenes.
+/// Published CPU observations on RD's 10:32 scene after four read intervals, its one tab
+/// the scenes' front tab. These facts establish no execution-window cause. Read once:
+/// a sweep draws thousands of scenes.
 pub(crate) fn spotlight_after_start_up() -> Arc<WhyFacts> {
     static FACTS: std::sync::OnceLock<Arc<WhyFacts>> = std::sync::OnceLock::new();
     Arc::clone(FACTS.get_or_init(|| {
@@ -1489,14 +1487,33 @@ fn full_with_details(w: f64, m: &FaceMetrics) -> f64 {
         .unwrap_or_else(|| panic!("no Full deck has {w} pt of Details"))
 }
 
-/// The CPU's Details fold by their column's width: its tab off the busiest clause first, then
-/// the cause to its short form, then the busiest clause before the load.
+/// Retained CPU cause records cannot occupy Details or paint a cause mark. Load keeps
+/// priority over the reported busiest program as the same columns narrow in either form.
 #[test]
-fn the_cause_clause_folds_before_load_and_after_busiest() {
+fn reported_cpu_retained_cause_never_displaces_load_or_reported_programs() {
+    use aterm_vitals::explain::{ActivityId, CauseId, Context, DeckCause, OpenCause};
     let m = FaceMetrics::helvetica_neue();
-    let sep = " \u{b7} ";
-    let [wide_w, mid_w, between_w, owner_w] =
-        [487.0, 242.0, 183.0, 162.0].map(|d| full_with_details(d, &m));
+    let mut retained = scene(Scene::Trouble);
+    retained
+        .facts
+        .busiest
+        .as_mut()
+        .expect("reported program")
+        .name = "rustc compiling a long module".into();
+    let facts = Arc::make_mut(retained.why.as_mut().expect("published observations"));
+    facts.clause = Some(DeckCause {
+        activity: ActivityId::Spotlight,
+        word: ActivityId::Spotlight.activity().word,
+        context: Some(Context::Startup),
+    });
+    facts.open = vec![OpenCause {
+        id: CauseId::Activity(ActivityId::Spotlight),
+        opened_unix_ms: retained.at_unix_ms,
+        since_ms: Some(0),
+        holds: true,
+        covers_mc: 6000,
+        contexts: vec![Context::Startup],
+    }];
     let details_in = |laid: &Laid, at: (Col, f64, f64)| -> (Vec<String>, Vec<Boxed>) {
         let (col, top, cell) = at;
         let texts = texts_in(laid, col, top - 1.0, top + cell + 1.0);
@@ -1504,125 +1521,53 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
             .boxes
             .iter()
             .filter(|b| {
-                b.kind == BoxKind::Mark && b.r[0] >= col.x - EPS && b.r[2] <= col.end() + EPS
-            })
-            .filter(|b| {
-                (b.r[1] + b.r[3]) / 2.0 > top - 1.0 && (b.r[1] + b.r[3]) / 2.0 < top + cell + 1.0
+                b.kind == BoxKind::Mark
+                    && b.r[0] >= col.x - EPS
+                    && b.r[2] <= col.end() + EPS
+                    && (b.r[1] + b.r[3]) / 2.0 > top - 1.0
+                    && (b.r[1] + b.r[3]) / 2.0 < top + cell + 1.0
             })
             .cloned()
             .collect();
         (texts, marks)
     };
-    let drawn = |sc: Scene, w: f64, form: DeckForm| -> Option<(Vec<String>, Vec<Boxed>)> {
-        let at = cpu_details(w, form, &m)?;
-        Some(details_in(&laid(sc, w, 2.0, form, &m, false), at))
-    };
-    let (wide, marks) = drawn(Scene::Trouble, wide_w, DeckForm::Full).expect("Details");
-    assert_eq!(
-        wide,
-        [
-            "8 waiting for a core",
-            sep,
-            "Spotlight, after start-up",
-            sep,
-            "rustc \u{d7}9 in Tab 3",
-        ]
-    );
-    let cause: Vec<&Boxed> = marks.iter().filter(|b| b.text == "cause").collect();
-    assert_eq!(cause.len(), 1, "one \u{2235}: {marks:?}");
-    let full = laid(Scene::Trouble, wide_w, 2.0, DeckForm::Full, &m, true);
-    let words = full
-        .boxes
-        .iter()
-        .find(|b| b.kind == BoxKind::Text && b.text == "Spotlight, after start-up")
-        .expect("the clause's words");
+    let wide_w = full_with_details(487.0, &m);
+    let input = scene_input(&retained, DeckForm::Full);
+    let words = DeckWords::new(&input, &m);
+    let wide = lay(&geom(wide_w, 2.0, DeckForm::Full), &input, &words, &m, true);
+    let (texts, marks) = details_in(&wide, cpu_details(wide_w, DeckForm::Full, &m).unwrap());
     assert!(
-        cause[0].r[2] <= words.r[0] + EPS && words.r[0] - cause[0].r[2] < 0.7 * SMALL_PT,
-        "the mark leads its words: {:?} then {:?}",
-        cause[0].r,
-        words.r
+        texts
+            .iter()
+            .any(|t| t.contains("load") || t.starts_with("8 waiting"))
     );
-    let inks = super::tests::dark_inks();
-    assert_ne!(inks.words2, inks.words, "CONTROL: the inks differ");
-    let [x0, y0, x1, y1] = cause[0].r.map(|v| (v * 2.0) as f32);
-    let mut dots: Vec<(f32, f32, [u8; 4])> = full
-        .prims
-        .iter()
-        .filter_map(|p| match *p {
-            DrawPrim::Dot { cx, cy, color, .. }
-                if (x0..=x1).contains(&cx) && (y0..=y1).contains(&cy) =>
-            {
-                Some((cx, cy, color))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        dots.iter().map(|d| d.2).collect::<Vec<_>>(),
-        [rgba(inks.words2, 0xFF); 3],
-        "the \u{2235}'s dots"
-    );
-    dots.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
-    let [(lx, ly, _), (rx, ry, _), (bx, by, _)] = dots[..] else {
-        panic!("three dots: {dots:?}")
-    };
     assert!(
-        ly == ry && ry < by && lx < bx && bx < rx,
-        "\u{2235}, not \u{2234}: {dots:?}"
+        texts.iter().any(|t| t.contains("rustc")),
+        "the reported program is retained"
     );
+    assert!(texts.iter().all(|t| !t.contains("Spotlight")));
+    assert!(marks.iter().all(|b| b.text != "cause"));
 
-    let (mid, _) = drawn(Scene::Trouble, mid_w, DeckForm::Full).expect("Details");
-    assert_eq!(
-        mid,
-        [
-            "8 waiting for a core",
-            sep,
-            "Spotlight, after start-up",
-            sep,
-            "rustc \u{d7}9"
-        ],
-        "the busiest clause sheds its tab first"
+    assert!(
+        cpu_details(900.0, DeckForm::Full, &m).is_none(),
+        "no Details column at this narrow width"
     );
-    let (between, _) = drawn(Scene::Trouble, between_w, DeckForm::Full).expect("Details");
-    assert_eq!(
-        between,
-        [
-            "8 waiting for a core",
-            sep,
-            "Spotlight",
-            sep,
-            "rustc \u{d7}9"
-        ],
-        "then the cause shortens"
-    );
-    let (owner, _) = drawn(Scene::Trouble, owner_w, DeckForm::Full).expect("Details");
-    assert_eq!(
-        owner,
-        ["8 waiting for a core", sep, "Spotlight"],
-        "and busiest folds before the load"
-    );
-    assert_eq!(
-        drawn(Scene::Trouble, 900.0, DeckForm::Full),
-        None,
-        "no Details at W 900"
-    );
-    let narrow = laid(Scene::Trouble, 900.0, 2.0, DeckForm::Full, &m, false);
+    let narrow = lay(&geom(900.0, 2.0, DeckForm::Full), &input, &words, &m, false);
     assert!(
         narrow
             .boxes
             .iter()
-            .all(|b| b.text != "cause" && !b.text.starts_with("Spotlight")),
-        "no clause where no Details column shows"
+            .all(|b| b.text != "cause" && !b.text.contains("Spotlight"))
     );
 
-    // The Details fold by their column's width alone: each width the plans give the CPU's
-    // Details column is laid once, at the narrowest deck giving it, on words read once per form.
-    let snaps = [Scene::Calm, Scene::Trouble].map(scene);
-    let mut seen = 0;
+    // Exercise each distinct column width, preserving the existing geometric sweep. The
+    // calm scene is the absence control; the retained-record scene must behave the same way.
+    let snapshots = [scene(Scene::Calm), retained];
+    let (mut both_shown, mut load_alone) = (0, 0);
     for form in [DeckForm::Full, DeckForm::Folded] {
-        let inputs = snaps.each_ref().map(|snap| scene_input(snap, form));
+        let inputs = snapshots.each_ref().map(|snap| scene_input(snap, form));
         let words = inputs.each_ref().map(|input| DeckWords::new(input, &m));
-        let mut widths: Vec<u64> = Vec::new();
+        let mut widths = Vec::new();
         for w in (160..=5120).map(f64::from) {
             let Some(details) = cpu_details(w, form, &m) else {
                 continue;
@@ -1631,35 +1576,38 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
                 continue;
             }
             widths.push(details.0.w.to_bits());
-            let [(calm, calm_marks), (texts, marks)] = [0, 1].map(|i| {
+            for i in 0..2 {
                 let laid = lay(&geom(w, 2.0, form), &inputs[i], &words[i], &m, false);
-                details_in(&laid, details)
-            });
-            assert!(
-                calm.iter().all(|t| !t.starts_with("Spotlight"))
-                    && calm_marks.iter().all(|b| b.text != "cause"),
-                "Calm holds no cause, {form:?} {w} pt: {calm:?}"
-            );
-            let at = |p: &dyn Fn(&str) -> bool| texts.iter().position(|t| p(t.as_str()));
-            let load = at(&|t| t.starts_with("load") || t.starts_with("8 waiting"));
-            let cause = at(&|t| t.starts_with("Spotlight"));
-            let busiest = at(&|t| t.starts_with("busiest") || t.starts_with("rustc"));
-            let order = match (load, cause, busiest) {
-                (_, None, Some(_)) => false,
-                (None, Some(_), _) => false,
-                (Some(l), Some(c), b) => l < c && b.is_none_or(|b| c < b),
-                _ => true,
-            };
-            assert!(order, "{form:?} {w} pt: {texts:?}");
-            assert_eq!(
-                marks.iter().filter(|b| b.text == "cause").count(),
-                usize::from(cause.is_some()),
-                "{form:?} {w} pt: {texts:?}"
-            );
-            seen += usize::from(cause.is_some());
+                let (texts, marks) = details_in(&laid, details);
+                assert!(
+                    texts.iter().all(|t| !t.contains("Spotlight"))
+                        && marks.iter().all(|b| b.text != "cause"),
+                    "{form:?} {w} pt scene{i}: {texts:?}"
+                );
+                let load = texts
+                    .iter()
+                    .position(|t| t.contains("load") || t.starts_with("8 waiting"));
+                let busiest = texts.iter().position(|t| t.contains("rustc"));
+                if let Some(program) = busiest {
+                    assert!(
+                        load.is_some_and(|load| load < program),
+                        "load must precede the reported program: {form:?} {w} pt {texts:?}"
+                    );
+                    both_shown += 1;
+                } else if load.is_some() {
+                    load_alone += 1;
+                }
+            }
         }
     }
-    assert!(seen > 100, "CONTROL: the clause drawn at {seen} widths");
+    assert!(
+        both_shown > 100,
+        "CONTROL: both clauses laid at {both_shown} widths"
+    );
+    assert!(
+        load_alone > 0,
+        "CONTROL: the reported program folds before load"
+    );
 }
 
 fn frame(laid: &Laid) -> Vec<(BoxKind, [f64; 4])> {
@@ -5011,9 +4959,9 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
     }
 }
 
-/// Every scope bar nests the three scopes, 0.144.0's bar as main draws it (the owner, 2026-10-26:
-/// "the bar of "this Mac, aterm, Tab 1" that's great"): on the five resources the machine's fill,
-/// aterm's inset in it and this tab's inset in that, from one left edge. Where a run stands at
+/// CPU paints machine tick utilization alone while retaining reported app and tab figures;
+/// memory, disk, network and process bars nest the three scopes from one left edge.
+/// Where a run stands at
 /// its end it says each row's reading with its maximum (the legend then names no totals), and
 /// the network's rates both ways; where none does (Folded at 1424 pt, whose strips keep the room)
 /// the legend names this Mac with how much of its memory and disk is used of their totals, and
@@ -5021,7 +4969,7 @@ fn time_gaps_and_special_event_lines_render_distinctly_on_the_multi_scale_strip(
 /// Details say aterm's disk writes and the network's state and round trip; Folded's Cores row
 /// names the chip, and a hot core paints in the heat ramp's ink with no halo.
 #[test]
-fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
+fn reported_cpu_machine_fill_keeps_other_scope_bars_and_each_rows_maximum() {
     let m = FaceMetrics::helvetica_neue();
     let mut snap = scene(Scene::Calm);
     snap.facts.cpu_brand = Some("Apple M5 Max".into());
@@ -5077,6 +5025,18 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             let fill = row
                 .bar
                 .unwrap_or_else(|| panic!("{form:?} {res:?}: missing BarFill"));
+            if res == Resource::Cpu {
+                assert!(fill.global.is_some_and(|v| v > 0.0));
+                assert_eq!((fill.aterm, fill.tab), (None, None));
+                assert_eq!(fill.global, row.heat_now);
+                let view = snap.resource(res, &[FRONT]);
+                assert!(
+                    view.aterm.now.is_some_and(|v| v > 0.0)
+                        && view.tab.now.is_some_and(|v| v > 0.0),
+                    "the reported data remains available without capacity-share fills"
+                );
+                continue;
+            }
             assert!(
                 fill.global.is_some_and(|v| v > 0.0)
                     && fill.aterm.is_some_and(|v| v > 0.0)
@@ -5133,10 +5093,11 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             "{at}: Folded's Cores row names the chip, Full's dial none: {texts:?}"
         );
 
-        // As painted: all five resources keep three visible nested scopes in their bar.
+        // As painted: CPU has only machine ink; four other resources retain nested scopes.
         let [machine_c, aterm_c, tab_c] =
             [inks.machine, inks.aterm, inks.tab].map(|c| rgba(c, 0xFF));
         let mut nested = 0;
+        let mut machine_only = 0;
         for (ti, (rows, _, bar, under)) in bar_tables(form, w, &m).into_iter().enumerate() {
             let first = if form == DeckForm::Full { 0 } else { ti * 4 };
             for r in 0..rows.count {
@@ -5166,6 +5127,18 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
                     matches[0]
                 };
                 let (gx, gy, gw, gh) = scope(machine_c);
+                if res == Resource::Cpu {
+                    assert!([gx, gy, gw, gh].iter().all(|v| v.fract() == 0.0));
+                    assert!(gw > 0.0 && gh > 0.0);
+                    assert!(
+                        panels
+                            .iter()
+                            .all(|(_, fill)| *fill != aterm_c && *fill != tab_c),
+                        "{at}: published CPU must not paint process shares of machine utilization"
+                    );
+                    machine_only += 1;
+                    continue;
+                }
                 let (ax, ay, aw, ah) = scope(aterm_c);
                 let (tx, ty, tw, th) = scope(tab_c);
                 assert!(
@@ -5203,9 +5176,10 @@ fn scope_bars_nest_every_scope_and_the_run_says_each_rows_maximum() {
             }
         }
         assert_eq!(
-            nested, 5,
-            "{form:?}: CPU, memory, disk, network and processes nest their three scopes"
+            nested, 4,
+            "{form:?}: memory, disk, network and processes nest their three scopes"
         );
+        assert_eq!(machine_only, 1, "{form:?}: CPU retains its machine fill");
     }
 
     // A hot core (0.95) paints in the heat ramp's ink like every data cell, with no halo.

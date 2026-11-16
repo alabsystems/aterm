@@ -10070,3 +10070,46 @@ fn a_volumes_lines_are_read_only_near_its_emergency_line() {
         assert_eq!(got.lines, Some(lines), "{why}");
     }
 }
+
+/// CUSTODY WRITES WAIT BELOW THE EMERGENCY LINE (DC-06d): on a 500 GiB volume under the default
+/// knobs, whose emergency line (5 GiB, 1% of it) lies under its floor and its warning, a
+/// snapshot or a push waits at zero free, a byte under the line, an inode under the inodes'
+/// line, and with the bytes unread; it runs at the line, a byte under the floor, and with the
+/// inodes unread. NEGATIVE CONTROLS: a predicate on the floor (where the automatic pass runs)
+/// holds the write a byte under the floor, one on the warning holds it there too, and one that
+/// let an unread volume write admits `None`; each assertion below names the line it tells apart.
+#[test]
+fn custody_writes_wait_below_the_emergency_line() {
+    let lines = floor::lines(floor::Knobs::default(), Some(500 * GIB), None);
+    let line = lines.emergency;
+    assert_eq!(line, 5 * GIB, "the larger of 4 GiB and 1% of the volume");
+    assert!(
+        line < lines.floor && lines.floor < lines.warn,
+        "the emergency line lies under the floor and the warning: {lines:?}"
+    );
+    let waits =
+        |free: Option<u64>, files: Option<u64>| floor::custody_writes_wait(free, files, &lines);
+    assert!(waits(Some(0), Some(1_000_000)), "at zero free");
+    assert!(waits(Some(line - 1), None), "a byte under the line");
+    assert!(
+        waits(None, Some(1_000_000)),
+        "the bytes unread: it waits for a reading"
+    );
+    assert!(
+        waits(Some(400 * GIB), Some(lines.files_emergency - 1)),
+        "an inode under the inodes' line"
+    );
+    assert!(
+        !waits(Some(line), Some(lines.files_emergency)),
+        "at both lines"
+    );
+    assert!(
+        !waits(Some(lines.floor - 1), None),
+        "a byte under the floor: the floor is the pass's line, not custody's"
+    );
+    assert!(
+        !waits(Some(lines.warn - 1), Some(1_000_000)),
+        "a byte under the warning"
+    );
+    assert!(!waits(Some(line), None), "the inodes unread hold nothing");
+}

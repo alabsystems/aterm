@@ -135,9 +135,14 @@ pub fn identity_and_modified_at(
 }
 
 /// A handle on whatever is at `path` itself, as [`identity_at`] looks: no access asked, every
-/// sharing allowed, a folder, link or other reparse point opened as itself.
+/// sharing allowed (so no writer, reader or replacement of the file is refused while it is
+/// open), a folder, link or other reparse point opened as itself. Its identity
+/// ([`identity_of`]), metadata and change-journal entry name the one entry that was there.
+///
+/// # Errors
+/// The open's: nothing at `path`, or a folder on the way that may not be traversed.
 #[cfg(windows)]
-fn look(path: &Path) -> io::Result<File> {
+pub fn look(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // FILE_SHARE_READ | _WRITE | _DELETE
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;

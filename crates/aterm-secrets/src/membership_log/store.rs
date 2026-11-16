@@ -30,6 +30,22 @@ pub(crate) mod classified_tests;
 /// Largest concatenated record stream [`decode_records`] reads (`64 MiB`).
 pub const MAX_RECORDS_STREAM: usize = 64 * 1024 * 1024;
 
+/// The most bytes of records one reply carries ([`Store::missing`]): the wire cap, which every
+/// reader of a records stream holds a stream to. A store of format 1 holds no more than this in
+/// all ([`Store::insert`]), so today every reply is whole; once a store's own byte capacity is
+/// larger (tracker FL-148), a reply is a causally closed prefix and the puller asks again.
+pub const REPLY_CAP: usize = MAX_RECORDS_STREAM;
+
+/// What a peer lacks of a store, as one reply carries it ([`Store::missing`]).
+#[derive(Clone, Debug, Default)]
+pub struct Missing {
+    /// The records, in causal order from the genesis: a prefix of what the peer lacks, closed
+    /// under parents over what the peer named, so a store that held what it named can take each.
+    pub records: Vec<Record>,
+    /// The store holds more that the peer lacks, past [`Self::records`]: the cap ended them.
+    pub more: bool,
+}
+
 /// The most ids [`Store::have`] names: more than a pull's URL has room for (about 120 of 8 KiB,
 /// `transport::records_have_url`), which keeps as many as fit, in order.
 pub const HAVE_IDS: usize = 256;
@@ -1035,21 +1051,48 @@ impl Store {
     }
 
     /// Records held here that a peer advertising causal frontier `have` lacks, in causal order
-    /// from genesis. Only causally complete records travel, none before a genesis: `have` names
-    /// complete heads alone, so a waiting record would go out again on every pull. One waiting
-    /// on a parent travels once the parent lands; one whose parent exists nowhere never does.
+    /// from genesis, as one reply carries them: at most [`REPLY_CAP`] bytes of them
+    /// ([`Store::missing_within`]). Only causally complete records travel, none before a genesis:
+    /// `have` names complete heads alone, so a waiting record would go out again on every pull.
+    /// One waiting on a parent travels once the parent lands; one whose parent exists nowhere
+    /// never does.
+    /// A caller that must know whether more follow asks [`Store::missing_within`].
     #[must_use]
     pub fn missing(&self, have: &[RecordId]) -> Vec<Record> {
+        self.missing_within(have, REPLY_CAP).records
+    }
+
+    /// [`Store::missing`] under a cap of `cap` bytes: the longest prefix of the records the peer
+    /// lacks, in the store's causal order, whose wire bytes come to at most `cap`, and at least
+    /// the first of them, so a puller whose `have` names its whole frontier moves each time it
+    /// asks again past what it took. One whose frontier is wider than its pull names (a seated
+    /// key's forks, past a URL's room) can be sent records it holds on every ask
+    /// (ATERM-KI-1116-1470). A prefix of a causal order is closed under parents: each record's
+    /// parents are among what `have` names or before it. [`Missing::more`] says the cap ended it.
+    #[must_use]
+    pub fn missing_within(&self, have: &[RecordId], cap: usize) -> Missing {
         let Some(log) = &self.log else {
-            return Vec::new();
+            return Missing::default();
         };
         let known = log.reach.closure(log.indexes(have));
-        log.order
+        let lacked = log
+            .order
             .iter()
             .enumerate()
             .filter(|(i, _)| (known[i / 64] >> (i % 64)) & 1 == 0)
-            .map(|(_, r)| r.clone())
-            .collect()
+            .map(|(_, r)| r);
+        let mut out = Missing::default();
+        let mut bytes = 0usize;
+        for record in lacked {
+            let next = bytes.saturating_add(record.wire_len());
+            if !out.records.is_empty() && next > cap {
+                out.more = true;
+                break;
+            }
+            bytes = next;
+            out.records.push(record.clone());
+        }
+        out
     }
 
     /// Insert one decoded [`Record`], returning `true` when it was new to this store.

@@ -260,6 +260,10 @@ pub enum Verdict {
     Question,
     /// `-`: no identified agent.
     Gone,
+    /// `wall`: a wall whose kind nothing names (a harness's `walled` state with no wall on the screen). The word is published and logged; the tracker opens no wall step for it, since a step, its need and its settle each carry a [`WallKind`] and none is guessed.
+    Walled,
+    /// `stopped`: the agent's process is stopped by job control. aterm reads it from the kernel; it changes nothing about an open step or turn.
+    Stopped,
     /// `unknown`
     Unknown,
 }
@@ -276,6 +280,8 @@ impl Verdict {
             "survey" => Verdict::Survey,
             "-" => Verdict::Gone,
             "wall:unresponsive" => Verdict::Unresponsive,
+            "wall" => Verdict::Walled,
+            "stopped" => Verdict::Stopped,
             w => WallKind::from_name(w)
                 .filter(|_| w.starts_with("wall:"))
                 .map_or(Verdict::Unknown, Verdict::Wall),
@@ -294,6 +300,8 @@ impl Verdict {
             Verdict::Idle => "idle",
             Verdict::Question => "question",
             Verdict::Gone => "-",
+            Verdict::Walled => "wall",
+            Verdict::Stopped => "stopped",
             Verdict::Unknown => "unknown",
         }
     }
@@ -990,7 +998,8 @@ impl TurnTracker {
         self.settle = None;
         self.tx.refuted = None;
         match v {
-            Verdict::Unknown => return None,
+            // A word that names no step and ends none: an open box, wall or turn stands as it was.
+            Verdict::Unknown | Verdict::Walled | Verdict::Stopped => return None,
             Verdict::Gone => {
                 self.close_turn(log, TurnOut::Gone, Conf::Strong, None, false, at);
                 if self.step.is_some() {
@@ -1047,7 +1056,7 @@ impl TurnTracker {
                     self.arm(SettleCause::Question, at);
                 }
             }
-            Verdict::Gone | Verdict::Unknown => {}
+            Verdict::Gone | Verdict::Unknown | Verdict::Walled | Verdict::Stopped => {}
         }
         self.wake_at()
     }

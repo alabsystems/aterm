@@ -116,7 +116,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo-tippy"],
         also: "",
-        runs: "targo-tippy <selection> --all-targets -- -D warnings -A clippy::all -D \
+        runs: "targo-tippy <selection> --all-targets -- -D unused_must_use -A clippy::all -D \
                clippy::correctness -D clippy::suspicious -D clippy::disallowed_methods -D \
                clippy::disallowed_types -D clippy::disallowed_macros, one pass over every crate \
                of the selection, a cone's dev dependents included; with --all (and in a \
@@ -744,9 +744,9 @@ pub fn list_table() -> String {
          \x20        change cone (test runs the selection's doctests after its test binaries)\n\
          release  what `ship release` requires: --all implied, --app required, a skip is exit 3\n\
          perf     not a check: the performance lanes, `verify perf --list`\n\
-         vendor-out  not a check: sealed copies of alab-policy (the pinned alab-harness copy\n\
-         \x20           in vendor/alab-harness, held to its pin first), aterm-phase and\n\
-         \x20           aterm-agent-names for another repository, `verify vendor-out --help`\n",
+         vendor-out  not a check: sealed aterm-phase and aterm-agent-names projections beside\n\
+         \x20           the target's independent canonical alab-harness pin (checked first);\n\
+         \x20           policy uses that pin, `verify vendor-out --help`\n",
     );
     out
 }

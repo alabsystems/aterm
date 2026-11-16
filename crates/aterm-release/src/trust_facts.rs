@@ -703,6 +703,94 @@ pub const TRUSTD_DIRTY: &str = "crash epoch is not CLEAN";
 /// counts, is not this.
 pub const TARGO_COULD_NOT_RUN: &str = "COULD NOT RUN: ";
 
+/// The longest line of a check's log the judge reads, its `\n` included: [`Measured::of_log`]
+/// skips a longer one whole, through its real newline (`read_log_line`), so nothing in it is a
+/// fact.
+pub const LINE_MAX: u64 = 1024 * 1024;
+
+/// How targo-trust says the coordinator refused a proof check memory.
+const ADMISSION: &str = "memory admission failed";
+
+/// How targo-trust says a proof check ran past its per-function budget.
+const BUDGET: &str = "exceeded the per-function verification budget";
+
+/// How targo-trust counts the proof checks a clock stopped.
+const TIMED_OUT: &str = "timed_out=";
+
+/// Every string but a path refusal's that [`Measured::of_log`] judges a line by: it reads
+/// nothing in a line that holds none of them and names no path refusal (it skips such a line),
+/// so the lane may leave that line out of a stored log ([`judged_line`]). Each predicate of
+/// `of_log` needs one of these (its census figures by `memory census:`), but its path refusals,
+/// which [`judged`] reads as `of_log` does (`path_refusals`), so a line that only passes their
+/// quick gate (a rustc note that something "must be used") is no judged line; a predicate added
+/// there adds its gate here.
+pub const JUDGED: [&str; 18] = [
+    "verification did not run",
+    "transport:missing-json",
+    TARGO_COULD_NOT_RUN,
+    TRUSTD_REFUSED,
+    TRUSTD_DIRTY,
+    "another trustd owns",
+    "did not establish exact-identity readiness",
+    "Summary:",
+    "Coverage:",
+    "Stop causes:",
+    "[transport:",
+    "exit successfully: `",
+    ADMISSION,
+    BUDGET,
+    CHECK_CANCELLED,
+    TIMED_OUT,
+    "memory census:",
+    CEILING_FLAG,
+];
+
+/// Whether [`Measured::of_log`] reads anything in `line`, a line without its line ending: it
+/// names one of [`JUDGED`], or a path refusal `of_log` reads (`path_refusals`).
+#[must_use]
+pub fn judged(line: &str) -> bool {
+    JUDGED.iter().any(|needle| line.contains(needle)) || !path_refusals(line).is_empty()
+}
+
+/// Whether [`Measured::of_log`] reads anything in `line`, one line of a log as it reads one
+/// (at most [`LINE_MAX`] bytes, its `\n` included): read as `of_log` reads it.
+#[must_use]
+pub fn judged_line(line: &[u8]) -> bool {
+    (line.len() as u64) <= LINE_MAX
+        && judged(String::from_utf8_lossy(line).trim_end_matches(['\n', '\r']))
+}
+
+/// What a stored log's name adds to the name the lane gives a check's log, by which its
+/// sidecars are named (`<name@version>.log`): the lane keeps a check's log zstd-compressed
+/// ([`stored_log`]).
+pub const STORED_SUFFIX: &str = ".zst";
+
+/// The stored, compressed log of the check whose log is named `log` (`<name@version>.log.zst`).
+#[must_use]
+pub fn stored_log(log: &Path) -> PathBuf {
+    let mut name = log.as_os_str().to_os_string();
+    name.push(STORED_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Opens the stored log ([`stored_log`]) of the check whose log is named `log`, decompressed.
+/// A stored log whose frame has not ended (its check still running, its lane ended before it
+/// finished it, or its output's read failed) reads as far as it is, then fails
+/// (`UnexpectedEof`), so no reader takes it for a whole log.
+///
+/// # Errors
+///
+/// Opening the stored log, naming it: `NotFound` where there is none; a symlink or anything
+/// but a regular file is refused.
+pub fn open_log(log: &Path) -> std::io::Result<impl BufRead> {
+    let stored = stored_log(log);
+    let file = crate::durable::open_regular_file(&stored)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", stored.display())))?;
+    Ok(BufReader::new(aterm_zstd::Decoder::new(BufReader::new(
+        file,
+    ))))
+}
+
 fn find_all<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
     debug_assert!(!needle.is_empty());
     hay.match_indices(needle).map(|(i, _)| i)
@@ -921,8 +1009,6 @@ impl Measured {
     /// # Errors
     /// A log read failed; even a complete-looking prefix cannot establish its final facts.
     pub fn of_log(log: impl BufRead, rc: &str) -> std::io::Result<Measured> {
-        const ADMISSION: &str = "memory admission failed";
-        const BUDGET: &str = "exceeded the per-function verification budget";
         let mut m = Measured {
             rc: rc.to_string(),
             ..Measured::default()
@@ -940,6 +1026,9 @@ impl Measured {
         while read_log_line(&mut log, &mut buf)? {
             let line = String::from_utf8_lossy(&buf);
             let line = line.trim_end_matches(['\n', '\r']);
+            if !judged(line) {
+                continue;
+            }
             if line.contains("verification did not run") || line.contains("transport:missing-json")
             {
                 m.transport = true;
@@ -984,8 +1073,8 @@ impl Measured {
                     named.push(said);
                 }
             }
-            for i in find_all(line, "timed_out=") {
-                let d = digits_at(line, i + "timed_out=".len());
+            for i in find_all(line, TIMED_OUT) {
+                let d = digits_at(line, i + TIMED_OUT.len());
                 m.lapsed = m.lapsed.saturating_add(d.parse().unwrap_or(0));
             }
             if line.contains(CHECK_CANCELLED) {
@@ -1219,13 +1308,12 @@ impl Measured {
 /// A continuation chunk can never become an independent Summary or Coverage line.
 fn read_log_line(log: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<bool> {
     use std::io::Read as _;
-    const MAX_LINE: u64 = 1024 * 1024;
     loop {
         buf.clear();
-        if (&mut *log).take(MAX_LINE + 1).read_until(b'\n', buf)? == 0 {
+        if (&mut *log).take(LINE_MAX + 1).read_until(b'\n', buf)? == 0 {
             return Ok(false);
         }
-        if buf.len() as u64 <= MAX_LINE {
+        if buf.len() as u64 <= LINE_MAX {
             return Ok(true);
         }
         if buf.last() != Some(&b'\n') {
@@ -2939,7 +3027,7 @@ pub fn judge(
             unfinished_n += 1;
             let _ = write!(skipped_what, " {name} (over its wall budget)");
             notes.push(format!(
-                "OVER BUDGET: {name}: still verifying when its per-crate wall budget of {} ran out, so the lane ended its check there and nothing was decided about it — a verification that does not finish is not verified; give it longer with --crate-budget <seconds>, or find what holds it (its log, up to where it was ended)",
+                "OVER BUDGET: {name}: still verifying when its per-crate wall budget of {} ran out, so the lane ended its check there and nothing was decided about it — a verification that does not finish is not verified; give it longer with --crate-budget <seconds>, or find what holds it in its log (`targo --unverified ship trust log {name}`: past its cap, every line the judge reads and the output's last bytes before it was ended)",
                 secs.map_or_else(
                     || "(unnamed)".to_string(),
                     |s| if s < 60 {
@@ -2991,7 +3079,7 @@ pub fn judge(
                 _ => "what no probe could tell",
             };
             notes.push(format!(
-                "NOT VERIFIED: {name}: targo would not start its check — {cause}; the socket then held {held}"
+                "NOT VERIFIED: {name}: targo would not start its check — {cause}; the socket then held {held} (its log: `targo --unverified ship trust log {name}`)"
             ));
             continue;
         }
@@ -3128,8 +3216,9 @@ pub fn judge(
             ))
         } else if m.backstops.is_none() && m.lapsed.saturating_add(m.rss) > 0 {
             Some(format!(
-                "a backstop stopped {} obligation(s), and the run kept no obligation record to name them beside its floor (the lane writes it beside the log as <name@version>.log{}, or says why it could not in <name@version>.log.oblig.err); re-base it from a run that keeps one",
+                "a backstop stopped {} obligation(s), and the run kept no obligation record to name them beside its floor (the lane writes it beside the stored log <name@version>.log{} as <name@version>.log{}, or says why it could not in <name@version>.log.oblig.err); re-base it from a run that keeps one",
                 m.lapsed.saturating_add(m.rss),
+                STORED_SUFFIX,
                 crate::trust_oblig::RECORD_SUFFIX,
             ))
         } else {
@@ -3761,7 +3850,7 @@ pub fn judge(
         }
         if !by_lost.is_empty() {
             said.push(format!(
-                "trustd went away while they ran, so nothing was decided about: {}; re-run them, and if targo then refuses for a DIRTY crash epoch, its log carries the recovery command (never signal a trustd)",
+                "trustd went away while they ran, so nothing was decided about: {}; re-run them, and if targo then refuses for a DIRTY crash epoch, its log (`targo --unverified ship trust log <crate>`) carries the recovery command (never signal a trustd)",
                 by_lost.join(" ")
             ));
         }
@@ -4286,16 +4375,15 @@ impl Plan {
         Ok((lines, refused))
     }
 
-    /// Reads each gated crate's log and its `.rc`, `.trustd`, `.trustd-lost`, `.budget`, `.pace`
-    /// and obligation record ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.facts`.
+    /// Reads each gated crate's stored log ([`open_log`]) and its `.rc`, `.trustd`,
+    /// `.trustd-lost`, `.budget`, `.pace` and obligation record
+    /// ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.facts`.
     /// # Errors
     /// A gated log or required status is unavailable, the status is malformed, or a present
     /// optional receipt could not be read or an obligation record is malformed. No partial
     /// measurement is kept.
     pub fn measure(&mut self) -> std::io::Result<()> {
-        self.measure_with(|path, rc| {
-            Measured::of_log(BufReader::new(crate::durable::open_regular_file(path)?), rc)
-        })
+        self.measure_with(|path, rc| Measured::of_log(open_log(path)?, rc))
     }
 
     fn measure_with(
@@ -5169,7 +5257,7 @@ fn short_name(name: &str) -> String {
     )
 }
 
-/// Parsed `trust` CLI subcommand (`Conclude`, `AdmitPlan`, `Verdict`, or `Pending`).
+/// Parsed `trust` CLI subcommand (`run`, `reduce`, `judge`, `credit` or `log`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrustCmd {
     Run(crate::trust_lane::Config),
@@ -5184,6 +5272,13 @@ pub enum TrustCmd {
     /// `trust.obligations.v1` records, against the working credit epoch
     /// ([`crate::trust_credit`]).
     Credit(Vec<PathBuf>),
+    /// `log <crate|name@version> [--target-root DIR]`: the log the lane kept of that library's
+    /// check under the target root a run with that `--target-root` uses, decompressed
+    /// ([`print_log`]).
+    Log {
+        lib: String,
+        root: Option<PathBuf>,
+    },
 }
 
 /// Parses CLI arguments for the `trust` subcommand.
@@ -5192,12 +5287,32 @@ pub fn parse_cmd<'a>(
 ) -> std::result::Result<TrustCmd, String> {
     let verb = it
         .next()
-        .ok_or("trust needs a verb: run, reduce, judge or credit")?;
+        .ok_or("trust needs a verb: run, reduce, judge, credit or log")?;
     if verb == "run" {
         return crate::trust_lane::parse(it).map(TrustCmd::Run);
     }
     if verb == "reduce" {
         return crate::trust_oblig::parse_reduce(it).map(TrustCmd::Reduce);
+    }
+    if verb == "log" {
+        let (mut lib, mut root) = (None, None);
+        while let Some(arg) = it.next() {
+            if arg == "--target-root" {
+                let dir = it
+                    .next()
+                    .filter(|d| !d.is_empty() && !d.starts_with('-'))
+                    .ok_or("trust log: --target-root needs a directory")?;
+                if root.replace(PathBuf::from(dir)).is_some() {
+                    return Err("trust log: --target-root given twice".into());
+                }
+            } else if arg.is_empty() || arg.starts_with('-') || lib.is_some() {
+                return Err(format!("trust log: unexpected {arg:?}"));
+            } else {
+                lib = Some(arg.to_string());
+            }
+        }
+        let lib = lib.ok_or("trust log names one library: <crate> or <name@version>")?;
+        return Ok(TrustCmd::Log { lib, root });
     }
     if verb == "credit" {
         let records: Vec<PathBuf> = it.map(PathBuf::from).collect();
@@ -5329,6 +5444,89 @@ pub(crate) fn reduce_with_io(
     }
 }
 
+/// Prints to `out` the stored log in `logdir` of the one check `lib` names, decompressed
+/// ([`open_log`]): `lib` is a `name@version` spec, or the name of a library whose log `logdir`
+/// holds at one version. 0 printed, a stored log whose frame has not ended included (a check
+/// still running, or one its lane was ended under): what its writer had stored, saying so on
+/// `err`; 1 no log there for `lib` (or no `logdir`); 2 logs of more than one version (each
+/// named on `err`), a `logdir` that could not be read, or a log that could not be.
+pub(crate) fn print_log(
+    logdir: &Path,
+    lib: &str,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    let entries = match fs::read_dir(logdir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = writeln!(err, "no log of {lib}: no {}", logdir.display());
+            return 1;
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{}: {e}", logdir.display());
+            return 2;
+        }
+    };
+    let mut specs = BTreeSet::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                let _ = writeln!(err, "{}: {e}", logdir.display());
+                return 2;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(spec) = name
+            .strip_suffix(STORED_SUFFIX)
+            .and_then(|n| n.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        let named = if lib.contains('@') {
+            spec == lib
+        } else {
+            spec.split_once('@').is_some_and(|(n, _)| n == lib)
+        };
+        if named {
+            specs.insert(spec.to_string());
+        }
+    }
+    let Some(spec) = specs.first() else {
+        let _ = writeln!(err, "no log of {lib} in {}", logdir.display());
+        return 1;
+    };
+    if specs.len() > 1 {
+        let all: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let _ = writeln!(
+            err,
+            "{lib} has logs at {}: name one as name@version",
+            all.join(", ")
+        );
+        return 2;
+    }
+    let printed = open_log(&logdir.join(format!("{spec}.log")))
+        .and_then(|mut log| std::io::copy(&mut log, out));
+    match printed {
+        Ok(_) => 0,
+        // Its writer flushes what the check wrote while it waits for more, so this is the
+        // check's output until a few seconds ago, but the last bytes it holds past its cap.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            let _ = writeln!(
+                err,
+                "{spec}: the stored log ends there, before its end: what its writer had stored so far (its check still running, its lane ended before it finished the log, or reading the check's output failed)"
+            );
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{spec}: {e}");
+            2
+        }
+    }
+}
+
 /// Executes `cmd` against `repo` and returns its process exit code (`0`, `1`, or `2`).
 pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
     let git = crate::ledger::GitCli::new(repo);
@@ -5339,6 +5537,13 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
             &mut std::io::stderr().lock(),
         ),
         TrustCmd::Credit(records) => crate::trust_credit::run_cmd(repo, &records),
+        TrustCmd::Log { lib, root } => match crate::trust_lane::log_dir(repo, root.as_deref()) {
+            Ok(dir) => print_log(&dir, &lib, &mut std::io::stdout(), &mut std::io::stderr()),
+            Err(why) => {
+                eprintln!("aterm-release trust log: {why}");
+                2
+            }
+        },
         TrustCmd::Run(mut cfg) => {
             cfg.repo = repo.to_path_buf();
             crate::trust_lane::run(&cfg, &mut std::io::stdout()).exit()

@@ -4405,7 +4405,7 @@ fn a_line_the_agent_went_on_past_never_goes_up_at_a_break() {
 
 /// A LINE HELD FOR THE GO-AHEAD STAYS OFF BEHIND ANOTHER LINE AT THE BREAK (2026-10-30 review 9):
 /// the carry typed at 30 is answered short, so the break at 40 parks on the go-ahead while the
-/// carry's ladder waits, and its line is held back. At 50 the host's own fact (`disk-free@v1`)
+/// carry's ladder waits, and its line is held back. At 50 the host's own fact
 /// takes the same break: the go-ahead is still decided, so its line stays off, and the agent's
 /// turn at 60 that frees the space and names no need answers it. NEGATIVE CONTROL: with answers
 /// off the same run puts the line up.
@@ -4448,7 +4448,7 @@ fn a_line_held_for_the_go_ahead_stays_off_behind_the_hosts_line() {
                 s.took(7, Some(&cfg), &mut Heard::default());
             }
             if i == 2 {
-                *host.fact.lock().expect("fact") = Some(disk_free_typed());
+                *host.fact.lock().expect("fact") = Some(host_fact_typed());
             }
         })
     };
@@ -4457,7 +4457,7 @@ fn a_line_held_for_the_go_ahead_stays_off_behind_the_hosts_line() {
         cruise
             .noted
             .iter()
-            .any(|n| n.ends_with("background disk-free@v1 step=typed")),
+            .any(|n| n.ends_with("background host-fact step=typed")),
         "the host's line takes the break at 50: {:#?}",
         cruise.noted
     );

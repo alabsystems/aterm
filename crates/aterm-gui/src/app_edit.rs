@@ -203,7 +203,8 @@ struct Waiter {
     /// A `uri=` key's spellings of the file: the codec's canonical one and,
     /// when the lane resolved it, the realpath one.
     spellings: Vec<String>,
-    reply: Sender<String>,
+    /// Its answer, which rings the door its lane parks at.
+    reply: crate::control::control_media::DoorReply<String>,
     /// A `uri=` wait this process has no ticket for (its server was replaced):
     /// done when no Editor view of the file remains.
     by_views: bool,
@@ -1514,7 +1515,7 @@ impl App {
 
 /// The model's two actions only a mutant enables have no seam to bind. A
 /// module-level carrier under the anchors' own cfg, not one in the cfg(test)
-/// conformance file, so aterm-models' closure links these waivers too.
+/// conformance file, so aterm-spec-closure's closure links these waivers too.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "AmacsEditTicket",

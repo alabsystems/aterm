@@ -3,8 +3,9 @@
 
 use super::*;
 
+/// The tab ID `t000000000<s>`: each fixture names its session by one Crockford base32 letter.
 fn sid(s: &str) -> SessionId {
-    SessionId::new(s)
+    SessionId::parse(&format!("t000000000{s}")).expect("a tab id")
 }
 
 fn chip(s: &str, local: u64) -> OverviewChip {
@@ -85,20 +86,16 @@ fn the_card_counts_needs_and_workers_and_lists_who_manages_whom() {
             && lines[0].contains("manages=1"),
         "{lines:?}"
     );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("sid=a") && l.contains("mark=stuck") && l.contains("need=frozen"))
-    );
-    assert!(lines.iter().any(|l| l.contains("sid=b")
+    assert!(lines.iter().any(|l| l.contains("sid=t000000000a")
+        && l.contains("mark=stuck")
+        && l.contains("need=frozen")));
+    assert!(lines.iter().any(|l| l.contains("sid=t000000000b")
         && l.contains("task_state=working")
         && l.contains("driver=worker")
         && l.contains("stoppable=1")));
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("overview manages manager=a local=1 workers=b,c"))
-    );
+    assert!(lines.iter().any(|l| l.starts_with(
+        "overview manages manager=t000000000a local=1 workers=t000000000b,t000000000c"
+    )));
     let tray = overview_tray(&s, &geom(), Theme::default());
     let texts = tray
         .prims
@@ -123,12 +120,12 @@ fn a_chip_says_who_typed_after_its_driver() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("sid=b ") && l.contains(" typed_by=lab-sweep "))
+            .any(|l| l.contains("sid=t000000000b ") && l.contains(" typed_by=lab-sweep "))
     );
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("sid=a ") && l.contains(" typed_by=- "))
+            .any(|l| l.contains("sid=t000000000a ") && l.contains(" typed_by=- "))
     );
 }
 
@@ -194,7 +191,7 @@ fn a_confirm_is_resolved_only_by_the_hand_that_armed_it() {
     assert!(
         s.controls_lines()
             .iter()
-            .any(|l| l.contains("sid=b") && l.contains("selected=true confirm=true"))
+            .any(|l| l.contains("sid=t000000000b") && l.contains("selected=true confirm=true"))
     );
     assert_eq!(s.stop_pressed(false), OverviewAct::StopWorker(2));
     assert!(!s.arm_stop_on(3, false), "c's task is done");
@@ -229,9 +226,11 @@ fn retarget_keeps_selection_identity_and_drops_a_dead_confirm() {
     groups[0].chips.insert(0, chip("z", 9));
     assert!(s.retarget(groups.clone(), state().manages));
     assert!(
-        s.controls_lines().iter().any(|l| l.contains("sid=b")
-            && l.contains("selected=true")
-            && l.contains("confirm=true"))
+        s.controls_lines()
+            .iter()
+            .any(|l| l.contains("sid=t000000000b")
+                && l.contains("selected=true")
+                && l.contains("confirm=true"))
     );
     assert!(
         !s.retarget(groups.clone(), state().manages),
@@ -335,7 +334,7 @@ fn a_held_chip_says_why_on_a_line_of_its_own_cut_with_an_ellipsis() {
     assert!(
         s.controls_lines()
             .iter()
-            .any(|l| l.contains("sid=h") && l.ends_with(" held=1")),
+            .any(|l| l.contains("sid=t000000000h") && l.ends_with(" held=1")),
         "{:?}",
         s.controls_lines()
     );

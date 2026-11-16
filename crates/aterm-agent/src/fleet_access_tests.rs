@@ -278,3 +278,40 @@ fn a_fleet_started_worker_is_one_with_a_record() {
         assert!(!fleet_started(&state, bad), "NEGATIVE CONTROL: {bad}");
     }
 }
+
+/// A change announced for one state home is heard by a registration of that home's name and by
+/// none of another home's, so a test or lab instance that changes its scratch home's level wakes
+/// no window of the person's home. Each post waits until its own home's ear heard it, so notifyd
+/// had handled it when the other ear is asked. The scratch homes' names are this test's alone.
+/// NEGATIVE CONTROL: `changed` answered the unscoped `CHANGED` whatever the home: "assertion
+/// `left == right` failed: a change announced for another home is not heard", left `Ok(true)`,
+/// right `Ok(false)`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_change_is_heard_by_its_own_home_alone() {
+    use aterm_sysprobe::notify::Posts;
+    let (_mine_tmp, mine) = scratch();
+    let (_other_tmp, other) = scratch();
+    let mut ear = Posts::new(&changed(&mine)).expect("registers");
+    let mut other_ear = Posts::new(&changed(&other)).expect("registers");
+    let heard = |ear: &mut Posts, what: &str| {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (ear.posted() == Ok(true)).then_some(())
+        });
+    };
+
+    announce(&other);
+    heard(&mut other_ear, "the other home's ear to hear its change");
+    assert_eq!(
+        ear.posted(),
+        Ok(false),
+        "a change announced for another home is not heard"
+    );
+    announce(&mine);
+    heard(&mut ear, "this home's ear to hear its change");
+    assert_eq!(
+        other_ear.posted(),
+        Ok(false),
+        "nor is this home's change heard by the other"
+    );
+}

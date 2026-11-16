@@ -8,6 +8,7 @@ fn posted(content_off: [f32; 2], dest: (u32, u32)) -> GlPosted {
     blit.dims = [800.0, 600.0];
     blit.content_off = content_off;
     GlPosted {
+        dock: None,
         blit,
         frame: (800, 600),
         dest,
@@ -196,5 +197,38 @@ fn a_post_s_damage_is_what_changed_since_the_last() {
         post_damage(Some(&card), &fit, row, false),
         Some([0, 0, 800, 70]),
         "a card gone is damage"
+    );
+}
+
+#[test]
+fn a_dock_change_damages_its_destination_rect_without_dirtying_the_frame() {
+    let mut held = posted([40.0, 0.0], (840, 600));
+    held.dock = Some(([0, 24, 40, 600], 7));
+    let clean = Some([0, 0, 0, 0]);
+    assert_eq!(
+        post_damage(Some(&held), &held, clean, true),
+        clean,
+        "an unchanged resident dock adds no damage"
+    );
+    let mut changed = held;
+    changed.dock = Some(([0, 24, 40, 600], 8));
+    assert_eq!(
+        post_damage(Some(&held), &changed, clean, true),
+        Some([0, 24, 40, 600]),
+        "a row change repaints the chrome column outside frame space"
+    );
+    let mut moved = changed;
+    moved.dock = Some(([2, 30, 38, 580], 8));
+    assert_eq!(
+        post_damage(Some(&changed), &moved, clean, true),
+        Some([0, 24, 40, 600]),
+        "both the old and new rectangles are damaged"
+    );
+    let mut hidden = held;
+    hidden.dock = None;
+    assert_eq!(
+        post_damage(Some(&held), &hidden, clean, true),
+        Some([0, 24, 40, 600]),
+        "removing a source repaints its old footprint"
     );
 }

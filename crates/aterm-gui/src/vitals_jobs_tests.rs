@@ -1222,7 +1222,7 @@ fn the_pass_tells_the_check_whether_a_program_waits_at_it() {
 /// stays so whatever this one reads.
 #[test]
 fn the_pass_names_stranded_only_a_held_program_older_than_a_daemon_that_answers_alone() {
-    use aterm_vitals::program_check::Daemon;
+    use aterm_process_facts::program_check::Daemon;
     const ME: u32 = 501;
     const SEC: u64 = 1_000_000;
     const T: u64 = 1_791_000_000 * SEC;
@@ -1447,8 +1447,8 @@ fn the_pass_names_stranded_only_a_held_program_older_than_a_daemon_that_answers_
 /// only held; with no check read (the inert arm's) the same rows are held and none is judged.
 #[test]
 fn the_pass_hands_the_engine_the_daemon_it_judged_against() {
+    use aterm_process_facts::program_check::Daemon;
     use aterm_vitals::jobs::Named;
-    use aterm_vitals::program_check::Daemon;
     use std::sync::atomic::{AtomicU64, Ordering};
     const ME: u32 = 501;
     const SEC: u64 = 1_000_000;
@@ -1569,7 +1569,7 @@ fn the_pass_hands_the_engine_the_daemon_it_judged_against() {
 /// thread ran, and a young row that read stopped start over.
 #[test]
 fn a_pass_dates_a_row_from_its_first_unrun_read_and_keeps_its_verdict() {
-    use aterm_vitals::program_check::Daemon;
+    use aterm_process_facts::program_check::Daemon;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     const ME: u32 = 501;
     const SEC: u64 = 1_000_000;

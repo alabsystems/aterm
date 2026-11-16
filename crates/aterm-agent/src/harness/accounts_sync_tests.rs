@@ -7738,6 +7738,7 @@ fn signed_in_row_asked_for_its_mailbox(
         (&w.home, &w.state),
         &w.roster(),
         UPKEEP_NOW,
+        &crate::harness::login_adoption::Pass::default(),
     )
     .unwrap();
     assert!(

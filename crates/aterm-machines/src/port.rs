@@ -3179,7 +3179,7 @@ impl System for Live {
     }
 
     fn service(&self, restart: &aterm_vitals::services::Restart) -> aterm_uds::services::Look {
-        aterm_uds::services::look(restart)
+        aterm_uds::services::look(restart.identity())
     }
 
     fn hold_service_restart(&self, path: &Path) -> io::Result<Box<dyn ServiceRestartHold>> {

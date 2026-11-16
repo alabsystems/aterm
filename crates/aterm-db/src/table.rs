@@ -127,6 +127,23 @@ impl Record {
     }
 }
 
+/// What one carried record came to ([`Session::authenticate_carried`]): a signed wire a roll
+/// restated into a later table generation's `archived` rows, under the scope of the generation
+/// that sealed it.
+pub(crate) enum Carried {
+    /// It authenticated: the roster it names grants its writer a seat at its epoch, and its
+    /// payload opened under that roster's key.
+    Record(Box<Record>),
+    /// Its envelope does not parse under the scope, or its signature does not verify.
+    Malformed,
+    /// Its writer's seat and key were found, and its payload did not open under them.
+    Unauthentic,
+    /// The history this Mac holds cannot open the roster it names
+    /// ([`aterm_secrets::ErrorKind::HistoryUnopened`]), or that roster grants its writer no seat
+    /// at its epoch.
+    Unopened,
+}
+
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     /// The negative control of the table writer's wait (one-mesh M4, §11 B11): while set, a
@@ -259,6 +276,19 @@ thread_local! {
     /// How many keys this thread's store read batches reused and checked again, afresh, before
     /// returning (`ReadBatch::revalidate`).
     pub(crate) static KEYS_REVALIDATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many carried records (the signed wires a roll restated into a later table
+    /// generation's `archived` rows) this thread handed to authentication, one wire each
+    /// (`crate::att::carried`), counted (never timed).
+    pub(crate) static CARRIED_AUTHENTICATED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// While set, this thread's [`Session::removers_of`] meets a membership log that does not
+    /// read (an I/O error), as a vault file that fails mid-read would leave it.
+    pub(crate) static REMOVERS_LOG_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The rosters whose history this thread's [`Session::historical_writer_in`] fails to read
+    /// (an I/O error) where it looks one up.
+    pub(crate) static HISTORICAL_FAILS: std::cell::RefCell<std::collections::BTreeSet<Digest>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 /// One more of [`OWN_CHECKS`].
@@ -582,43 +612,75 @@ impl<'a> Session<'a> {
     /// Who removed each of `actors` whose seat this session's membership log shows removed: the
     /// signers of the effective `Remove`s of it, or of the quorum `Remove` that took it out. Only
     /// they may cut it from a table (`store::cutoff`). One log read for every actor asked; a
-    /// session with no log removes nobody this way.
+    /// session with no log, or whose vault holds none, removes nobody this way.
+    ///
+    /// # Errors
+    /// The log does not read: who removed whom is then unknown, never "nobody", so a reader
+    /// refuses rather than count a cut writer's later records.
     pub(crate) fn removers_of(
         &self,
         actors: impl IntoIterator<Item = Actor>,
-    ) -> std::collections::BTreeMap<Actor, std::collections::BTreeSet<Actor>> {
+    ) -> Result<std::collections::BTreeMap<Actor, std::collections::BTreeSet<Actor>>> {
         if !self.access.is_log_backed() {
-            return std::collections::BTreeMap::new();
+            return Ok(std::collections::BTreeMap::new());
         }
-        let Some((log, _)) = aterm_secrets::client::trusted_commons_log_now(
+        let read = aterm_secrets::client::trusted_commons_log_now(
             self.bootstrap.paths(),
             self.bootstrap.trust(),
-        )
-        .ok()
-        .flatten() else {
-            return std::collections::BTreeMap::new();
+        );
+        #[cfg(test)]
+        let read = if REMOVERS_LOG_FAILS.get() {
+            Err(aterm_secrets::Error::from(std::io::Error::other(
+                "the membership log did not read (test seam)",
+            )))
+        } else {
+            read
+        };
+        let Some((log, _)) = read.map_err(failure)? else {
+            return Ok(std::collections::BTreeMap::new());
         };
         let membership = log.membership();
-        actors
+        Ok(actors
             .into_iter()
             .filter_map(|actor| Some((actor, membership.removal(&actor)?.by.clone())))
-            .collect()
+            .collect())
     }
 
-    pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> bool {
+    /// Whether `actor` held a Writer seat in the roster `roster`, the one a record names: what
+    /// keeps a removed writer's records readable (`store::Store::projected`). A roster the history
+    /// this Mac holds cannot open ([`aterm_secrets::ErrorKind::HistoryUnopened`]) grants nobody
+    /// a seat.
+    ///
+    /// # Errors
+    /// The roster's history failed to read any other way (a busy vault, a moved observation, a
+    /// file that does not read): whether `actor` held the seat is unknown, so a reader refuses
+    /// rather than withhold the writer's records.
+    pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> Result<bool> {
         if !self.history.borrow().contains_key(roster) {
-            let Ok(history) = self
+            let looked = self
                 .bootstrap
-                .historical(&self.journal, &self.access, *roster)
-            else {
-                return false;
+                .historical(&self.journal, &self.access, *roster);
+            #[cfg(test)]
+            let looked = if HISTORICAL_FAILS.with_borrow(|fails| fails.contains(roster)) {
+                Err(aterm_secrets::Error::from(std::io::Error::other(
+                    "the historical grant did not read (test seam)",
+                )))
+            } else {
+                looked
+            };
+            let history = match looked {
+                Ok(history) => history,
+                Err(unopened) if unopened.kind() == aterm_secrets::ErrorKind::HistoryUnopened => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(failure(error)),
             };
             self.history.borrow_mut().insert(*roster, history);
         }
-        self.history.borrow()[roster]
+        Ok(self.history.borrow()[roster]
             .members()
             .iter()
-            .any(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
+            .any(|m| m.binding().actor() == *actor && m.role() == Role::Writer))
     }
 
     /// The binding `actor` held as a Writer in the roster `roster`, the one a record names,
@@ -642,6 +704,30 @@ impl<'a> Session<'a> {
             .iter()
             .find(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
             .map(|m| m.binding().clone())
+    }
+
+    /// [`Self::historical_binding`] answered from the history this session already holds and
+    /// nothing else: every record it authenticated put its roster there (a table read's
+    /// eligible records, [`Self::authenticate_carried`]'s), so a reader of those records reads
+    /// one membership, never one that moved between them.
+    ///
+    /// # Errors
+    /// The session holds no history of `roster`: the record was not authenticated through it,
+    /// so whose it is is unknown here, never no one's.
+    pub(crate) fn held_binding(
+        &self,
+        roster: &Digest,
+        actor: &Actor,
+    ) -> Result<Option<aterm_secrets::commons::binding::Binding>> {
+        let histories = self.history.borrow();
+        let history = histories.get(roster).ok_or_else(|| {
+            Error::new("a record's roster was not read in this session; its writer is unknown")
+        })?;
+        Ok(history
+            .members()
+            .iter()
+            .find(|m| m.binding().actor() == *actor && m.role() == Role::Writer)
+            .map(|m| m.binding().clone()))
     }
 
     pub(crate) fn observation(&self) -> Result<[u8; 64]> {
@@ -1619,7 +1705,7 @@ impl<'a> Session<'a> {
         let control_valid = if self.access.is_log_backed() {
             decision.control() == *self.access.head()
                 || decision.control() == *self.access.basis()
-                || self.historical_writer_in(&decision.control(), &preparation.device.actor())
+                || self.historical_writer_in(&decision.control(), &preparation.device.actor())?
                 || matches!(
                     self.journal.state(),
                     aterm_secrets::commons::journal::State::Ready { head, .. }
@@ -2012,6 +2098,81 @@ impl<'a> Session<'a> {
         self.open_envelope(scope, self.envelope(scope, wire)?)
     }
 
+    /// Each of `wires`, records a roll carried (signed under `scope`, an earlier table
+    /// generation's), authenticated in one store read batch, in order: what each came to
+    /// ([`Carried`]). The rosters they name that this session has not opened are asked of the
+    /// held history in one call ([`Bootstrap::historicals_in`]) first, and the batch then takes
+    /// one key per roster between its opening fence and its closing one
+    /// ([`Self::read_context`], [`Self::close_read`]), so no answer leaves unless the membership
+    /// this session observes held from before the first wire was read until after the last.
+    ///
+    /// A wire is left out ([`Carried::Malformed`], [`Carried::Unauthentic`],
+    /// [`Carried::Unopened`]) only for what its own bytes and the history this Mac holds decide:
+    /// asked again under the same history, it is left out again.
+    ///
+    /// # Errors
+    /// Anything else: a busy vault or store, a membership that moved while the batch read (both
+    /// busy), a check that ran out of time, a file or key that did not read. A reader refuses
+    /// then; it never reads the records it could not authenticate as absent.
+    pub(crate) fn authenticate_carried(
+        &self,
+        scope: Scope,
+        wires: &[&[u8]],
+    ) -> Result<Vec<Carried>> {
+        if wires.is_empty() {
+            return Ok(Vec::new());
+        }
+        let envelopes: Vec<Option<Envelope<'_>>> = wires
+            .iter()
+            .map(|wire| Envelope::parse(scope, wire).ok())
+            .collect();
+        let mut asked: Vec<Digest> = Vec::new();
+        {
+            let held = self.history.borrow();
+            for envelope in envelopes.iter().flatten() {
+                if !held.contains_key(&envelope.roster) && !asked.contains(&envelope.roster) {
+                    asked.push(envelope.roster);
+                }
+            }
+        }
+        let mut unopened = std::collections::BTreeSet::new();
+        let answers =
+            self.bootstrap
+                .historicals_in(&self.journal, &self.access, &asked, self.look());
+        for (roster, answer) in asked.into_iter().zip(answers) {
+            match answer {
+                Ok(history) => {
+                    self.history.borrow_mut().insert(roster, history);
+                }
+                Err(error) if error.kind() == aterm_secrets::ErrorKind::HistoryUnopened => {
+                    unopened.insert(roster);
+                }
+                Err(error) => return Err(failure(error)),
+            }
+        }
+        self.with_read_batch(scope, |batch| {
+            envelopes
+                .into_iter()
+                .map(|envelope| {
+                    let Some(envelope) = envelope else {
+                        return Ok(Carried::Malformed);
+                    };
+                    if unopened.contains(&envelope.roster) {
+                        return Ok(Carried::Unopened);
+                    }
+                    match self.decode_envelope(scope, envelope, false, batch.keys.as_ref()) {
+                        Ok(Some(record)) => Ok(Carried::Record(Box::new(record))),
+                        Ok(None) => Ok(Carried::Unauthentic),
+                        // The roster opened and grants the record's writer no seat at its epoch
+                        // (`with_payload_key`'s exact historical writer grant).
+                        Err(error) if error.is_awaiting_membership() => Ok(Carried::Unopened),
+                        Err(error) => Err(error),
+                    }
+                })
+                .collect()
+        })
+    }
+
     /// Amortize live context checks across a bounded local interpretation. Each
     /// envelope still verifies its historical writer, signature and ciphertext.
     /// No result leaves until custody and context have been checked again. The
@@ -2174,17 +2335,18 @@ impl<'a> Session<'a> {
             actor,
         } = *class;
         if !self.history.borrow().contains_key(&roster) {
-            // A roster this Mac has not seen, or holds no access to, waits for its view to
-            // grow; local contention stays busy.
+            // A roster the history this Mac holds proves it cannot open (one it has not seen, one
+            // sealed to other devices) waits for that history to grow. Every other failure keeps
+            // its kind: local contention stays busy, and a read that failed refuses, so a
+            // transient failure never reads as a record that waits for membership.
             let history = self
                 .bootstrap
                 .historical_in(&self.journal, &self.access, roster, self.look())
                 .map_err(|error| {
-                    let error = failure(error);
-                    if error.is_busy() {
-                        error
-                    } else {
+                    if error.kind() == aterm_secrets::ErrorKind::HistoryUnopened {
                         Error::awaiting_membership(&error.0)
+                    } else {
+                        failure(error)
                     }
                 })?;
             self.history.borrow_mut().insert(roster, history);

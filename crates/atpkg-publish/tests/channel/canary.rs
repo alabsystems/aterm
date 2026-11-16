@@ -783,3 +783,75 @@ fn a_source_replaced_during_native_execution_cannot_be_signed_as_the_installed_p
     assert!(!out.join(canary::RECEIPT).exists());
     assert!(!out.join(canary::SIGNATURE).exists());
 }
+
+/// RL-70: a canary judges exactly the consumers it is named, and none when none is named. With
+/// dirty `aterm`, `ay`, `ty` and `clean` checkouts in HOME, its arguments name no consumer, the
+/// install runs none (its runner panics on any), and the signed receipt holds no consumer row
+/// and starts with `no consumer named`; it still verifies. A named consumer is the only one
+/// judged. CONTROL: before RL-70 `run` filled those four in from HOME, and the receipt held four
+/// could-not-run rows.
+#[test]
+fn a_canary_with_no_consumer_named_reads_no_checkout_and_its_receipt_says_none_was_named() {
+    struct NoConsumer;
+    impl Runner for NoConsumer {
+        fn compiler(&self, bin: &Path, rustup: &Path) -> Result<String> {
+            Runs { fail: false }.compiler(bin, rustup)
+        }
+        fn consumer(
+            &self,
+            name: &str,
+            dir: &Path,
+            _: &Path,
+            _: &Path,
+            _: &Installed,
+        ) -> ConsumerReport {
+            panic!(
+                "a canary with no consumer named judged {name} at {}",
+                dir.display()
+            )
+        }
+    }
+    let (rig, q, source) = setup();
+    for name in ["aterm", "ay", "ty", "clean"] {
+        let dir = rig.ctx.home.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("uncommitted"), "another session's work\n").unwrap();
+    }
+    let out = rig.path("canary");
+    let args = [
+        "trust=8".to_string(),
+        "--out".into(),
+        out.display().to_string(),
+    ];
+    let request = canary::parse(&args).unwrap();
+    assert!(request.consumers.is_empty(), "{request:?}");
+    let receipt = canary::install(
+        &rig.ctx,
+        &q,
+        &source,
+        8,
+        &out,
+        &request.consumers,
+        &NoConsumer,
+    )
+    .unwrap();
+    assert!(receipt.consumers.is_empty());
+    let text = std::fs::read_to_string(out.join(canary::RECEIPT)).unwrap();
+    assert!(text.starts_with(canary::NO_CONSUMER), "{text}");
+    assert!(text.contains("no consumer named"), "{text}");
+    assert!(!text.contains("[[consumers]]"), "{text}");
+
+    let named = [
+        "trust=8".to_string(),
+        "--out".into(),
+        out.display().to_string(),
+        "--consumer".into(),
+        format!("ay={}", rig.path("ay-clone").display()),
+    ];
+    let request = canary::parse(&named).unwrap();
+    assert_eq!(
+        request.consumers,
+        BTreeMap::from([("ay".to_string(), rig.path("ay-clone"))]),
+        "a named consumer is the only one judged"
+    );
+}

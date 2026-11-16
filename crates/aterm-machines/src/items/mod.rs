@@ -89,6 +89,12 @@ pub trait Item: Send + Sync {
     /// Reads the host and decides without mutating state.
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe;
 
+    /// Explain `probe` from its captured facts, where the report needs more detail than the
+    /// row's compact reason. This reads no host state and carries no earlier outcome's facts.
+    fn explain(&self, _probe: &Probe) -> Option<aterm_converge::Explain> {
+        None
+    }
+
     /// Apply the change planned by [`Item::probe`].
     ///
     /// # Errors

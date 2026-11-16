@@ -1984,11 +1984,13 @@ fn the_instances_row_names_what_nothing_reaches_and_never_fails() {
 /// A link broker launchd adopted, as the leftover view's reader gives its facts: running a
 /// build under a verify run's roots, holding its listener, leading its own group with no
 /// terminal; `runs` says how the run records tie it.
-fn adopted_broker(runs: Vec<aterm_vitals::left::RunTie>) -> aterm_vitals::left::Facts {
-    aterm_vitals::left::Facts {
+fn adopted_broker(
+    runs: Vec<aterm_process_facts::left::RunTie>,
+) -> aterm_process_facts::left::Facts {
+    aterm_process_facts::left::Facts {
         pid: 71102,
         ppid: 1,
-        lineage: Some(aterm_vitals::left::Lin {
+        lineage: Some(aterm_process_facts::left::Lin {
             uniqueid: 310,
             parent: 1,
             pgid: 71102,
@@ -2005,19 +2007,19 @@ fn adopted_broker(runs: Vec<aterm_vitals::left::RunTie>) -> aterm_vitals::left::
         aterm: true,
         runs,
         tty_master_held: Some(false),
-        ..aterm_vitals::left::Facts::default()
+        ..aterm_process_facts::left::Facts::default()
     }
 }
 
 /// The dead verify run whose run id an adopted broker carries, its executable under the
 /// run's roots.
-fn dead_runs_tie() -> aterm_vitals::left::RunTie {
-    aterm_vitals::left::RunTie {
+fn dead_runs_tie() -> aterm_process_facts::left::RunTie {
+    aterm_process_facts::left::RunTie {
         id: "41983-1792163800331520".to_owned(),
         run: true,
         tree: true,
         dead: true,
-        ..aterm_vitals::left::RunTie::default()
+        ..aterm_process_facts::left::RunTie::default()
     }
 }
 
@@ -2084,7 +2086,7 @@ fn an_unsupervised_broker_no_witness_proves_gets_no_token() {
         super::offered_token(&adopted_broker(Vec::new()), LAUNCHD_VERSION, 9000),
         None
     );
-    let live = aterm_vitals::left::RunTie {
+    let live = aterm_process_facts::left::RunTie {
         dead: false,
         ..dead_runs_tie()
     };
@@ -2344,8 +2346,8 @@ fn the_syspolicyd_row_warns_while_the_pool_is_full() {
     };
     let reading = |workers, at_limit| {
         Some(aterm_uds::program_check::Look::Read(
-            aterm_uds::program_check::Reading {
-                daemon: aterm_uds::program_check::Daemon {
+            aterm_process_facts::program_check::Reading {
+                daemon: aterm_process_facts::program_check::Daemon {
                     pid: 690,
                     start_s: 1,
                     start_us: 0,
@@ -2381,7 +2383,7 @@ fn the_syspolicyd_row_warns_while_the_pool_is_full() {
 /// another image gets no restart, and a row that could not read claims nothing.
 #[test]
 fn the_services_row_names_a_service_past_the_bar_and_its_restart() {
-    use aterm_uds::services::{Reading, Service};
+    use aterm_process_facts::services::{Reading, Service};
     let report = |services| {
         doctor_checks_with_origin(
             "/bin/sh",
@@ -2537,7 +2539,8 @@ fn the_fabric_weights_are_never_a_failure() {
 #[cfg(unix)]
 #[test]
 fn leftovers_row_is_withheld_while_the_check_is_full() {
-    use aterm_uds::program_check::{Daemon, Look, Reading};
+    use aterm_process_facts::program_check::{Daemon, Reading};
+    use aterm_uds::program_check::Look;
     let full = || {
         Some(Look::Read(Reading {
             daemon: Daemon {
@@ -2590,7 +2593,8 @@ fn leftovers_row_is_withheld_while_the_check_is_full() {
 #[cfg(unix)]
 #[test]
 fn a_full_program_check_withholds_the_argument_reads() {
-    use aterm_uds::program_check::{Daemon, Look, Reading};
+    use aterm_process_facts::program_check::{Daemon, Reading};
+    use aterm_uds::program_check::Look;
     let reading = |workers, at_limit| {
         Look::Read(Reading {
             daemon: Daemon {
@@ -3826,6 +3830,11 @@ fn init_hands_the_walk_only_the_windows_own_grants_under_another_terminal() {
         Access::FullDiskAccess,
         Access::DeveloperTools,
         Access::Debugger,
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
         Access::Accessibility,
     ];
     let line = init_walk_over(&missing, true, false, &walking).expect("a walk took some");

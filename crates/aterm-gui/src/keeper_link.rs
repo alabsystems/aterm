@@ -1403,7 +1403,11 @@ fn admit_recovered_journaled(
         Some(_) => {}
     }
     let tag = Tag::decode(tag).ok_or("carries a tag this build does not read")?;
-    let sid = tag.sid.clone().ok_or("carries no session id")?;
+    let sid = tag
+        .sid
+        .as_deref()
+        .and_then(aterm_session::SessionId::parse)
+        .ok_or("carries no session id")?;
     let fabric = crate::seamless::recovered_fabric(meta);
     if fabric.topics_lost > 0 || fabric.queued_lost > 0 {
         aterm_log::warn!(
@@ -1456,7 +1460,7 @@ fn admit_recovered_journaled(
         local_id: header.local_id,
         master,
         pid,
-        sid: aterm_session::SessionId::new(sid),
+        sid,
         nonce: aterm_session::LaunchNonce::generate(),
         checkpoint,
         control,

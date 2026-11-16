@@ -1068,6 +1068,227 @@ fn ending_a_preference_is_three_way() {
     assert_eq!(rows[&dee].lifecycle(), Some("ended"));
 }
 
+/// A preference an import ended whose machine or account the owner has since retired is not
+/// revived when a source states it again: the revival would make a live preference name a row
+/// that is not live, which the rules every write passes refuse (`typed::check::names_not_live`),
+/// with the whole run and every later run that planned it again. The run is not refused and
+/// writes nothing of that preference. Ending it is not the answer: it is ended already, and
+/// leaving it so spends no record and keeps the import's own `row` cell, so a later run revives
+/// it once the owner makes its machine or account live again.
+///
+/// A retired machine is never reached by name: a label, node or host answers only live rows, so
+/// the sheet's `m5` gets a new planned machine and a new preference beside the ended one, which
+/// stays ended. An account is reached by its key, so a retired account's preference is the one
+/// `revived` would bring back: the run leaves it ended and says so by key and column
+/// (`target-not-live`).
+/// NEGATIVE CONTROL: with `finish` not calling `live_references`, the run revives Cy's
+/// preference onto the retired account and the rules refuse it: `` assertion `left == right`
+/// failed: the run passes the rules every write passes left: Some(Refused { collection:
+/// "preference", pk: "pf-…", column: "account", rule: "names account row ac-…, which is not
+/// live; point it at a live row, leave it empty, or make that row live first" }) right: None ``.
+#[test]
+fn an_import_does_not_revive_a_preference_onto_a_retired_machine_or_account() {
+    let cy = pref("m5", "cy@example.invalid");
+    // Cy's preference, written by one import and ended by the next, with `retire` then retiring
+    // the row its `column` names; then the source states it again.
+    let restated = |column: &str| {
+        let mut book = Book::new();
+        let first = vault(&[",cy@example.invalid,m5,,1,,,,,,,,"]);
+        let one = plan(&input(std::slice::from_ref(&first), &[]), &Cells::new()).unwrap();
+        apply(&mut book, &one);
+        let dropped = vault(&[",cy@example.invalid,,,1,,,,,,,,"]);
+        let ended = plan(&input(&[dropped], &[]), &book.cells()).unwrap();
+        let cells = apply(&mut book, &ended);
+        let row = &cell::project(&PREFERENCE, &cells).rows[&cy];
+        assert_eq!(row.lifecycle(), Some("ended"));
+        let target = row.get(column).and_then(Value::as_str).unwrap().to_owned();
+        let collection = if column == "machine" {
+            &MACHINE
+        } else {
+            &ACCOUNT
+        };
+        let seen = book.all();
+        book.write(
+            2,
+            &seen,
+            vec![put(collection, &target, "row", json!("retired"))],
+        );
+        let cells = book.cells();
+        let back = plan(
+            &input(&[vault(&[",cy@example.invalid,m5,,1,,,,,,,,"])], &[]),
+            &cells,
+        )
+        .unwrap();
+        let mut view = crate::typed::View::empty_for_test();
+        view.cells = cells;
+        assert_eq!(
+            check::refused(
+                back.table.unwrap(),
+                &back.rows,
+                &view,
+                crate::alab::seeds::compiled
+            ),
+            None,
+            "the run passes the rules every write passes"
+        );
+        assert!(
+            !back
+                .rows
+                .iter()
+                .flatten()
+                .any(|change| change.key.starts_with(&format!("{cy}."))),
+            "nothing of Cy's preference is written: {:?}",
+            back.rows
+        );
+        let after = apply(&mut book, &back);
+        assert_eq!(
+            cell::project(&PREFERENCE, &after).rows[&cy].lifecycle(),
+            Some("ended")
+        );
+        (back, after)
+    };
+
+    let (_, after) = restated("machine");
+    // The label went to a new machine, and the source's preference with it.
+    let live: Vec<_> = cell::project(&PREFERENCE, &after)
+        .rows
+        .into_iter()
+        .filter(|(_, row)| row.live())
+        .collect();
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_ne!(
+        live[0].1.get("machine"),
+        Some(&json!(keys::machine_pk("m5")))
+    );
+
+    let (back, _) = restated("account");
+    assert!(
+        back.findings.iter().any(|f| f.kind == Kind::TargetNotLive
+            && f.pk.as_deref() == Some(cy.as_str())
+            && f.column.as_deref() == Some("account")),
+        "{:?}",
+        back.findings
+    );
+}
+
+/// A login at a provider the owner retired adds no account, as observation adds none
+/// (`account-provider-retired`): the account's provider is its realm's, so its birth could only
+/// name the retired provider, which the rules every write passes refuse, or leave a live account
+/// with no provider. The run writes nothing of the account and no preference naming it, says so
+/// by the account's key and its `provider` column (`target-not-live`), passes those rules, and
+/// still writes the login's address and the machine. An account the registry already holds at
+/// that realm is not this rule's: it is wanted as before.
+/// NEGATIVE CONTROL: with `Planner::account` wanting every account (its retired-provider arm
+/// removed), the account is born without its provider: `` an account is added at a retired
+/// provider: ["ac-….label", "ac-….login", "ac-….realm", "ac-….status",
+/// "ac-….services.claude-code", "ac-….row", "ac-….src"] ``.
+#[test]
+fn an_import_adds_no_account_at_a_retired_provider() {
+    use crate::alab::registry::PROVIDER;
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![put(&PROVIDER, keys::ANTHROPIC, "row", json!("retired"))],
+    );
+    let cells = book.cells();
+    let run = plan(
+        &input(&[vault(&[",cy@example.invalid,m5,,1,,,,,,,,"])], &[]),
+        &cells,
+    )
+    .unwrap();
+    let account = keys::account_pk("claude", "cy@example.invalid").unwrap();
+    let written: Vec<&str> = run
+        .rows
+        .iter()
+        .flatten()
+        .filter(|change| change.key.starts_with(&format!("{account}.")))
+        .map(|change| change.key.as_str())
+        .collect();
+    assert!(
+        written.is_empty(),
+        "an account is added at a retired provider: {written:?}"
+    );
+    let collections: BTreeSet<&str> = run
+        .rows
+        .iter()
+        .flatten()
+        .map(|change| change.collection.as_str())
+        .collect();
+    assert!(!collections.contains(PREFERENCE.name), "{collections:?}");
+    assert!(collections.contains(ADDRESS.name), "{collections:?}");
+    assert!(collections.contains(MACHINE.name), "{collections:?}");
+    assert!(
+        run.findings.iter().any(|f| f.kind == Kind::TargetNotLive
+            && f.collection == Some(ACCOUNT.name)
+            && f.pk.as_deref() == Some(account.as_str())
+            && f.column.as_deref() == Some("provider")),
+        "{:?}",
+        run.findings
+    );
+    let mut view = crate::typed::View::empty_for_test();
+    view.cells = cells;
+    assert_eq!(
+        check::refused(
+            run.table.unwrap(),
+            &run.rows,
+            &view,
+            crate::alab::seeds::compiled
+        ),
+        None
+    );
+}
+
+/// A row the sources name that the run leaves unborn, because its key names a row that is not
+/// live (`live_references`), is counted among the rows the sources name and is no new row: the
+/// report's `new` says what the plan gives birth to. Cy's account, born by one run with no
+/// machine, is retired; the next run's `m5` names a new machine and a new preference of that
+/// account, which is not born.
+/// NEGATIVE CONTROL: with `new_rows` counted before `live_references` answers (as it was), the
+/// unborn preference is counted new: `` assertion `left == right` failed: the unborn preference
+/// is no new row left: (1, 1) right: (1, 0) ``.
+#[test]
+fn a_preference_left_unborn_for_a_retired_account_is_no_new_row() {
+    let cy = pref("m5", "cy@example.invalid");
+    let mut book = Book::new();
+    let first = plan(
+        &input(&[vault(&[",cy@example.invalid,,,1,,,,,,,,"])], &[]),
+        &Cells::new(),
+    )
+    .unwrap();
+    apply(&mut book, &first);
+    let account = keys::account_pk("claude", "cy@example.invalid").unwrap();
+    let seen = book.all();
+    book.write(
+        2,
+        &seen,
+        vec![put(&ACCOUNT, &account, "row", json!("retired"))],
+    );
+    let run = plan(
+        &input(&[vault(&[",cy@example.invalid,m5,,1,,,,,,,,"])], &[]),
+        &book.cells(),
+    )
+    .unwrap();
+    assert!(
+        !run.rows
+            .iter()
+            .flatten()
+            .any(|change| change.key.starts_with(&format!("{cy}."))),
+        "{:?}",
+        run.rows
+    );
+    let count = run.counts.get(PREFERENCE.name).copied().unwrap_or_default();
+    assert_eq!(
+        (count.rows, count.new_rows),
+        (1, 0),
+        "the unborn preference is no new row"
+    );
+    assert_eq!(
+        run.counts.get(MACHINE.name).map(|count| count.new_rows),
+        Some(1)
+    );
+}
+
 /// An owner's correction naming another listed login links this address to it, and a `+tag` of a
 /// listed login is its alias unless a correction says otherwise; a guess links nothing, and an
 /// address listed nowhere is no target (a mailbox's login never enters a row).

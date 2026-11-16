@@ -45,7 +45,7 @@ fn a_side_inset_drops_exactly_its_columns_and_moves_no_cell() {
         })
         .collect();
     for k in [1u16, 3, 30] {
-        app.set_side_inset_cells(WID, k);
+        app.set_side_inset_for_test(WID, k);
         let inset = usize::from(k) * cw;
         assert_eq!(app.win_side_inset_px(WID), inset);
         {
@@ -86,7 +86,7 @@ fn a_side_inset_drops_exactly_its_columns_and_moves_no_cell() {
             "the setter never re-grids a tab"
         );
     }
-    app.set_side_inset_cells(WID, 0);
+    app.set_side_inset_for_test(WID, 0);
     app.windows.get_mut(&WID).unwrap().win_px = Some(base);
     assert_eq!(app.window_frame_px_for(WID, rows, cols), base);
     assert_eq!(app.grid_dims_for(WID, raw), dims);
@@ -96,13 +96,13 @@ fn a_side_inset_drops_exactly_its_columns_and_moves_no_cell() {
         headless
     );
     assert_eq!(app.frame_origin(WID), origin);
-    app.set_side_inset_cells(WID, 3);
+    app.set_side_inset_for_test(WID, 3);
     app.set_font_size(app.font_px + 2.0);
     let (new_cw, _) = app.win_cell_size(WID);
     assert_eq!(app.win_side_inset_px(WID), 3 * new_cw);
     let size = app.window_frame_px_for(WID, rows, cols);
     let with = app.grid_dims_for(WID, size);
-    app.set_side_inset_cells(WID, 0);
+    app.set_side_inset_for_test(WID, 0);
     let without = app.grid_dims_for(WID, size);
     assert_eq!(with, (without.0, without.1 - 3));
     app.windows.get_mut(&WID).unwrap().win_px = None;
@@ -138,7 +138,7 @@ fn the_pointer_and_the_picture_agree_with_a_side_inset() {
     app.windows.get_mut(&WID).unwrap().win_px = Some(zero_size);
     app.redraw_window(WID);
     let zero_glass = glass(&mut app);
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     let size = PhysicalSize::new(frame.width + inset as u32 + 3, frame.height + 2);
     app.windows.get_mut(&WID).unwrap().win_px = Some(size);
     app.redraw_window(WID);
@@ -199,14 +199,14 @@ fn the_pointer_and_the_picture_agree_with_a_side_inset() {
         );
     }
     // With the surface unchanged, a placement change must repaint the cached frame.
-    app.set_side_inset_cells(WID, 2);
+    app.set_side_inset_for_test(WID, 2);
     app.redraw_window(WID);
     let moved = app.frame_origin(WID);
     assert_eq!(
         rgba,
         glass_rgba(&mut app, (moved.0 as usize, moved.1 as usize, fw, fh))
     );
-    app.set_side_inset_cells(WID, 0);
+    app.set_side_inset_for_test(WID, 0);
     app.windows.get_mut(&WID).unwrap().win_px = Some(zero_size);
     app.redraw_window(WID);
     assert_eq!(
@@ -214,7 +214,7 @@ fn the_pointer_and_the_picture_agree_with_a_side_inset() {
         zero_glass,
         "returning to zero reproduces every surface pixel"
     );
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     app.windows.get_mut(&WID).unwrap().win_px = Some(size);
     app.redraw_window(WID);
     app.on_cursor_moved(WID, (inset / 2) as f64, (top + ch / 2) as f64);
@@ -288,7 +288,7 @@ fn the_pointer_and_the_picture_agree_with_a_side_inset() {
         !app.stats_lens_within_surface(WID),
         "the right-edge lens is cropped after the inset"
     );
-    app.set_side_inset_cells(WID, 0);
+    app.set_side_inset_for_test(WID, 0);
     assert!(
         app.stats_lens_within_surface(WID),
         "negative control: without the inset it fits"
@@ -324,7 +324,7 @@ fn in_grid_strip_hits_survive_a_side_inset() {
         before_chip,
         Some(crate::tab_bar::TabHit::Select(_))
     ));
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     app.windows.get_mut(&WID).unwrap().win_px = Some(PhysicalSize::new(
         frame.width + (4 * cw) as u32,
         frame.height,
@@ -352,7 +352,10 @@ fn in_grid_strip_hits_survive_a_side_inset() {
 }
 
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
-fn image_meta(app: &mut App, clean: bool) -> ((usize, usize, Vec<u8>), &'static str, u64) {
+pub(super) fn image_meta(
+    app: &mut App,
+    clean: bool,
+) -> ((usize, usize, Vec<u8>), &'static str, u64) {
     let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
     let (reply, rx) = std::sync::mpsc::channel();
     app.render_image(crate::control::ImageReq {
@@ -382,7 +385,7 @@ fn image_meta(app: &mut App, clean: bool) -> ((usize, usize, Vec<u8>), &'static 
 }
 
 /// Straight RGBA pixels of the CPU surface inside `rect`.
-fn glass_rgba(app: &mut App, rect: (usize, usize, usize, usize)) -> Vec<u8> {
+pub(super) fn glass_rgba(app: &mut App, rect: (usize, usize, usize, usize)) -> Vec<u8> {
     let ((surface_w, _), pixels) = glass(app);
     let (x0, y0, width, height) = rect;
     (y0..y0 + height)
@@ -403,7 +406,7 @@ use std::{
     time::{Duration, Instant},
 };
 #[cfg(unix)]
-fn observer() -> (UnixStream, Arc<SinkWriter>) {
+pub(super) fn observer() -> (UnixStream, Arc<SinkWriter>) {
     let (reader, writer) = UnixStream::pair().expect("private input observer");
     reader.set_nonblocking(true).unwrap();
     (reader, Arc::new(SinkWriter::new_owned(writer.into())))
@@ -425,7 +428,7 @@ fn drain(reader: &mut UnixStream) -> String {
 }
 
 #[cfg(unix)]
-fn written_before_marker(app: &mut App, session: u64, wire: &mut UnixStream) -> String {
+pub(super) fn written_before_marker(app: &mut App, session: u64, wire: &mut UnixStream) -> String {
     const MARK: &str = "<marker>";
     app.input_to_session(
         WID,
@@ -458,7 +461,7 @@ fn side_inset_headless_cpu_picture_pointer_and_capture_share_the_surface() {
     let mut app = crate::scripted_redraw_fixture::scripted_app();
     feed(&app, b"\x1b]11;#102030\x07\x1b[?25lheadless inset");
     let bare = app.window_frame_px_for(WID, app.windows[&WID].rows, app.windows[&WID].cols);
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     assert!(app.windows[&WID].win_px.is_none());
     let inset = app.win_side_inset_px(WID);
     app.redraw_window(WID);

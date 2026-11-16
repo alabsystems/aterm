@@ -905,14 +905,17 @@ pub struct HeldNow {
 impl HeldNow {
     /// Whether this reading, taken after `before` (the same reader's earlier one; `None` when that
     /// one did not read), is a backed-up queue by the jobs engine's rule:
-    /// [`aterm_vitals::jobs::HELD_AT_ONCE`] held at once, or a program held at both readings. A
-    /// count names no row, so a different program held at each counts too: each has stood unrun
-    /// past the 20 s age bound, where a normal exec reads so for under 0.3 ms. A new program
+    /// [`aterm_process_facts::program_check::HELD_AT_ONCE`] held at once, or a program held at both
+    /// readings. A count names no row, so a different program held at each counts too: each has
+    /// stood unrun past the 20 s age bound, where a normal exec reads so for under 0.3 ms. A new program
     /// started now would wait in the same line.
     #[must_use]
     pub const fn backed_up(&self, before: Option<Self>) -> bool {
-        self.count >= aterm_vitals::jobs::HELD_AT_ONCE
-            || (self.count > 0 && matches!(before, Some(b) if b.count > 0))
+        let before_count = match before {
+            Some(before) => Some(before.count),
+            None => None,
+        };
+        aterm_process_facts::program_check::held_count_backed_up(self.count, before_count)
     }
 }
 

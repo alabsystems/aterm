@@ -112,7 +112,7 @@ fn shared_file_holds_and_each_law_falls_to_exactly_its_one_named_mutant() {
     assert_eq!(
         of_kind(InvariantKind::Claim),
         laws.map(|(law, _)| law),
-        "the model's claims are the design's sixteen laws, in its order"
+        "the model's claims are the design's seventeen laws, in its order"
     );
     assert_eq!(
         of_kind(InvariantKind::Bound),
@@ -120,7 +120,7 @@ fn shared_file_holds_and_each_law_falls_to_exactly_its_one_named_mutant() {
     );
     assert_eq!(
         model.mutant_dials(),
-        (1..=16).collect::<Vec<i64>>(),
+        (1..=17).collect::<Vec<i64>>(),
         "one mutant to a law"
     );
     for (dial, (law, mutant)) in (1..).zip(laws) {

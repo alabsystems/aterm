@@ -1428,3 +1428,431 @@ fn a_cells_directory_is_a_build_directory_of_its_own() {
     close(&beside, &Dir::Side(smoke.clone()));
     assert!(keep_used(&beside).is_empty(), "and keeps nothing");
 }
+
+/// A RUN THAT BUILT A SECOND HASH RECORDS WHAT MOVED ([`note_used`], [`record_second_hashes`]): a
+/// test compile builds `aterm-grid`'s test unit under a second hash beside its first, which differs
+/// only in its dependency `mid`'s hash, and `mid`'s two builds only in theirs of `aterm-json`
+/// (named `json` in `mid`'s `deps`), whose features moved; the run's end says it in one line of
+/// its log, one `second-hash` event and one row of the machine's record, which names
+/// `aterm-json`'s `features`, and counts it by cause. NEGATIVE CONTROLS: the cause is the
+/// dependency, not `mid` between; the first unit of its kind (`solo`) records nothing; a unit
+/// cargo found fresh is not read; the same unit noted again is not read again, and a run that
+/// built no second hash records nothing. A bin a test needs, which the compile names by its copy
+/// in the target alone, is read as the unit its copy came from; and two units of one kind the
+/// run built both of, each found beside the other, are one second hash, said once.
+#[test]
+fn a_run_that_built_a_second_hash_records_what_moved() {
+    const GRID_OLD: &str = "a1a1a1a1a1a1a1a1";
+    const GRID_NEW: &str = "a2a2a2a2a2a2a2a2";
+    const SOLO: &str = "d1d1d1d1d1d1d1d1";
+    const TOOL_OLD: &str = "e1e1e1e1e1e1e1e1";
+    const TOOL_NEW: &str = "e2e2e2e2e2e2e2e2";
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("verify-disk-second-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch");
+    let leaf = dir.path().join("cache/w/.cargo-build");
+    let profile = leaf.join("debug");
+    let lay =
+        |package: &str, hash: &str, kind: &str, fp: u64, features: &str, deps: &[(&str, u64)]| {
+            let unit = profile.join("build").join(package).join(hash);
+            std::fs::create_dir_all(unit.join("fingerprint")).expect("its fingerprint");
+            std::fs::create_dir_all(unit.join("out")).expect("its outputs");
+            let hex: String = fp
+                .to_le_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            std::fs::write(unit.join("fingerprint").join(kind), hex).expect("its hash file");
+            let json = aterm_json::json!({
+                "rustc": 1, "features": features, "declared_features": "[]", "target": 2,
+                "profile": 3, "path": 4,
+                "deps": deps.iter().map(|(name, h)| aterm_json::json!([5, *name, false, *h]))
+                    .collect::<Vec<_>>(),
+                "local": [{"CheckDepInfo": {"dep_info": format!("debug/build/{package}/{hash}/x"),
+                    "fingerprint": "mtime"}}],
+                "rustflags": [], "config": 6, "compile_kind": 0,
+            });
+            std::fs::write(
+                unit.join("fingerprint").join(format!("{kind}.json")),
+                aterm_json::to_string(&json).expect("json"),
+            )
+            .expect("its fingerprint JSON");
+            let out = unit.join("out").join(format!("{package}-{hash}"));
+            std::fs::write(&out, b"o").expect("its output");
+            out.display().to_string()
+        };
+    let json_old = lay(
+        "aterm-json",
+        "c1c1c1c1c1c1c1c1",
+        "lib-aterm_json",
+        501,
+        "[]",
+        &[],
+    );
+    let json_new = lay(
+        "aterm-json",
+        "c2c2c2c2c2c2c2c2",
+        "lib-aterm_json",
+        502,
+        "[\"std\"]",
+        &[],
+    );
+    lay(
+        "mid",
+        "b1b1b1b1b1b1b1b1",
+        "lib-mid",
+        601,
+        "[]",
+        &[("json", 501)],
+    );
+    lay(
+        "mid",
+        "b2b2b2b2b2b2b2b2",
+        "lib-mid",
+        602,
+        "[]",
+        &[("json", 502)],
+    );
+    let old = lay(
+        "aterm-grid",
+        GRID_OLD,
+        "test-lib-aterm_grid",
+        701,
+        "[]",
+        &[("mid", 601)],
+    );
+    let new = lay(
+        "aterm-grid",
+        GRID_NEW,
+        "test-lib-aterm_grid",
+        702,
+        "[]",
+        &[("mid", 602)],
+    );
+    let solo = lay("solo", SOLO, "lib-solo", 801, "[]", &[]);
+    // A bin of two builds whose features moved; cargo copied the new one's into the target.
+    lay("tool", TOOL_OLD, "bin-tool", 901, "[]", &[]);
+    lay("tool", TOOL_NEW, "bin-tool", 902, "[\"cli\"]", &[]);
+    for (hash, bytes) in [(TOOL_OLD, &b"the old bin"[..]), (TOOL_NEW, &b"new"[..])] {
+        std::fs::write(
+            profile.join("build/tool").join(hash).join("out/tool"),
+            bytes,
+        )
+        .expect("its bin");
+    }
+    let events = dir.path().join("run.events");
+    let mut ctx = Ctx::new(
+        dir.path().join("w"),
+        crate::Scope::packages(&["aterm-grid".to_owned()]),
+        crate::EnvSnapshot::default(),
+        PathBuf::from("/tmp/x"),
+    )
+    .with_checks(&[Check::Test])
+    .with_events(Some(
+        crate::event_log::EventLog::open(&events).expect("events"),
+    ));
+    ctx.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+    let bin = ctx.target_dir.join("debug/tool");
+    std::fs::create_dir_all(ctx.target_dir.join("debug")).expect("the target");
+    std::fs::hard_link(
+        profile.join("build/tool").join(TOOL_NEW).join("out/tool"),
+        &bin,
+    )
+    .expect("cargo's copy of the bin");
+    let artifact = |file: &str, package: &str, fresh: bool| crate::shape::Artifact {
+        filenames: vec![file.to_owned()],
+        fresh,
+        package: Some(package.to_owned()),
+        test: true,
+    };
+    let record = dir.path().join("state/verify/second-hashes.json");
+    // Cargo found the old unit fresh, and `solo` is the first of its kind: nothing to record.
+    note_used(
+        &ctx,
+        &Dir::Main,
+        &[
+            artifact(&old, "aterm-grid", true),
+            artifact(&solo, "solo", false),
+        ],
+        &[],
+        true,
+    );
+    assert!(record_second_hashes(&ctx, Some(&record)).is_empty());
+    assert!(
+        !record.exists(),
+        "a run that built no second hash records nothing"
+    );
+
+    note_used(
+        &ctx,
+        &Dir::Main,
+        &[
+            artifact(&new, "aterm-grid", false),
+            // Both builds of `aterm-json`, each beside the other.
+            artifact(&json_old, "aterm-json", false),
+            artifact(&json_new, "aterm-json", false),
+            crate::shape::Artifact {
+                filenames: vec![bin.display().to_string()],
+                fresh: false,
+                package: Some("tool".to_owned()),
+                test: false,
+            },
+        ],
+        &[],
+        true,
+    );
+    // Noted again by a later call: read once.
+    note_used(
+        &ctx,
+        &Dir::Main,
+        &[artifact(&new, "aterm-grid", false)],
+        &[],
+        true,
+    );
+    let said = record_second_hashes(&ctx, Some(&record));
+    // One line for each second hash, and one for what the record kept.
+    assert_eq!(said.len(), 4, "{said:?}");
+    let grid = said
+        .iter()
+        .find(|l| l.contains(GRID_NEW))
+        .expect("aterm-grid's line");
+    for fact in [GRID_OLD, "aterm-json", "features"] {
+        assert!(grid.contains(fact), "{fact} in {grid}");
+    }
+    assert_eq!(
+        said.iter()
+            .filter(|l| l.contains("c1c1c1c1c1c1c1c1"))
+            .count(),
+        1,
+        "two builds of one kind, each beside the other, said once: {said:?}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.contains(TOOL_NEW) && l.contains(TOOL_OLD)),
+        "the bin, read by the unit its copy came from: {said:?}"
+    );
+    assert!(
+        said.iter()
+            .any(|l| l.contains(&record.display().to_string())),
+        "{said:?}"
+    );
+    let rows = aterm_capacity::second_hash::SecondHashes::load(&record);
+    let rows = rows.rows();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let row = |package: &str| {
+        rows.iter()
+            .find(|r| r.package == package)
+            .unwrap_or_else(|| panic!("{package}'s row in {rows:?}"))
+    };
+    assert_eq!(
+        (
+            row("aterm-grid").hash.as_str(),
+            row("aterm-grid").other.as_str()
+        ),
+        (GRID_NEW, GRID_OLD)
+    );
+    assert_eq!(
+        (
+            row("aterm-grid").cause.as_str(),
+            row("aterm-grid").input.as_str()
+        ),
+        ("aterm-json", "features"),
+        "the dependency whose own input moved, not `mid` between"
+    );
+    assert_eq!(
+        (
+            row("tool").hash.as_str(),
+            row("tool").other.as_str(),
+            row("tool").input.as_str()
+        ),
+        (TOOL_NEW, TOOL_OLD, "features")
+    );
+    let text = std::fs::read_to_string(&events).expect("the events");
+    let events: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("\"second-hash\""))
+        .collect();
+    assert_eq!(events.len(), 3, "{events:?}");
+    let event = events
+        .iter()
+        .find(|l| l.contains(&format!("\"hash\":\"{GRID_NEW}\"")))
+        .expect("aterm-grid's second-hash event");
+    for field in ["\"cause\":\"aterm-json\"", "\"input\":\"features\""] {
+        assert!(event.contains(field), "{field} in {event}");
+    }
+    let (inputs, causes) = aterm_capacity::second_hash::SecondHashes::load(&record).by_cause();
+    assert_eq!(inputs.get("features"), Some(&3), "{inputs:?}");
+    assert_eq!(
+        causes.get(&("aterm-json".to_owned(), "features".to_owned())),
+        Some(&2),
+        "{causes:?}"
+    );
+    assert!(
+        record_second_hashes(&ctx, Some(&record)).is_empty(),
+        "each second hash is recorded once"
+    );
+}
+
+/// WHERE `targo`'S RECEIPTS NAME THE UNITS A RUN USED, THEY ARE ITS RECORD ([`keep_used`],
+/// [`receipts_speak`], DC-12d): a run of one scope whose build directory holds no receipt keeps
+/// its run as before; the scope's next run, whose builds' receipts (begun since it began) name
+/// every unit it used, keeps no run of its own: the record takes the receipts, its scope's run
+/// before goes, and the unit only that run used is retired for the trim, with the directory
+/// bound, and the log says so. NEGATIVE CONTROLS: a receipt that names only some of the run's
+/// units, one of a build begun before the run began, and receipts that name them all beside one
+/// the read left out (torn), leave the run to keep itself, as before receipts.
+#[test]
+fn a_run_whose_builds_receipts_name_its_units_keeps_no_run_of_its_own() {
+    use atpkg::build_cache::stale;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("verify-disk-receipts-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch");
+    let leaf = dir.path().join("cache/w/.cargo-build");
+    std::fs::create_dir_all(&leaf).expect("the build directory");
+    let grid = || crate::Scope::packages(&["aterm-grid".to_owned()]);
+    let made = || {
+        let mut ctx = Ctx::new(
+            dir.path().join("w"),
+            grid(),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp/x"),
+        )
+        .with_checks(&[Check::Test]);
+        ctx.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+        ctx
+    };
+    let run = |ctx: &Ctx, hashes: &[&str]| {
+        let artifacts: Vec<crate::shape::Artifact> = hashes
+            .iter()
+            .map(|hash| crate::shape::Artifact {
+                filenames: vec![
+                    leaf.join(format!(
+                        "debug/build/aterm-grid/{hash}/out/aterm_grid-{hash}"
+                    ))
+                    .display()
+                    .to_string(),
+                ],
+                fresh: true,
+                package: Some("aterm-grid".to_owned()),
+                test: true,
+            })
+            .collect();
+        note_used(ctx, &Dir::Main, &artifacts, &[], true);
+        close(ctx, &Dir::Main);
+        keep_used(ctx)
+    };
+    let millis = |at: std::time::SystemTime| {
+        u64::try_from(
+            at.duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis(),
+        )
+        .expect("ms")
+    };
+    let receipt = |began_ms: u64, hashes: &[&str]| {
+        let folder = leaf.join(stale::RECEIPTS);
+        std::fs::create_dir_all(&folder).expect("the receipts");
+        let named: Vec<String> = hashes.iter().map(|h| format!("\"{h}\"")).collect();
+        std::fs::write(
+            folder.join("00000000000000a1.json"),
+            format!(
+                "{{\"began_ms\":{began_ms},\"members\":[\"aterm-grid\"],\
+                 \"profiles\":{{\"debug\":[{}]}},\"receipt\":1,\"selection\":{{}}}}",
+                named.join(",")
+            ),
+        )
+        .expect("a receipt");
+    };
+    let read = || stale::Kept::read(&leaf);
+
+    let first = made();
+    let said = run(&first, &["1111111111111111", "3333333333333333"]);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].line.starts_with("disk: kept the 2 unit(s)"),
+        "{said:?}"
+    );
+    let key = run_key(&first);
+    assert!(read().runs.contains_key(&key));
+
+    let partial = made();
+    receipt(millis(partial.began), &["1111111111111111"]);
+    let said = run(&partial, &["1111111111111111", "2222222222222222"]);
+    assert!(
+        said[0].line.starts_with("disk: kept the 2 unit(s)"),
+        "{said:?}"
+    );
+    assert!(
+        read().runs.contains_key(&key),
+        "a receipt naming some of its units"
+    );
+
+    let earlier = made();
+    receipt(
+        millis(earlier.began) - 1000,
+        &["1111111111111111", "2222222222222222"],
+    );
+    let said = run(&earlier, &["1111111111111111", "2222222222222222"]);
+    assert!(
+        said[0].line.starts_with("disk: kept the 2 unit(s)"),
+        "{said:?}"
+    );
+    assert!(
+        read().runs.contains_key(&key),
+        "a receipt of a build begun before the run"
+    );
+
+    let unread = made();
+    receipt(
+        millis(unread.began),
+        &["1111111111111111", "2222222222222222"],
+    );
+    let torn = leaf.join(stale::RECEIPTS).join("00000000000000b2.json");
+    std::fs::write(&torn, b"{\"began_ms\":").expect("a torn receipt");
+    let said = run(&unread, &["1111111111111111", "2222222222222222"]);
+    assert!(
+        said[0].line.starts_with("disk: kept the 2 unit(s)"),
+        "{said:?}"
+    );
+    assert!(
+        read().runs.contains_key(&key),
+        "a receipt the read left out"
+    );
+    std::fs::remove_file(&torn).expect("the torn receipt removed");
+
+    let spoken = made();
+    // The scope's run before used 1111 and 2222 (the `unread` run's): this run's builds used
+    // 1111 and 4444.
+    receipt(
+        millis(spoken.began),
+        &["1111111111111111", "4444444444444444"],
+    );
+    let said = run(&spoken, &["1111111111111111", "4444444444444444"]);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].line.contains("receipts of this run's builds")
+            && said[0]
+                .line
+                .contains("1 unit(s) nothing kept names retired"),
+        "{said:?}"
+    );
+    assert_eq!(
+        (said[0].retired, said[0].bound.is_some()),
+        (1, true),
+        "{said:?}"
+    );
+    let kept = read();
+    assert!(
+        !kept.runs.contains_key(&key),
+        "the receipts speak for the scope"
+    );
+    assert_eq!(kept.receipts.len(), 1);
+    assert_eq!(
+        kept.retired.profiles["debug"],
+        std::collections::BTreeSet::from(["2222222222222222".to_owned()])
+    );
+}

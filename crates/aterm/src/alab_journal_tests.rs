@@ -172,24 +172,43 @@ fn every_harness_word_is_a_journal_word() {
     );
 }
 
-/// EVERY PLAN THE REGISTRY SEEDS IS A PLAN WORD A MAC WRITES. The accounts relation reads an
-/// observed plan as `<provider>-<word>` and compares it with the plan row a person set, so a
-/// seeded row (`openai-prolite`, which Codex reports as `prolite`) whose word `plan_word` does
-/// not keep could be set but never observed: its `plan-seen` would never be written.
+/// EVERY PLAN ROW OF A PROVIDER WHOSE CLI STATES ITS PLAN CAN BE OBSERVED. The accounts relation
+/// reads an observed plan as `<provider>-<word>` and compares it with the plan row a person
+/// set, a row that adds a tier to the observed word included (`anthropic-max-20x` beside an
+/// observed `max`). So where a provider's CLI states its plan (some bought row of the provider
+/// is a word `plan_word` keeps), every row of that provider is such a word, or one with a tier
+/// after it: a row that is neither (`openai-prolite`, were `prolite` no plan word) could be
+/// set but never observed, since its `plan-seen` would never be written. A provider whose CLIs
+/// state no plan (Google, xAI) has rows only a person sets.
 /// NEGATIVE CONTROL: with `prolite` out of `journal::PLANS`, `` the registry's plan
 /// openai-prolite is no plan word a Mac writes ``.
 #[test]
 fn every_plan_the_registry_seeds_is_a_plan_word_a_mac_writes() {
-    let mut seen = 0;
-    for seed in &aterm_db::alab::seeds::PLANS {
-        let word = seed
-            .pk
+    let word_of = |seed: &aterm_db::alab::seeds::PlanSeed| {
+        seed.pk
             .strip_prefix(seed.provider)
             .and_then(|rest| rest.strip_prefix('-'))
-            .unwrap_or_else(|| panic!("{} is keyed <provider>-<word>", seed.pk));
-        assert_eq!(
-            journal::plan_word(word),
-            Some(word),
+            .unwrap_or_else(|| panic!("{} is keyed <provider>-<word>", seed.pk))
+    };
+    // The word a Mac writes of a row: the row's own word, or the word its tier follows.
+    let written = |word: &str| {
+        journal::plan_word(word).or_else(|| {
+            let (base, tier) = word.rsplit_once('-')?;
+            journal::plan_word(base).filter(|_| !tier.is_empty())
+        })
+    };
+    let states_plans: std::collections::BTreeSet<&str> = aterm_db::alab::seeds::PLANS
+        .iter()
+        .filter(|seed| word_of(seed) != "free" && written(word_of(seed)).is_some())
+        .map(|seed| seed.provider)
+        .collect();
+    let mut seen = 0;
+    for seed in &aterm_db::alab::seeds::PLANS {
+        if !states_plans.contains(seed.provider) {
+            continue;
+        }
+        assert!(
+            written(word_of(seed)).is_some(),
             "the registry's plan {} is no plan word a Mac writes",
             seed.pk
         );

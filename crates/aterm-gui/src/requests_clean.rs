@@ -293,11 +293,13 @@ pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
 ) -> String {
     let hosted = |sid: &str| {
-        sessions
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(&SessionId::new(sid))
-            .is_some()
+        SessionId::parse(sid).is_some_and(|sid| {
+            sessions
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_sid(&sid)
+                .is_some()
+        })
     };
     let start = |job: Job| {
         let kit = host_kit(sessions.clone(), proxy.clone());
@@ -439,8 +441,8 @@ fn host_kit(sessions: Store, proxy: aterm_window::event_loop::EventLoopProxy<cra
                 let registry = sessions.read().unwrap_or_else(|p| p.into_inner());
                 sids.iter()
                     .filter_map(|sid| {
-                        registry
-                            .by_sid(&SessionId::new(sid))
+                        SessionId::parse(sid)
+                            .and_then(|id| registry.by_sid(&id))
                             .map(|handle| (handle.local_id, sid.clone()))
                     })
                     .collect()
@@ -487,10 +489,11 @@ fn standing_cwds(sessions: &Store) -> Vec<String> {
 
 /// Tab `sid` of `sessions` as a cleanup keeps it ([`Captured`]).
 fn capture_host(sessions: &Store, sid: &str) -> Option<Captured> {
+    let id = SessionId::parse(sid)?;
     let handle = sessions
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .by_sid(&SessionId::new(sid))
+        .by_sid(&id)
         .cloned()?;
     let result = handle
         .ctx

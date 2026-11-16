@@ -879,6 +879,22 @@ fn managed_git_uses_the_named_accounts_store_before_the_process_accounts_store()
         installed_git_for(&sys, Some(Path::new("/Users//bob"))),
         Some(named.clone())
     );
+    assert_eq!(
+        installed_git_execution_for(&sys, Some(Path::new("/Users//bob"))),
+        Some(GitExecution {
+            program: named.clone(),
+            entry: Some(atpkg_prefix_for(&sys, Path::new("/Users//bob")).join("bin/git")),
+        }),
+        "the named account's executable and entry are one admitted installation"
+    );
+    assert_eq!(
+        installed_git_execution_for(&sys, None),
+        Some(GitExecution {
+            program: own.clone(),
+            entry: Some(atpkg_prefix_for(&sys, Path::new(&alice().home)).join("bin/git")),
+        }),
+        "the unnamed lookup retains the process account's distinct installation"
+    );
     assert_actor_git(&sys, &alice(), &own);
     assert_actor_git(
         &sys,
@@ -931,6 +947,11 @@ fn a_named_account_without_managed_git_never_borrows_the_process_accounts_build(
             None,
             "Linux: {linux}: no native or Bob-owned Git"
         );
+        assert_eq!(
+            installed_git_execution_for(&sys, Some(Path::new(&bob.home))),
+            None,
+            "the descriptor cannot borrow the process account's admitted build"
+        );
         assert!(!crate::git_credential::Git::for_user(&sys, &bob).installed(&sys));
         let native = if linux { SYSTEM_GIT } else { CLT_GIT };
         assert_actor_git(&sys, &bob, Path::new(native));
@@ -939,6 +960,14 @@ fn a_named_account_without_managed_git_never_borrows_the_process_accounts_build(
             installed_git_for(&sys, Some(Path::new(&bob.home))),
             Some(PathBuf::from(native)),
             "Linux: {linux}: another account's store is not Bob's fallback"
+        );
+        assert_eq!(
+            installed_git_execution_for(&sys, Some(Path::new(&bob.home))),
+            Some(GitExecution {
+                program: native.into(),
+                entry: None
+            }),
+            "native fallback has no managed entry"
         );
         assert_actor_git(&sys, &bob, Path::new(native));
         assert_actor_git(&sys, &alice(), &own);

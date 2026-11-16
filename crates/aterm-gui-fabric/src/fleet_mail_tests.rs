@@ -100,7 +100,7 @@ impl FabricSession for Session {
 
 pub(super) fn session(path: &std::path::Path) -> Session {
     Session {
-        sid: SessionId::new("t0012345678"),
+        sid: SessionId::parse("t0012345678").expect("a tab id"),
         fabric: SessionFabric::default(),
         path: path.to_owned(),
         facts: Default::default(),
@@ -365,7 +365,7 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
     use crate::report::{To, post as report};
     let scratch = aterm_tempfile::tempdir().unwrap();
     let there = std::sync::Arc::new(Session {
-        sid: SessionId::new("t0087654321"),
+        sid: SessionId::parse("t0087654321").expect("a tab id"),
         ..session(&scratch.path().join("there/t0087654321.toml"))
     });
     let served = std::sync::Arc::clone(&there);
@@ -479,7 +479,7 @@ fn a_leaving_sessions_report_is_driven_to_a_mac_the_mesh_would_carry_it_to() {
         crate::note_bridge_supervised();
         let scratch = aterm_tempfile::tempdir().unwrap();
         let there = std::sync::Arc::new(Session {
-            sid: SessionId::new("t0087654321"),
+            sid: SessionId::parse("t0087654321").expect("a tab id"),
             ..session(&scratch.path().join("there/t0087654321.toml"))
         });
         let served = std::sync::Arc::clone(&there);

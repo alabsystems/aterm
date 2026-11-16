@@ -3732,7 +3732,8 @@ fn a_nested_child_is_forwarded_with_its_own_token() {
             .map(|(_, value)| value.clone())
             .unwrap_or_else(|| panic!("the child's {key}"))
     };
-    let child = SessionId::new(get(aterm_types::domain::ENV_SESSION_ID));
+    let child = SessionId::parse(&get(aterm_types::domain::ENV_SESSION_ID))
+        .expect("the child's session id");
     let (read, write, signal) =
         crate::proxy::read_edge_tokens(&get(aterm_types::domain::ENV_EDGE_TOKENS))
             .expect("the child's edges");
@@ -4108,7 +4109,7 @@ fn an_invalid_sid_is_never_joined_into_a_path() {
         dir.join("x").is_file(),
         "the planted entry sits outside graph/"
     );
-    let folded = SessionId::new("s-0a1b2c3d4e5f60718293");
+    let folded = SessionId::parse("s-0a1b2c3d4e5f60718293").expect("a legacy tab id");
     crate::proxy::write_graph_entry(dir, &folded, &sock_str, &nonce);
 
     for line in [
@@ -6101,7 +6102,7 @@ fn edge_granted(op: Op, ctx: &SessionCtx) -> Scope {
     let tok = {
         let mut tbl = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
         tbl.grant(
-            SessionId::new("s-test-controller"),
+            SessionId::parse("t00000ctr01").expect("a tab id"),
             ctx.self_id.clone(),
             op,
             ctx.nonce,
@@ -6824,7 +6825,7 @@ fn privilege_verbs_reject_edge_scope_in_body() {
     let ctx = test_ctx();
     let edge = edge();
     assert_eq!(
-        cmd_grant(&ctx, edge, "s-deadbeef read-screen"),
+        cmd_grant(&ctx, edge, "tdeadbeef00 read-screen"),
         "ERR denied\n"
     );
     assert_eq!(cmd_revoke(&ctx, edge, &"0".repeat(64)), "ERR denied\n");
@@ -6846,7 +6847,7 @@ fn grant_then_edge_handshake_then_revoke_roundtrip() {
     let ctx = test_ctx();
     let owner = Scope::Owner;
 
-    let reply = cmd_grant(&ctx, owner, "s-source01 read-screen");
+    let reply = cmd_grant(&ctx, owner, "t0000000s01 read-screen");
     let hex = reply
         .strip_prefix("OK ")
         .and_then(|s| s.strip_suffix('\n'))
@@ -6883,7 +6884,7 @@ fn grant_then_edge_handshake_then_revoke_roundtrip() {
 fn revoke_src_form_sweeps_the_whole_connection_and_fails_closed_on_unknown() {
     let ctx = test_ctx();
     let owner = Scope::Owner;
-    let src = SessionId::new("s-sweepsrc1");
+    let src = SessionId::parse("t00000swp01").expect("a tab id");
 
     let minted = {
         let mut edges = ctx.edges.lock().unwrap();
@@ -6903,7 +6904,7 @@ fn revoke_src_form_sweeps_the_whole_connection_and_fails_closed_on_unknown() {
         );
     }
 
-    assert_eq!(cmd_revoke(&ctx, owner, "src=s-sweepsrc1"), "OK 3\n");
+    assert_eq!(cmd_revoke(&ctx, owner, "src=t00000swp01"), "OK 3\n");
     for (_op, tok) in &minted {
         let line = format!("AUTH {}", tok.to_hex());
         assert!(
@@ -6913,11 +6914,11 @@ fn revoke_src_form_sweeps_the_whole_connection_and_fails_closed_on_unknown() {
     }
 
     assert_eq!(
-        cmd_revoke(&ctx, owner, "src=s-nobody99"),
+        cmd_revoke(&ctx, owner, "src=t00000nbd99"),
         "ERR no such edge\n"
     );
     assert!(cmd_revoke(&ctx, owner, "src=").starts_with("ERR usage"));
-    assert_eq!(cmd_revoke(&ctx, edge(), "src=s-sweepsrc1"), "ERR denied\n");
+    assert_eq!(cmd_revoke(&ctx, edge(), "src=t00000swp01"), "ERR denied\n");
 }
 
 #[test]
@@ -6926,7 +6927,7 @@ fn session_edge_audit_events_are_structured_and_hex_free() {
 
     let ctx = test_ctx();
     let owner = Scope::Owner;
-    let src = "s-auditsrc7";
+    let src = "t0000adt007";
 
     let reply1 = cmd_grant(&ctx, owner, &format!("{src} read-screen"));
     let hex1 = reply1.strip_prefix("OK ").unwrap().trim_end();
@@ -8838,7 +8839,7 @@ fn subscribe_multiplex_two_sids_tags_each() {
     for h in [&a, &b] {
         assert!(h.ctx.edges.lock().unwrap().insert(
             token,
-            SessionId::new("s-reader"),
+            SessionId::parse("t00000rdr01").expect("a tab id"),
             h.sid.clone(),
             Op::ReadScreen,
             h.nonce,
@@ -9072,13 +9073,13 @@ fn edges_verb_lists_capability_edges_without_tokens() {
     let tok = {
         let mut tbl = ctx.edges.lock().unwrap();
         tbl.grant(
-            SessionId::new("s-src-a"),
+            SessionId::parse("t00000src0a").expect("a tab id"),
             ctx.self_id.clone(),
             Op::ReadScreen,
             ctx.nonce,
         );
         tbl.grant(
-            SessionId::new("s-src-b"),
+            SessionId::parse("t00000src0b").expect("a tab id"),
             ctx.self_id.clone(),
             Op::WriteInput,
             ctx.nonce,
@@ -9094,11 +9095,11 @@ fn edges_verb_lists_capability_edges_without_tokens() {
     let l1 = lines.next().unwrap();
     let l2 = lines.next().unwrap();
     assert!(
-        l1.starts_with("s-src-a ") && l1.ends_with(" read-screen"),
+        l1.starts_with("t00000src0a ") && l1.ends_with(" read-screen"),
         "edge 1: {l1}"
     );
     assert!(
-        l2.starts_with("s-src-b ") && l2.ends_with(" write-input"),
+        l2.starts_with("t00000src0b ") && l2.ends_with(" write-input"),
         "edge 2: {l2}"
     );
     assert!(l1.contains(ctx.self_id.as_str()), "dst is self: {l1}");
@@ -9111,7 +9112,7 @@ fn edges_verb_lists_capability_edges_without_tokens() {
     let body = j.strip_prefix("OK 1\n").unwrap().trim_end();
     assert_well_formed_json(body);
     assert!(
-        body.contains("\"src\":\"s-src-a\"") && body.contains("\"op\":\"read-screen\""),
+        body.contains("\"src\":\"t00000src0a\"") && body.contains("\"op\":\"read-screen\""),
         "{body}"
     );
     assert!(
@@ -9322,7 +9323,12 @@ fn connect_verb_arguments_fail_closed() {
         "ERR self-loop\n"
     );
     assert_eq!(
-        cmd_connect_in(&conn, &store, Scope::Owner, "dst=s-nope src=s-any"),
+        cmd_connect_in(
+            &conn,
+            &store,
+            Scope::Owner,
+            "dst=t000000n0pe src=t000000any1"
+        ),
         "ERR no such session\n",
         "dst must be registered"
     );
@@ -9371,7 +9377,7 @@ fn disconnect_verb_kind_filters_and_sweeps_unrecorded_grants() {
         "ERR no such connection\n"
     );
 
-    let c = SessionId::new("s-wire-src");
+    let c = SessionId::parse("t0000wre001").expect("a tab id");
     {
         let mut tbl = b.ctx.edges.lock().unwrap();
         let _ = tbl.grant(c.clone(), b.sid.clone(), Op::ReadScreen, b.ctx.nonce);
@@ -9402,7 +9408,12 @@ fn disconnect_verb_kind_filters_and_sweeps_unrecorded_grants() {
         "ERR denied\n"
     );
     assert_eq!(
-        cmd_disconnect_in(&conn, &store, Scope::Owner, "dst=s-nope src=s-x"),
+        cmd_disconnect_in(
+            &conn,
+            &store,
+            Scope::Owner,
+            "dst=t000000n0pe src=t000000x001"
+        ),
         "ERR no such session\n"
     );
 }
@@ -9455,7 +9466,7 @@ fn family_connection_rows_are_owner_only() {
         .starts_with("OK"),
         "fixture connect"
     );
-    let x = SessionId::new("s-foreign");
+    let x = SessionId::parse("t0000frgn01").expect("a tab id");
     {
         let mut tbl = a.ctx.edges.lock().unwrap();
         let _ = tbl.grant(x.clone(), a.sid.clone(), Op::ReadScreen, a.ctx.nonce);
@@ -9755,7 +9766,7 @@ fn a_typing_verb_credits_its_caller_only_when_it_wrote() {
     }
     assert_eq!(by().as_deref(), Some("aterm"));
 
-    let manager = SessionId::new("s-0123456789abcdef");
+    let manager = SessionId::parse("s-0123456789abcdef0123").expect("a legacy tab id");
     let token = front.ctx.edges.lock().unwrap().grant(
         manager.clone(),
         front.sid.clone(),
@@ -10020,7 +10031,7 @@ fn binary_input_revalidates_target_and_authority_after_payload() {
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(
                         token,
-                        SessionId::new("s-late-controller"),
+                        SessionId::parse("t000000ctr2").expect("a tab id"),
                         dst,
                         Op::WriteInput,
                         nonce,
@@ -16589,8 +16600,8 @@ fn help_names_the_harness_lane_and_exactly_the_exempt_lanes() {
 /// THE ONE OBSERVE GATE (H6-R1), at the input admission every harness write passes: a write the
 /// window harness makes into an agent the host observes is refused unless it names a lane THE
 /// RULING exempts (relaunch after exit, live upgrade, the codex-alab, agy and Muse Code drives);
-/// the disk resume, the disk-free ask and a write that names no lane are refused, and a
-/// confirmed agent passes every row. The write is judged, not only its connection: one naming a
+/// the disk resume and a write that names no lane are refused, and a confirmed agent passes
+/// every row. The write is judged, not only its connection: one naming a
 /// harness lane on any other connection (the token beside the socket, where the window's token
 /// was refused) is judged as the harness's, and one naming none there passes. An agent the host
 /// does not admit (a plain Codex that is no codex-alab; Grok Build, which no reader drives) is
@@ -20187,10 +20198,11 @@ fn quit_log(ep: u32, wall: u64, runs: usize) -> aterm_slog::Log {
 /// ([`aterm_types::tab_id::is_legacy`]).
 #[cfg(unix)]
 fn both_id_forms() -> [aterm_session::SessionId; 2] {
-    let earlier = aterm_session::SessionId::new(format!(
+    let earlier = aterm_session::SessionId::parse(&format!(
         "s-{}",
         &aterm_session::LaunchNonce::generate().to_hex()[..20]
-    ));
+    ))
+    .expect("a legacy tab id");
     let forms = [aterm_session::SessionId::generate(), earlier];
     assert_eq!(
         forms.each_ref().map(|sid| (
@@ -22005,8 +22017,12 @@ fn a_marks_author_is_the_connection_and_never_a_chosen_word() {
     store.write().unwrap().register(h.clone());
     let reply = dispatch_mark(&h.ctx, Scope::Owner, "- verdict word=done as=reviewer");
     assert!(reply.ends_with(" node=- by=ctl\n"), "{reply}");
+    // The word `harness` names no session, so no edge carries it as its source; an edge's
+    // presenter is its source session, whatever word its mark chooses.
+    assert_eq!(SessionId::parse("harness"), None);
+    let src = SessionId::parse("t0000frg001").expect("a tab id");
     let forged = h.ctx.edges.lock().unwrap().grant(
-        SessionId::new("harness"),
+        src.clone(),
         h.sid.clone(),
         aterm_session::Op::WriteInput,
         h.ctx.nonce,
@@ -22024,7 +22040,7 @@ fn a_marks_author_is_the_connection_and_never_a_chosen_word() {
         Scope::Edge(forged),
         "- label text=trust%20me as=bot",
     );
-    assert!(reply.ends_with(" by=-\n"), "{reply}");
+    assert!(reply.ends_with(&format!(" by={src}\n")), "{reply}");
     let g = h.ctx.timeline.lock().unwrap();
     let log = g.slog().log();
     let lines: Vec<String> = log
@@ -22052,7 +22068,8 @@ fn a_marks_author_is_the_connection_and_never_a_chosen_word() {
     let back = aterm_slog::Fold::from_snapshot(&refs).expect("reads");
     assert_eq!(
         back.state().label.as_ref().map(|c| c.by),
-        Some(aterm_slog::Actor::Nobody)
+        crate::session_log::sid_actor(src.as_str()),
+        "the label's author is the edge's source session"
     );
     assert!(
         back.state().label_trusted.is_none(),
@@ -23569,7 +23586,7 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
 
 #[test]
 fn a_drives_record_names_what_moved() {
-    let sid = SessionId::new("t0000d71e00");
+    let sid = SessionId::parse("t0000d71e00").expect("a tab id");
     let hold = |on, held| DriveAct {
         shell: false,
         kind: DriveKind::Hold,
@@ -23661,7 +23678,7 @@ fn a_drives_record_names_what_moved() {
         node: "07".repeat(16),
         host: "mac-07".to_owned(),
     };
-    let worker = SessionId::new("t0000d71e01");
+    let worker = SessionId::parse("t0000d71e01").expect("a tab id");
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
     let spawn = DriveAct {
         shell: false,
@@ -23702,7 +23719,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
         host: "mac-0a".to_owned(),
     };
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
-    let worker = SessionId::new("t0000f00d01");
+    let worker = SessionId::parse("t0000f00d01").expect("a tab id");
     let forget = || {
         DRIVE_SPAWNED
             .lock()
@@ -23721,7 +23738,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     assert_eq!(drive_owned(&worker, &driver.node), Some(false));
     assert!(drive_may_close(&store, &worker, &driver.node));
     assert_eq!(drive_owned(&worker, "foreign"), None, "another node's");
-    let other = SessionId::new("t0000f00d02");
+    let other = SessionId::parse("t0000f00d02").expect("a tab id");
     assert_eq!(drive_owned(&other, &driver.node), None, "another session");
     let close = DriveAct {
         shell: false,
@@ -23734,7 +23751,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     note_drive_act(&close, "OK closed\n", &store);
     assert_eq!(drive_owned(&worker, &driver.node), None, "closed");
 
-    let shell = SessionId::new("t0000f00d03");
+    let shell = SessionId::parse("t0000f00d03").expect("a tab id");
     let opened = DriveAct {
         shell: true,
         kind: DriveKind::Spawn,
@@ -23763,7 +23780,7 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
     let (handle, _output) = pipe_session(8231);
     let stalled = handle.sid.clone();
     store.write().unwrap().register(handle);
-    let gone = SessionId::new("t0000f00d11");
+    let gone = SessionId::parse("t0000f00d11").expect("a tab id");
     std::fs::create_dir_all(&workers).expect("the folder");
     let old =
         std::time::SystemTime::now() - DRIVE_WORKER_FILE_AGE - std::time::Duration::from_secs(3600);
@@ -23781,7 +23798,7 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
         host: "mac-0b".to_owned(),
     };
     let _driving = crate::fabric::DrivingAs::enter(driver);
-    let fresh = SessionId::new("t0000f00d12");
+    let fresh = SessionId::parse("t0000f00d12").expect("a tab id");
     let spawn = DriveAct {
         shell: false,
         kind: DriveKind::Spawn,
@@ -24131,7 +24148,7 @@ fn a_drive_spawn_takes_one_req_of_request_id_shape() {
 
 #[test]
 fn owned_shell_history_and_waits_are_bounded_and_not_granted_to_workers() {
-    let sid = SessionId::new("t0000a8227f");
+    let sid = SessionId::parse("t0000a8227f").expect("a tab id");
     let hosts = |s: &SessionId| s == &sid;
     for rest in [
         "blocks",
@@ -25589,4 +25606,68 @@ fn agent_settings_refuse_multiline_drafts_with_a_blank_line_gap() {
     assert!(!control_session::agent_settings_composer_empty(&term_lock(
         &h.term
     )));
+}
+
+/// A typed tab ID prefix is spelled as the whole ID of the one tab it begins where the request
+/// line is read, before any verb, gate or record sees it; one two tabs begin is refused naming
+/// both; and an edge, which may not list the tabs, gets neither, its line read as typed (LT-20).
+#[test]
+#[cfg(unix)]
+fn prefix_selector_is_spelled_whole_and_an_ambiguous_one_is_refused_naming_both() {
+    use super::{Request, Scope};
+    use aterm_session::SessionId;
+    use std::sync::Arc;
+
+    let store = crate::session_store::new_store();
+    let at = aterm_slog::Stamp::new(1_792_000_000_000, 1_000);
+    let epochs = Arc::new(crate::session_log::Epochs::new());
+    for (local, sid) in [(1, "tqn5r6e0148"), (2, "tqn5rzz0000"), (3, "tab12345678")] {
+        store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(crate::session_store::test_handle_identified(
+                local,
+                SessionId::parse(sid).expect(sid),
+                aterm_session::LaunchNonce::generate(),
+                Arc::clone(&epochs),
+                at,
+            ));
+    }
+    let read = |line: &str, scope| {
+        let request = Request::spelled(line.to_owned(), &store, scope);
+        (request.line().to_owned(), request.refusal)
+    };
+    let owner = Scope::Owner;
+    assert_eq!(
+        read("@tab12 status", owner),
+        ("@tab12345678 status".to_owned(), None)
+    );
+    assert_eq!(
+        read("  @tqn5r6\tturn hi", owner),
+        ("  @tqn5r6e0148\tturn hi".to_owned(), None)
+    );
+    assert_eq!(
+        read("@tqn5r status", owner),
+        (
+            "@tqn5r status".to_owned(),
+            Some("ERR ambiguous tab ID @tqn5r: it begins @tqn5r6e0148 @tqn5rzz0000\n".to_owned())
+        )
+    );
+    // A whole ID, a local number, `@.`, a prefix too short or nothing begins, and a line with no
+    // selector stay as they came, unrefused.
+    for kept in [
+        "@tqn5r6e0148 status",
+        "@3 status",
+        "@. status",
+        "@tab1 status",
+        "@txxxx status",
+        "status @tab12",
+    ] {
+        assert_eq!(read(kept, owner), (kept.to_owned(), None), "{kept}");
+    }
+    // An edge reads no prefix: neither the spelling nor the refusal that would name the IDs.
+    let edge = Scope::Edge(aterm_session::EdgeToken::generate());
+    for typed in ["@tab12 status", "@tqn5r status"] {
+        assert_eq!(read(typed, edge), (typed.to_owned(), None), "{typed}");
+    }
 }

@@ -116,19 +116,23 @@ impl Place {
 
 pub fn command(root: &Path, args: &[&str]) -> Command {
     let mut cmd = crate::git_provider::command();
-    // Journal selectors name exact stored paths, never caller-selected glob patterns.
+    // Journal identities name stored objects and exact paths, never local replacements
+    // or caller-selected glob patterns.
     cmd.current_dir(root)
         .arg("--literal-pathspecs")
+        .arg("--no-replace-objects")
         .args(args)
         .env_remove("GITHUB_TOKEN");
-    for mode in [
-        "GIT_LITERAL_PATHSPECS",
-        "GIT_GLOB_PATHSPECS",
-        "GIT_NOGLOB_PATHSPECS",
-        "GIT_ICASE_PATHSPECS",
-    ] {
-        cmd.env_remove(mode);
+    // Match remote reads: inherited Git state must not redirect this checkout's
+    // journal reads or object writes into another repository or object store.
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"GIT_") {
+            cmd.env_remove(key);
+        }
     }
+    // Missing objects are an incomplete local snapshot, not permission for an implicit
+    // promisor fetch. Remote imports have their own explicit transport and work budget.
+    cmd.env("GIT_NO_LAZY_FETCH", "1");
     cmd
 }
 
@@ -136,23 +140,43 @@ pub fn deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60)
 }
 
-/// Reads, object assembly and compare-and-swap races share this admission deadline.
-/// An admitted mutation owns a separate work window and retains its owner through settlement.
-struct ReadBudget(std::time::Instant);
+/// Initial reads and assembly must admit publication before `read_until`. The first admitted
+/// writer starts one shared publication window, including race readback and later attempts.
+/// No race renews that window; each writer retains its owner through settlement.
+struct AppendBudget {
+    read_until: std::time::Instant,
+    publication_until: std::cell::Cell<Option<std::time::Instant>>,
+}
 
 struct MutationBudget(std::time::Instant);
 
-impl ReadBudget {
+impl AppendBudget {
+    fn new(read_until: std::time::Instant) -> Self {
+        Self {
+            read_until,
+            publication_until: std::cell::Cell::new(None),
+        }
+    }
+
+    fn deadline(&self) -> std::time::Instant {
+        self.publication_until.get().unwrap_or(self.read_until)
+    }
+
     fn admit(&self, now: std::time::Instant) -> Result<MutationBudget, String> {
-        if now >= self.0 {
-            return Err("journal mutation not started: read and assembly budget expired".into());
+        if now >= self.deadline() {
+            return Err("journal mutation not started: append budget expired".into());
         }
         if INTERRUPTIBLE.get() && crate::exec::group::taken().is_some() {
             return Err("journal mutation not started: landing interrupted".into());
         }
-        now.checked_add(agh::git::GRANT_MAX)
-            .map(MutationBudget)
-            .ok_or_else(|| "journal mutation work deadline overflow".into())
+        if let Some(until) = self.publication_until.get() {
+            return Ok(MutationBudget(until));
+        }
+        let until = now
+            .checked_add(agh::git::GRANT_MAX)
+            .ok_or("journal mutation work deadline overflow")?;
+        self.publication_until.set(Some(until));
+        Ok(MutationBudget(until))
     }
 }
 
@@ -346,10 +370,8 @@ fn filed(
         &mut command(root, &["cat-file", "--batch"]),
         Some(names.as_bytes()),
     )?;
-    let records = decode_objects(objects.as_bytes())?;
-    if records.len() != entries.len() {
-        return Err("the journal's listing and its objects disagree".into());
-    }
+    let requested: Vec<_> = entries.iter().map(|(object, _)| *object).collect();
+    let records = decode_objects(objects.as_bytes(), &requested)?;
     Ok(entries
         .into_iter()
         .map(|(_, path)| path.to_owned())
@@ -379,6 +401,7 @@ pub fn published(
         root,
         &[
             "log",
+            "--root",
             "--format=",
             "--raw",
             "--no-abbrev",
@@ -427,6 +450,7 @@ pub fn history(root: &Path, head: &str, since: u64) -> Result<Vec<Record>, Strin
         root,
         &[
             "log",
+            "--root",
             "--format=",
             "--raw",
             "--no-abbrev",
@@ -458,7 +482,7 @@ pub fn history(root: &Path, head: &str, since: u64) -> Result<Vec<Record>, Strin
             Some(input.as_bytes()),
             until,
         )?;
-        for record in decode_objects(bytes.as_bytes())? {
+        for record in decode_objects(bytes.as_bytes(), batch)? {
             attempts
                 .entry((record.tree.clone(), record.token.clone()))
                 .or_insert(record);
@@ -470,24 +494,24 @@ pub fn history(root: &Path, head: &str, since: u64) -> Result<Vec<Record>, Strin
         .collect())
 }
 
-fn decode_objects(bytes: &[u8]) -> Result<Vec<Record>, String> {
-    blobs(bytes)?
+fn decode_objects(bytes: &[u8], requested: &[&str]) -> Result<Vec<Record>, String> {
+    blobs(bytes, requested)?
         .into_iter()
         .map(|text| aterm_toml::from_str(text).map_err(|e| e.to_string()))
         .collect()
 }
 
 /// The text of each blob in a `git cat-file --batch` answer, in the order asked.
-pub(crate) fn blobs(mut bytes: &[u8]) -> Result<Vec<&str>, String> {
+fn blobs<'a>(mut bytes: &'a [u8], requested: &[&str]) -> Result<Vec<&'a str>, String> {
     let mut blobs = Vec::new();
-    while !bytes.is_empty() {
+    for expected in requested {
         let end = bytes
             .iter()
             .position(|b| *b == b'\n')
             .ok_or("truncated object header")?;
         let header = std::str::from_utf8(&bytes[..end]).map_err(|e| e.to_string())?;
         let fields: Vec<_> = header.split_whitespace().collect();
-        if fields.len() != 3 || fields[1] != "blob" {
+        if fields.len() != 3 || fields[0] != *expected || fields[1] != "blob" {
             return Err(format!("invalid object in a git batch answer: {header}"));
         }
         let length = fields[2].parse::<usize>().map_err(|e| e.to_string())?;
@@ -504,6 +528,9 @@ pub(crate) fn blobs(mut bytes: &[u8]) -> Result<Vec<&str>, String> {
             .get(length..)
             .and_then(|b| b.strip_prefix(b"\n"))
             .ok_or("missing object terminator")?;
+    }
+    if !bytes.is_empty() {
+        return Err("unexpected trailing bytes in a git batch answer".into());
     }
     Ok(blobs)
 }
@@ -810,7 +837,7 @@ fn append_with(
     until: std::time::Instant,
     trees: &mut Trees<'_>,
 ) -> Result<bool, String> {
-    // One absolute deadline bounds the whole append, including CAS races and pruning.
+    // Reads and pruning share the admission deadline; publication owns one work window.
     let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
     let last_pruned = parent
@@ -853,8 +880,15 @@ fn append_with(
     });
     let tree = edit_tree_with(parent, &edits, trees)?;
     let message = format!("verify watch: {} {}", record.state, record.commit);
-    publish(root, remote, parent, &tree, &message, until)
-        .map(|pushed| matches!(pushed, Appended::Holds(_)))
+    publish(
+        root,
+        remote,
+        parent,
+        &tree,
+        &message,
+        &AppendBudget::new(until),
+    )
+    .map(|pushed| matches!(pushed, Appended::Holds(_)))
 }
 
 /// Commit `tree` over `parent` (none: the journal's first commit) and push it as the journal's
@@ -869,7 +903,7 @@ fn publish(
     parent: Option<&str>,
     tree: &str,
     message: &str,
-    until: std::time::Instant,
+    budget: &AppendBudget,
 ) -> Result<Appended, String> {
     let started = std::time::Instant::now();
     let timed = |why| {
@@ -882,7 +916,7 @@ fn publish(
     if let Some(parent) = parent {
         commit.args(["-p", parent]);
     }
-    let sha = output_until(&mut commit, None, until)
+    let sha = output_until(&mut commit, None, budget.deadline())
         .map_err(timed)?
         .trim()
         .to_owned();
@@ -891,13 +925,12 @@ fn publish(
         capture_until(
             &mut crate::remote::command(root, &git, tool, args)?,
             None,
-            until,
+            budget.deadline(),
         )
         .map_err(|why| format!("{tool:?} journal transport: {why}"))
     };
-    let admission = ReadBudget(until);
     let write = |tool, args: &[std::ffi::OsString]| {
-        let MutationBudget(until) = admission.admit(std::time::Instant::now())?;
+        let MutationBudget(until) = budget.admit(std::time::Instant::now())?;
         let scoped = INTERRUPTIBLE.get();
         let watch = scoped.then(aterm_toolchain::interrupt::Watch::enter);
         crate::remote::run_mutation(root, &git, tool, args, until, &mut || {
@@ -1007,8 +1040,8 @@ pub fn expired(kind: Kept, day: u64, today: u64) -> bool {
 /// directory (so no writer's clock skew hides one), each held to
 /// [`crate::land_record::Entry::read`]'s checks; and each entry of `land/` that is no day
 /// directory, but the run records' [`RUNS`] ([`run_records`]), named as unreadable. Only those
-/// trees' directories are listed. One bad entry never fails the read: one that is no file, or is
-/// longer than [`crate::land_record::MAX_BYTES`], is unreadable, and is not read.
+/// trees' directories are listed. One bad entry never fails the read: one that is no regular
+/// file, or is longer than [`crate::land_record::MAX_BYTES`], is unreadable, and is not read.
 /// # Errors
 /// A git read failed.
 pub fn land_records(
@@ -1052,7 +1085,7 @@ pub fn land_records(
             ));
             continue;
         }
-        dirs.extend(wanted.iter().map(|tree| format!("{path}/{tree}/")));
+        dirs.extend(wanted.iter().map(|tree| format!("{path}/{tree}")));
     }
     if dirs.is_empty() {
         return Ok(entries);
@@ -1087,9 +1120,16 @@ pub fn run_records(
         return Ok(Vec::new());
     };
     let top = ls_tree(root, head, until)?;
-    let Some(land) = top.get(LAND).filter(|land| land.is_tree()) else {
+    let Some(land) = top.get(LAND) else {
         return Ok(Vec::new());
     };
+    if !land.is_tree() {
+        return Ok(vec![Entry::unread(
+            LAND,
+            Origin::Journal,
+            "it is no directory".into(),
+        )]);
+    }
     let Some(runs) = ls_tree(root, &land.id, until)?
         .get(&RUNS[LAND.len() + 1..])
         .cloned()
@@ -1136,19 +1176,20 @@ pub fn run_records(
     Ok(entries)
 }
 
-/// Each file under the directories `dirs` (each ending in `/`) of the journal's `head`, by one
+/// Each file selected by `paths` on the journal's `head`, recursively under directories, by one
 /// listing and one batch read: those read, with their bytes, and those not read, with why (one
-/// that is no file, longer than [`crate::land_record::MAX_BYTES`], or whose object is missing).
+/// that is no regular file, longer than [`crate::land_record::MAX_BYTES`], or whose object is
+/// missing).
 /// # Errors
 /// A git read failed, or its output did not parse.
 fn blobs_under(
     root: &Path,
     head: &str,
-    dirs: &[String],
+    paths: &[String],
     until: std::time::Instant,
 ) -> Result<ReadBlobs, String> {
     let mut args = vec!["ls-tree", "-r", "-z", "--full-tree", "--long", head, "--"];
-    args.extend(dirs.iter().map(String::as_str));
+    args.extend(paths.iter().map(String::as_str));
     let listing = capture_until(&mut command(root, &args), None, until)?;
     if !listing.status.success() {
         return Err(String::from_utf8_lossy(&listing.stderr).into_owned());
@@ -1160,7 +1201,7 @@ fn blobs_under(
         let (fields, path) = item.split_once('\t').ok_or_else(invalid)?;
         // The standard long format pads sizes; only the metadata is whitespace-separated.
         let mut fields = fields.split_whitespace();
-        let (Some(_mode), Some(kind), Some(id), Some(size), None) = (
+        let (Some(mode), Some(kind), Some(id), Some(size), None) = (
             fields.next(),
             fields.next(),
             fields.next(),
@@ -1169,8 +1210,8 @@ fn blobs_under(
         ) else {
             return Err(invalid());
         };
-        if kind != "blob" {
-            unread.push((path.to_owned(), "it is no file".to_owned()));
+        if kind != "blob" || !matches!(mode, "100644" | "100755") {
+            unread.push((path.to_owned(), "it is no regular file".to_owned()));
         } else if size
             .parse::<u64>()
             .is_ok_and(|size| size <= crate::land_record::MAX_BYTES)
@@ -1276,8 +1317,9 @@ pub fn land_append(
     now: u64,
     until: std::time::Instant,
 ) -> Result<Appended, String> {
-    land_append_with(root, remote, parent, records, now, until, &mut |bytes| {
-        write_blob(root, bytes, until)
+    let budget = AppendBudget::new(until);
+    land_append_with(root, remote, parent, records, now, &budget, &mut |bytes| {
+        write_blob(root, bytes, budget.deadline())
     })
 }
 
@@ -1313,9 +1355,10 @@ fn land_append_with(
     parent: Option<&str>,
     records: &[crate::land_record::Signed],
     now: u64,
-    until: std::time::Instant,
+    budget: &AppendBudget,
     blob: &mut dyn FnMut(&[u8]) -> Result<String, String>,
 ) -> Result<Appended, String> {
+    let until = budget.deadline();
     let today = now / 86_400;
     let mut trees = Trees {
         list: &mut |id| ls_tree(root, id, until),
@@ -1405,12 +1448,13 @@ fn land_append_with(
             .ok_or_else(|| "an empty journal holds nothing".to_owned());
     };
     let message = format!("verify land: {} records", records.len());
-    publish(root, remote, parent, &tree, &message, until)
+    publish(root, remote, parent, &tree, &message, budget)
 }
 
 /// Append `records` until an append holds them ([`land_append`]): each race carries the observed
-/// journal head into the next attempt. Reads, assembly and mutation admission share `until`;
-/// an admitted writer retains its own work window and settlement lifetime. The head that holds
+/// journal head into the next attempt. Initial reads and assembly share `until`; the first
+/// admitted mutation starts one work window shared by race readback and all later attempts.
+/// A writer retains its owner through settlement. The head that holds
 /// them (`None`: no records, and no journal).
 /// # Errors
 /// As [`land_append`], or the deadline passed.
@@ -1421,11 +1465,12 @@ pub fn append_land(
     now: u64,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
-    let mut blob = cached_blobs(|bytes| write_blob(root, bytes, until));
+    let budget = AppendBudget::new(until);
+    let mut blob = cached_blobs(|bytes| write_blob(root, bytes, budget.deadline()));
     append_land_through(
         records.is_empty(),
-        || head_in(root, remote, until, ReadContext::AppendHead),
-        |parent| land_append_with(root, remote, parent, records, now, until, &mut blob),
+        || head_in(root, remote, budget.deadline(), ReadContext::AppendHead),
+        |parent| land_append_with(root, remote, parent, records, now, &budget, &mut blob),
     )
 }
 

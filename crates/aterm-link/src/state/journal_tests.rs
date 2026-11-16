@@ -5,6 +5,8 @@ use super::*;
 use crate::state::PublishIdentity;
 use astream_wire::steps::encode_step;
 
+/// A reservation's pin at `seq`, its head at `40 + seq`; but sequence 8's is anywhere (a log that
+/// continues none of its own, ATERM-KI-1114-1414), so every round trip reads one back.
 fn pin(seq: u64) -> PublishPin {
     PublishPin {
         seq,
@@ -16,7 +18,11 @@ fn pin(seq: u64) -> PublishPin {
         original: None,
         original_off: None,
         owner: Some(4),
-        at: Some(40 + seq),
+        at: Some(if seq == 8 {
+            Head::Anywhere
+        } else {
+            Head::From(40 + seq)
+        }),
     }
 }
 
@@ -26,7 +32,7 @@ fn entry(seq: u64) -> InFlight {
         subject: "/f/sim/in/n-1/s-b/n-1/s-a/note".to_string(),
         body: b"v=1 t=5 text=hello".to_vec(),
         log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
-        at: Some(50 + seq),
+        at: Some(Head::From(50 + seq)),
     }
 }
 
@@ -182,7 +188,15 @@ fn a_journal_with_heads_reads_record_for_record_to_a_build_before_them() {
 #[test]
 fn a_tail_this_build_cannot_read_names_no_head() {
     let entry = Frame::InFlight(entry(7));
-    for tail in ["at", "at x", "at 1 at 2", "pin-at 3 later 4", "\u{ff}"] {
+    for tail in [
+        "at",
+        "at x",
+        "at Any",
+        "at any any",
+        "at 1 at 2",
+        "pin-at 3 later 4",
+        "\u{ff}",
+    ] {
         assert_eq!(
             Frame::of_record(entry.body().as_bytes(), tail.as_bytes()),
             Frame::parse(entry.body().as_bytes()),
@@ -193,6 +207,48 @@ fn a_tail_this_build_cannot_read_names_no_head() {
         Frame::of_record(entry.body().as_bytes(), b"at 57 pin-at 47"),
         Some(entry),
         "CONTROL"
+    );
+}
+
+/// **A HEAD ANYWHERE IS `any`** (ATERM-KI-1114-1414): a record's head and its pin's each read
+/// back as written, alone or beside a number, and the journal encodes them; a build before it
+/// reads `any` as it reads any tail it cannot read, as no head (the record published again at
+/// its pin, as every build before this one published such a record).
+#[test]
+fn a_head_anywhere_reads_back_as_any() {
+    let anywhere = InFlight {
+        at: Some(Head::Anywhere),
+        ..entry(8)
+    };
+    for (entry, tail) in [
+        (entry(8), "at 58 pin-at any"),
+        (anywhere.clone(), "at any pin-at any"),
+        (
+            InFlight {
+                pin: pin(7),
+                ..anywhere
+            },
+            "at any pin-at 47",
+        ),
+    ] {
+        let frame = Frame::InFlight(entry);
+        assert_eq!(frame.tail(), tail);
+        assert_eq!(
+            Frame::of_record(frame.body().as_bytes(), tail.as_bytes()).as_ref(),
+            Some(&frame),
+            "{tail}"
+        );
+        encode(0, &frame).expect("the journal encodes it");
+    }
+    let reserve = Frame::Reserve {
+        sid: "s-a".to_string(),
+        id: 2,
+        pin: pin(8),
+    };
+    assert_eq!(reserve.tail(), "at any");
+    assert_eq!(
+        Frame::of_record(reserve.body().as_bytes(), b"at any").as_ref(),
+        Some(&reserve)
     );
 }
 
@@ -366,7 +422,7 @@ fn publication_order_survives_replacement_removal_and_compaction() {
     index.apply(Frame::InFlight(entry(90)));
     index.apply(Frame::InFlight(entry(2)));
     index.apply(Frame::InFlight(InFlight {
-        at: Some(100),
+        at: Some(Head::From(100)),
         body: b"v=1 t=99 text=hello".to_vec(),
         ..entry(90)
     }));

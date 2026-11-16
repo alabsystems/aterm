@@ -713,8 +713,8 @@ fn a_park_the_harness_attaches_to_gets_the_go_ahead() {
     assert!(!st.go_ahead_held(t0()));
 }
 
-/// A REPLY TO A HOST'S FACT IS NO PERSON'S TURN (2026-10-29 review): the disk-free ask, an
-/// upgrade's tell or Cruise's carry at a break leaves the go-ahead owed.
+/// A REPLY TO A HOST'S FACT IS NO PERSON'S TURN (2026-10-29 review): an upgrade's tell or
+/// Cruise's carry at a break leaves the go-ahead owed.
 #[test]
 fn a_reply_to_a_host_fact_or_a_carry_still_gets_the_go_ahead() {
     for carried in [false, true] {

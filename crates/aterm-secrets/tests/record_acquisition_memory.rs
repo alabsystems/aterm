@@ -18,72 +18,21 @@ use aterm_secrets::{
     },
     text::{Audience, Entry},
 };
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::MetadataExt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static GROSS: AtomicUsize = AtomicUsize::new(0);
-thread_local! {
-    // Only the bounded fixture server opts out. Every client worker is counted.
-    static FIXTURE_THREAD: Cell<bool> = const { Cell::new(false) };
-}
+#[path = "memory_alloc/gross.rs"]
+mod gross;
 
-fn allocated(bytes: usize) {
-    if ACTIVE.load(Ordering::SeqCst) && !FIXTURE_THREAD.try_with(Cell::get).unwrap_or(false) {
-        GROSS.fetch_add(bytes, Ordering::SeqCst);
-    }
-}
-
-struct Counting;
-
-// SAFETY: forward original pointers and layouts to System. Atomics and const TLS
-// allocate nothing. Count successful requests, including realloc's new size;
-// never subtract frees, including frees of pre-window cache and memo owners.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller supplies a valid allocation layout.
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            allocated(layout.size());
-        }
-        pointer
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller supplies a valid allocation layout.
-        let pointer = unsafe { System.alloc_zeroed(layout) };
-        if !pointer.is_null() {
-            allocated(layout.size());
-        }
-        pointer
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: forward the matching live allocation and requested size.
-        let changed = unsafe { System.realloc(pointer, layout, new_size) };
-        if !changed.is_null() {
-            allocated(new_size);
-        }
-        changed
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // SAFETY: forward the allocation and its matching original layout.
-        unsafe { System.dealloc(pointer, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
+use gross::{ACTIVE, FIXTURE_THREAD, GROSS};
 
 struct Measuring;
 

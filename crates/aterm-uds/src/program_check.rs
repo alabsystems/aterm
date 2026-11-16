@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS `syspolicyd` thread-pool reader for [`aterm_vitals::program_check`].
+//! macOS `syspolicyd` thread-pool reader for plain process observations.
 
 use std::time::Duration;
 
-pub use aterm_vitals::program_check::{Daemon, Reading};
+use aterm_process_facts::program_check::{Daemon, Reading};
 
 /// `syspolicyd`'s image.
 pub const SYSPOLICYD: &str = "/usr/libexec/syspolicyd";

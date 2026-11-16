@@ -177,11 +177,11 @@ fn a_new_pane_counts_its_folder_at_its_first_discovery() {
     let t0 = Instant::now();
     let p = Path::new("/w");
     let mut m = Membership::default();
-    m.observe(&set(&[p]), 1, t0);
+    m.observe(&set(&[p]), 1, t0, PANE_STALE_AFTER);
     assert!(m.holds(p), "joined at once");
     let mut stale = m.clone();
     let q = Path::new("/q");
-    stale.observe(&set(&[q]), 2, t0 + PANE_STALE_AFTER);
+    stale.observe(&set(&[q]), 2, t0 + PANE_STALE_AFTER, PANE_STALE_AFTER);
     assert!(
         stale.holds(q) && !stale.holds(p),
         "a pane unseen for {PANE_STALE_AFTER:?} starts again"
@@ -195,18 +195,18 @@ fn a_project_joins_at_its_second_discovery_and_leaves_at_its_second_miss() {
     let at = |s: u64| t0 + Duration::from_secs(s);
     let (a, b) = (Path::new("/a"), Path::new("/b"));
     let mut m = Membership::default();
-    m.observe(&set(&[a]), 1, at(0));
-    m.observe(&set(&[a, b]), 2, at(5));
+    m.observe(&set(&[a]), 1, at(0), PANE_STALE_AFTER);
+    m.observe(&set(&[a, b]), 2, at(5), PANE_STALE_AFTER);
     assert!(m.joining(b) && !m.holds(b), "named once");
-    m.observe(&set(&[a, b]), 3, at(10));
+    m.observe(&set(&[a, b]), 3, at(10), PANE_STALE_AFTER);
     assert!(m.holds(b), "named twice in a row");
-    m.observe(&set(&[b]), 4, at(15));
+    m.observe(&set(&[b]), 4, at(15), PANE_STALE_AFTER);
     assert!(m.holds(a), "one miss keeps it");
-    m.observe(&set(&[b]), 5, at(20));
+    m.observe(&set(&[b]), 5, at(20), PANE_STALE_AFTER);
     assert!(!m.holds(a), "two misses in a row");
-    m.observe(&set(&[a, b]), 6, at(25));
-    m.observe(&set(&[b]), 7, at(30));
-    m.observe(&set(&[a, b]), 8, at(35));
+    m.observe(&set(&[a, b]), 6, at(25), PANE_STALE_AFTER);
+    m.observe(&set(&[b]), 7, at(30), PANE_STALE_AFTER);
+    m.observe(&set(&[a, b]), 8, at(35), PANE_STALE_AFTER);
     assert!(!m.holds(a), "a miss restarts the count");
 }
 
@@ -216,12 +216,12 @@ fn a_cd_shorter_than_one_discovery_never_moves_the_tab_segment() {
     let at = |s: u64| t0 + Duration::from_secs(s);
     let (a, b) = (Path::new("/a"), Path::new("/b"));
     let mut m = Membership::default();
-    m.observe(&set(&[a]), 1, at(0));
+    m.observe(&set(&[a]), 1, at(0), PANE_STALE_AFTER);
     let before: Vec<PathBuf> = m.members().cloned().collect();
     // A cd to /b and back that one discovery saw, and one none saw.
-    m.observe(&set(&[b]), 2, at(5));
-    m.observe(&set(&[a]), 3, at(10));
-    m.observe(&set(&[a]), 4, at(15));
+    m.observe(&set(&[b]), 2, at(5), PANE_STALE_AFTER);
+    m.observe(&set(&[a]), 3, at(10), PANE_STALE_AFTER);
+    m.observe(&set(&[a]), 4, at(15), PANE_STALE_AFTER);
     assert_eq!(m.members().cloned().collect::<Vec<_>>(), before);
     assert!(!m.joining(b));
 }
@@ -2903,27 +2903,149 @@ fn the_slow_tier_counts_build_profiles_of_the_homes_checkouts() {
     );
 }
 
+/// A HUGE FOLDER FILES NO DIGEST ENTRY AND ENDS ONE AN OLDER BUILD LEFT. An older build's log
+/// holds an open `vitals.huge-dir.<hash>.entries` entry beside an unrelated open entry. Launch
+/// opens both again, and the first settle withdraws the huge-folder entry with main's retired
+/// keys ([`crate::system_state_access::RETIRED_KEY_PREFIXES`]): withdrawn, nothing filed as
+/// fixed, the other entry left open, and a second settle ends nothing more. A seamless update's
+/// successor that folds in such an entry its parent filed (`catch_up_messages_with`) re-arms
+/// the retired keys, and the next settle withdraws it and announces the digest's change. A
+/// raised folder is one log line, once, and no entry: no family owns the prefix any longer. The
+/// disk pass's entry bound is the walker's two counts. NEGATIVE CONTROLS: before the settle the
+/// launch's entry stands (so it is the settle that ends it, and without the prefix nothing would
+/// for 14 days); a withdrawal that swept more than its prefix would end the unrelated entry,
+/// which the test holds open; the walker's service ends nothing; and a `huge_news` that did not
+/// keep what it said would say the folder again at the second call.
 #[test]
-fn a_huge_folder_entry_is_a_well_formed_digest_entry() {
-    let (_, h) = huge("/w/target/debug/deps", 104_211);
-    let e = huge_entry(&h);
-    assert!(e.message().is_ok(), "{:?}", e.message().err());
-    let family = aterm_messages::exceptions::Family::HugeDir;
-    assert!(e.key().starts_with(&family.prefix()), "{}", e.key());
-    assert_eq!(e.family(), family);
-    assert_eq!(huge_entry(&h).key(), e.key(), "one folder, one key");
-    let (_, other) = huge("/w/other", 104_211);
-    assert_ne!(huge_entry(&other).key(), e.key());
-    let plain = HugeDir {
-        executables: false,
-        ..h.clone()
+fn a_huge_folder_files_no_digest_entry_and_ends_one_an_older_build_left() {
+    use crate::message_reporters as mr;
+    use crate::system_state_access::RETIRED_KEY_PREFIXES;
+    use aterm_messages::{LogLine, LogRecord, MessageId, MessageLog, Retired};
+    const HUGE: &str = "vitals.huge-dir.";
+    const LEFT: &str = "vitals.huge-dir.00000000deadbeef.entries";
+    assert!(RETIRED_KEY_PREFIXES.contains(&HUGE));
+    let retired_in = |center: &mut aterm_messages::MessageCenter| -> Vec<Retired> {
+        center
+            .drain_shelved_for_persist()
+            .into_iter()
+            .filter_map(|(line, _)| match line {
+                LogLine::Retired { how, .. } => Some(how),
+                _ => None,
+            })
+            .collect()
     };
-    let p = huge_entry(&plain);
-    assert!(p.message().is_ok(), "{:?}", p.message().err());
-    assert_ne!(
-        format!("{:?}", p.message().ok()),
-        format!("{:?}", e.message().ok()),
-        "the tccd sentence and the build step only where binaries are"
+
+    // An older build's log: an unrelated open entry, and a huge-folder entry under the key that
+    // build filed (the same record under that key and the next id).
+    let mut earlier = crate::App::headless_for_test();
+    earlier.except(&mr::accounts_refused_entry());
+    let other_key = mr::accounts_refused_entry().key();
+    let other: LogRecord = earlier
+        .messages
+        .drain_shelved_for_persist()
+        .into_iter()
+        .find_map(|(line, _)| match line {
+            LogLine::Posted(rec) if rec.key.as_deref() == Some(other_key.as_str()) => Some(rec),
+            _ => None,
+        })
+        .expect("the unrelated entry's posted line");
+    let left_at = |step: u64| LogRecord {
+        id: MessageId::from_raw(other.id.raw() + step).expect("a non-zero id"),
+        key: Some(LEFT.to_owned()),
+        ..other.clone()
+    };
+    let mut log = MessageLog::empty();
+    log.replay_all([LogLine::Posted(other.clone()), LogLine::Posted(left_at(1))]);
+
+    // Launch opens the log's entries again, as a window process does.
+    let now = Instant::now();
+    let mut center = crate::messages_host::new_center(log, now);
+    let _ = center.adopt_digest(crate::messages_host::wall_stamp_now(), now);
+    let _ = center.settle_digest(crate::messages_host::wall_stamp_now(), now);
+    assert_eq!(
+        center.digest_keys_under(HUGE),
+        [LEFT.to_owned()],
+        "launch opens it"
+    );
+    let mut app = crate::App::headless_for_test();
+    app.messages = center;
+    let _ = retired_in(&mut app.messages);
+
+    // The first settle withdraws it with the retired keys.
+    app.settle_access_steps(Instant::now());
+    assert!(
+        app.messages.digest_keys_under(HUGE).is_empty(),
+        "the settle ends the older build's entry"
+    );
+    assert_eq!(
+        retired_in(&mut app.messages),
+        [Retired::Withdrawn],
+        "withdrawn, never fixed"
+    );
+    assert_eq!(
+        app.messages.digest_keys_under(&other_key),
+        [other_key.clone()],
+        "the unrelated entry stays open"
+    );
+    app.settle_access_steps(Instant::now());
+    assert!(retired_in(&mut app.messages).is_empty(), "nothing more");
+
+    // A seamless update's parent, an older build, filed one after launch: the catch-up re-arms
+    // the retired keys, and the next settle ends it.
+    #[cfg(unix)]
+    {
+        let moves = || crate::exceptions_host::DIGEST_MOVES.with(Cell::get);
+        app.catch_up_messages_with(vec![LogLine::Posted(left_at(2))]);
+        assert_eq!(
+            app.messages.digest_keys_under(HUGE),
+            [LEFT.to_owned()],
+            "the catch-up adopts the parent's entry"
+        );
+        let before = moves();
+        app.settle_access_steps(Instant::now());
+        assert!(
+            app.messages.digest_keys_under(HUGE).is_empty(),
+            "the settle after the catch-up ends the parent's entry"
+        );
+        assert_eq!(retired_in(&mut app.messages), [Retired::Withdrawn]);
+        assert!(moves() > before, "the digest's change is announced");
+    }
+    // The walker's service ends nothing.
+    app.service_diskwalk(Instant::now());
+    assert!(retired_in(&mut app.messages).is_empty());
+
+    // A raised folder is one log line, once, and no entry.
+    let raised: BTreeMap<PathBuf, HugeDir> =
+        BTreeMap::from([huge("/w/target/debug/deps", 104_211)]);
+    let mut said = BTreeSet::new();
+    assert_eq!(
+        huge_news(&mut said, &raised),
+        ["vitals huge-dir path=/w/target/debug/deps entries=104211 executables=true"]
+    );
+    assert!(huge_news(&mut said, &raised).is_empty(), "once");
+    assert!(huge_news(&mut said, &BTreeMap::new()).is_empty());
+    assert_eq!(
+        huge_news(&mut said, &raised).len(),
+        1,
+        "a folder raised again is said again"
+    );
+    assert_eq!(app.messages.digest().len(), 1, "only the unrelated entry");
+    for family in aterm_messages::exceptions::Family::ALL {
+        let prefix = family.prefix();
+        assert!(
+            !prefix.starts_with(HUGE) && !HUGE.starts_with(&prefix),
+            "{family:?} owns {prefix}"
+        );
+    }
+
+    // The disk pass's entry bound and its clear count are the walker's two counts.
+    assert_eq!(
+        aterm_agent::harness::disk::ENTRY_BOUND,
+        aterm_diskwalk::HUGE_WARN
+    );
+    assert_eq!(
+        aterm_agent::harness::disk::ENTRY_BOUND_CLEAR,
+        aterm_diskwalk::HUGE_NOTE
     );
 }
 
@@ -3210,3 +3332,7 @@ fn sys_disk_stores_are_sized_by_the_walk_of_the_root_around_them_and_no_other() 
     rig.engine.discover_if_due(t3);
     assert!(rig.board().stores.is_empty(), "{:?}", rig.board().stores);
 }
+
+/// The walker at rest: its pairs of looks, the hysteresis they keep and the mounts it hears.
+#[path = "diskwalk_host/rest_tests.rs"]
+mod rest;

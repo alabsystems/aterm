@@ -200,14 +200,13 @@ fn leaves_private_rows(line: &[u8]) -> bool {
     let Ok(line) = aterm_json::from_slice::<Value>(line) else {
         return false;
     };
+    let Some(id) = line.get("id").and_then(Value::as_str) else {
+        return false;
+    };
     let failure = line.get("failed").and_then(Value::as_str).is_some()
         && line.get("to").is_none()
         && line.get("from").is_none();
-    failure
-        || line
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(aterm_machines::init::writes_no_private_row)
+    failure || aterm_machines::init::writes_no_private_row(id)
 }
 
 /// Whether `seen` is a row this record keeps: read privately, read back settled, dated.

@@ -226,6 +226,84 @@ fn scratch_root_patterns() {
     assert!(ScratchRoot::dir(Path::new("/a/../b")).is_none());
 }
 
+/// A WINDOWS FOLDER IS ITS ROOT AND ITS NAMES, AS WINDOWS COMPARES THEM: a drive (`C:`) or a share
+/// (`\\SERVER\SHARE`) first, `\` and `/` both separators, a verbatim prefix read away and every
+/// name folded, so each spelling of one folder reads alike. CONTROL: another folder, a name
+/// with a common prefix (`proj2`), the drive's root and a folder on another drive read apart;
+/// a path no Windows folder spells (a relative, a drive-relative, a `..`, a unix path) reads as
+/// none. The reading is the same on every host: only Windows reads a folder by it
+/// ([`folder_components`]).
+#[test]
+fn a_windows_folder_reads_as_windows_compares_it() {
+    let proj = windows_components(r"C:\Users\u\proj").expect("a drive folder");
+    assert_eq!(proj, ["C:", "USERS", "U", "PROJ"]);
+    for spelled in [
+        r"c:\users\U\Proj",
+        "C:/Users//u/proj",
+        r"C:\Users\u\proj\",
+        r"C:\Users\\u\proj",
+        r"\\?\C:\Users\u\proj",
+        r"\\?\c:\USERS\u\proj",
+    ] {
+        assert_eq!(
+            windows_components(spelled).as_ref(),
+            Some(&proj),
+            "{spelled}"
+        );
+    }
+    for other in [
+        r"C:\Users\u\proj2",
+        r"C:\Users\u",
+        r"D:\Users\u\proj",
+        r"C:\",
+    ] {
+        let read = windows_components(other).expect("a drive folder");
+        assert_ne!(read, proj, "{other}");
+    }
+    assert_eq!(windows_components(r"C:\").expect("the root"), ["C:"]);
+    let share = windows_components(r"\\Server\Share\proj").expect("a share folder");
+    assert_eq!(share, [r"\\SERVER\SHARE", "PROJ"]);
+    assert_eq!(
+        windows_components(r"\\?\UNC\server\share\Proj").as_ref(),
+        Some(&share)
+    );
+    for none in [
+        "relative",
+        r"C:proj",
+        r"C:\Users\..\u",
+        "/Users//u/proj",
+        r"\\server",
+    ] {
+        assert_eq!(windows_components(none), None, "{none}");
+    }
+}
+
+/// ON WINDOWS A ROOT IS READ AS A WINDOWS FOLDER, its glob too, as Windows compares names: a
+/// folder under it in any case and either separator is held. CONTROL: a sibling whose name only
+/// begins as the root's does, a folder outside it and one the glob does not match are not; a
+/// unix root reads as it does on unix. MUTANTS: names compared unfolded fail the cased folder;
+/// a folder read as its drive alone fails the common prefix.
+#[cfg(windows)]
+#[test]
+fn a_windows_root_holds_its_folders_as_windows_compares_them() {
+    let comps = |p: &str| folder_components(p).expect("a folder");
+    let exact = ScratchRoot::dir(Path::new(r"C:\Users\u\Proj")).expect("a root");
+    assert!(exact.holds(&comps(r"c:\users\u\proj")));
+    assert!(exact.holds(&comps("C:/Users//U/PROJ/src")));
+    assert!(!exact.holds(&comps(r"C:\Users\u\proj2")), "a common prefix");
+    assert!(!exact.holds(&comps(r"C:\Users\u")), "its parent");
+    let glob = ScratchRoot::glob_under(Path::new(r"\\?\C:\Users\u"), "Pro*").expect("a root");
+    assert_eq!(glob.label(), r"\\?\C:\Users\u\Pro*");
+    assert!(glob.holds(&comps(r"C:\users\U\proj7\x")));
+    assert!(!glob.holds(&comps(r"C:\Users\u\other")));
+    let unix = ScratchRoot::dir(Path::new("/private/tmp/w")).expect("a unix root");
+    assert!(unix.holds(&comps("/private/tmp/w/x")));
+    assert!(
+        !unix.holds(&comps("/private/tmp/W/x")),
+        "a unix name keeps its case"
+    );
+}
+
 fn all_escalate(cases: &[(&str, &str)]) {
     for (cmd, want) in cases {
         let e = escalates(cmd);

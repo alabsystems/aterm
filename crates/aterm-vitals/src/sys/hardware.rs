@@ -194,13 +194,12 @@ pub fn bundle_json(b: &Bundle) -> Jv {
             Jv::obj([
                 (
                     "max_mean_performance_busy_pm",
-                    Jv::u((crate::scheduling::PERFORMANCE_BUSY_MAX * 1000.0).round() as u64),
+                    Jv::u((crate::hardware::PERFORMANCE_BUSY_MAX * 1000.0).round() as u64),
                 ),
                 (
                     "min_each_efficiency_busy_pm",
                     Jv::u((crate::hardware::EFFICIENCY_BUSY_MIN * 1000.0).round() as u64),
                 ),
-                ("min_runnable_wait_mc", Jv::u(1000)),
                 ("continuous_ns", Jv::u(crate::hardware::SUSTAIN_NS)),
             ]),
         ),
@@ -530,7 +529,7 @@ pub fn lines(s: &Snapshot) -> Vec<String> {
     }
     if let Some(b) = &s.cpu_diagnostics {
         out.push(format!(
-            "Saved CPU underuse: {} frames (P mean <=25%, every E >=90%, wait >=1 core, >=30s); cause not established",
+            "Saved CPU underuse: {} frames (P mean <=25%, every E >=90%, >=30s); cause not established",
             b.frames.len()
         ));
     }

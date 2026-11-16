@@ -553,41 +553,6 @@ fn a_wait_that_panics_clears_its_deadline() {
 }
 
 #[test]
-fn a_network_change_wakes_every_checker_generation_once() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-    let signal = WakeSignal::new();
-    let pending = Arc::new(AtomicBool::new(true));
-    let probe = Arc::clone(&pending);
-    signal.set_network_probe(Box::new(move || probe.swap(false, Ordering::AcqRel)));
-    let seen = signal.posts();
-    assert!(matches!(
-        sleep_watching_for_wake(&signal, seen, Duration::from_secs(60), || true),
-        Waited::Woke(_)
-    ));
-    assert!(
-        signal.wait_past(seen, Duration::ZERO),
-        "another waiter sees the same move"
-    );
-    assert!(
-        !signal.wait_past(signal.posts(), Duration::ZERO),
-        "the move is consumed"
-    );
-}
-
-#[test]
-fn a_network_change_at_the_end_of_a_wait_slice_is_not_delayed_again() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let signal = WakeSignal::new();
-    let polls = AtomicUsize::new(0);
-    signal.set_network_probe(Box::new(move || polls.fetch_add(1, Ordering::AcqRel) == 1));
-    assert!(signal.wait_past(0, Duration::ZERO));
-    assert_eq!(signal.posts(), 1);
-}
-
-#[test]
 fn jitter_stays_within_the_declared_band_for_every_byte() {
     let lo = BASE.as_millis() as u64 * (100 - JITTER_PCT) / 100;
     let hi = BASE.as_millis() as u64 * (100 + JITTER_PCT) / 100;
@@ -610,28 +575,6 @@ fn jitter_cannot_panic_on_extremes() {
     assert_eq!(jitter(Duration::ZERO, 255), Duration::ZERO);
     let _ = jitter(Duration::MAX, 255);
     let _ = jitter(Duration::MAX, 0);
-}
-
-#[test]
-fn wake_gap_ignores_scheduling_slop_and_catches_a_lid_close() {
-    let slice = Duration::from_secs(15);
-    assert!(!is_wake_gap(slice, slice), "an exact slice is not a wake");
-    assert!(
-        !is_wake_gap(slice, slice + Duration::from_secs(5)),
-        "ordinary scheduling delay is not a wake"
-    );
-    assert!(
-        !is_wake_gap(slice, slice + SLEEP_GAP - Duration::from_millis(1)),
-        "just under the threshold is not a wake"
-    );
-    assert!(
-        is_wake_gap(slice, slice + Duration::from_secs(3 * 3600)),
-        "a three-hour lid close IS a wake"
-    );
-    assert!(
-        !is_wake_gap(slice, Duration::ZERO),
-        "a backwards clock step must not read as a wake"
-    );
 }
 
 #[test]
@@ -699,12 +642,13 @@ fn recovery_is_reported_once_with_the_streak() {
     assert!(log.success().is_none(), "and only once");
 }
 
-/// A day-long wait on a signal another thread posts past the count the waiter
-/// answered returns `Woke` — through this test's one-minute hang detector, which a
-/// wait that only watched the clock would trip.
+/// A day-long wait on an armed signal (one leg for the whole day) that another thread posts
+/// past the count the waiter answered returns `Woke` — through this test's one-minute hang
+/// detector, which a leg whose predicate did not watch the posts would trip.
 #[test]
 fn a_posted_wake_ends_the_wait_at_once() {
     static SIGNAL: WakeSignal = WakeSignal::new();
+    assert!(SIGNAL.arm());
     SIGNAL.post();
     assert_eq!(
         sleep_watching_for_wake(&SIGNAL, SIGNAL.posts(), Duration::from_millis(50), || true),

@@ -584,6 +584,7 @@ const MAX_TRAY_STACK_PX: u32 = 16_384;
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SubmitBShape {
+    dock: Option<((i64, i64), (u32, u32), u64)>,
     side_inset: u32,
     invert: bool,
     overlay: Option<DropOverlay>,
@@ -694,6 +695,47 @@ pub struct TrayQuad<'a> {
     /// renderer whose [`GpuRenderer::tray_stack_supported`] says so takes one; elsewhere the
     /// caller folds the cards itself and passes none.
     pub above: &'a [TrayLayer<'a>],
+}
+
+#[cfg(any(gl_arm, d3d11_arm))]
+struct ArmDockStage<T> {
+    input: T,
+    target: T,
+    serial: Option<u64>,
+}
+
+/// Window chrome retained independently of the terminal's frame.
+struct DockCard {
+    rgba: Vec<u8>,
+    size: (u32, u32),
+    serial: u64,
+    /// The rows this card changed since the card its delta names ([`TrayQuad::delta`]): a
+    /// resident copy of that card uploads them alone, with no compare.
+    delta: Option<TrayDelta>,
+}
+impl DockCard {
+    fn quad(&self) -> TrayQuad<'_> {
+        TrayQuad {
+            rgba: &self.rgba,
+            pw: self.size.0,
+            ph: self.size.1,
+            dx: 0,
+            dy: 0,
+            scrim: None,
+            serial: self.serial,
+            delta: self.delta,
+            above: &[],
+        }
+    }
+}
+#[cfg(target_os = "macos")]
+struct MetalDockStage {
+    /// Only a changed card writes the stage. Poll its receipt on the next present, never on a timer.
+    pending_writer: Option<crate::metal::encoder::CbProbe>,
+    target: crate::metal::resources::SealedTexture,
+    size: (u32, u32),
+    format: crate::device_layer::TexelFormat,
+    serial: Option<u64>,
 }
 
 /// One card of a tray stack above its base ([`TrayQuad::above`]): the card (its own `above`
@@ -2132,6 +2174,8 @@ struct ArmSubmitBSlot {
     bloom_u: Option<ArmStream>,
     shimmer_u: Option<ArmStream>,
     tray_u: Option<ArmStream>,
+    dock_tray_u: Option<ArmStream>,
+    dock_blit_u: Option<ArmStream>,
     crown_u: Option<ArmStream>,
     blit_u: Option<(BlitUniform, crate::device_layer::LayerBuffer)>,
 }
@@ -4002,6 +4046,8 @@ pub struct WindowGpu {
     #[cfg(gl_arm)]
     gl_offscreen: Option<gl_arm::GlOffscreen>,
     #[cfg(gl_arm)]
+    gl_dock_stage: Option<ArmDockStage<crate::gl::resources::GlTexture>>,
+    #[cfg(gl_arm)]
     gl_shift_scratch: Option<crate::gl::resources::GlTexture>,
     #[cfg(gl_arm)]
     gl_tray_card: Option<gl_arm::GlTrayCard>,
@@ -4009,6 +4055,8 @@ pub struct WindowGpu {
     // (`last_frame_arm_d3d11`), its band-shift scratch and the tray card.
     #[cfg(d3d11_arm)]
     d3d11_offscreen: Option<d3d11_arm::D3dOffscreen>,
+    #[cfg(d3d11_arm)]
+    d3d11_dock_stage: Option<ArmDockStage<crate::d3d11::resources::D3dTexture>>,
     #[cfg(d3d11_arm)]
     d3d11_shift_scratch: Option<crate::d3d11::resources::D3dTexture>,
     #[cfg(d3d11_arm)]
@@ -4066,6 +4114,10 @@ pub struct WindowGpu {
     pub(crate) metal_shimmer_scratch: Option<crate::metal::resources::SealedTexture>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_tray_card: Option<MetalTrayCard>,
+    #[cfg(target_os = "macos")]
+    metal_dock_card: Option<MetalTrayCard>,
+    #[cfg(target_os = "macos")]
+    metal_dock_stage: Option<MetalDockStage>,
     /// The resident cards of the tray stack's layers above the base ([`TrayQuad::above`]).
     #[cfg(target_os = "macos")]
     pub(crate) metal_tray_layers: Vec<Option<MetalTrayCard>>,
@@ -4078,6 +4130,8 @@ pub struct WindowGpu {
     pub(crate) last_submit_b: Option<SubmitBRecord>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_virtual_off: Option<crate::metal::resources::SealedTexture>,
+    dock_card: Option<std::sync::Arc<DockCard>>,
+    dock_origin: (i64, i64),
     occluded_hint: bool,
     capture_present: bool,
     frame_awaited: bool,
@@ -4119,6 +4173,67 @@ impl WindowGpu {
     /// Set the side inset for this window’s next present.
     pub const fn set_side_inset_px(&mut self, px: u32) {
         self.side_inset_px = px;
+    }
+
+    /// Hand the next present its chrome source. An unchanged nonzero serial reads no pixels, and
+    /// a delta from the card held here reads its rows alone.
+    pub fn set_dock_quad(&mut self, quad: Option<TrayQuad<'_>>, origin: (i64, i64)) {
+        self.dock_origin = origin;
+        let Some(quad) = quad else {
+            self.dock_card = None;
+            return;
+        };
+        if self.dock_card.as_ref().is_some_and(|card| {
+            quad.serial != 0 && card.serial == quad.serial && card.size == (quad.pw, quad.ph)
+        }) {
+            return;
+        }
+        // A delta from the card held here patches that card's rows in place: the rest of the
+        // card is the same pixels, so it is neither copied here nor compared where it is resident.
+        if quad.serial != 0
+            && let Some(delta) = quad.delta.filter(|delta| delta.since != 0)
+            && let Some(card) = self.dock_card.as_mut().and_then(std::sync::Arc::get_mut)
+            && card.serial == delta.since
+            && card.size == (quad.pw, quad.ph)
+            && card.rgba.len() == quad.rgba.len()
+        {
+            let stride = quad.pw as usize * 4;
+            let (y0, y1) = (
+                delta.rows.0.min(quad.ph) as usize * stride,
+                delta.rows.1.min(quad.ph) as usize * stride,
+            );
+            if y0 < y1 {
+                card.rgba[y0..y1].copy_from_slice(&quad.rgba[y0..y1]);
+            }
+            card.serial = quad.serial;
+            card.delta = Some(delta);
+            return;
+        }
+        self.dock_card = Some(std::sync::Arc::new(DockCard {
+            rgba: quad.rgba.to_vec(),
+            size: (quad.pw, quad.ph),
+            serial: quad.serial,
+            delta: quad.delta,
+        }));
+    }
+
+    fn dock_rect(&self, (width, height): (u32, u32)) -> Option<[u32; 4]> {
+        let card = self.dock_card.as_ref()?;
+        let (x, y) = self.dock_origin;
+        let clip = |v: i64, max: u32| v.clamp(0, i64::from(max)) as u32;
+        Some([
+            clip(x, width),
+            clip(y, height),
+            clip(x.saturating_add(i64::from(card.size.0)), width),
+            clip(y.saturating_add(i64::from(card.size.1)), height),
+        ])
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dock_shape(&self) -> Option<((i64, i64), (u32, u32), u64)> {
+        self.dock_card
+            .as_ref()
+            .map(|card| (self.dock_origin, card.size, card.serial))
     }
 
     #[inline]
@@ -8536,8 +8651,8 @@ impl GpuRenderer {
     ) -> Result<(crate::metal::encoder::Submitted, bool), String> {
         use crate::metal::ffi::{self as mtl, PixelFormat as MPix};
         use crate::metal::present::{
-            ApronStripPass, BandShiftPass, BloomPasses, CrownPass, PostPass, PresentSequence,
-            ShimmerPass, TrayPass, TrayStackPass, encode_present_sequence,
+            ApronStripPass, BandShiftPass, BloomPasses, CrownPass, DockPass, PostPass,
+            PresentSequence, ShimmerPass, TrayPass, TrayStackPass, encode_present_sequence,
         };
 
         win.last_submit_b = None;
@@ -8616,6 +8731,12 @@ impl GpuRenderer {
                 .metal_present_off
                 .as_ref()
                 .is_none_or(|t| (t.width(), t.height()) != (fw as usize, fh as usize));
+        let dock_card = win.dock_card.clone();
+        if dock_card.is_none() {
+            // A hidden dock keeps no resident card or stage, as no tray keeps no tray card.
+            win.metal_dock_card = None;
+            win.metal_dock_stage = None;
+        }
         let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
         let live = cell.live_mut();
         let mint_scratch = |live: &MetalArmLive, label, w: usize, h: usize| {
@@ -9023,7 +9144,114 @@ impl GpuRenderer {
         {
             win.metal_last_compose_rect = use_present_off.then_some(copy_rect);
         }
+        let dock_parts = if let Some(card) = dock_card.as_ref() {
+            if let Some(stage) = win.metal_dock_stage.as_mut()
+                && let Some(outcome) = stage
+                    .pending_writer
+                    .as_ref()
+                    .and_then(crate::metal::encoder::CbProbe::try_terminal)
+            {
+                stage.pending_writer = None;
+                if outcome != crate::metal::loss::CbOutcome::Completed {
+                    stage.serial = None;
+                }
+            }
+            let quad = card.quad();
+            Self::ensure_metal_tray_card(
+                live,
+                &mut win.metal_dock_card,
+                &quad,
+                tray_reader,
+                &mut self.tray_uploads,
+                &mut self.tray_upload_bytes,
+                &mut self.tray_compare_bytes,
+            )?;
+            if win.metal_dock_stage.as_ref().is_none_or(|stage| {
+                stage.size != card.size
+                    || stage.format != crate::device_layer::TexelFormat::Rgba8Unorm
+            }) {
+                win.metal_dock_stage = Some(MetalDockStage {
+                    pending_writer: None,
+                    target: live
+                        .layer()
+                        .try_create_texture_2d(
+                            "aterm-gpu dock offscreen",
+                            crate::device_layer::TexelFormat::Rgba8Unorm,
+                            card.size.0,
+                            card.size.1,
+                            crate::device_layer::TexUsage::OFFSCREEN,
+                            None,
+                        )?
+                        .into_metal(),
+                    size: card.size,
+                    format: crate::device_layer::TexelFormat::Rgba8Unorm,
+                    serial: None,
+                });
+            }
+            let stage = win.metal_dock_stage.as_ref().expect("dock stage ensured");
+            let redraw = card.serial == 0 || stage.serial != Some(card.serial);
+            let mut dock_uniform = want.for_dock(&quad);
+            dock_uniform.content_off = [win.dock_origin.0 as f32, win.dock_origin.1 as f32];
+            let sb = live.submit_b_idx;
+            let bu = MetalArmLive::upload_scratch_stream(
+                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                &mut live.submit_b_slots[sb].dock_blit_u,
+                aterm_bits::bytes_of(&dock_uniform),
+            )?;
+            let tu = MetalArmLive::upload_scratch_stream(
+                crate::device_layer::DeviceHandle::Metal(&live.mint),
+                &mut live.submit_b_slots[sb].dock_tray_u,
+                aterm_bits::bytes_of(&TrayUniform {
+                    rect: [0.0, 0.0, card.size.0 as f32, card.size.1 as f32],
+                    fb: [card.size.0 as f32, card.size.1 as f32],
+                    _pad: [0.0; 2],
+                }),
+            )?;
+            let tp = live.present_pso(Pipeline::Tray, MPix::Rgba8Unorm)?;
+            let rect = win.dock_rect((dw, dh)).expect("dock source exists");
+            Some((stage.target.clone_handle(), redraw, tu, tp, bu, rect))
+        } else {
+            None
+        };
         let seq = PresentSequence {
+            dock: dock_parts
+                .as_ref()
+                .map(|(target, redraw, tu, tp, bu, rect)| {
+                    let tb = Pipeline::Tray.spec().binds;
+                    let bb = Pipeline::Blit.spec().binds;
+                    DockPass {
+                        stage: redraw.then(|| {
+                            (
+                                target,
+                                TrayPass {
+                                    pso: tp,
+                                    card_tex: win
+                                        .metal_dock_card
+                                        .as_ref()
+                                        .expect("dock source ensured")
+                                        .tex()
+                                        .obj(),
+                                    tex_slot: tb.fragment_textures[0] as usize,
+                                    sampler: &live.nearest,
+                                    sampler_slot: tb.fragment_samplers[0] as usize,
+                                    uniform: tu,
+                                    uniform_slot: tb.vertex_uniform.expect("tray vertex uniform")
+                                        as usize,
+                                },
+                            )
+                        }),
+                        blit: PostPass {
+                            pso: &blit_pso,
+                            tex: target.obj(),
+                            tex_slot: bb.fragment_textures[0] as usize,
+                            sampler: &live.nearest,
+                            sampler_slot: bb.fragment_samplers[0] as usize,
+                            uniform: bu,
+                            uniform_slot: bb.fragment_buffers[0] as usize,
+                        },
+                        rect: *rect,
+                    }
+                }),
             offscreen: &off_tex,
             present_off: present_off.as_ref(),
             copy_rect,
@@ -9184,6 +9412,7 @@ impl GpuRenderer {
         }
         win.last_submit_b = Some(SubmitBRecord {
             shape: SubmitBShape {
+                dock: win.dock_shape(),
                 side_inset: win.side_inset_px,
                 invert,
                 overlay,
@@ -9240,6 +9469,15 @@ impl GpuRenderer {
             }
         }
         let submitted = cb.commit();
+        if let (Some(stage), Some(card), Some((_, true, ..))) = (
+            win.metal_dock_stage.as_mut(),
+            dock_card.as_ref(),
+            dock_parts.as_ref(),
+        ) {
+            stage.serial = Some(card.serial);
+            stage.pending_writer = Some(crate::metal::encoder::CbProbe::of(&submitted));
+        }
+
         if use_present_off {
             win.metal_present_off_pending
                 .push(crate::metal::encoder::CbProbe::of(&submitted));
@@ -10426,6 +10664,7 @@ impl GpuRenderer {
             .resident_present_crop(input, crop)
             .map_err(|()| OverlayRefusal::ShapeChanged)?;
         let shape = SubmitBShape {
+            dock: win.dock_shape(),
             side_inset: win.side_inset_px,
             invert,
             overlay,
@@ -10436,7 +10675,7 @@ impl GpuRenderer {
             translucent,
             premult,
         };
-        if shape != last.shape {
+        if shape != last.shape || shape.dock.is_some_and(|(_, _, serial)| serial == 0) {
             return Err(OverlayRefusal::ShapeChanged);
         }
         let fit = |[x0, y0, x1, y1]: [i64; 4]| {
@@ -14024,3 +14263,26 @@ mod d3d11_removal_tests;
 
 #[path = "fx_gpu.rs"]
 pub(crate) mod fx_gpu;
+
+impl BlitUniform {
+    pub(crate) fn for_dock(self, dock: &TrayQuad<'_>) -> Self {
+        Self {
+            flag: 0,
+            overlay: 0,
+            border_px: 0.0,
+            accent: [0.0; 3],
+            chrome_y1: 0.0,
+            dims: [dock.pw as f32, dock.ph as f32],
+            wash_a: 0.0,
+            border_a: 0.0,
+            band: [0.0; 4],
+            content_off: [dock.dx as f32, dock.dy as f32],
+            translucent: 0.0,
+            visible_y: 0.0,
+            visible_h: dock.ph as f32,
+            chrome_y0: 0.0,
+            chrome_pad: [0.0; 3],
+            ..self
+        }
+    }
+}

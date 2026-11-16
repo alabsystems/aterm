@@ -3630,7 +3630,7 @@ struct HandoffPeer {
 impl HandoffPeer {
     fn of(session: &str, path: &Path) -> Self {
         Self {
-            sid: aterm_session::SessionId::new(session),
+            sid: aterm_session::SessionId::parse(session).expect("a session id"),
             fabric: aterm_gui_fabric::SessionFabric::default(),
             path: path.to_owned(),
         }

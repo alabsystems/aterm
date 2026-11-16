@@ -2377,7 +2377,10 @@ impl App {
         self.detach_active_tab_in_window_logical(wid_a)
     }
 
-    fn detach_active_tab_in_window_logical(&mut self, wid_a: WindowId) -> Option<WindowId> {
+    pub(crate) fn detach_active_tab_in_window_logical(
+        &mut self,
+        wid_a: WindowId,
+    ) -> Option<WindowId> {
         let (stable_tab, terminal_index, tree, rows, cols) = {
             let ws = self.windows.get(&wid_a)?;
             if ws.tab_set.len() <= 1 || workers_stay_in_window(ws) {
@@ -2445,6 +2448,7 @@ impl App {
             crate::tab_model::TabSet::new(stable_tab),
         );
         self.insert_unattached_window(wid_b, ws_b);
+        self.inherit_dock_record(wid_a, wid_b);
         self.frontmost_window = Some(wid_b);
         self.sync_window(wid_a);
         self.sync_active_session();
@@ -2648,6 +2652,7 @@ impl App {
             crate::tab_model::TabSet::new(tab),
         );
         self.insert_unattached_window(wid_b, ws_b);
+        self.inherit_dock_record(wid_a, wid_b);
         self.install_window_config_assets(wid_b);
         self.frontmost_window = Some(wid_b);
         self.sync_active_session();
@@ -2942,7 +2947,8 @@ impl App {
     ) -> crate::tab_spawn::TabSpawnThen {
         crate::tab_spawn::TabSpawnThen::Run(Box::new(move |app, landed| {
             let connected = landed.and_then(|sid| {
-                let newborn = aterm_session::SessionId::new(sid);
+                let newborn = aterm_session::SessionId::parse(&sid)
+                    .ok_or_else(|| format!("the new tab's ID {sid:?} is no session's"))?;
                 app.connect_newborn(kind, &origin, &newborn)
             });
             done(app, connected);

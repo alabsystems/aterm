@@ -211,10 +211,11 @@ impl WitnessedPrefix {
         let mut missing = Vec::new();
         for entry in &self.entries {
             current()?;
+            let id = entry.wire.id();
             let retained = if entry.conflict {
-                conflicts.get(&entry.receipt.id).copied() == Some(entry.wire.wire())
+                conflicts.get(&id).copied() == Some(entry.wire.wire())
             } else {
-                store.records.get(&entry.receipt.id).is_some_and(|stored| {
+                store.records.get(&id).is_some_and(|stored| {
                     stored.payload.is_ready() && stored.wire.as_slice() == entry.wire.wire()
                 })
             };

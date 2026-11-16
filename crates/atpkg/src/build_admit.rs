@@ -657,6 +657,12 @@ pub struct Held {
     /// This admission requires native ARM/birth/BIND rather than holder transfer.
     #[cfg(unix)]
     cohort: bool,
+    /// The build directory the build writes, where its front read one from the shim's placement
+    /// ([`DiskHold::at`], read back by [`hold::receipt_leaf`]): its holder takes the receipts
+    /// `targo` keeps there and trims what they retired once the build ends
+    /// ([`hold::build_ended`]). `None` where none was named.
+    #[cfg(target_os = "macos")]
+    build_dir: Option<PathBuf>,
 }
 
 impl Held {
@@ -1092,6 +1098,11 @@ fn admit_for(
     hold: Option<&mut DiskHold>,
 ) -> Admission {
     let cohort = !matches!(kind, AdmissionKind::Holder);
+    #[cfg(target_os = "macos")]
+    let build_dir = hold
+        .as_deref()
+        .and_then(|disk| disk.at.as_deref())
+        .map(hold::receipt_leaf);
     #[cfg(unix)]
     let independent = matches!(kind, AdmissionKind::HostJob);
     #[cfg(not(unix))]
@@ -1237,6 +1248,8 @@ fn admit_for(
             own: seat.own.clone(),
             #[cfg(unix)]
             cohort,
+            #[cfg(target_os = "macos")]
+            build_dir,
         })),
         Err(e @ Error::Refused(_)) if possible_lock.is_some() => {
             let line = format!(
@@ -2616,6 +2629,13 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     let Some((target, rest)) = argv.split_first() else {
         return usage();
     };
+    // The passes that evict the shared dependency store run without the build's environment,
+    // which this hop has: note the store this build may fill for them.
+    if shim.is_some()
+        && let Some(home) = aterm_types::dirs::home_dir()
+    {
+        crate::build_cache::shared_units::note(&home);
+    }
     // A shim's target is the build it was laid for; in a tree whose trust.lock names another,
     // the hop runs that one, so plain `targo` and verify compile with one compiler.
     let locked = match (shim, std::env::current_dir()) {
@@ -2915,8 +2935,9 @@ fn holder_arms_within() -> std::time::Duration {
 /// read within [`holder_arms_within`]. Its child, which forks the holder away, is reaped. A
 /// holder that did not arm is let go: the pipe closed under it (so a late arming fails and it
 /// leaves, handing the claim off), and once its pid was read it is ended by proof of its
-/// identity. The claim is this process's either way until it hands it off. Why it did not arm,
-/// where it did not.
+/// identity. The claim is this process's either way until it hands it off. The holder is told
+/// the build directory the build writes ([`Held::build_dir`]), whose receipts it takes at the
+/// build's end ([`hold::build_ended`]). Why it did not arm, where it did not.
 #[cfg(target_os = "macos")]
 fn hand_over(held: &Held) -> Result<(), String> {
     if held.cohort {
@@ -2929,13 +2950,7 @@ fn hand_over(held: &Held) -> Result<(), String> {
         .ok()
         .and_then(aterm_uds::process::process_serial)
         .ok_or("this process's serial is unread")?;
-    let words = hold::Words {
-        pid: me,
-        serial,
-        claim: held.claim.path().to_path_buf(),
-        key: held.key.clone(),
-        own: held.own.clone(),
-    };
+    let words = hold::Words::of(held, me, serial);
     let descriptor = held
         .claim
         .descriptor()
@@ -3001,6 +3016,7 @@ pub fn hand_over_for_test(root: &Path) -> Result<PathBuf, String> {
         },
         own: None,
         cohort: false,
+        build_dir: None,
     };
     hand_over(&held)?;
     held.claim.hand_off();

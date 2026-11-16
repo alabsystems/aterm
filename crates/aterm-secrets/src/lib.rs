@@ -307,9 +307,21 @@ pub enum ErrorKind {
     /// A membership record or batch cannot fit the existing count or byte bounds.
     /// No local operation may treat a partial draft as the complete operation.
     MembershipCapacity,
-    /// A locally retained causal frontier is not yet covered by complete raw records.
-    /// Credential authority is unavailable; record intake may repair the missing history.
+    /// The membership records this Mac holds are not shown to hold the history it acknowledged
+    /// or, before its first acknowledgement, the log it last applied: records are missing, or
+    /// they grew and no vault pass has enrolled them yet. Credential authority is unavailable
+    /// rather than read from a rollback. A vault pass enrolls records that hold the applied log
+    /// whole, and record intake restores missing ones; neither needs a person.
     MembershipHistoryUnavailable,
+    /// The history this device holds proves it cannot open an earlier roster: the log holds
+    /// the epoch only pending its parents, or does not wrap its key to this device; the control
+    /// journal does not hold the node on its selected history, or holds it sealed to other
+    /// devices; or the handoff it holds of it names another recipient, or an issuer or recipient
+    /// the issuance did not admit. Nothing was busy or unread: asked again under the same held
+    /// history, it is the same answer, and a record sealed under that roster stays unread until
+    /// the history this device holds grows (a sync, a handoff). Every other failure of a
+    /// historical read keeps its own kind.
+    HistoryUnopened,
     /// A request that ran past its deadline: a long-poll the server still held, a lookup with
     /// no answer, a slow network or a host that sleeps, which nothing here tells apart.
     TimedOut,

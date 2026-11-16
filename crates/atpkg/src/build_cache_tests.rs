@@ -927,6 +927,117 @@ fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
     assert!(asserted > 0, "no shell rendered a numeric soft limit");
 }
 
+/// THE SHIM GIVES A BUILDING VERB AN EXPLICIT SDK ROOT, the one `xcrun` names: a Trust
+/// compiler that looked the SDK up itself withholds reuse of every linked unit, so a call
+/// with `SDKROOT` unset would compile each build script, binary and test again on every
+/// build. NEGATIVE CONTROLS: a root the caller set stands; a verb that builds nothing gets
+/// none; a build for another Apple platform keeps the compiler's own lookup.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_shim_gives_a_building_verb_the_sdk_root_and_keeps_the_callers() {
+    let f = Fixture::new("build-cache-sdkroot");
+    let ws = f.dir("home/ws");
+    let run = |shell: &[&str],
+               tool: Tool,
+               sdkroot: Option<&str>,
+               target: Option<&str>,
+               words: &[&str]|
+     -> String {
+        let mut cmd = aterm_uds::spawnfd::command(shell[0]);
+        cmd.args(&shell[1..])
+            .arg("-c")
+            .arg(format!("{}printf '%s' \"${{SDKROOT-unset}}\"", block(tool)))
+            .arg("sh")
+            .args(words)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.home)
+            .env("PWD", &ws)
+            .current_dir(&ws);
+        if let Some(root) = sdkroot {
+            cmd.env("SDKROOT", root);
+        }
+        if let Some(target) = target {
+            cmd.env("CARGO_BUILD_TARGET", target);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success() && out.stderr.is_empty(),
+            "{shell:?} {words:?}: {out:?}"
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // What the compiler's own lookup answers in the environment the block runs in. A Mac with
+    // no developer tools selected has no answer, and the block asks nothing there.
+    let asked = |program: &str, arg: &str| -> Option<String> {
+        let out = aterm_uds::spawnfd::command(program)
+            .arg(arg)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .ok()?;
+        let line = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+        (out.status.success() && !line.is_empty()).then_some(line)
+    };
+    let Some(sdk) = asked("/usr/bin/xcode-select", "-p")
+        .and_then(|_| asked("/usr/bin/xcrun", "--show-sdk-path"))
+        .filter(|sdk| Path::new(sdk).is_dir())
+    else {
+        aterm_spec::host::could_not_run(
+            "no developer tools are selected here (`xcode-select -p`), so no SDK root to give",
+        );
+    };
+    let ios = ["--unverified", "build", "--target", "aarch64-apple-ios"];
+    let mac = ["--unverified", "build", "--target", "aarch64-apple-darwin"];
+    for shell in shells() {
+        for (tool, words) in [
+            (Tool::Targo, &["--unverified", "build"][..]),
+            (Tool::Targo, &["--unverified", "test", "-p", "x"][..]),
+            (Tool::Targo, &mac[..]),
+            (Tool::Tippy, &["-p", "x"][..]),
+        ] {
+            assert_eq!(
+                run(&shell, tool, None, None, words),
+                sdk,
+                "{shell:?} {tool:?} {words:?}: a building verb gets the SDK root"
+            );
+            assert_eq!(
+                run(&shell, tool, Some(""), None, words),
+                sdk,
+                "{shell:?} {tool:?} {words:?}: an empty root names none"
+            );
+            assert_eq!(
+                run(&shell, tool, Some("/elsewhere/Some.sdk"), None, words),
+                "/elsewhere/Some.sdk",
+                "{shell:?} {tool:?} {words:?}: the caller's root stands"
+            );
+        }
+        for words in [&["--unverified", "fmt"][..], &["metadata"][..]] {
+            assert_eq!(
+                run(&shell, Tool::Targo, None, None, words),
+                "unset",
+                "{shell:?} {words:?}: a verb that builds nothing asks for no root"
+            );
+        }
+        assert_eq!(
+            run(&shell, Tool::Targo, None, None, &ios),
+            "unset",
+            "{shell:?}: a build for another Apple platform keeps the compiler's lookup"
+        );
+        assert_eq!(
+            run(
+                &shell,
+                Tool::Targo,
+                None,
+                Some("aarch64-apple-ios-sim"),
+                &["--unverified", "build"]
+            ),
+            "unset",
+            "{shell:?}: so does one whose target the environment names"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn the_shim_and_the_rust_rule_decide_every_case_alike() {
@@ -5016,6 +5127,39 @@ fn every_stage_name_is_read_as_a_stage_and_nothing_else_is() {
     assert!(!numbered.exists() && walked.join(LEAF).is_dir());
 }
 
+/// A STAGE NAME IS TAKEN BY NAME ALONE, LOWEST FREE FIRST, AND NEVER OVER ANOTHER ENTRY
+/// ([`take_stage`], the naming the harness's disk pass makes its stages by): a name `make` finds
+/// taken (`AlreadyExists`) moves on to the next, so `base` and `base-1` standing gives `base-2`;
+/// any other refusal is returned as it is, never read as a taken name. CONTROL: the path form
+/// ([`take_stage_name`]) still answers `holder/base` when that name is free. NEGATIVE CONTROL:
+/// with the `AlreadyExists` arm gone, the first standing name is returned as a refusal and the
+/// first assertion fails.
+#[test]
+fn take_stage_picks_the_lowest_free_name_and_never_replaces_one() {
+    let base = OsStr::new(".aterm-removing");
+    let mut tried: Vec<OsString> = Vec::new();
+    let taken = take_stage(base, &mut |name| {
+        tried.push(name.to_os_string());
+        if tried.len() <= 2 {
+            Err(std::io::ErrorKind::AlreadyExists.into())
+        } else {
+            Ok(())
+        }
+    })
+    .expect("a free name");
+    assert_eq!(taken, ".aterm-removing-2");
+    let lowest: Vec<OsString> = (0..3).map(|n| stage_name(base, n)).collect();
+    assert_eq!(tried, lowest);
+    let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let refused = take_stage(base, &mut |_| Err(denied())).expect_err("a refusal is no taken name");
+    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    let holder = Path::new("/h/target/debug");
+    assert_eq!(
+        take_stage_name(holder, base, &mut |_| Ok(())).expect("free"),
+        holder.join(base)
+    );
+}
+
 /// THE STRANDED STAGE GOES IN ONE PASS (found live 2026-10-27, 252 GB stranded): under the root
 /// the cache moved from, a stage whose FIRST entry in readdir order holds, as its `tmp/` did, a
 /// test scratch's folder carrying `group:everyone deny delete` and the allow entry that run
@@ -7527,12 +7671,16 @@ fn a_merged_worktrees_build_directories_go_whole_and_nothing_beside_them() {
 
     let went = run(&wt, &mut asked);
     assert_eq!(
-        merged(&went),
-        [top.clone()],
+        merged(&went).as_slice(),
+        std::slice::from_ref(&top),
         "the one nothing holds: {went:?}"
     );
     assert_eq!(went.len(), 1, "{went:?}");
-    assert_eq!(asked, [top.clone()], "no other intent was asked");
+    assert_eq!(
+        asked.as_slice(),
+        std::slice::from_ref(&top),
+        "no other intent was asked"
+    );
     assert!(!top.exists(), "it went whole");
     assert!(
         stages_in(&mirror, OsStr::new(DOOMED)).is_empty(),
@@ -7590,7 +7738,11 @@ fn a_merged_worktrees_build_directories_go_whole_and_nothing_beside_them() {
     std::os::unix::fs::symlink(f.dir("home/real"), &spelled).unwrap();
     let under_name = lay(&root, &spelled, 8 * DAY);
     let went = run(&spelled, &mut asked);
-    assert_eq!(merged(&went), [under_name.clone()], "{went:?}");
+    assert_eq!(
+        merged(&went).as_slice(),
+        std::slice::from_ref(&under_name),
+        "{went:?}"
+    );
     assert!(!under_name.exists());
 
     // The home, the filesystem root and a relative path mirror no worktree; nor does the home

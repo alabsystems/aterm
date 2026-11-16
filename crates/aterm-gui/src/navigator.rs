@@ -98,7 +98,8 @@ pub(crate) struct WordFacts<'a> {
     /// answers itself is not one.
     pub(crate) asks: bool,
     /// What its program reads as now (`busy`, `question`, `prompt`, `wall:…`, `idle`,
-    /// `unknown`, or `-` for a shell with no agent).
+    /// `unknown`, or `-` for a shell with no agent): as Tab Status read it, or, where nothing
+    /// observes it, as the program's own report says.
     pub(crate) agent_word: &'a str,
     /// Its shell has a command running: what Tab Status observed of it (the fact the tab's busy
     /// mark is lit from), or, where nothing observes it, the shell's own word.
@@ -515,6 +516,7 @@ impl NavigatorApp {
 #[derive(Debug)]
 pub(crate) struct NavigatorViewState {
     pub(crate) common: CommonViewState,
+    docked: bool,
     filter: TextInputState,
     scroll: f32,
     /// The selected row's session. It outlives the keyboard's move to the filter.
@@ -538,6 +540,7 @@ impl Default for NavigatorViewState {
     fn default() -> Self {
         Self {
             common: CommonViewState::default(),
+            docked: false,
             filter: TextInputState::new(String::new()),
             scroll: 0.0,
             cursor: None,
@@ -564,6 +567,14 @@ impl NavigatorViewState {
         };
         view.common.last_focus = person_in.map(|session| UiKey::new(format!("{ROW}{session}")));
         view
+    }
+
+    pub(crate) fn in_dock(person_in: Option<u64>) -> Self {
+        Self {
+            docked: true,
+            at_hand: false,
+            ..Self::starting_in(person_in)
+        }
     }
 
     fn fold(&self) -> Fold<'_> {
@@ -609,7 +620,7 @@ impl NavigatorViewState {
 
     fn frame(&self, tree: &NavTree) -> Option<Frame> {
         let (width, height) = self.laid.get()?;
-        Some(Frame::of(tree, &self.fold(), width, height))
+        Some(Frame::of(tree, &self.fold(), width, height, self.docked))
     }
 
     /// Put the selection, and the keyboard, on `session`'s row and scroll it into the room.
@@ -709,6 +720,12 @@ impl NavigatorViewState {
         if keys {
             return moved;
         }
+        if self.docked && person_in.is_none() && self.cursor.is_some() {
+            self.person_in = None;
+            self.cursor = None;
+            self.common.last_focus = None;
+            moved = true;
+        }
         if let Some(session) = person_in
             && tree.index_of(session).is_some()
             && (self.person_in != Some(session) || self.cursor != Some(session))
@@ -762,7 +779,7 @@ impl NavigatorViewState {
 
     /// The sessions whose rows a page `width` by `height` paints, into `out`.
     pub(crate) fn on_screen(&self, tree: &NavTree, width: f32, height: f32, out: &mut Vec<u64>) {
-        let frame = Frame::of(tree, &self.fold(), width, height);
+        let frame = Frame::of(tree, &self.fold(), width, height, self.docked);
         let scroll = self.scroll.min(frame.limit());
         out.extend(
             frame
@@ -810,7 +827,7 @@ impl NavigatorViewState {
         if sessions.peek().is_none() {
             return Shows::Nothing;
         }
-        let frame = Frame::of(tree, &self.fold(), width, height);
+        let frame = Frame::of(tree, &self.fold(), width, height, self.docked);
         let scroll = self.scroll.min(frame.limit());
         let (list_top, list_bottom) = frame.painted_span();
         let mut listed = false;
@@ -1260,7 +1277,7 @@ struct Measure {
 }
 
 impl Measure {
-    fn at(width: f32) -> Self {
+    fn at(width: f32, docked: bool) -> Self {
         let scale = crate::native_appearance::text_scale();
         let narrow = width < 480.0;
         let pad = if narrow { 12.0 } else { 24.0 };
@@ -1272,7 +1289,11 @@ impl Measure {
             narrow,
             pad,
             inner: (width - pad * 2.0).clamp(1.0, MEASURE),
-            header_h: title_h + HEADER_GAP + filter_h,
+            header_h: if docked {
+                title_h
+            } else {
+                title_h + HEADER_GAP + filter_h
+            },
             title_h,
             filter_h,
             title_line,
@@ -1300,8 +1321,8 @@ struct Frame {
 }
 
 impl Frame {
-    fn of(tree: &NavTree, fold: &Fold<'_>, width: f32, height: f32) -> Self {
-        let m = Measure::at(width);
+    fn of(tree: &NavTree, fold: &Fold<'_>, width: f32, height: f32, docked: bool) -> Self {
+        let m = Measure::at(width, docked);
         let rows = listed(tree, fold);
         let mut tops = Vec::with_capacity(rows.len());
         let mut machine_from = None;
@@ -1586,7 +1607,7 @@ fn row_node(entry: &NavEntry, listed: Listed, cx: RowCx) -> UiNode {
         .children(face)
 }
 
-/// The page: the machine's name and the filter over the list.
+/// The page: the machine's name above the list, with a filter only in a tab host.
 pub(crate) fn page(
     app: &NavigatorApp,
     view: &NavigatorViewState,
@@ -1594,39 +1615,41 @@ pub(crate) fn page(
     height: f32,
 ) -> UiTree {
     let tree = &*app.tree;
-    let frame = Frame::of(tree, &view.fold(), width, height);
+    let frame = Frame::of(tree, &view.fold(), width, height, view.docked);
     view.laid.set(Some((width, height)));
     let m = frame.m;
     let limit = frame.limit();
     let scroll = view.scroll.min(limit);
 
-    let filter = UiNode::new(
-        FILTER,
-        UiContent::TextField(
-            Control::new(
-                TextFieldSpec {
-                    label: FILTER_LABEL.into(),
-                    placeholder: Some(FILTER_LABEL.into()),
-                    secret: false,
-                    visual_value: None,
-                    input: Some(view.filter.projection()),
-                    swatch: None,
-                    swatch_line: false,
-                    trailing_hint: None,
-                    description: None,
-                    end_button: false,
-                },
-                ActionId::new(FILTER),
-            )
-            .value(SemanticValue::Text(view.filter.value().into()))
-            .state(ControlState {
-                focused: view.in_filter(),
-                ..ControlState::default()
-            })
-            .style(StyleRef::Secondary),
-        ),
-    )
-    .layout(Layout::default().height(Length::Fixed(m.filter_h)));
+    let filter = (!view.docked).then(|| {
+        UiNode::new(
+            FILTER,
+            UiContent::TextField(
+                Control::new(
+                    TextFieldSpec {
+                        label: FILTER_LABEL.into(),
+                        placeholder: Some(FILTER_LABEL.into()),
+                        secret: false,
+                        visual_value: None,
+                        input: Some(view.filter.projection()),
+                        swatch: None,
+                        swatch_line: false,
+                        trailing_hint: None,
+                        description: None,
+                        end_button: false,
+                    },
+                    ActionId::new(FILTER),
+                )
+                .value(SemanticValue::Text(view.filter.value().into()))
+                .state(ControlState {
+                    focused: view.in_filter(),
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Secondary),
+            ),
+        )
+        .layout(Layout::default().height(Length::Fixed(m.filter_h)))
+    });
     let header = plain_group("navigator/header")
         .layout(
             Layout::column()
@@ -1634,19 +1657,22 @@ pub(crate) fn page(
                 .width(Length::Fixed(m.inner))
                 .height(Length::Fixed(m.header_h)),
         )
-        .children(vec![
-            UiNode::new(
-                "navigator/title",
-                UiContent::Text(TextSpec::heading(one_line(
-                    app.title(),
-                    SemanticRole::Heading,
-                    StyleRef::Primary,
-                    m.inner,
-                ))),
+        .children(
+            std::iter::once(
+                UiNode::new(
+                    "navigator/title",
+                    UiContent::Text(TextSpec::heading(one_line(
+                        app.title(),
+                        SemanticRole::Heading,
+                        StyleRef::Primary,
+                        m.inner,
+                    ))),
+                )
+                .layout(Layout::default().height(Length::Fixed(m.title_h))),
             )
-            .layout(Layout::default().height(Length::Fixed(m.title_h))),
-            filter,
-        ]);
+            .chain(filter)
+            .collect(),
+        );
 
     let cx = RowCx {
         m,

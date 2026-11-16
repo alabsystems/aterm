@@ -332,6 +332,8 @@ fn a_change_under_any_other_id_or_none_keeps_the_reading_out() {
         "{\"time\":2,\"id\":\"init.github\",\"from\":\"a\",\"to\":\"b\"}\n",
         "{\"time\":2,\"from\":\"a\",\"to\":\"b\"}\n",
         "{\"time\":2,\"id\":7,\"from\":\"a\",\"to\":\"b\"}\n",
+        "{\"time\":2,\"failed\":\"offline\"}\n",
+        "{\"time\":2,\"id\":7,\"failed\":\"offline\"}\n",
         "{\"time\":2,\"id\":\"sync.requests\",\"from\":\"a\"\n",
         "sync.requests\n",
     ] {

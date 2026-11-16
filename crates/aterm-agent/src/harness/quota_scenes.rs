@@ -340,6 +340,7 @@ pub fn tap_words(view: &QuotaView) -> String {
         ctx_left: None,
         dur_us: 0,
         row: Some(Row::Own),
+        route: None,
     }
     .week_words(view.as_of, Some(&utc()))
 }

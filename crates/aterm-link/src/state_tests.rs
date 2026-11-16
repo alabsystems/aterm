@@ -886,7 +886,7 @@ fn a_receipts_and_a_keys_pin_hold_no_head() {
     let dir = scratch("pin-files");
     let st = StateDir::open(&dir).expect("open");
     let pin = PublishPin {
-        at: Some(42),
+        at: Some(Head::From(42)),
         owner: Some(1),
         ..in_flight_entry(9).pin
     };
@@ -911,7 +911,7 @@ fn a_receipts_and_a_keys_pin_hold_no_head() {
     );
     assert_eq!(
         st.receipt_head("s-a", 3, pin.seq).expect("reads"),
-        Some((log, 42))
+        Some((log, Head::From(42)))
     );
     assert_eq!(
         st.key_pin("s-a", "k").expect("reads"),
@@ -931,10 +931,10 @@ fn a_receipts_and_a_keys_pin_hold_no_head() {
 fn a_hand_off_keeps_the_heads_the_files_cannot_hold() {
     let headed = |seq: u64| InFlight {
         pin: PublishPin {
-            at: Some(40),
+            at: Some(Head::From(40)),
             ..in_flight_entry(seq).pin
         },
-        at: Some(50),
+        at: Some(Head::From(50)),
         ..in_flight_entry(seq)
     };
     for older_went_past in [false, true] {
@@ -991,10 +991,10 @@ fn a_hand_off_keeps_the_heads_the_files_cannot_hold() {
 fn a_hand_off_whose_heads_the_disk_refuses_keeps_the_journal() {
     let headed = |seq: u64| InFlight {
         pin: PublishPin {
-            at: Some(40),
+            at: Some(Head::From(40)),
             ..in_flight_entry(seq).pin
         },
-        at: Some(50),
+        at: Some(Head::From(50)),
         ..in_flight_entry(seq)
     };
     for control in [false, true] {
@@ -1039,10 +1039,10 @@ fn a_hand_off_whose_heads_the_disk_refuses_keeps_the_journal() {
 fn an_attach_takes_a_hand_offs_files_before_its_incarnation() {
     let headed = |seq: u64| InFlight {
         pin: PublishPin {
-            at: Some(40),
+            at: Some(Head::From(40)),
             ..in_flight_entry(seq).pin
         },
-        at: Some(50),
+        at: Some(Head::From(50)),
         ..in_flight_entry(seq)
     };
     for control in [false, true] {
@@ -1080,10 +1080,10 @@ fn an_attach_takes_a_hand_offs_files_before_its_incarnation() {
 fn a_hand_off_handed_on_before_its_taker_attached_keeps_its_heads() {
     let headed = |seq: u64| InFlight {
         pin: PublishPin {
-            at: Some(40),
+            at: Some(Head::From(40)),
             ..in_flight_entry(seq).pin
         },
-        at: Some(50),
+        at: Some(Head::From(50)),
         ..in_flight_entry(seq)
     };
     for control in [false, true] {
@@ -1747,7 +1747,7 @@ fn publication_identity_survives_pins_and_malformed_reservations_are_not_absent(
         }),
         original_off: Some(0),
         owner: Some(1),
-        at: Some(42),
+        at: Some(Head::From(42)),
     };
     st.set_post_pin("s-a", 1, &pin).unwrap();
     assert_eq!(
@@ -2531,57 +2531,104 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let _ = std::fs::remove_dir_all(&twin);
 }
 
-/// **ON A LOG THAT CONTINUES NONE A PIN'S HEAD GOES TO THE HEAD THE ATTACH READ; ON A MOVE, DOWN
-/// TO ITS FORK** (critic review F1, 2026-11-13): another id told with a lineage, the same id
-/// continuing nothing and another id told without one are alike, since astream gives a log that
-/// kept its records another id too (a fresh one where its identity sidecar does not read, one
-/// derived from its records where the sidecar is gone), and nothing says what lies below the
-/// attach's head there: a read back from 0 met the sender's earlier post of the same words. Here
-/// the attach read 50, above the pin's 40, as on a log renamed with its records; a move that
-/// continues to 30 brings the head down to 30, and
-/// one that continues to 45 leaves it at 40. NEGATIVE CONTROLS: ATERM-KI-1111-4's rule puts it at
-/// 0 on a log that continues none (`heads_from_the_logs_start`), and every build before that
-/// rule took it out (`pin_head_gone_on_another_log`); neither touches a move's.
+/// **ON A LOG THAT CONTINUES NONE A PIN'S HEAD IS ANYWHERE; ON A MOVE, DOWN TO ITS FORK**
+/// (ATERM-KI-1114-1414): another id told with a lineage, the same id continuing nothing and
+/// another id told without one are alike, since astream gives a log that kept its records
+/// another id too (a fresh one where its identity sidecar does not read, one derived from its
+/// records where the sidecar is gone), and nothing says where on it the pin's attempt lies: a
+/// carried cut may have kept it below the head the attach read. Here the attach read 50, above
+/// the pin's 40, as on a log renamed with its records; a move that continues to 30 brings the
+/// head down to 30, one that continues to 45 leaves it at 40, and a head already anywhere stays
+/// anywhere through a move. A keyed re-post's pin (`via_key`) goes to the head the attach read:
+/// every re-post of its key shares its sequence, so no origin tells its attempt from an earlier
+/// re-post's (ATERM-KI-1114-1414's step S3). NEGATIVE CONTROLS: the rule from critic review F1 to
+/// ATERM-KI-1114-1414 puts it at the head the attach read on a log that continues none
+/// (`heads_at_the_attach`), and every build before F1's rule took it out
+/// (`pin_head_gone_on_another_log`); neither touches a move's.
 #[test]
-fn a_pins_head_on_a_log_that_continues_none_goes_to_the_head_the_attach_read() {
+fn a_pins_head_on_a_log_that_continues_none_is_anywhere() {
     let now = astream_broker::LogIdentity {
         id: [2; 16],
         generation: 0,
     };
-    let headed = PublishPin {
-        at: Some(40),
-        ..in_flight_entry(7).pin
-    };
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Rule {
-        AtTheHead,
-        FromTheStart,
+        Anywhere,
+        AtTheAttach,
         Gone,
     }
-    for rule in [Rule::AtTheHead, Rule::FromTheStart, Rule::Gone] {
-        for (what, keep_below, want) in [
-            ("a log that continues none", None, Some(50)),
-            ("a move that continues to 30", Some(30), Some(30)),
-            ("a move that continues to 45", Some(45), Some(40)),
+    for rule in [Rule::Anywhere, Rule::AtTheAttach, Rule::Gone] {
+        for (what, was, keep_below, via_key, want) in [
+            (
+                "a log that continues none",
+                Head::From(40),
+                None,
+                false,
+                Head::Anywhere,
+            ),
+            (
+                "a keyed pin, a log that continues none",
+                Head::From(40),
+                None,
+                true,
+                Head::From(50),
+            ),
+            (
+                "a move that continues to 30",
+                Head::From(40),
+                Some(30),
+                false,
+                Head::From(30),
+            ),
+            (
+                "a keyed pin, a move to 30",
+                Head::From(40),
+                Some(30),
+                true,
+                Head::From(30),
+            ),
+            (
+                "a move that continues to 45",
+                Head::From(40),
+                Some(45),
+                false,
+                Head::From(40),
+            ),
+            (
+                "a head anywhere, on a move",
+                Head::Anywhere,
+                Some(30),
+                false,
+                Head::Anywhere,
+            ),
         ] {
             let want = match rule {
-                _ if keep_below.is_some() => want,
-                Rule::AtTheHead => want,
-                Rule::FromTheStart => Some(0),
+                _ if keep_below.is_some() => Some(want),
+                Rule::Anywhere => Some(want),
+                Rule::AtTheAttach => Some(Head::From(50)),
                 Rule::Gone => None,
+            };
+            let headed = PublishPin {
+                at: Some(was),
+                via_key,
+                ..in_flight_entry(7).pin
             };
             let dir = scratch("pin-head-continues-none");
             let st = StateDir::open(&dir).expect("open");
-            st.heads_from_the_logs_start(rule == Rule::FromTheStart);
+            st.heads_at_the_attach(rule == Rule::AtTheAttach);
             st.pin_head_gone_on_another_log(rule == Rule::Gone);
             st.take_incarnation(0).expect("an attach");
             st.set_post_pin("s-a", 1, &headed).expect("reserved");
             st.forget_log_offsets(50, Some(now), keep_below, None)
                 .expect("forgotten");
             assert_eq!(
-                st.post_pin("s-a", 1).expect("reads").map(|pin| pin.at),
+                StateDir::open(&dir)
+                    .expect("reopen")
+                    .post_pin("s-a", 1)
+                    .expect("reads")
+                    .map(|pin| pin.at),
                 Some(want),
-                "{rule:?}: {what}"
+                "{rule:?}: {what}, across a reopen"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2601,7 +2648,7 @@ fn a_receipts_pin_keeps_its_head_beside_it() {
     };
     let none = astream_broker::Lineage::from_steps(&[]).expect("an empty lineage");
     let headed = PublishPin {
-        at: Some(40),
+        at: Some(Head::From(40)),
         ..in_flight_entry(7).pin
     };
     let dir = scratch("receipt-head");
@@ -2614,14 +2661,14 @@ fn a_receipts_pin_keeps_its_head_beside_it() {
             .expect("reopen")
             .receipt_head("s-a", 3, headed.seq)
             .expect("reads"),
-        Some((log(1, 0), 40)),
+        Some((log(1, 0), Head::From(40))),
         "the head survives a reopen"
     );
     st.forget_log_offsets(20, Some(log(2, 0)), None, Some(&none))
         .expect("forgotten");
     assert_eq!(
         st.receipt_head("s-a", 3, headed.seq).expect("reads"),
-        Some((log(1, 0), 40)),
+        Some((log(1, 0), Head::From(40))),
         "a move leaves it naming the log it was written on"
     );
     assert_eq!(
@@ -2643,6 +2690,24 @@ fn a_receipts_pin_keeps_its_head_beside_it() {
         st.receipt_head("s-a", 4, headed.seq).expect("reads"),
         None,
         "no log, no head"
+    );
+    let anywhere = PublishPin {
+        at: Some(Head::Anywhere),
+        ..headed.clone()
+    };
+    st.set_receipt_pin("s-a", 5, &anywhere, Some(log(1, 0)))
+        .expect("reserved");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(format!("{ACK_HEADS}/s-a.5"))).expect("its head"),
+        format!("{} {} any\n", anywhere.seq, log(1, 0))
+    );
+    assert_eq!(
+        StateDir::open(&dir)
+            .expect("reopen")
+            .receipt_head("s-a", 5, anywhere.seq)
+            .expect("reads"),
+        Some((log(1, 0), Head::Anywhere)),
+        "a head anywhere survives a reopen"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

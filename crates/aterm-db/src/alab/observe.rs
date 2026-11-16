@@ -8,12 +8,18 @@
 //!
 //! An observation is matched to an account by address, never by a recomputed key: the `account`
 //! row at the observed realm whose `login` or `identity` address row says the login email. Where
-//! no live row does but a row that is not live holds the key a birth would take, the sighting is
-//! that row's and nothing is born: a birth would revive what the owner retired. Where none does,
+//! no live row does but a row holds the key a birth would take, the sighting is that row's and
+//! nothing is born: a birth would revive what the owner retired, or write its automatic status
+//! and label over a live row's (one born without a login, or whose login the owner pointed
+//! elsewhere). Where none does,
 //! the account is born (and its address first, where no row says it), keyed as the importer keys
 //! it (`keys::account_pk` of the realm and the claims email), so two Macs that observe one login
 //! birth the same cells and converge; a concurrent owner's cell beats a birth cell. Where several
-//! rows say it, nothing is written and the pass reports `account-ambiguous`.
+//! rows say it, nothing is written and the pass reports `account-ambiguous`. A birth never names
+//! a row that is not live, which the rules every write passes would refuse with the whole pass
+//! (`typed::check::names_not_live`): where the one row that says the login is retired the account
+//! is born without a login, and a provider the owner retired takes no new account
+//! (`account-provider-retired`).
 //!
 //! A record is written only for news the registry keeps for good: an account born, or this
 //! Mac's first row of an account. A row that exists is rewritten only with such a record, where
@@ -41,7 +47,7 @@
 use super::{
     checks::Finding,
     register::day_of,
-    registry::{ACCOUNT, ACCOUNT_OBS, ADDRESS, AddressHolder, AddressIndex},
+    registry::{ACCOUNT, ACCOUNT_OBS, ADDRESS, AddressHolder, AddressIndex, PROVIDER},
 };
 use crate::{
     Result,
@@ -195,8 +201,9 @@ fn service(provider: &str) -> &'static str {
     }
 }
 
-/// An observed account's birth: its provider, realm, login address, `status=active`, its
-/// default label, the service and `row=live`, every cell automatic. The label is left empty
+/// An observed account's birth: its provider, realm, login address (none where the address's one
+/// row is not live, [`matched`]), `status=active`, its default label, the service and `row=live`,
+/// every cell automatic. The label is left empty
 /// (which reads as the default) where `taken`, the labels live accounts and this pass's births
 /// hold, already holds it: `label` is unique among live accounts, and the rules every write
 /// passes would refuse the birth, and with it every later pass that plans it again
@@ -204,7 +211,7 @@ fn service(provider: &str) -> &'static str {
 fn account_birth(
     pk: &str,
     realm: &str,
-    login: &str,
+    login: Option<&str>,
     taken: &mut BTreeSet<String>,
 ) -> Result<Vec<Change>> {
     let provider = keys::provider_of_realm(realm)
@@ -212,7 +219,11 @@ fn account_birth(
     let mut out = vec![
         automatic(&ACCOUNT, pk, "provider", Value::from(provider))?,
         automatic(&ACCOUNT, pk, "realm", Value::from(realm))?,
-        automatic(&ACCOUNT, pk, "login", Value::from(login))?,
+    ];
+    if let Some(login) = login {
+        out.push(automatic(&ACCOUNT, pk, "login", Value::from(login))?);
+    }
+    out.extend([
         automatic(&ACCOUNT, pk, "status", Value::from("active"))?,
         cell::change(
             &ACCOUNT,
@@ -224,7 +235,7 @@ fn account_birth(
             &CellValue::automatic(ACCOUNT.version, Value::Bool(true)),
         )?,
         automatic(&ACCOUNT, pk, LIFECYCLE, Value::from("live"))?,
-    ];
+    ]);
     if let Ok(label) = keys::default_account_label(realm, pk)
         && taken.insert(label.clone())
     {
@@ -252,25 +263,49 @@ const fn tabs_bucket(tabs: u64) -> u64 {
 
 /// The account a sighting is of, by address.
 enum Matched {
-    /// One live account row at the realm says the email, or none does and a row that is not live
+    /// One live account row at the realm says the email, or none does and a row, live or not,
     /// holds the key a birth would take.
     Row(String),
     /// None does: born under this key, its login address `login` (born first where `addr` is
-    /// some, not yet a row).
+    /// some, not yet a row; none where the one row that says it is not live).
     Born {
         pk: String,
-        login: String,
+        login: Option<String>,
         addr: Option<String>,
     },
-    /// Several rows say it, or the address's key is held by another row.
+    /// Several rows say it, the address's key is held by another row, or the owner retired the
+    /// provider its realm runs on.
     Held(Finding),
 }
 
-fn matched(
-    sighting: &Sighting,
-    index: &AddressIndex,
-    accounts: &cell::Projection,
-) -> Result<Matched> {
+/// The registry as [`matched`] reads it, projected once for every sighting of a pass.
+pub(crate) struct Known {
+    index: AddressIndex,
+    addresses: cell::Projection,
+    accounts: cell::Projection,
+    providers: cell::Projection,
+}
+
+impl Known {
+    /// What `cells`, the registry's cells, hold of addresses, accounts and providers.
+    pub(crate) fn of(cells: &Cells) -> Self {
+        let addresses = cell::project(&ADDRESS, cells);
+        Self {
+            index: AddressIndex::of(&addresses),
+            addresses,
+            accounts: cell::project(&ACCOUNT, cells),
+            providers: cell::project(&PROVIDER, cells),
+        }
+    }
+}
+
+fn matched(sighting: &Sighting, known: &Known) -> Result<Matched> {
+    let Known {
+        index,
+        addresses,
+        accounts,
+        providers,
+    } = known;
     let realm = keys::canonical_realm(&sighting.realm)
         .ok_or_else(|| crate::Error::new("account-obs: not a realm"))?;
     let email = keys::address(&sighting.email)?;
@@ -305,20 +340,46 @@ fn matched(
         [] => {}
     }
     let pk = keys::account_pk(realm, &keys::claims_email(None, Some(&email))?)?;
-    // A row at the account's own key that is not live (the owner retired, ended, merged or
-    // locked it, or its lifecycle is conflicted) is this account: the sighting marks it and
-    // births nothing. This Mac reads the row as not live only once it holds the owner's write,
-    // so a birth would be appended after it and its automatic cells would replace the owner's
-    // (`documents::apply` keeps no candidate a write observed): `row=live`, `status=active` and
-    // the default label, the account back in use. A machine's birth never revives an ended row
+    // A row at the account's own key is this account, whatever its cells say: the sighting marks
+    // it and births nothing. A birth would be appended after the cells this Mac holds of it, and
+    // its automatic cells would replace them (`documents::apply` keeps no candidate a write
+    // observed): `row=live`, `status=active` and the default label over the owner's retire, end,
+    // merge or lock, or over a live row's status and label. A live row reaches here when no live
+    // row at the realm says the address: one born without a login while its address row was
+    // retired (below), whose address the owner has since made live again, or one whose login
+    // the owner pointed elsewhere. The row keeps the cells it has; observation writes no login
+    // onto a row it did not just give birth to. A machine's birth never revives an ended row
     // either (`register::plan`).
-    if accounts.rows.get(&pk).is_some_and(|row| !row.live()) {
+    if accounts.rows.contains_key(&pk) {
         return Ok(Matched::Row(pk));
     }
+    // A provider the owner retired takes no new account: a live account born naming it would be
+    // refused (`typed::check::names_not_live`), and with it every later pass that plans it again.
+    if let Some(provider) = keys::provider_of_realm(realm)
+        && providers.rows.get(provider).is_some_and(|row| !row.live())
+    {
+        return Ok(Matched::Held(Finding {
+            kind: "account-provider-retired",
+            collection: PROVIDER.name,
+            pks: vec![provider.to_owned()],
+        }));
+    }
     match index.holder(&email)? {
+        // The one row that says the address is not live (no live row does, `AddressHolder`): the
+        // owner retired it, and a live account born naming it would be refused
+        // (`typed::check::names_not_live`) on this pass and every later one. The account is born
+        // without a login, and once born it is this sighting's row by its key (above), so a later
+        // pass writes no second birth over it, whether or not the address is live again by then.
+        AddressHolder::Row(login) if addresses.rows.get(login).is_some_and(|row| !row.live()) => {
+            Ok(Matched::Born {
+                pk,
+                login: None,
+                addr: None,
+            })
+        }
         AddressHolder::Row(login) => Ok(Matched::Born {
             pk,
-            login: login.to_owned(),
+            login: Some(login.to_owned()),
             addr: None,
         }),
         AddressHolder::Free {
@@ -326,7 +387,7 @@ fn matched(
             taken: false,
         } => Ok(Matched::Born {
             pk,
-            login: derived,
+            login: Some(derived),
             addr: Some(email),
         }),
         AddressHolder::Several(pks) => Ok(Matched::Held(Finding {
@@ -352,9 +413,9 @@ pub(crate) enum Holds {
     Unmatched,
 }
 
-/// [`Holds`] of `s` in the registry `index` and `accounts` describe.
-pub(crate) fn holds(s: &Sighting, index: &AddressIndex, accounts: &cell::Projection) -> Holds {
-    match matched(s, index, accounts) {
+/// [`Holds`] of `s` in what `known` reads of the registry.
+pub(crate) fn holds(s: &Sighting, known: &Known) -> Holds {
+    match matched(s, known) {
         Ok(Matched::Row(pk)) => Holds::Row(pk),
         Ok(Matched::Born { pk, .. }) => Holds::Unborn(pk),
         Ok(Matched::Held(_)) | Err(_) => Holds::Unmatched,
@@ -388,10 +449,8 @@ fn obs_row(n: u64, account: &str, s: &Sighting, first_at: u64, at: u64) -> Value
 /// # Errors
 /// A change does not fit its column.
 pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
-    let addresses = cell::project(&ADDRESS, cells);
-    let index = AddressIndex::of(&addresses);
-    let accounts = cell::project(&ACCOUNT, cells);
-    let mut labels = live_labels(&accounts);
+    let known = Known::of(cells);
+    let mut labels = live_labels(&known.accounts);
     let today = day_of(input.now_ms);
     let mut out = Plan::default();
     let mut births: Vec<Change> = Vec::new();
@@ -414,7 +473,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
         {
             continue;
         }
-        let Ok(found) = matched(s, &index, &accounts) else {
+        let Ok(found) = matched(s, &known) else {
             continue;
         };
         let account = match found {
@@ -429,11 +488,12 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
                 if seen.contains(&pk) {
                     pk
                 } else if input.room {
-                    let Ok(account) = account_birth(&pk, &s.realm, &login, &mut labels) else {
+                    let Ok(account) = account_birth(&pk, &s.realm, login.as_deref(), &mut labels)
+                    else {
                         continue;
                     };
-                    if let Some(addr) = &addr {
-                        births.extend(address_birth(&login, addr)?);
+                    if let (Some(login), Some(addr)) = (&login, &addr) {
+                        births.extend(address_birth(login, addr)?);
                     }
                     births.extend(account);
                     out.born += 1;

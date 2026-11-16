@@ -159,6 +159,9 @@ impl aterm_converge::Item for Bound<'_> {
     }
 
     fn explain(&self, probe: &Probe) -> Explain {
+        if let Some(explain) = self.item.explain(probe) {
+            return explain;
+        }
         let (why, remedy) = match probe {
             Probe::Person { step, how } => (
                 how.clone(),

@@ -33,6 +33,10 @@ mod enrollment_seat_tests;
 #[path = "log_entries/no_leak_tests.rs"]
 mod no_leak_tests;
 
+#[cfg(test)]
+#[path = "log_entries/frontier_misses_tests.rs"]
+mod frontier_misses_tests;
+
 /// Deterministic SHA-256 digest over a [`Log`]'s current head [`RecordId`]s
 /// ([`Log::heads_digest`], the value a vault server advertises as its TXT `rec=`).
 pub(super) fn records_heads_digest(log: &Log) -> [u8; 32] {
@@ -457,12 +461,455 @@ enum Stamp {
     Heads(Vec<RecordId>),
 }
 
-/// An applied log digest is a floor even before receipt enrollment. A client that has
-/// applied only an envelope can still classify partial records as behind that envelope.
+/// Whether a READER reads a log this Mac never acknowledged: only where no log was applied, or
+/// `log` is exactly the one applied, by its heads digest. A reader checks equality and nothing
+/// more, since it can enroll nothing: a log that grew past the applied one is read once a writer
+/// shows it still holds that one whole ([`legacy_applied_held`]) and enrolls it. A client that
+/// has applied only an envelope can still classify partial records as behind that envelope.
 pub(super) fn legacy_applied_log_available(state: &State, log: &Log) -> bool {
     state
         .records_digest
         .is_none_or(|applied| log.has_epochs() && applied == records_heads_digest(log))
+}
+
+/// How much work a writer's search for the applied log does ([`legacy_applied_held`]), in the
+/// units [`Log::down_set_search`] charges: one for each 64-byte block SHA-256 hashes, and one
+/// for each 64 bytes of the reach index and of the head lists it reads between two candidates.
+/// So a search hashes or reads at most 256 MiB however wide the log is or was, and a log one
+/// Mac was writing (one head) is found within one unit for each record held after it, and a
+/// few for the scan.
+const WITNESS_BUDGET: usize = 1 << 22;
+
+/// The version of the search's rule: its candidates, their order and what each is charged. An
+/// answer kept on disk under another version is no answer ([`read_misses`]).
+const WITNESS_RULE: u32 = 1;
+
+/// [`WITNESS_BUDGET`], or a test's own on this thread.
+fn witness_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = TEST_WITNESS_BUDGET.get() {
+        return budget;
+    }
+    WITNESS_BUDGET
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's budget for this thread's witness searches.
+    pub(super) static TEST_WITNESS_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// How many witness searches this thread ran, a remembered or kept answer not counted.
+    pub(super) static WITNESS_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What a writer's search of the records this Mac holds found of the log it last applied
+/// ([`legacy_applied_held`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Witness {
+    /// The applied heads are held, so the applied log is, whole.
+    Held,
+    /// Every down-set of the held log was hashed and none is the applied one: records it
+    /// applied are missing.
+    Absent,
+    /// The search stopped at its budget with nothing found, which says nothing either way.
+    Unsearched,
+    /// The held log lacks records the applied envelope was written at, so nothing was hashed.
+    Short,
+}
+
+/// What a search's answer answers: the applied digest, the held log's heads digest, the applied
+/// envelope's digest (zero with none) and the budget it ran under. The heads digest names the
+/// held records (a log holds a record only with its parents), and the envelope the stamp that
+/// ordered the search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WitnessKey {
+    applied: [u8; 32],
+    heads: [u8; 32],
+    envelope: [u8; 32],
+    budget: u64,
+}
+
+/// One search's answer. `Held`, `Absent` and `Short` are functions of the key alone. A search
+/// cut short at its budget is not: which candidates it reached depends on the order the log
+/// held its records in (a reload sorts concurrent records by id, a running process holds them
+/// as they landed), so `Unsearched` answers only a log held in the same order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Answer {
+    key: WitnessKey,
+    /// [`held_order`] of the log searched for `Unsearched`; zero for every other answer.
+    order: [u8; 32],
+    witness: Witness,
+}
+
+impl Answer {
+    fn of(key: WitnessKey, log: &Log, witness: Witness) -> Self {
+        let order = if witness == Witness::Unsearched {
+            held_order(log)
+        } else {
+            [0; 32]
+        };
+        Self {
+            key,
+            order,
+            witness,
+        }
+    }
+
+    /// Whether this answers a search of `log` under `key`.
+    fn answers(&self, key: &WitnessKey, log: &Log) -> bool {
+        self.key == *key && (self.witness != Witness::Unsearched || self.order == held_order(log))
+    }
+}
+
+/// SHA-256 of the ids of `log`'s records in the order it holds them.
+fn held_order(log: &Log) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for record in log.records() {
+        hash.update(record.id());
+    }
+    hash.finalize()
+}
+
+/// This process's last few answers: a pass over the same state hashes nothing again, a `Held`
+/// one included (an enrolling write asks three times: its check before the records are
+/// written, and its acknowledgement's two plans). Each holds only whether public record ids
+/// hash to a public digest.
+#[cfg(not(test))]
+static WITNESSES: std::sync::Mutex<std::collections::VecDeque<Answer>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(test)]
+thread_local! {
+    /// [`WITNESSES`] of this thread alone, as the budget and the search count are: what a test
+    /// remembers is not pushed out by the tests beside it.
+    static WITNESSES: std::cell::RefCell<std::collections::VecDeque<Answer>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// How many answers a process remembers.
+const WITNESSES_KEPT: usize = 16;
+
+/// Read or change the remembered answers; `None` where they cannot be reached.
+fn with_witnesses<T>(with: impl FnOnce(&mut std::collections::VecDeque<Answer>) -> T) -> Option<T> {
+    #[cfg(not(test))]
+    return WITNESSES.lock().ok().map(|mut held| with(&mut held));
+    #[cfg(test)]
+    Some(WITNESSES.with(|held| with(&mut held.borrow_mut())))
+}
+
+/// Forget what this thread remembers, as a process just started has: what it knows next is what
+/// the vault folder keeps ([`read_misses`]).
+#[cfg(test)]
+pub(super) fn forget_witnesses() {
+    with_witnesses(std::collections::VecDeque::clear);
+}
+
+fn remember_witness(answer: Answer) {
+    with_witnesses(|held| {
+        if !held.contains(&answer) {
+            if held.len() >= WITNESSES_KEPT {
+                held.pop_front();
+            }
+            held.push_back(answer);
+        }
+    });
+}
+
+/// The file beside the state that keeps the misses: the searches of this Mac's records that did
+/// not find the log it applied. Another process, and this one after a restart, reads the answer
+/// there and searches nothing again; without it every `aterm secrets get`, credential-helper
+/// read and vault pass of a Mac whose records lack part of that log would repeat the whole
+/// search under the exclusive state lock.
+///
+/// **Only a miss is kept, and only a miss is believed.** A kept answer can refuse records and
+/// can never enroll them: `Held` is not written, is not parsed, and is shown by a search every
+/// time ([`legacy_applied_held`]). So a file that is wrong, by damage or by another writer of
+/// the folder, costs a refusal that ends when the records change, and never a rollback. A file
+/// that is missing, unreadable, too long, of another rule or whose digest does not match is no
+/// answer: the search runs as if there were none, and nothing fails for it.
+const MISSES_FILE: &str = "records.frontier-misses";
+const MISSES_MAGIC: &[u8] = b"aterm-vault-frontier-misses/1\n";
+/// How many misses the file keeps, the oldest dropped first: a store that changes gives each
+/// later search another key, and two processes that hold one store in two orders two answers.
+const MAX_MISSES: usize = 8;
+/// One miss: the key's three digests, the order digest, the budget, the rule and the answer.
+const MISS_LEN: usize = 4 * 32 + 8 + 4 + 1;
+
+fn encode_misses(misses: &[Answer]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(MISSES_MAGIC.len() + misses.len() * MISS_LEN + 32);
+    bytes.extend_from_slice(MISSES_MAGIC);
+    for miss in misses {
+        bytes.extend_from_slice(&miss.key.applied);
+        bytes.extend_from_slice(&miss.key.heads);
+        bytes.extend_from_slice(&miss.key.envelope);
+        bytes.extend_from_slice(&miss.order);
+        bytes.extend_from_slice(&miss.key.budget.to_le_bytes());
+        bytes.extend_from_slice(&WITNESS_RULE.to_le_bytes());
+        bytes.push(match miss.witness {
+            Witness::Absent => 1,
+            Witness::Unsearched => 2,
+            Witness::Short | Witness::Held => 3,
+        });
+    }
+    let sum = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&sum);
+    bytes
+}
+
+/// The misses `bytes` hold under this build's rule; `None` where they are not a misses file.
+fn parse_misses(bytes: &[u8]) -> Option<Vec<Answer>> {
+    let (body, sum) = bytes.split_last_chunk::<32>()?;
+    if Sha256::digest(body) != *sum {
+        return None;
+    }
+    let (misses, rest) = body.strip_prefix(MISSES_MAGIC)?.as_chunks::<MISS_LEN>();
+    if !rest.is_empty() || misses.len() > MAX_MISSES {
+        return None;
+    }
+    let mut held = Vec::with_capacity(misses.len());
+    for miss in misses {
+        let digest = |at: usize| -> [u8; 32] {
+            let mut digest = [0; 32];
+            digest.copy_from_slice(&miss[32 * at..32 * (at + 1)]);
+            digest
+        };
+        let budget = u64::from_le_bytes(miss[128..136].try_into().ok()?);
+        let rule = u32::from_le_bytes(miss[136..140].try_into().ok()?);
+        let witness = match miss[140] {
+            1 => Witness::Absent,
+            2 => Witness::Unsearched,
+            3 => Witness::Short,
+            _ => return None,
+        };
+        if rule == WITNESS_RULE {
+            held.push(Answer {
+                key: WitnessKey {
+                    applied: digest(0),
+                    heads: digest(1),
+                    envelope: digest(2),
+                    budget,
+                },
+                order: digest(3),
+                witness,
+            });
+        }
+    }
+    Some(held)
+}
+
+/// The misses kept beside the state ([`MISSES_FILE`]); none where the file gives no answer.
+fn read_misses(paths: &Paths) -> Vec<Answer> {
+    let most = MISSES_MAGIC.len() + MAX_MISSES * MISS_LEN + 32;
+    fsx::read_private(&paths.dir.join(MISSES_FILE), most)
+        .ok()
+        .flatten()
+        .and_then(|bytes| parse_misses(bytes.as_slice()))
+        .unwrap_or_default()
+}
+
+/// Keep `miss` beside the state, durably. Its caller holds the exclusive state lock
+/// ([`FrontierFor::Enrollment`]), so no two writers replace the file at once. A write that
+/// fails keeps nothing and fails nothing: the next take searches again.
+fn keep_miss(paths: &Paths, miss: Answer) {
+    if miss.witness == Witness::Held {
+        return;
+    }
+    let mut misses = read_misses(paths);
+    if misses.contains(&miss) {
+        return;
+    }
+    // A complete answer for the same key stands for every order the log is held in.
+    misses.retain(|old| {
+        old.key != miss.key || (miss.witness == Witness::Unsearched && old.order != miss.order)
+    });
+    misses.push(miss);
+    let over = misses.len().saturating_sub(MAX_MISSES);
+    misses.drain(..over);
+    let _ = aterm_journal::write_private_durable(&paths.dir, MISSES_FILE, &encode_misses(&misses));
+}
+
+/// Write beside the state a file that claims `claim` (a miss's byte, or one no build writes) for
+/// the search of `log` a writer at `paths` would run now.
+#[cfg(test)]
+pub(super) fn forge_kept_answer(paths: &Paths, log: &Log, claim: u8) {
+    let reads = Reads::new(paths);
+    let config = reads.config().unwrap().unwrap();
+    let envelope = applied_stamp(&reads, config)
+        .unwrap()
+        .map_or([0; 32], |(digest, _)| digest);
+    let key = witness_key(reads.state().unwrap(), log, envelope).expect("a search would run");
+    let mut bytes = encode_misses(&[Answer::of(key, log, Witness::Absent)]);
+    let body = bytes.len() - 32;
+    bytes[body - 1] = claim;
+    let sum = Sha256::digest(&bytes[..body]);
+    bytes[body..].copy_from_slice(&sum);
+    fsx::write_atomic(&paths.dir.join(MISSES_FILE), &bytes, 0o600).unwrap();
+}
+
+/// The key a search of `log` for the log `state` applied runs under, where one would run:
+/// `None` where no search is needed (nothing was applied, or `log` is the applied log).
+fn witness_key(state: &State, log: &Log, envelope: [u8; 32]) -> Option<WitnessKey> {
+    let applied = state.records_digest?;
+    let heads = records_heads_digest(log);
+    (heads != applied).then_some(WitnessKey {
+        applied,
+        heads,
+        envelope,
+        budget: witness_budget() as u64,
+    })
+}
+
+/// What is known of a search of `log` under `key` without making one: this process's answer,
+/// or a miss kept beside the state. The second of the pair says the folder holds it.
+fn witness_known(paths: &Paths, key: &WitnessKey, log: &Log) -> Option<(Witness, bool)> {
+    let remembered = with_witnesses(|held| {
+        held.iter()
+            .rev()
+            .find(|answer| answer.answers(key, log))
+            .map(|answer| answer.witness)
+    })
+    .flatten();
+    if let Some(witness) = remembered.filter(|witness| *witness == Witness::Held) {
+        return Some((witness, false));
+    }
+    let kept = read_misses(paths)
+        .into_iter()
+        .rev()
+        .find(|miss| miss.answers(key, log));
+    match (remembered, kept) {
+        (_, Some(miss)) => {
+            remember_witness(miss);
+            Some((miss.witness, true))
+        }
+        (Some(witness), None) => Some((witness, false)),
+        (None, None) => None,
+    }
+}
+
+/// What the last search of `log` for the log `state` applied found, by this process or one
+/// before it ([`MISSES_FILE`]), under any envelope and budget; `None` where none is known.
+fn witness_searched(paths: &Paths, state: &State, log: &Log) -> Option<Witness> {
+    let key = (state.records_digest?, records_heads_digest(log));
+    let of = |answer: &Answer| (answer.key.applied, answer.key.heads) == key;
+    with_witnesses(|held| held.iter().rev().find(|answer| of(answer)).copied())
+        .flatten()
+        .or_else(|| read_misses(paths).into_iter().rev().find(of))
+        .map(|answer| answer.witness)
+}
+
+/// Whether a WRITER may enroll `log` as the first history this Mac acknowledges: no log was
+/// applied, or `log` still holds the applied one whole. The store only grows (intake writes
+/// records and moves no applied digest), so equality with the applied digest fails for good once
+/// one record lands after the last apply; containment is what a floor needs. It is shown by
+/// exhibiting the applied heads ([`Log::down_set_named`]): held records whose heads digest is
+/// the applied one, a SHA-256 preimage, so `log` holds them and every record in their pasts.
+/// `stamp` (the applied envelope's stamp heads) only orders the search. A store put back to an
+/// older snapshot, or one that kept the stamp's records and lost a later record this Mac
+/// applied, holds no such heads and is refused as before.
+///
+/// **What it costs.** One search of at most [`WITNESS_BUDGET`] units of work for each key
+/// ([`WitnessKey`]): a miss is remembered by this process and, where `serving` enrolls, kept
+/// beside the state for every other ([`MISSES_FILE`]), so the same records are searched once
+/// on this Mac and never again. A record that lands afterwards changes the heads digest, and
+/// the next exclusive take searches the grown log whole, once: a Mac whose records lack part
+/// of the applied log pays up to one budget for each landing pass until the missing records
+/// arrive. (A search of only the candidates that hold a record landed since would be
+/// complete, since a log that lacked the applied heads names them only with a new record;
+/// it is not built: the walks here do not enumerate by a record they must hold.) `Held` is
+/// never read from disk: it is shown by a search in each process that enrolls.
+fn legacy_applied_held(
+    paths: &Paths,
+    state: &State,
+    log: &Log,
+    stamp: &[RecordId],
+    envelope: [u8; 32],
+    serving: FrontierFor,
+) -> bool {
+    if state.records_digest.is_none() {
+        return true;
+    }
+    if !log.has_epochs() {
+        return false;
+    }
+    let Some(key) = witness_key(state, log, envelope) else {
+        return true;
+    };
+    let (witness, kept) = witness_known(paths, &key, log).unwrap_or_else(|| {
+        #[cfg(test)]
+        WITNESS_SEARCHES.set(WITNESS_SEARCHES.get() + 1);
+        let budget = usize::try_from(key.budget).unwrap_or(usize::MAX);
+        let search = log.down_set_search(&key.applied, stamp, budget);
+        let witness = match (search.named, search.complete) {
+            (Some(_), _) => Witness::Held,
+            (None, true) => Witness::Absent,
+            (None, false) => Witness::Unsearched,
+        };
+        remember_witness(Answer::of(key, log, witness));
+        (witness, false)
+    });
+    if !kept && serving == FrontierFor::Enrollment {
+        keep_miss(paths, Answer::of(key, log, witness));
+    }
+    witness == Witness::Held
+}
+
+/// Whether a read refused before this Mac's first receipt would be refused again after an
+/// exclusive take: a miss stands for the records it holds now ([`MISSES_FILE`], or this
+/// process's own), so the take would enroll nothing and search nothing, and the reader makes
+/// none (`StateLock::first_enrollment_due`). `false` wherever that is not known, a file or
+/// record that does not read included: the take then answers.
+pub(super) fn first_enrollment_refused(paths: &Paths) -> bool {
+    matches!(held_witness_known(paths), Ok(Some(witness)) if witness != Witness::Held)
+}
+
+/// What is known, without a search, of the search a writer at `paths` would run now over the
+/// records this Mac holds ([`witness_known`]); `None` where none would run or nothing is known.
+fn held_witness_known(paths: &Paths) -> crate::Result<Option<Witness>> {
+    let reads = Reads::new(paths);
+    let Some(config) = reads.config()? else {
+        return Ok(None);
+    };
+    let state = reads.state()?;
+    let store = super::load_records_for(&reads, config)?;
+    let Some(log) = store.log() else {
+        return Ok(None);
+    };
+    let envelope = applied_stamp(&reads, config)?.map_or([0; 32], |(digest, _)| digest);
+    Ok(witness_key(state, log, envelope)
+        .and_then(|key| witness_known(paths, &key, log))
+        .map(|(witness, _)| witness))
+}
+
+/// Why a reader refuses a log this Mac never acknowledged and did not apply
+/// ([`legacy_applied_log_available`]): the one text every surface prints. Until a writer
+/// searched, the records only changed and a vault pass settles it; after a search that found
+/// nothing, by this process or one before it, it says what ends the refusal. `aterm secrets
+/// repair` is named only where it would accept the records ([`super::repair_legacy_frontier`]),
+/// and with what it accepts: records as they are, which lack, or may lack, ones this Mac
+/// applied.
+pub(super) fn legacy_refusal(paths: &Paths, state: &State, log: &Log) -> String {
+    let seq = state.seq;
+    let unread = "so its secrets stay unread rather than roll back; they read again once a vault \
+                  server sends the missing records";
+    let repair = "or once `aterm secrets repair` accepts the records this Mac holds as they are";
+    match witness_searched(paths, state, log) {
+        None | Some(Witness::Held) => format!(
+            "this Mac's membership records changed since the vault version it last applied (seq \
+             {seq}); a vault pass (`aterm secrets sync`) checks that they still hold it"
+        ),
+        Some(Witness::Absent) => format!(
+            "this Mac's membership records do not hold the vault version it last applied (seq \
+             {seq}), {unread}, {repair}, without the records it applied that they lack"
+        ),
+        Some(Witness::Unsearched) => format!(
+            "a bounded search of this Mac's membership records did not find the vault version \
+             it last applied (seq {seq}), {unread}, {repair}, which may lack records it applied"
+        ),
+        Some(Witness::Short) => format!(
+            "this Mac's membership records lack records the vault version it last applied (seq \
+             {seq}) was written at, {unread} (`aterm secrets sync`)"
+        ),
+    }
 }
 
 /// Whether the version of its vault this Mac applied was written at a membership log: the
@@ -493,26 +940,163 @@ pub fn applied_version_names_log(paths: &Paths) -> crate::Result<bool> {
     ))
 }
 
-/// First enrollment must match an applied digest and cover a verified envelope's causal witness.
-pub(super) fn check_legacy_frontier(
+/// The digest of the verified envelope this Mac applied and the heads its stamp names, where it
+/// holds one and its locker for this Mac is stamped.
+fn applied_stamp(
+    reads: &Reads<'_>,
+    config: &Config,
+) -> crate::Result<Option<([u8; 32], Vec<RecordId>)>> {
+    if let Some(envelope) = reads.verified_under(config, reads.state()?)?
+        && let Some(identity) = reads.identity()?
+        && let Stamp::Heads(heads) = envelope_stamp(envelope, identity)?
+    {
+        return Ok(Some((envelope.digest(), heads)));
+    }
+    Ok(None)
+}
+
+/// Whether `log` holds every record the applied envelope was written at: the heads its stamp
+/// names, with their pasts. `true` where this Mac applied no stamped envelope.
+pub(super) fn covers_applied_stamp(
     reads: &Reads<'_>,
     config: &Config,
     log: &Log,
 ) -> crate::Result<bool> {
+    Ok(applied_stamp(reads, config)?
+        .is_none_or(|(_, heads)| super::retained_frontier::covers(log, log.network(), &heads)))
+}
+
+/// Which caller [`check_legacy_frontier`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FrontierFor {
+    /// A writer's acknowledgement under the exclusive state lock
+    /// (`retained_history::acknowledge_selected`): the one caller that enrolls. Containment,
+    /// and a miss is kept beside the state ([`MISSES_FILE`]).
+    Enrollment,
+    /// The check of a store before it is written, of what its acknowledgement will do
+    /// (`retained_history::validate_configured`): containment, as the acknowledgement's; not
+    /// every such caller holds the state lock, so nothing is kept on disk.
+    Candidate,
+    /// A caller that enrolls nothing: an author's snapshot, `conflicts`, the labels read
+    /// ([`checked_author_projection_for`]), under a shared observation or none. Equality, the
+    /// rule before 2026-11-15: no search runs outside a writer's take. What equality refuses
+    /// here ends at the next exclusive take, which binds the configured keys to the context
+    /// these callers read through (`retained_history::durably_bound`).
+    Reader,
+}
+
+/// Whether `log` may be this Mac's first acknowledged history: it holds the log this Mac applied
+/// and the records its verified envelope was written at. For a writer ([`FrontierFor::Enrollment`],
+/// [`FrontierFor::Candidate`]) the applied log is held where the applied heads are
+/// ([`legacy_applied_held`]); for a caller that enrolls nothing ([`FrontierFor::Reader`]) only
+/// where `log` is the applied log itself or a receipt binds this vault's keys to it.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "VaultFirstEnrollment",
+        action = "Enroll",
+        project = "aterm_secrets::client::retained_history_tests::first_enrollment_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "Intake",
+        reason = "Environment: records land in the store after this Mac's last apply, \
+                  which moves no applied digest"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "Rollback",
+        reason = "Environment: the records file is put back to an older verified \
+                  snapshot"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "Truncate",
+        reason = "Environment: the records file keeps what the applied envelope was \
+                  written at and loses a later record this Mac applied"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "Restore",
+        reason = "Environment: intake brings the missing records back"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "EnrollByStamp",
+        reason = "Buggy=1 negative control only: the applied envelope's stamp heads \
+                  order the search and accept nothing; the Tier-1 runs a writer over \
+                  records that hold them and lack a later applied record, and no receipt \
+                  is written"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "EnrollAny",
+        reason = "Buggy=1 negative control only: a verified store that lacks part of the \
+                  applied log holds no records whose heads digest is the applied one; \
+                  the Tier-1 runs a writer over one and no receipt is written"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "VaultFirstEnrollment",
+        action = "RefuseGrown",
+        reason = "Buggy=1 liveness negative control only: the rule before 2026-11-15, \
+                  which demanded the applied digest itself of a store that only grows"
+    )
+)]
+pub(super) fn check_legacy_frontier(
+    reads: &Reads<'_>,
+    config: &Config,
+    log: &Log,
+    serving: FrontierFor,
+) -> crate::Result<bool> {
     let state = reads.state()?;
-    if !super::retained_history::durably_bound(reads, config, log.network())?
-        && !legacy_applied_log_available(state, log)
-    {
+    let exact = super::retained_history::durably_bound(reads, config, log.network())?
+        || legacy_applied_log_available(state, log);
+    if !exact && serving == FrontierFor::Reader {
         return Ok(false);
     }
-    if let Some(envelope) = reads.verified_under(config, state)?
-        && let Some(identity) = reads.identity()?
-        && let Stamp::Heads(heads) = envelope_stamp(envelope, identity)?
-        && !super::retained_frontier::covers(log, log.network(), &heads)
-    {
+    let stamp = match applied_stamp(reads, config) {
+        Ok(stamp) => stamp,
+        // The equality rule refused these records before it read the envelope: one that does not
+        // read refuses them still, and fails no writer's take.
+        Err(_) if !exact => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let (envelope, heads) = stamp
+        .as_ref()
+        .map_or(([0; 32], &[][..]), |(digest, heads)| (*digest, heads));
+    // The cheap clause first: a store short of the stamp is refused with nothing hashed.
+    if !super::retained_frontier::covers(log, log.network(), heads) {
+        if !exact && let Some(key) = witness_key(state, log, envelope) {
+            let short = Answer::of(key, log, Witness::Short);
+            remember_witness(short);
+            if serving == FrontierFor::Enrollment {
+                keep_miss(reads.paths(), short);
+            }
+        }
         return Ok(false);
     }
-    Ok(true)
+    Ok(exact || legacy_applied_held(reads.paths(), state, log, heads, envelope, serving))
 }
 
 /// The heads `envelope`'s stamp names ([`STAMP_PREFIX`]), read from the first locker but the
@@ -1032,7 +1616,7 @@ fn everyone_roster(
     .into_roster()
 }
 
-fn log_denial_roster(
+pub(super) fn log_denial_roster(
     log: &Log,
     identity: &Identity,
 ) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
@@ -4933,7 +5517,7 @@ pub(super) fn checked_author_projection_for(
         ));
     }
     if let Some(log) = store.log()
-        && !check_legacy_frontier(&Reads::new(paths), config, log)?
+        && !check_legacy_frontier(&Reads::new(paths), config, log, FrontierFor::Reader)?
     {
         return Err(Error::of_kind(
             crate::ErrorKind::MembershipHistoryUnavailable,

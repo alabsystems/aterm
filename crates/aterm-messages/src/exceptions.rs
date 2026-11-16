@@ -47,8 +47,6 @@ pub enum Family {
     LongHold,
     /// The fleet this Mac cannot read (`fleet.unreadable.<cause>`).
     FleetUnreadable,
-    /// The folders whose direct entry count makes everything that lists them slow.
-    HugeDir,
     /// macOS's own services that hold far more memory than any service needs
     /// (`vitals.service-memory.<service>`).
     ServiceMemory,
@@ -103,7 +101,6 @@ impl Family {
             Self::ApiOutage => "harness.api-outage",
             Self::LongHold => "harness.long-hold",
             Self::FleetUnreadable => "fleet.unreadable",
-            Self::HugeDir => "vitals.huge-dir",
             Self::ServiceMemory => "vitals.service-memory",
             Self::Vitals => "vitals.proc",
             Self::Stranded => "vitals.stranded",
@@ -133,7 +130,6 @@ impl Family {
             | Self::ApiOutage
             | Self::LongHold
             | Self::FleetUnreadable
-            | Self::HugeDir
             | Self::ServiceMemory
             | Self::Vitals
             | Self::Stranded
@@ -157,7 +153,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 25] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -174,7 +170,6 @@ impl Family {
         Self::ApiOutage,
         Self::LongHold,
         Self::FleetUnreadable,
-        Self::HugeDir,
         Self::ServiceMemory,
         Self::Vitals,
         Self::Stranded,
@@ -205,7 +200,6 @@ impl Family {
             Self::Toolchain => tags::TOOLCHAIN,
             Self::Disk
             | Self::FleetUnreadable
-            | Self::HugeDir
             | Self::ServiceMemory
             | Self::Vitals
             | Self::Stranded

@@ -9,7 +9,7 @@
 //! [`fold::fold`] joins them.
 //!
 //! - [`rows`]: the relations' schemas (names, types and words: what `aterm db fleet` prints by
-//!   and a sheet reads) and their row types.
+//!   and a sheet reads) and their row types, in the shared relation types ([`crate::relation`]).
 //! - [`read`]: the offered records. [`read::At`] is a value with its read time and has no
 //!   `Default`, so an unread value is never a zero.
 //! - [`fold`]: the join, its inputs and each input's state (`live`, `held`, `never`, `off`).

@@ -250,7 +250,7 @@ fn speculative_sidecar_waivers() {}
 /// [`speculate_layout`] is built only for tests, and its anchor with it, while
 /// [`seal_layout`] binds the machine's other actions. Without this waiver a
 /// Linux build's registry leaves `Speculate` neither bound nor waived, which
-/// aterm-models' `spec_xref_closure` refuses (obligation 3).
+/// aterm-spec-closure's `spec_xref_closure` refuses (obligation 3).
 #[cfg(all(debug_assertions, not(test), unix, not(target_os = "macos")))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "native_update_speculative_sidecar",

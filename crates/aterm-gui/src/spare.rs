@@ -2926,6 +2926,8 @@ impl Wake {
             Wake::MachineName(..) | Wake::MachineNameNotSet(..) | Wake::MachinePage(..) => None,
             Wake::ProtectedRead { session, .. } => Some(*session),
             Wake::GrokSigninLooked { session } => Some(*session),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Wake::NavigatorTitleReady(_) => None,
             Wake::LeaseChanged { .. }
             | Wake::CrashJournalOwed
             | Wake::HostMaintenance
@@ -2933,6 +2935,7 @@ impl Wake {
             | Wake::Typed { .. }
             | Wake::Driven { .. }
             | Wake::Image(..)
+            | Wake::NativeImage { .. }
             | Wake::Video { .. }
             | Wake::VideoStatus { .. }
             | Wake::VideoStop { .. }

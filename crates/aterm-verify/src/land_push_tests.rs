@@ -125,6 +125,9 @@ fn fetching_main_never_writes_a_symbolic_refs_target_branch() {
     assert_eq!(git(&world.work, &["rev-parse", "origin/main"]), tip);
 }
 
+/// Another writer (a landing in another worktree of this repository) records its observation
+/// while this read runs: the conditional cache update loses, that observation is kept, and the
+/// tip this read took from the remote stands.
 #[test]
 fn fetching_main_cannot_overwrite_an_observation_made_during_its_read() {
     let world = world();
@@ -146,11 +149,55 @@ fn fetching_main_cannot_overwrite_an_observation_made_during_its_read() {
         }
         Ok(out)
     });
+    assert_eq!(
+        fetched.as_deref(),
+        Ok(tip.as_str()),
+        "the read stands though its cache update lost the race"
+    );
+    assert_eq!(
+        git(&world.work, &["rev-parse", "origin/main"]),
+        newer,
+        "the raced cache update must not overwrite {newer} with {tip}"
+    );
+}
+
+/// A cache update that fails while the tracking ref still names what this read saw before it
+/// lost to no other writer: the read fails, and the cache is as it was.
+#[test]
+fn fetching_main_fails_where_its_cache_update_fails_with_the_cache_unmoved() {
+    let world = world();
+    let seen = git(&world.work, &["rev-parse", "origin/main"]);
+    let tip = rival_moves(&world, "b/y.txt", "main at read\n");
+    // Git's own fetch then records no observation: only the update under test writes the cache.
+    git(
+        &world.work,
+        &["config", "--unset-all", "remote.origin.fetch"],
+    );
+    let common = std::path::PathBuf::from(git(&world.work, &["rev-parse", "--git-common-dir"]));
+    let common = if common.is_absolute() {
+        common
+    } else {
+        world.work.join(common)
+    };
+    let lock = common.join("refs/remotes/origin/main.lock");
+    let plumbing = Git {
+        root: &world.work,
+        make: &git_cmd,
+    };
+    let fetched = plumbing.fetch_through(&|tool, args| {
+        let out = crate::remote::run(&world.work, &git_cmd, tool, args, Instant::now() + SLACK)?;
+        if args.iter().any(|arg| arg == "fetch") && out.status.success() {
+            std::fs::create_dir_all(lock.parent().expect("lock dir")).expect("lock dir");
+            std::fs::write(&lock, "").expect("hold the ref's lock");
+        }
+        Ok(out)
+    });
+    std::fs::remove_file(&lock).expect("release the ref's lock");
     assert!(
         fetched.is_err(),
-        "the raced cache update must be refused, not overwrite {newer} with {tip}"
+        "an update that failed with the cache unmoved must fail the read, not report {tip}"
     );
-    assert_eq!(git(&world.work, &["rev-parse", "origin/main"]), newer);
+    assert_eq!(git(&world.work, &["rev-parse", "origin/main"]), seen);
 }
 
 #[test]

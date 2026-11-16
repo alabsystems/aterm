@@ -256,6 +256,38 @@ fn swap_keeping_length_and_mtime(path: &std::path::Path, bytes: &[u8]) {
         .expect("the old mtime");
 }
 
+/// Rewrite `path` with `bytes` of its length and put its modification time back
+/// ([`swap_keeping_length_and_mtime`]), where only its change-journal counter can tell it: its
+/// volume keeps a journal, and the rewrite leaves every other field [`file_id`] reads (length,
+/// volume, file id, modification time) as it was. Where the scratch volume keeps no change
+/// journal (FAT, exFAT, a network share, an NTFS volume whose journal is off) nothing can tell
+/// such a rewrite (ATERM-KI-1115-31416), and the test is COULD NOT RUN.
+#[cfg(windows)]
+fn rewrite_only_the_counter_tells(path: &std::path::Path, bytes: &[u8]) {
+    let journal = std::fs::File::open(path).map(|file| aterm_dirfd::usn(&file));
+    if !matches!(journal, Ok(Ok(Some(_)))) {
+        aterm_uds::host::could_not_run(format!(
+            "the scratch volume of {} keeps no change journal ({journal:?}), so nothing tells a \
+             same-length rewrite whose modification time is put back (ATERM-KI-1115-31416)",
+            path.display()
+        ));
+    }
+    let before = file_id(path);
+    swap_keeping_length_and_mtime(path, bytes);
+    let after = file_id(path);
+    assert_eq!(
+        FileId {
+            journal: None,
+            ..after
+        },
+        FileId {
+            journal: None,
+            ..before
+        },
+        "the rewrite's length, identity and modification time"
+    );
+}
+
 /// A ROW COMES ONLY FROM A VERIFIED RECORD: a record whose manifest a rostered machine signed
 /// and whose installed tree hashes to the signed `tree_root` makes a row, with its agent and its
 /// words; a forged signature, a tree changed after signing, a revoked signer and a readable copy
@@ -825,6 +857,13 @@ fn backdate(path: &std::path::Path) {
 /// holds, and the spawn reads nothing. NEGATIVE CONTROL (2026-11-14): before the glance, a tab
 /// spawn read nothing at all, so a record installed while the window ran changed no shell's
 /// list until a config reload or a claim.
+///
+/// On Windows a link's declaration rewritten with as many bytes and its modification time put
+/// back moves the glance too, by its change-journal counter alone
+/// ([`rewrite_only_the_counter_tells`]). NEGATIVE CONTROL (2026-11-15): with the counter dropped
+/// from [`file_id`]'s Windows read, the glance held. No unix case stands for it here: there the
+/// status change tells it only where the clock stepped since the change before, which a Linux
+/// before 6.13 stamps from the coarse clock (ATERM-KI-1115-47201).
 #[test]
 fn a_spawns_glance_moves_with_what_the_strip_list_is_read_from() {
     let (_dir, layout) = scratch();
@@ -869,12 +908,27 @@ fn a_spawns_glance_moves_with_what_the_strip_list_is_read_from() {
     assert!(!seen.holds(), "a link was made");
     let seen = glance();
     assert!(seen.holds());
+    let declaration = AGY_ALAB.replace(r#""GEMINI_"]"#, r#""GEMINI_", "ZED_"]"#);
     std::fs::write(
         checkout.join(atpkg::harness_record::DECLARATION_FILE),
-        AGY_ALAB.replace(r#""GEMINI_"]"#, r#""GEMINI_", "ZED_"]"#),
+        &declaration,
     )
     .expect("the declaration is edited");
     assert!(!seen.holds(), "a link's declaration moved");
+
+    #[cfg(windows)]
+    {
+        let seen = glance();
+        assert!(seen.holds());
+        rewrite_only_the_counter_tells(
+            &checkout.join(atpkg::harness_record::DECLARATION_FILE),
+            declaration.replace("ZED_", "ZEB_").as_bytes(),
+        );
+        assert!(
+            !seen.holds(),
+            "a link's declaration rewritten, its length and modification time kept"
+        );
+    }
 }
 
 /// THE REGISTRY NAMES EVERY `shell_env_strip` ITEM IT CANNOT READ: an item that is not a string
@@ -1252,6 +1306,13 @@ fn each_harness_declaration_makes_its_row_with_the_agent_the_name_table_reads() 
 /// own, bumped after the read was installed and read by a second call, so a pass that took the
 /// registry and then the generation after another thread's read recorded the newer generation for
 /// the older rows, and every later pass skipped the newer ones.
+///
+/// On Windows a link's declaration rewritten with as many bytes and its modification time put
+/// back makes a new read too, by its change-journal counter alone
+/// ([`rewrite_only_the_counter_tells`]), whose row is the rewritten declaration's. NEGATIVE
+/// CONTROL (2026-11-15): with the counter dropped from [`file_id`]'s Windows read, the read
+/// handed back the registry it held, at its generation. No unix case stands for it, as in
+/// [`a_spawns_glance_moves_with_what_the_strip_list_is_read_from`].
 #[test]
 fn a_read_and_the_generation_it_was_installed_as_are_one_value() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1294,8 +1355,36 @@ fn a_read_and_the_generation_it_was_installed_as_are_one_value() {
         first.entry("quiet-alab").is_none(),
         "the pass that took the first read keeps its rows with its generation"
     );
-    let held = slot.read().expect("the slot");
-    let held = held.as_ref().expect("a read");
-    assert!(Arc::ptr_eq(&held.registry, &moved));
-    assert_eq!(held.generation, next);
+    {
+        let held = slot.read().expect("the slot");
+        let held = held.as_ref().expect("a read");
+        assert!(Arc::ptr_eq(&held.registry, &moved));
+        assert_eq!(held.generation, next);
+    }
+
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            moved.entry("quiet-alab").map(|e| e.name.as_str()),
+            Some("Test")
+        );
+        rewrite_only_the_counter_tells(
+            &checkout.join(atpkg::harness_record::DECLARATION_FILE),
+            declaration
+                .replace("name = \"Test\"", "name = \"Tess\"")
+                .as_bytes(),
+        );
+        let (rewritten, after) = read();
+        assert_eq!(
+            after,
+            next + 1,
+            "a declaration rewritten, its length and modification time kept: a new read"
+        );
+        assert_eq!(
+            rewritten.entry("quiet-alab").map(|e| e.name.as_str()),
+            Some("Tess"),
+            "its row is the rewritten declaration's"
+        );
+        assert_eq!(installed.load(Ordering::SeqCst), 3, "installed once more");
+    }
 }

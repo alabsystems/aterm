@@ -302,10 +302,11 @@ pub(crate) fn grouped(rows: &[WorkerRow]) -> Vec<(String, Vec<&WorkerRow>)> {
             > 1
     };
     let short = |sid: &str| {
-        let short = aterm_messages::presence::short_sid(sid);
+        let short = crate::presence::short_sid(sid);
+        // The shown form is one the minter's known IDs tell apart; a manager here that it
+        // knows not (another aterm process's) may still begin with it.
         let clashes = groups.iter().any(|(other, ..)| {
-            matches!(other, RowGroup::Manager(other) if other != sid
-                && aterm_messages::presence::short_sid(other) == short)
+            matches!(other, RowGroup::Manager(other) if other != sid && other.starts_with(&short))
         });
         if clashes { sid.to_owned() } else { short }
     };

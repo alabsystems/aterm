@@ -243,6 +243,8 @@ pub fn run_of(ctx: &Ctx) -> Result<Option<atpkg::admit_disk::Run>, String> {
 }
 
 /// Project disk work from the same invocation that will execute the prepared cells.
+// Read by [`admit_planned`] (unix) and by `cells_prerequisite_tests`.
+#[cfg(any(unix, test))]
 pub(crate) fn run_planned(
     plan: &crate::RunPlan<'_>,
 ) -> Result<Option<atpkg::admit_disk::Run>, String> {
@@ -328,6 +330,8 @@ pub fn admit(ctx: &Ctx, mode: atpkg::admit_disk::Admit) -> Result<Disk, String> 
 }
 
 /// Admit only the compiler work the bound invocation actually owes.
+// Read only by the live run's unix-only disk claim in `lib.rs`.
+#[cfg(unix)]
 pub(crate) fn admit_planned(
     plan: &crate::RunPlan<'_>,
     mode: atpkg::admit_disk::Admit,
@@ -626,6 +630,9 @@ fn note_used_owning(
             .and_then(|leaf| leaf.path().ok().map(Path::to_path_buf)),
         Dir::Side(dir) => Some(dir.clone()),
     };
+    if let Some(leaf) = leaf.as_deref() {
+        note_second_hashes(ctx, dir, leaf, artifacts);
+    }
     let mut run = ctx
         .shape_run
         .lock()
@@ -658,6 +665,186 @@ fn note_used_owning(
     for out in script_runs {
         used.add(leaf, Path::new(out));
     }
+}
+
+/// What a run's compile calls built under a second hash ([`note_used`]): each unit read once.
+#[derive(Debug, Default)]
+pub struct SecondHashes {
+    /// Each unit already read, by its profile's folder and its hash.
+    read: std::collections::BTreeSet<(PathBuf, String)>,
+    /// Each second hash found, with its profile's folder.
+    found: Vec<(PathBuf, atpkg::build_cache::stale::SecondHash)>,
+}
+
+/// FIND WHAT MINTS THE VARIANTS (DC-03b, `docs/DESIGN-disk-custody-2026-11-12.md` §3.1): for each
+/// unit of the build directory `leaf` the call built (an artifact cargo did not find fresh, in the
+/// layout that keeps one folder per unit, `atpkg::build_cache::stale::folder_unit_of`; for the
+/// main lane, a bin a test needs by the unit its copy in the target came from, as [`note_used`]
+/// reads it) and the run has not read yet, the other unit of its package, kind and source the
+/// profile holds and the first input that moved between them
+/// (`atpkg::build_cache::stale::SecondHashes`, a cross target's profile read with its host
+/// profile, `<leaf>/debug` beside `<leaf>/<triple>/debug`, where its proc-macros and build
+/// scripts lie), kept for the run's end ([`record_second_hashes`]). It reads the fingerprints
+/// and, to follow a dependency, the profiles' hash files; it reads outside the run's lock and
+/// removes nothing.
+fn note_second_hashes(ctx: &Ctx, dir: &Dir, leaf: &Path, artifacts: &[crate::shape::Artifact]) {
+    use atpkg::build_cache::stale;
+    let mut built: std::collections::BTreeSet<(String, String, String)> =
+        std::collections::BTreeSet::new();
+    for artifact in artifacts.iter().filter(|a| !a.fresh) {
+        for file in artifact.filenames.iter().map(Path::new) {
+            if let Some(unit) = stale::folder_unit_of(leaf, file) {
+                built.insert(unit);
+            } else if matches!(dir, Dir::Main)
+                && !file.starts_with(leaf)
+                && let (Some(package), Some(profile)) =
+                    (artifact.package.as_deref(), uplift_profile(ctx, file))
+            {
+                for hash in stale::uplifted_units(leaf, &profile, package, file) {
+                    built.insert((profile.clone(), package.to_owned(), hash));
+                }
+            }
+        }
+    }
+    if built.is_empty() {
+        return;
+    }
+    let unread: Vec<(String, String, String)> = {
+        let mut run = ctx
+            .shape_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        built
+            .into_iter()
+            .filter(|(profile, _, hash)| {
+                run.second_hashes
+                    .read
+                    .insert((leaf.join(profile), hash.clone()))
+            })
+            .collect()
+    };
+    let mut readers: std::collections::BTreeMap<String, stale::SecondHashes<'_>> =
+        std::collections::BTreeMap::new();
+    let mut found = Vec::new();
+    for (profile, package, hash) in unread {
+        let reader = readers.entry(profile.clone()).or_insert_with(|| {
+            // `<triple>/debug`'s host profile is `debug`.
+            let host = leaf.join(profile.rsplit('/').next().unwrap_or(&profile));
+            stale::SecondHashes::new(&stale::Disk, &leaf.join(&profile)).with_host(&host)
+        });
+        if let Some(second) = reader.second_hash(&package, &hash) {
+            found.push((leaf.join(&profile), second));
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    ctx.shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .second_hashes
+        .found
+        .extend(found);
+}
+
+/// RECORD WHAT THE RUN'S COMPILES BUILT UNDER A SECOND HASH ([`note_second_hashes`]): for each,
+/// one `verify-event` (`second-hash`) and one line for the run's log, which this returns; and one
+/// row each in the machine's record at `record` (`aterm_capacity::second_hash::RECORD`, under
+/// this user's aterm state directory), whose count of second hashes by cause
+/// `aterm pkg machine cache second-hashes` prints, with the line that says what it kept. Nothing
+/// where the run built no second hash.
+#[must_use]
+pub fn record_second_hashes(ctx: &Ctx, record: Option<&Path>) -> Vec<String> {
+    let found = std::mem::take(
+        &mut ctx
+            .shape_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .second_hashes
+            .found,
+    );
+    if found.is_empty() {
+        return Vec::new();
+    }
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let mut lines = Vec::new();
+    let mut rows = Vec::new();
+    let mut pairs = std::collections::BTreeSet::new();
+    for (profile, second) in found {
+        // Two units of one kind the run built both of (two variants one compile built at once)
+        // each found the other: one second hash, said once.
+        let pair = if second.hash <= second.other {
+            (second.hash.clone(), second.other.clone())
+        } else {
+            (second.other.clone(), second.hash.clone())
+        };
+        if !pairs.insert((
+            profile.clone(),
+            second.package.clone(),
+            second.kind.clone(),
+            pair,
+        )) {
+            continue;
+        }
+        let moved = &second.moved;
+        lines.push(format!(
+            "disk: second hash: {} ({}) built as {} beside {} in {}: {} of {} moved ({})",
+            second.package,
+            second.kind,
+            second.hash,
+            second.other,
+            profile.display(),
+            moved.input,
+            moved.package,
+            moved.detail
+        ));
+        crate::event_log::emit(
+            ctx.events.as_ref(),
+            &format!(
+                "verify-event: {}",
+                crate::event_log::event_value(
+                    crate::event_log::EventKind::SecondHash,
+                    aterm_json::json!({
+                        "profile": profile.display().to_string(),
+                        "package": second.package.as_str(),
+                        "kind": second.kind.as_str(),
+                        "hash": second.hash.as_str(),
+                        "other": second.other.as_str(),
+                        "cause": moved.package.as_str(),
+                        "input": moved.input.as_str(),
+                        "detail": moved.detail.as_str(),
+                    })
+                )
+            ),
+        );
+        rows.push(aterm_capacity::second_hash::Row {
+            at_ms,
+            package: second.package,
+            kind: second.kind,
+            hash: second.hash,
+            other: second.other,
+            cause: moved.package.clone(),
+            input: moved.input.clone(),
+            detail: moved.detail.clone(),
+        });
+    }
+    if let Some(record) = record {
+        lines.push(
+            match aterm_capacity::second_hash::SecondHashes::keep(record, rows) {
+                Ok(added) => format!(
+                    "disk: {added} new second hash(es) kept in {}",
+                    record.display()
+                ),
+                Err(e) => format!(
+                    "disk: the second hashes were not kept in {} ({e})",
+                    record.display()
+                ),
+            },
+        );
+    }
+    lines
 }
 
 /// The call that completes what the run builds into `dir` passed ([`crate::shape::Noted::closed`]):
@@ -772,12 +959,16 @@ pub type DirId = aterm_dirfd::FileId;
 /// Keep, for each build directory the run's compile calls completed in (its closing call
 /// passed, [`close`], and no call into it failed, [`note_used`]), what they used of it and when
 /// the run began ([`Ctx::began`]) as its scope's run ([`run_key`]) in the record at the
-/// directory's top (`atpkg::build_cache::stale::USED`), which replaces the scope's run before
-/// and retires what the kept runs no longer use: one entry for each directory written or tried,
+/// directory's top (`atpkg::build_cache::stale::USED`), changed under the record's lock
+/// (`atpkg::build_cache::stale::Kept::update`, which a plain build's holder ending there holds
+/// too), which replaces the scope's run before and retires what the kept runs no longer use:
+/// one entry for each directory written or tried,
 /// with the line the run's log says and, where the record was written, the directory it was
 /// written in ([`KeptDir::bound`]). Nothing where the main lane's build directory cannot be
 /// read (an error, or one replaced under the run), and no entry for a directory whose calls did
 /// not complete or reported no unit of it; a run of any check, selection or tier keeps its own.
+/// Where `targo`'s receipts of the run's builds name every unit it used, they are its record
+/// there instead ([`receipts_speak`]).
 #[must_use]
 pub fn keep_used(ctx: &Ctx) -> Vec<KeptDir> {
     let Ok(main) = main_leaf(ctx) else {
@@ -815,11 +1006,16 @@ pub fn keep_used(ctx: &Ctx) -> Vec<KeptDir> {
         if units == 0 {
             continue;
         }
-        let mut kept = atpkg::build_cache::stale::Kept::read(&leaf);
-        let retired = kept.end(&key, used);
+        let receipts = atpkg::build_cache::stale::Receipts::read(&leaf);
+        if receipts.name_all(&used) {
+            out.push(receipts_speak(of, leaf, &receipts, &key, units, began_ms));
+            continue;
+        }
         let record = leaf.join(atpkg::build_cache::stale::USED);
-        let (line, retired, bound) = match kept.keep(&leaf) {
-            Ok(()) => (
+        let ended =
+            atpkg::build_cache::stale::Kept::update(&leaf, |kept| Some(kept.end(&key, used)));
+        let (line, retired, bound) = match ended.map(Option::unwrap_or_default) {
+            Ok(retired) => (
                 format!(
                     "disk: kept the {units} unit(s) this run used in {}, {retired} unit(s) its \
                      kept runs stopped using retired",
@@ -847,6 +1043,55 @@ pub fn keep_used(ctx: &Ctx) -> Vec<KeptDir> {
         });
     }
     out
+}
+
+/// THE RECEIPTS OF THE RUN'S BUILDS SPEAK FOR IT in the build directory `leaf` (DC-12d): `targo`
+/// kept a receipt of each build (`atpkg::build_cache::stale::RECEIPTS`), and those begun since
+/// the run began name every unit its compile calls reported ([`note_used`];
+/// `atpkg::build_cache::stale::Receipts::name_all`), so the record keeps no run of the scope
+/// `key` beside them: it takes the receipts, its scope's run before goes, and what that run and
+/// the receipts the run's builds replaced used that nothing kept names is retired as of when the
+/// run began (`atpkg::build_cache::stale::Kept::take_receipts`, under the record's lock), for
+/// [`trim_used`] to take as it takes any run's. A build directory with no such receipts, or
+/// whose receipts did not all read, keeps the run itself ([`keep_used`]).
+fn receipts_speak(
+    of: Dir,
+    leaf: PathBuf,
+    receipts: &atpkg::build_cache::stale::Receipts,
+    key: &str,
+    units: usize,
+    began_ms: u64,
+) -> KeptDir {
+    let named = format!(
+        "disk: the receipts of this run's builds in {} name the {units} unit(s) it used",
+        leaf.join(atpkg::build_cache::stale::RECEIPTS).display()
+    );
+    let taken = atpkg::build_cache::stale::Kept::update(&leaf, |kept| {
+        kept.take_receipts(receipts, Some((key, began_ms)))
+    });
+    let (line, retired, bound) = match taken {
+        Ok(None) => (format!("{named}; its record needed no change"), 0, None),
+        Ok(Some(retired)) => (
+            format!("{named}; {retired} unit(s) nothing kept names retired"),
+            retired,
+            identity(&leaf),
+        ),
+        Err(e) => (
+            format!(
+                "{named}; they were not taken into {} ({e}); the record before stands",
+                leaf.join(atpkg::build_cache::stale::USED).display()
+            ),
+            0,
+            None,
+        ),
+    };
+    KeptDir {
+        of,
+        dir: leaf,
+        line,
+        retired,
+        bound,
+    }
 }
 
 /// The real directory at `dir`, by its device and inode; `None` where nothing stands there, it

@@ -171,6 +171,7 @@ fn a_park_that_begins_mid_slice_is_noticed_within_one_slice() {
     let lane = crate::park::Lane {
         slice,
         hung_up: there,
+        bell: None,
     };
     let handle = test_handle(0);
     let sub = crate::session_watch::Subscription::single(&handle.ctx.watchers);

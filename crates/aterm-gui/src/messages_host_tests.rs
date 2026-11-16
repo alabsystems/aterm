@@ -1689,6 +1689,7 @@ pub(crate) fn parked() -> crate::PendingUpdateHandoff {
         teardown: crate::DeferredHandoffTeardown::None,
         commit_drain_started: None,
         commit_flush: None,
+        table_flush: None,
         held_commit: None,
         revoked_by_activity: false,
     }
@@ -1743,6 +1744,62 @@ fn restoring_messages_retires_obsolete_join_alerts_before_polling() {
                 .is_some()
         );
     }
+}
+
+/// The standing "The disk is filling" alert, which only the ask to free space raised and ended,
+/// does not outlive the update that brings a build without that ask: the live alert a
+/// predecessor carried is withdrawn as it is seeded, and so is a standing "Disk full" alert
+/// (this build writes that news as a record alone), and its digest entry, which a later process
+/// adopts from the log, at the first settle. NEGATIVE CONTROL (in the test): an unrelated
+/// carried warning stands through the seed, and this build's own low-disk entry through the
+/// settle, so neither step withdraws by family or wholesale.
+#[test]
+fn a_carried_disk_filling_alert_is_withdrawn_at_the_update() {
+    use aterm_messages::exceptions::{Entry, Family};
+    use aterm_messages::need::{Reason, Then, Why};
+    const ALERT: &str = "system.disk.filling";
+    const ENTRY: &str = "disk.filling";
+    fn live(app: &App, key: &str) -> bool {
+        app.messages.live_by_key(key).is_some()
+    }
+    fn standing(app: &App, key: &str) -> bool {
+        app.messages.digest().entries.iter().any(|e| e.key == key)
+    }
+    let mut parent = App::headless_for_test();
+    let full = crate::message_reporters::DISK_FULL_KEY;
+    for key in [ALERT, full, "unrelated.warning"] {
+        parent.post_message(warn("Carried warning").key(key));
+    }
+    assert!(live(&parent, ALERT), "PREMISE: the parent holds it");
+    assert!(live(&parent, full), "PREMISE: the parent holds it");
+    let carry = window_carry(parent.carried_messages());
+    let mut successor = App::headless_for_test();
+    successor.seed_carried_messages(&carry, None);
+    assert!(!live(&successor, ALERT), "withdrawn as it is seeded");
+    assert!(!live(&successor, full), "withdrawn as it is seeded");
+    assert!(live(&successor, "unrelated.warning"), "CONTROL");
+
+    // The entry as an older build filed it, under this build's low-disk words.
+    let older = Entry::new(
+        Family::Disk,
+        "",
+        "filling",
+        "The disk is filling",
+        Why::OnlyYou(Reason::new(
+            "aterm reclaimed what it may in two passes and the home volume is still short",
+        )),
+        Then::step("Free up space on the home volume"),
+    );
+    assert_eq!(older.key(), ENTRY);
+    let low =
+        crate::message_reporters::disk_settings_entry(&["disk.apply is not read".to_string()]);
+    successor.except(&older);
+    successor.except(&low);
+    assert!(standing(&successor, ENTRY), "PREMISE: adopted");
+    assert!(standing(&successor, &low.key()), "PREMISE: raised");
+    successor.settle_access_steps(Instant::now());
+    assert!(!standing(&successor, ENTRY), "withdrawn at the settle");
+    assert!(standing(&successor, &low.key()), "CONTROL");
 }
 
 #[cfg(unix)]

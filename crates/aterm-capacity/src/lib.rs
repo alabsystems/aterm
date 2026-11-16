@@ -148,6 +148,7 @@ pub mod overrun;
 pub mod phase;
 pub mod reading;
 pub mod room;
+pub mod second_hash;
 pub mod telemetry;
 pub mod tree_meter;
 #[cfg(unix)]

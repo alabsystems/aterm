@@ -83,9 +83,10 @@ fn created(id: u64) -> Settled {
     }
 }
 
-/// The document's thirteen keys, sorted.
-const KEYS: [&str; 13] = [
+/// The document's fourteen keys, sorted.
+const KEYS: [&str; 14] = [
     "at_secs",
+    "closable",
     "grant",
     "id",
     "identity",

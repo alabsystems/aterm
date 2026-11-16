@@ -39,9 +39,15 @@ fn interrupted_spool_cleanup_keeps_the_unpublished_record_visible() {
         excluded.load(Ordering::Relaxed),
         "another writer cannot enter during comparison"
     );
-    assert_eq!(spool.pending().unwrap().records, [newer.clone()]);
+    assert_eq!(
+        spool.pending().unwrap().records.as_slice(),
+        std::slice::from_ref(&newer)
+    );
     spool.done(&appended).unwrap();
-    assert_eq!(spool.pending().unwrap().records, [newer.clone()]);
+    assert_eq!(
+        spool.pending().unwrap().records.as_slice(),
+        std::slice::from_ref(&newer)
+    );
     spool.done(&newer).unwrap();
     assert_eq!(spool.pending().unwrap(), Pending::default());
 }
@@ -95,6 +101,16 @@ fn a_spooled_record_stays_until_an_append_holds_it() {
         spool.pending().unwrap().records,
         std::slice::from_ref(&fail)
     );
+
+    let corrupt = Dir::at(tmp.path().join("corrupt-spool"));
+    std::fs::create_dir_all(corrupt.path()).unwrap();
+    let file = corrupt.path().join(file_of(&fail.path).unwrap());
+    std::fs::write(&file, b"not a record").unwrap();
+    assert!(
+        corrupt.put(&fail).is_err(),
+        "presence is not proof of a kept FAIL"
+    );
+    assert_eq!(std::fs::read(file).unwrap(), b"not a record");
 
     let later = signed(Check::Test, Word::Ok, (DAY + 3) * 86_400, "later");
     spool.put(&later).unwrap();

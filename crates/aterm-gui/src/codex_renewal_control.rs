@@ -20,7 +20,10 @@ pub(super) use service::Service;
 #[path = "codex_rotation_control.rs"]
 mod rotation;
 pub(super) use rotation::Preparation as RotationPreparation;
-pub(super) use rotation::{ProcessKey, READ_LAPSES, note_ask, observe_paced};
+pub(super) use rotation::{ProcessKey, note_ask};
+// Read only by the unix-only `codex_exec_handoff_control`.
+#[cfg(unix)]
+pub(super) use rotation::{READ_LAPSES, observe_paced};
 #[path = "codex_login_rotation_control.rs"]
 mod login_rotation;
 pub(super) use login_rotation::{

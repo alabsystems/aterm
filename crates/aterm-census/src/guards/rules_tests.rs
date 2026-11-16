@@ -1046,6 +1046,10 @@ fn a_look_at_the_machine_past_a_derived_door_is_named() {
             "let cwd = aterm_sysprobe::process_cwd(pid);\n",
         ),
         (
+            "the kernel asked beside a path's spelling",
+            "let k = aterm_path::plain(&aterm_sysprobe::process_cwd(pid)?);\n",
+        ),
+        (
             "this process's environment",
             "let p = std::env::var(\"PATH\");\n",
         ),
@@ -1094,7 +1098,31 @@ fn a_look_at_the_machine_past_a_derived_door_is_named() {
     }
 }
 
-/// Derived doors, home functions, and look-alike identifiers are silent.
+/// Pure spelling transforms need no recorded machine observation; a kernel read beside one does.
+#[test]
+fn pure_path_transformations_do_not_read_the_kernel() {
+    let path = "crates/aterm-agent/src/supervise/policy/approval.rs";
+    for pure in [
+        "aterm_path::plain(p)",
+        "aterm_path :: windows_key(p)",
+        "chars.map(aterm_path::fold_case)",
+    ] {
+        assert!(run(&SUPERVISE_FX, &[(path, pure)]).is_empty(), "{pure}");
+        let mixed = format!("{pure}; let cwd = aterm_sysprobe::process_cwd(pid);");
+        assert_eq!(
+            spots(&run(&SUPERVISE_FX, &[(path, &mixed)])),
+            [format!("{path}:1")]
+        );
+    }
+    let lookalike = "aterm_sysprobe::paths_extra::read(p)";
+    assert_eq!(
+        spots(&run(&SUPERVISE_FX, &[(path, lookalike)])),
+        [format!("{path}:1")]
+    );
+}
+
+/// Derived doors, home functions, look-alike identifiers and `aterm_path`'s spelling
+/// rules, which ask nothing of the machine, are silent.
 #[test]
 fn the_derived_doors_and_their_homes_are_silent() {
     let doors = "ctx.shell_cwds = ctx.probe.shell_cwds(w, cwd);\n\
@@ -1111,6 +1139,8 @@ fn the_derived_doors_and_their_homes_are_silent() {
                  zone_offset: limit::zone_offset_at,\n\
                  // std::fs::read_dir(p) in prose\n\
                  let s = \"p.exists()\";\n\
+                 let k = aterm_path::windows_key(Path::new(p))?;\n\
+                 let g: String = glob.chars().map(aterm_path::fold_case).collect();\n\
                  #[cfg(test)]\nmod tests {\n    fn t() { let _ = std::fs::read(p); }\n}\n";
     assert_eq!(
         spots(&run(

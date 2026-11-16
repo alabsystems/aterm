@@ -53,12 +53,15 @@ fn named_self_cpu_names_require_a_whole_valid_bounded_observation() {
     }
 }
 
+/// The epoch's lead is 73 microseconds, not nanoseconds: on Windows std reads two instants less
+/// than the performance counter's resolution apart as one (its `checked_duration_since` answers
+/// zero, not `None`, for a lead under it), so a lead of 73 ns read as no lead there.
 #[test]
 fn named_self_cpu_read_brackets_reject_a_future_epoch_without_fabricating_zero() {
     let epoch = Instant::now();
-    let later = epoch + std::time::Duration::from_nanos(73);
+    let later = epoch + std::time::Duration::from_micros(73);
     assert_eq!(stamp(epoch, epoch), Ok(0));
-    assert_eq!(stamp(epoch, later), Ok(73));
+    assert_eq!(stamp(epoch, later), Ok(73_000));
     assert_eq!(stamp(later, epoch), Err(ReadError::Clock));
 }
 

@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The leftover view's reader (`sys left`, `docs/DESIGN-leftover-processes-2026-10-16.md` §3.1,
-//! §4): which rows of this uid's table are candidates, and each one's kernel facts in the pure
-//! judge's plain types ([`aterm_vitals::left::Facts`]). It writes no kernel read of its own: it
-//! composes this crate's readers ([`crate::process`]'s lineage, identity, markers, thread check,
+//! §4): which rows of this uid's table are candidates, and each one's kernel facts in the plain
+//! observation types ([`aterm_process_facts::left::Facts`]). It writes no kernel read of its own:
+//! it composes this crate's readers ([`crate::process`]'s lineage, identity, markers, thread check,
 //! group listing and path, [`crate::holders`]' listener, terminal and sandbox reads) through one
 //! injected seam ([`LeftKernel`], [`Live`] in the window, [`Inert`] and fakes in tests).
 //!
@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use aterm_vitals::left::{Facts, Held, Lin, Marks, RunTie, Waiting};
+use aterm_process_facts::left::{Facts, Held, Lin, Marks, RunTie, Waiting};
 
 use crate::holders::HolderScan;
 use crate::process::{

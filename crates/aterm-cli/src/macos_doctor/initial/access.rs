@@ -132,8 +132,10 @@ pub(super) fn needs_administrator() -> String {
 }
 
 /// Every grant, read once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Grants {
+    /// Independently read OS, helper, naming, Spotlight and network membership requirements.
+    pub additional: [Option<Observation>; 5],
     pub fda: Fda,
     /// This build's identity survives the next build, so a grant to it lasts.
     pub stable: bool,
@@ -230,6 +232,7 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
             selection,
         ) == Ok(false);
     let mut grants = Grants {
+        additional: additional::read(),
         fda,
         stable: !matches!(privacy.dr, DrClass::Cdhash | DrClass::Unsigned),
         devtools: devtools_listing(),
@@ -274,6 +277,7 @@ impl Grants {
     #[cfg(test)]
     pub(super) const fn fixture() -> Self {
         Self {
+            additional: [None, None, None, None, None],
             fda: Fda::NotConfirmed,
             stable: true,
             devtools: DevTools::NeedsFullDiskAccess,
@@ -292,7 +296,12 @@ impl Grants {
             Access::DeveloperTools => self.devtools == DevTools::Off,
             Access::Debugger => matches!(self.debugger, Debugger::Off | Debugger::OffNotAsked),
             Access::Accessibility => self.accessibility == Some(false),
-            Access::FullDiskAccess => false,
+            Access::FullDiskAccess
+            | Access::LocalNetwork
+            | Access::NameRule
+            | Access::SpotlightScope
+            | Access::NetworkAuth
+            | Access::NetworkHelper => false,
         }
     }
 }
@@ -333,6 +342,9 @@ fn managed(access: Access, selection: Selection) -> bool {
 /// opted out of reads as they chose ([`honor_opt_out`]).
 pub(super) fn observation(access: Access, grants: &Grants, selection: Selection) -> Observation {
     let seen = reading(access, grants, selection);
+    if access.requires_confirmation() && seen.standing == Standing::Unknown {
+        return seen;
+    }
     match opted(grants, access) {
         Some(why) if managed(access, selection) => honor_opt_out(seen, why),
         _ => seen,
@@ -342,6 +354,15 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
 /// [`observation`] before an opt-out is honored: what the grant reads, offered where nobody
 /// asked for it.
 fn reading(access: Access, grants: &Grants, selection: Selection) -> Observation {
+    if let Some(index) = additional::index(access) {
+        let mut seen = grants.additional[index]
+            .clone()
+            .unwrap_or_else(|| Observation::unknown(Subject::Access(access)));
+        if !managed(access, selection) && seen.standing == Standing::NeedsYou {
+            seen.standing = Standing::Differs;
+        }
+        return seen;
+    }
     let managed = managed(access, selection);
     let person = if managed {
         Standing::NeedsYou
@@ -351,6 +372,11 @@ fn reading(access: Access, grants: &Grants, selection: Selection) -> Observation
     let admin = (grants.debugger == Debugger::NeedsAdmin).then(needs_administrator);
     let (standing, now, note, detail): (Standing, Option<&str>, Option<&str>, Option<&str>) =
         match access {
+            Access::LocalNetwork
+            | Access::NameRule
+            | Access::SpotlightScope
+            | Access::NetworkAuth
+            | Access::NetworkHelper => unreachable!("additional requirement handled above"),
             Access::FullDiskAccess => match grants.fda {
                 Fda::On => (Standing::InPlace, Some("On"), None, None),
                 Fda::NotConfirmed if !grants.stable => (
@@ -516,9 +542,10 @@ fn honor_opt_out(seen: Observation, why: &'static str) -> Observation {
 /// mode behind setup's one Mac password while that password comes by itself, developer mode left
 /// to the person once it does not ([`DEBUGGER_NOT_ASKED`]), one the person opted out of while it
 /// reads `Not confirmed`, and one this revision handed to macOS, whose record says what was
-/// attempted and never that the grant is on. One this process cannot read (or reads only with Full Disk
-/// Access), opted out of or not, is [`UNREAD`]. The stage completes on all of these
-/// ([`super::row_ready`]); any other row waits for the window's lane ([`WAITING`]): the pass
+/// attempted and never that the grant is on. A legacy privacy grant this process cannot read
+/// (or reads only with Full Disk Access), opted out of or not, is [`UNREAD`]. The stage completes
+/// on those readings ([`super::row_ready`]). A requirement that needs confirmation stays
+/// [`WAITING`] when unread; any other unfinished row also waits for the window's lane: the pass
 /// parks, never retries it.
 pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -> Vec<Row> {
     let selection = {
@@ -530,6 +557,11 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
         Access::FullDiskAccess,
         Access::DeveloperTools,
         Access::Debugger,
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
     ]
     .into_iter()
     .map(|access| {
@@ -548,6 +580,18 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
         let reading = seen.now.as_deref().unwrap_or("Not read");
         let offered = |why: &str| (OFFERED, format!("{reading}; {why}"));
         let (status, detail) = match seen.standing {
+            // Required setup evidence stays unconfirmed even when an opt-out changes its
+            // presentation. An unread authorization cannot complete the Permissions stage.
+            _ if access.requires_confirmation() && read.standing == Standing::Unknown => (
+                WAITING,
+                format!(
+                    "Not confirmed: {}",
+                    read.note
+                        .as_deref()
+                        .or(read.detail.as_deref())
+                        .unwrap_or("the requirement could not be read")
+                ),
+            ),
             // An opt-out read as the person's wanted value is in place as they chose.
             Standing::InPlace => match opted(grants, access) {
                 Some(why) if seen.wanted != Subject::Access(access).wanted() => {
@@ -588,6 +632,12 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
                     seen.detail.as_deref().unwrap_or("this Mac does not use it")
                 ),
             ),
+            Standing::NeedsYou if access.requires_confirmation() => (
+                WAITING,
+                seen.note
+                    .clone()
+                    .unwrap_or_else(|| "Finish this requirement in System State".into()),
+            ),
             // The list is readable only with Full Disk Access, which nothing here waits on.
             Standing::Waiting if access == Access::DeveloperTools => (
                 UNREAD,
@@ -603,13 +653,16 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
             Standing::Waiting if seen.note.as_deref() == Some(DEBUGGER_BY_ELEVATION) => {
                 offered(DEBUGGER_BY_ELEVATION)
             }
-            // The window takes no step on a grant this Mac does not let aterm read, so waiting
-            // on one would park the run for good.
+            // Legacy privacy grants this Mac does not let aterm read remain on offer. Required
+            // setup evidence was kept waiting above.
             Standing::Unknown => (
                 UNREAD,
                 format!(
                     "could not be read here, so aterm leaves it: {}{}",
-                    seen.detail.as_deref().unwrap_or("macOS did not say"),
+                    seen.note
+                        .as_deref()
+                        .or(seen.detail.as_deref())
+                        .unwrap_or("macOS did not say"),
                     step.map(|step| format!("; {step}")).unwrap_or_default()
                 ),
             ),
@@ -661,3 +714,5 @@ pub(super) fn stage(revision: u64) -> Vec<Row> {
 #[cfg(test)]
 #[path = "access_tests.rs"]
 mod tests;
+
+mod additional;

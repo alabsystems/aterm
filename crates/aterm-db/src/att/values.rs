@@ -4,9 +4,9 @@
 //! Every value one cell held, and what one write replaced and had not seen
 //! (docs/DESIGN-tables-app-2026-11-14.md §4 item 4, tracker LT-34).
 //!
-//! Both reads are one store read, one projection ([`View::read`], for what stands now and for
-//! the quota) and one pass over the log's eligible records in history order, looking only at the
-//! changes to the cells asked for.
+//! Both reads are one store read, one projection ([`View::of`] what `Resolved::read` resolves:
+//! what stands now, the quota, and the records a roll archived) and one pass over the log's
+//! eligible records in history order, looking only at the changes to the cells asked for.
 //!
 //! **A cell** is a typed cell's stored key, or an owned or log collection's row key, whose value
 //! is the whole row. A write is listed only where a reader keeps it: every write to a typed
@@ -73,7 +73,7 @@
 //! it). An archived row is in no unseen list: it is its key's own Mac's write of an earlier
 //! generation, which that Mac's later writes followed.
 
-use super::{Handle, Inert, View, decode};
+use super::{Handle, Inert, Resolved, View, decode};
 use crate::{
     Error, Result,
     alab::{self, registry},
@@ -217,7 +217,8 @@ impl Handle {
         super::reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
                 let log = Log::read_with(session, store, scope, decode)?;
-                let view = View::read(table, session, &log);
+                let resolved = Resolved::read(table, session, &log)?;
+                let view = View::of(table, &log, &resolved);
                 let resolve = owned::commons::historical(session);
                 read(&Reader {
                     table,
@@ -225,7 +226,7 @@ impl Handle {
                     carried: alab::history::carried(&view, &resolve, None),
                     view: &view,
                     resolve: &resolve,
-                    archive: &|| super::archived_records(table, session, &within(&view)),
+                    archive: &|| super::archived_records(&resolved, &within(&view)),
                     archived: OnceCell::new(),
                 })
             })
@@ -262,8 +263,8 @@ struct Reader<'a> {
     view: &'a View,
     resolve: &'a dyn Fn(&Digest, &Actor) -> Option<[u8; 16]>,
     carried: alab::history::Carried,
-    /// Reads the records a roll archived, each with the operation of this log that archived it
-    /// (`super::archived_records` over [`within`]).
+    /// The records a roll archived, each with the operation of this log that archived it
+    /// (`super::archived_records` of the view's resolution over [`within`]).
     archive: &'a dyn Fn() -> Vec<(Digest, owned::Op)>,
     /// What `archive` read, once an owned key asks for it.
     archived: OnceCell<Vec<(Digest, owned::Op)>>,

@@ -365,13 +365,13 @@ fn the_tables_rule_relates_every_spelling_of_a_directory() {
         "the unix rule: a false not-under"
     );
     assert_eq!(
-        crate::paths::windows_under(Path::new(r"C:\alias\x"), Path::new(r"C:\mnt\data")),
+        aterm_path::windows_under(Path::new(r"C:\alias\x"), Path::new(r"C:\mnt\data")),
         Some(false),
         "the table-less key cannot see a volume's second mount point"
     );
     assert_eq!(under(r"C:\alias\x", r"C:\mnt\data"), Some(true));
     assert_eq!(
-        crate::paths::windows_under(Path::new(r"S:\proj"), Path::new(r"C:\work")),
+        aterm_path::windows_under(Path::new(r"S:\proj"), Path::new(r"C:\work")),
         None
     );
 }
@@ -663,7 +663,7 @@ fn the_home_volume_reads_through_any_spelling() {
     assert_eq!(r.files_free, None);
     assert!(matches!(r.key, VolumeKey::Volume(_)), "{r:?}");
     assert!(t.points().contains(&r.mount), "{r:?}");
-    let plain = crate::paths::plain(&canonical).into_owned();
+    let plain = aterm_path::plain(&canonical).into_owned();
     let lower = PathBuf::from(plain.to_string_lossy().to_lowercase());
     for spelling in [plain, lower] {
         let again = read_path(&spelling, &t).expect("the same volume");
@@ -781,6 +781,55 @@ fn a_junction_answers_as_itself_unless_followed() {
     );
 }
 
+/// A DIRECTORY'S CASE SENSITIVITY IS READ AS WINDOWS KEEPS IT ([`crate::case_sensitive_dir`]): a
+/// new directory reads off, and two of its names that differ only by case are one entry; once
+/// turned on it reads on, and the same two names are two entries, each holding its own content;
+/// a directory made below it afterwards reads on too (it takes the flag at its making, MEASURED
+/// 2026-11-15 with `fsutil file queryCaseSensitiveInfo` on Windows 11 x64), and the volume's root
+/// reads off. CONTROL: a path that is not there is no reading, and turned off again (once the two
+/// names are one) it reads off.
+#[cfg(windows)]
+#[test]
+fn a_directory_s_case_sensitivity_is_read_as_windows_keeps_it() {
+    let dir = scratch();
+    let root = std::fs::canonicalize(dir.path()).expect("canonical scratch");
+    let folded = root.join("folded");
+    std::fs::create_dir(&folded).expect("the folded directory");
+    assert!(!crate::case_sensitive_dir(&folded).expect("a reading"));
+    std::fs::write(folded.join("name"), "lower").expect("the lower name");
+    std::fs::write(folded.join("NAME"), "upper").expect("the upper name is the same entry");
+    assert_eq!(
+        std::fs::read_dir(&folded).expect("the listing").count(),
+        1,
+        "a folded directory holds one of the two names"
+    );
+    let exact = root.join("exact");
+    std::fs::create_dir(&exact).expect("the exact directory");
+    crate::set_case_sensitive_dir(&exact, true).expect("its case sensitivity turned on");
+    assert!(crate::case_sensitive_dir(&exact).expect("a reading"));
+    std::fs::write(exact.join("name"), "lower").expect("the lower name");
+    std::fs::write(exact.join("NAME"), "upper").expect("the upper name");
+    assert_eq!(
+        std::fs::read_to_string(exact.join("name")).expect("the lower name"),
+        "lower"
+    );
+    assert_eq!(
+        std::fs::read_to_string(exact.join("NAME")).expect("the upper name"),
+        "upper",
+        "an exact directory holds both names"
+    );
+    let below = exact.join("below");
+    std::fs::create_dir(&below).expect("a directory below");
+    assert!(crate::case_sensitive_dir(&below).expect("a reading"));
+    std::fs::remove_dir(&below).expect("the directory below goes");
+    let volume = root.ancestors().last().expect("the volume's root");
+    assert!(!crate::case_sensitive_dir(volume).expect("the volume root's reading"));
+    assert!(crate::case_sensitive_dir(&root.join("not-there")).is_err());
+    std::fs::remove_file(exact.join("NAME")).expect("one name left");
+    crate::set_case_sensitive_dir(&exact, false).expect("turned off again");
+    assert!(!crate::case_sensitive_dir(&exact).expect("a reading"));
+}
+
 /// A real folder with a long name, read through its 8.3 short spelling, is spelled long.
 #[cfg(windows)]
 #[test]
@@ -798,7 +847,7 @@ fn a_short_spelling_of_a_real_folder_is_spelled_long() {
         )
     });
     assert!(
-        crate::paths::short_spelled(&short).is_some(),
+        aterm_path::short_spelled(&short).is_some(),
         "{short:?} is short-spelled"
     );
     assert_eq!(
@@ -829,7 +878,7 @@ fn a_short_spelling_of_a_real_folder_is_spelled_long() {
     crate::win_paths::make_junction(&link, &target).expect("the junction");
     let inside = crate::short_spelling(&link.join("sub")).expect("its short spelling");
     assert!(
-        crate::paths::short_spelled(&inside).is_some(),
+        aterm_path::short_spelled(&inside).is_some(),
         "{inside:?} is short-spelled"
     );
     let inside_long = t.long_spelling(&inside);

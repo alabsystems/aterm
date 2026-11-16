@@ -3668,8 +3668,8 @@ impl Needs {
 /// last read that parked nothing, whatever word or prose each asks for
 /// ([`go_ahead::Park::token`] words the answer only): an agent that alternates its token, or its
 /// need and its prose, is one park (2026-10-30 review 9). A reply that parks no more and a new
-/// key of the person's ([`TurnEndState::person_keyed`]) reset it; a host's act (`disk-free@v1`,
-/// an upgrade's tell) does not, nor does the work the agent ran between its parks or a sleep of
+/// key of the person's ([`TurnEndState::person_keyed`]) reset it; a host's act (an upgrade's
+/// tell) does not, nor does the work the agent ran between its parks or a sleep of
 /// the Mac (each starts only the span again), nor a room the answer told it to wait for: the
 /// answer says to drop the line now, and an agent that waits for room as told drops it and parks
 /// nothing.

@@ -388,6 +388,55 @@ pub(crate) struct PostPass<'a> {
     pub(crate) uniform_slot: usize,
 }
 
+/// A resident chrome card, rasterized through Tray in the frame's format, then Blit.
+pub(crate) struct DockPass<'a> {
+    pub(crate) stage: Option<(&'a SealedTexture, TrayPass<'a>)>,
+    pub(crate) blit: PostPass<'a>,
+    pub(crate) rect: [u32; 4],
+}
+
+/// Encode the same second-source pipeline for window presents and the GPU/CPU twin.
+pub(crate) fn encode_dock_stage(
+    cb: &mut CommandBuffer<'_>,
+    dock: &DockPass<'_>,
+) -> Result<(), String> {
+    if let Some((target, tray)) = &dock.stage {
+        let pass = cb.render_pass(&RenderPassDesc {
+            target,
+            load: LoadAction::Clear(ClearColor {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            }),
+            store: StoreAction::Store,
+            viewport: None,
+            scissor: None,
+        })?;
+        pass.set_pipeline(tray.pso);
+        pass.set_fragment_texture(tray.card_tex, tray.tex_slot);
+        pass.set_fragment_sampler(tray.sampler, tray.sampler_slot);
+        pass.set_vertex_buffer(tray.uniform, tray.uniform_slot)?;
+        pass.draw_strip_quad()?;
+    }
+    Ok(())
+}
+
+/// Draw the resident dock in the destination's already open blit pass.
+pub(crate) fn draw_dock(pass: &PassEncoder<'_, '_>, dock: &DockPass<'_>) -> Result<(), String> {
+    let [x0, y0, x1, y1] = dock.rect;
+    if x1 > x0 && y1 > y0 {
+        pass.set_scissor(MtlScissorRect {
+            x: x0 as usize,
+            y: y0 as usize,
+            width: (x1 - x0) as usize,
+            height: (y1 - y0) as usize,
+        });
+        draw_post(pass, &dock.blit)?;
+    }
+    Ok(())
+}
+
 /// Half-resolution bloom extract and fullscreen composite passes.
 pub(crate) struct BloomPasses<'a> {
     /// Half-res target, cleared transparent, drawn with row 4 `GlowAdd`.
@@ -503,6 +552,7 @@ pub(crate) struct PresentSequence<'a> {
     /// The letterbox blit (row 16) onto the drawable: POST_FS binds; the
     /// clear is the live terminal background.
     pub(crate) blit: PostPass<'a>,
+    pub(crate) dock: Option<DockPass<'a>>,
     pub(crate) clear: ClearColor,
     pub(crate) crown: Option<CrownPass<'a>>,
 }
@@ -733,6 +783,10 @@ pub(crate) fn encode_present_sequence(
         pass.draw_strip_quad()?;
     }
 
+    if let Some(dock) = &seq.dock {
+        encode_dock_stage(cb, dock)?;
+    }
+
     {
         let pass = cb.render_pass(&RenderPassDesc {
             target: dest,
@@ -765,6 +819,9 @@ pub(crate) fn encode_present_sequence(
             pass.set_fragment_buffer(crown.uniform, crown.fragment_uniform_slot);
             pass.set_instance_stream(crown.stream);
             pass.draw_instanced(PrimitiveType::Triangle, 6, crown.count)?;
+        }
+        if let Some(dock) = &seq.dock {
+            draw_dock(&pass, dock)?;
         }
     }
     Ok(())

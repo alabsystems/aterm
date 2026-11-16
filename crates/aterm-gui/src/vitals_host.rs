@@ -43,9 +43,13 @@ mod ownership;
 #[path = "vitals_self_cpu.rs"]
 mod self_cpu;
 
-/// A reading a second while a focused window shows the Deck.
+/// A reading a second while a focused window shows the Deck and neither rests nor has gone
+/// unattended, and while aterm has a focused window and a Tab Control or Allocation page on
+/// screen ([`Audience::Shown`]; an open stats lens reads on its own cadence either way).
 pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
-/// One every five seconds while aterm is in the background.
+/// One every five seconds while the bars are in view and aterm is in the background, or its
+/// focused window rests or nobody has touched it for [`crate::window_rest::ATTENTION`], with no
+/// such page on screen ([`Audience::Background`]).
 pub(crate) const BACKGROUND_PERIOD: Duration = Duration::from_secs(5);
 /// The machine counters every ten seconds while every window that draws the bars is hidden.
 pub(crate) const HIDDEN_PERIOD: Duration = Duration::from_secs(10);
@@ -74,9 +78,11 @@ const WEEKS_MAX_BYTES: u64 = 128 * 1024;
 /// and this file nothing there. A new schema names a new [`WEEKS_FILE`].
 const WEEKS_SCHEMA: u32 = 1;
 /// How often the probe thread reads the disk journal's tail again once it changed, while a window
-/// holds a Disk lens open.
+/// holds a Disk lens open or a window in view draws the bars (the Disk Custody band shows the
+/// newest deed beside the freed-today figure, which is live): one read of a file whose length or
+/// time moved.
 const DEEDS_EVERY: Duration = Duration::from_secs(10);
-/// How often it does while none does: the list is in the Snapshot when a lens opens.
+/// How often it does while neither: the list is in the Snapshot when a lens opens.
 const DEEDS_IDLE_EVERY: Duration = Duration::from_secs(300);
 /// The most deeds the Disk lens is handed ([`DiskFacts::deeds`]).
 const DEEDS_KEPT: usize = 8;
@@ -3986,7 +3992,7 @@ impl Reader {
         let room = aterm_sysprobe::task_tables(self.uid.unwrap_or(0)).with_pids(pids.0, pids.1);
         let capacity = aterm_sysprobe::capacity();
         self.journal.refresh(
-            req.lenses.contains(&aterm_vitals::Resource::Disk),
+            req.deck || req.lenses.contains(&aterm_vitals::Resource::Disk),
             req.machine_only,
             Instant::now(),
             at_unix_ms,
@@ -3999,6 +4005,7 @@ impl Reader {
         );
         let mut disk = disk_facts(shelf, key.as_ref(), Clock::read, &self.survey, &self.home);
         (disk.deeds, disk.removals) = self.journal.facts(&req.session_ids, &req.tabs, at_unix_ms);
+        disk.journal_read = self.journal.read;
         disk.held = self.holdings.rows();
         disk.held_age_s = self.holdings.age_s(Instant::now());
         let mut sample = Sample {
@@ -4517,9 +4524,10 @@ fn local_volume(
 }
 
 /// The Disk row's facts for the home volume `home_key`: the watch's level, lines and passes
-/// with the survey's folders ([`deck_disk`]), and the cap DC-04's budget holds the volume to
-/// where the watch sized one ([`DiskFacts::cap`]). With the harness off (no watch) it reads no
-/// clock and no board fact, and the facts are the default.
+/// with the survey's folders ([`deck_disk`]), and DC-04's budget as the watch last sized it
+/// ([`DiskFacts::budget`]: its cap, and how far the rebuildable bytes are from its target, which
+/// the Disk Custody band says). With the harness off (no watch) it reads no clock and no board
+/// fact, and the facts are the default.
 fn disk_facts(
     shelf: &Shelf,
     home_key: Option<&VolumeKey>,
@@ -4527,29 +4535,30 @@ fn disk_facts(
     survey: &Where,
     home: &Path,
 ) -> DiskFacts {
-    let (raw, cap) = match home_key {
+    let (raw, budget, (cleanup, budget_unmet_unix)) = match home_key {
         Some(key) if shelf.watched() => {
             let clock = now();
             // The level and the budget are one board state: one guard reads both, and it is
             // held across no other lock.
-            let (raw, budget) = {
-                let board = shelf.board_lock();
-                (
-                    board.deck_facts(key, &clock),
-                    board.budget_read(Some(key), clock.unix),
-                )
-            };
-            let cap = match budget {
-                aterm_vitals::sys::BudgetRead::Sized(sized) => Some(sized.cap),
-                _ => None,
-            };
-            (raw, cap)
+            let board = shelf.board_lock();
+            let budget = board.budget_read(Some(key), clock.unix);
+            (
+                board.deck_facts(key, &clock),
+                budget,
+                board.budget_pass(Some(key), budget, clock.unix),
+            )
         }
-        _ => (DiskFactsRaw::default(), None),
+        _ => (
+            DiskFactsRaw::default(),
+            aterm_vitals::sys::BudgetRead::NotSampled,
+            (None, None),
+        ),
     };
     let (found, sizing) = survey.read();
     DiskFacts {
-        cap,
+        budget,
+        cleanup,
+        budget_unmet_unix,
         ..deck_disk(raw, found, sizing, home)
     }
 }
@@ -4602,7 +4611,10 @@ fn deck_disk(
         removals: Vec::new(),
         held: None,
         held_age_s: None,
-        cap: None,
+        budget: aterm_vitals::sys::BudgetRead::NotSampled,
+        journal_read: false,
+        cleanup: None,
+        budget_unmet_unix: None,
     }
 }
 
@@ -5396,12 +5408,12 @@ struct DeedRead {
 
 /// How [`deeds_of`] reads a row of `kind` with `action`, as its writer in `aterm_agent::harness`
 /// wrote it. A removal is a `removed` row, a build cache's sweep, a worktree step's or a
-/// `disk-free` row that removed (or failed part-way with bytes gone, the rows
-/// `aterm_agent::harness::disk_free::removed_by` counts), and a released reserve; a `stopped`
-/// row's released bytes repeat its pass's own `removed` rows, and a `free-ask` row's rise in free
-/// space is no removal by the software. A `poke` row's session is the one that ran short of
-/// space, and a `free-ask` row's the one its step concerns (the one asked, chosen or that freed
-/// space), so each row's subject is its session, else aterm.
+/// `disk-free` row that removed (or failed part-way with bytes gone), and a released reserve; a
+/// `stopped` row's released bytes repeat its pass's own `removed` rows, and a `free-ask` row's
+/// rise in free space is no removal by the software (no build writes that row now; a ledger keeps
+/// an earlier build's until its own bound drops them). A `poke` row's session is the one that
+/// ran short of space, and a `free-ask` row's the one its step concerned (the one asked, chosen
+/// or that freed space), so each row's subject is its session, else aterm.
 fn deed_read(kind: &str, action: Option<&str>, row: &aterm_json::Value) -> DeedRead {
     let num = |key: &str| row.get(key).and_then(aterm_json::Value::as_u64);
     let word = |key: &str| row.get(key).and_then(aterm_json::Value::as_str);
@@ -5556,6 +5568,9 @@ struct DeedTail {
     seen: Option<(u64, Option<SystemTime>)>,
     /// The last tail-read attempt, successful or not: retries use the same cadence.
     read_at: Option<Instant>,
+    /// Whether the journal was read, or found missing: until then its empty list is not an
+    /// empty journal ([`DiskFacts::journal_read`]).
+    read: bool,
     rows: Vec<(String, DiskDeed)>,
     removals: Vec<(i64, u64)>,
 }
@@ -5566,13 +5581,15 @@ impl DeedTail {
             path,
             seen: None,
             read_at: None,
+            read: false,
             rows: Vec::new(),
             removals: Vec::new(),
         }
     }
 
     /// Reads the journal's tail again at `now` (`now_unix_ms` on the wall clock) if it is due:
-    /// `open` while a window holds a Disk lens open, `hidden` while every window is.
+    /// `open` while a window holds a Disk lens open or draws the bars, `hidden` while every
+    /// window is hidden.
     fn refresh(&mut self, open: bool, hidden: bool, now: Instant, now_unix_ms: i64) {
         self.refresh_with(
             open,
@@ -5606,6 +5623,7 @@ impl DeedTail {
             Ok(mark) => mark,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.seen = None;
+                self.read = true;
                 self.rows.clear();
                 self.removals.clear();
                 return;
@@ -5625,6 +5643,7 @@ impl DeedTail {
             return;
         };
         self.seen = seen;
+        self.read = true;
         (self.rows, self.removals) = deeds_of(&text, now_unix_ms);
     }
 
@@ -5720,20 +5739,22 @@ impl crate::App {
         let in_view = page
             || self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
-        // The rest slows the one shared stream only while no page reads it
-        // ([`crate::window_rest`]): a resting window reads as one in the background unless a page
-        // on screen reads the stream, which keeps the cadence a focused window gives it.
+        // The rest and the lapse of a person's attention slow the one shared stream only while no
+        // page reads it ([`crate::window_rest`]): a focused window that rests, or that nobody
+        // has touched within its attention, reads as one in the background unless a page on
+        // screen reads the stream, which keeps the cadence a focused window gives it. An open
+        // stats lens keeps its own cadence either way ([`Audience::cadence`]).
         let focused = self
             .windows
             .values()
-            .any(|ws| ws.focused && (page || !ws.rest.resting()));
+            .any(|ws| ws.focused && (page || (!ws.rest.resting() && ws.rest.attended())));
         Audience::of(in_view, bars && drawing().next().is_some(), focused)
     }
 
-    /// A window woke from rest at `now`: while a window shows the bars, the next reading is due
-    /// at once, or at the focused cadence's next half-slot after the last one asked if that is
-    /// later ([`due_on_phase`]), so the deck is live again from the next reading rather than the
-    /// background cadence's next.
+    /// A window woke from rest at `now`, or a person touched it after its attention lapsed:
+    /// while a window shows the bars, the next reading is due at once, or at the focused
+    /// cadence's next half-slot after the last one asked if that is later ([`due_on_phase`]), so
+    /// the deck is live again from the next reading rather than the background cadence's next.
     pub(crate) fn vitals_ask_now(&mut self, now: Instant) {
         if !self.vitals.windowed {
             return;
@@ -6157,7 +6178,6 @@ impl crate::App {
         self.redraw_stats_decks();
         // The frame this asks for draws the band as the last poll adopted it.
         self.network_ride.drawn();
-        self.push_chip_loads();
         if self.tabs_page_shown() {
             self.publish_native_harness_state();
         }
@@ -6382,44 +6402,6 @@ impl crate::App {
             Instant::now(),
             aterm_time::unix_millis().and_then(|ms| i64::try_from(ms).ok()),
         );
-    }
-
-    /// One tab's load step for its chip's meter: all its panes'.
-    pub(crate) fn chip_load(&self, tab_count: usize, tab: &crate::tab_model::Tab) -> u8 {
-        if tab_count < 2 || !self.stats_bars_form().shown() {
-            return 0;
-        }
-        let Some(snap) = self.vitals.snapshot.as_deref() else {
-            return 0;
-        };
-        let capacity = snap.total_cores().unwrap_or(0) as f32;
-        snap.tab_of(&self.tab_sessions(tab)).map_or(0, |tab| {
-            crate::tab_bar::chip_load_step(tab.scope.cores.level, capacity)
-        })
-    }
-
-    /// Hands each native strip its chips' load steps and the meters' inks after a reading.
-    pub(crate) fn push_chip_loads(&self) {
-        if self._toolbars.is_empty() {
-            return;
-        }
-        let band = crate::chrome_band::band_colors(
-            self.chrome_palette(crate::app_render::ChromeSurface::Header),
-        );
-        let inks = crate::stats_deck::cached_inks(band.bar_bg, band.value, band.accent);
-        for (wid, handle) in &self._toolbars {
-            let Some(ws) = self.windows.get(wid) else {
-                continue;
-            };
-            let n = ws.tab_set.shown_len();
-            let loads: Vec<u8> = ws
-                .tab_set
-                .shown()
-                .iter()
-                .map(|tab| self.chip_load(n, tab))
-                .collect();
-            crate::toolbar::set_chip_loads(handle, &loads, [inks.tab, inks.aterm]);
-        }
     }
 
     /// Asks a frame of each window that draws the stats bars on screen for the reading just
@@ -6749,7 +6731,7 @@ impl crate::App {
     }
 }
 
-// Its one caller, `stats_live_tests::a_resting_window_draws_the_deck_still`, is unix-only.
+// Every test that calls it is unix-only.
 #[cfg(all(test, unix))]
 impl VitalsHost {
     /// A test's stand-in for the reader thread: the host asks it its readings, so the deck has
@@ -6775,3 +6757,7 @@ mod split_tests;
 #[cfg(test)]
 #[path = "vitals_host_lanes_tests.rs"]
 mod lanes_tests;
+
+#[cfg(all(test, unix))]
+#[path = "vitals_host_attended_tests.rs"]
+mod attended_tests;

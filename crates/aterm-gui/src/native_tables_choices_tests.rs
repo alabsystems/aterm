@@ -13,8 +13,14 @@ use super::*;
 #[test]
 fn a_typed_word_marks_itself_before_a_longer_word_it_starts() {
     let mut choice = Choice {
-        words: vec!["release-candidate", "release", "spare"],
+        words: ["release-candidate", "release", "spare"]
+            .map(String::from)
+            .to_vec(),
+        said: ["release-candidate", "release", "spare"]
+            .map(String::from)
+            .to_vec(),
         many: false,
+        whole: false,
         at: None,
         wrote: String::new(),
     };

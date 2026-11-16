@@ -803,10 +803,11 @@ fn gather(
         {
             sids.push((session, h.sid.as_str().to_owned()));
         }
-        let caller_key = q.caller.as_deref().and_then(|c| {
-            g.by_sid(&aterm_session::SessionId::new(c))
-                .map(|h| h.local_id)
-        });
+        let caller_key = q
+            .caller
+            .as_deref()
+            .and_then(aterm_session::SessionId::parse)
+            .and_then(|c| g.by_sid(&c).map(|h| h.local_id));
         (sids, terms, caller_key)
     };
     let sid_of = |k: u64| {
@@ -985,6 +986,10 @@ pub(crate) struct Passes {
     /// A verify run's end trims a build directory of aterm's build cache where a run kept its
     /// record of the units it used (macOS, where that cache lies; no setting turns it off).
     pub(crate) run_end: bool,
+    /// The pressure pass's outside-cache step runs (the tier pass on and
+    /// `disk.idle_build_days` at least 1; not on Windows, whose walker dates nothing), taking a
+    /// cache folder unwritten for this many days.
+    pub(crate) outside_days: Option<u64>,
 }
 
 impl Passes {
@@ -1006,6 +1011,9 @@ impl Passes {
             low_disk: on,
             daily_days: (mac && on && config.dead_build_dirs).then_some(days),
             run_end: mac,
+            outside_days: u64::try_from(config.idle_build_days)
+                .ok()
+                .filter(|&d| on && d >= 1 && !cfg!(windows)),
         }
     }
 }
@@ -1020,6 +1028,9 @@ struct Nexts {
     /// A build mirror whose session is at work, in whose build directory a verify run kept its
     /// record: that run's end, else as `cached`.
     at_end: disk_held::Next,
+    /// The cache folders outside aterm's (`~/.cache`, `~/Library/Caches`): the pressure pass's
+    /// outside-cache step, else nothing where cleanup is off or the step does not run.
+    outside: disk_held::Next,
 }
 
 impl Nexts {
@@ -1039,10 +1050,16 @@ impl Nexts {
         } else {
             cached
         };
+        let outside = match passes.outside_days {
+            Some(idle_days) => Next::OutsideCaches { idle_days },
+            None if passes.low_disk => Next::Nothing,
+            None => Next::CleanupOff,
+        };
         Self {
             low,
             cached,
             at_end,
+            outside,
         }
     }
 
@@ -1311,10 +1328,11 @@ struct HeldPart {
 
 /// The parts of the shown root rows ([`HeldPart`]): each project's `target` (the tier pass's);
 /// aterm's build cache (the daily pass's), the root it moved from and its tooling cache (each
-/// entry the daily pass's once unused, the tooling costly to fetch again); and each build
-/// mirror in the build cache that a build-start line names, marked by the sessions its own
-/// lines name ([`Nexts::mirror`]). Each once, held by the deepest shown row that holds it, and
-/// none that is a shown row itself.
+/// entry the daily pass's once unused, the tooling costly to fetch again); the cache roots
+/// outside aterm's that the pressure pass's outside-cache step reaches (`~/.cache`,
+/// `~/Library/Caches`); and each build mirror in the build cache that a build-start line names,
+/// marked by the sessions its own lines name ([`Nexts::mirror`]). Each once, held by the
+/// deepest shown row that holds it, and none that is a shown row itself.
 fn parts_of(
     board: &crate::diskwalk_host::Published,
     shown: &[&crate::diskwalk_host::RootRow],
@@ -1367,6 +1385,21 @@ fn parts_of(
         for (path, worktree, class, next) in caches {
             let by = HeldBy::of_path(board, facts.live, &path);
             found.push(part(path, "aterm".to_owned(), worktree, class, next, by));
+        }
+        // The cache roots the pressure pass's outside-cache step reaches; aterm's own caches in
+        // them are parts of their own, nearer.
+        for (rel, _) in aterm_agent::harness::disk::free::PASS_ROOTS {
+            let path = home.join(rel);
+            let by = HeldBy::of_path(board, facts.live, &path);
+            let project = project_of(&path);
+            found.push(part(
+                path,
+                project,
+                Worktree::Caches,
+                Class::Rebuildable,
+                nexts.outside,
+                by,
+            ));
         }
         let root = cache_root(home);
         let mut named: Vec<(PathBuf, Vec<String>)> = Vec::new();
@@ -2313,7 +2346,7 @@ pub(crate) fn cmd_sys(
     let held = with_services(
         &q,
         held,
-        aterm_uds::services::read,
+        || aterm_uds::services::read(aterm_vitals::services::followed_from),
         crate::services_watch::filed(),
     );
     let (panes, machine) = SYS.facts();
@@ -2351,7 +2384,7 @@ fn split_read(snap: &Snapshot) -> bool {
 fn with_services(
     q: &SysQuery,
     held: Option<Held>,
-    read: impl FnOnce() -> Option<aterm_vitals::services::Reading>,
+    read: impl FnOnce() -> Option<aterm_process_facts::services::Reading>,
     filed: Vec<String>,
 ) -> Option<Held> {
     let mut held = held?;

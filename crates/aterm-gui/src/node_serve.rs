@@ -1473,9 +1473,7 @@ fn parse_sid_list(list: &str) -> Option<Vec<SessionId>> {
     if list == "-" {
         return Some(Vec::new());
     }
-    list.split(',')
-        .map(|sid| relay_names(sid).then(|| SessionId::new(sid)))
-        .collect()
+    list.split(',').map(SessionId::parse).collect()
 }
 
 /// Whether `sid` is a session id a relay line carries: a session ID this Mac's tabs hold
@@ -3491,6 +3489,9 @@ fn mind_node_checker(
 impl NodeUpdater for LiveNodeUpdater {
     fn start_checker(&self, noticed: Box<dyn Fn() + Send>) {
         crate::network_moved::observe_for_updater();
+        // The job's sleeps end the check's wait; a LaunchAgent is never stopped by job control,
+        // so its listener always acknowledges a will-sleep.
+        let _ = aterm_update::hear_wakes();
         aterm_update::spawn_background_check_with_settings(
             crate::running_build_number(),
             Arc::new(crate::app_config::update_check_settings_setting),

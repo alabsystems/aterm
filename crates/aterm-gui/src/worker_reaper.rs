@@ -441,6 +441,27 @@ impl crate::App {
             self.worker_autopilot_off(handle.sid.as_str());
         }
     }
+
+    /// Session `sid`'s Autopilot turned Off, written by aterm, where `sid` is a live session of
+    /// this process: whether it was.
+    fn worker_autopilot_off(&mut self, sid: &str) -> bool {
+        let local = {
+            let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
+            store
+                .live_handles()
+                .find(|h| h.sid.as_str() == sid)
+                .map(|h| h.local_id)
+        };
+        let Some(local) = local else {
+            return false;
+        };
+        self.write_autopilot_batch(
+            &[(local, Some(Autopilot::Off), None)],
+            aterm_slog::Actor::Aterm,
+            None,
+        );
+        true
+    }
 }
 
 #[cfg(test)]

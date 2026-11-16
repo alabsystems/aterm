@@ -265,7 +265,7 @@ fn gate_answer(pid: u32, line: &str, holds: &Holds) -> Option<String> {
         } else if holds.rows.contains(sid) && verb == "result" {
             format!("OK 1\nwindow={pid} row result {sid}\n")
         } else if holds.rows.contains(sid) {
-            "ERR denied: a worker whose tab the driven Mac closed once its task concluded answers \
+            "ERR denied: a session that ended on the driven Mac answers \
              only @<sid> result and await task\n"
                 .to_owned()
         } else {

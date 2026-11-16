@@ -783,8 +783,8 @@ fn land_owned(store: &crate::session_store::Store, pairs: Vec<(&str, BusCursor)>
     for (sid, at) in pairs {
         let live = {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
-            g.by_sid(&aterm_session::SessionId::new(sid.to_string()))
-                .map(|h| h.ctx.clone())
+            aterm_session::SessionId::parse(sid)
+                .and_then(|sid| g.by_sid(&sid).map(|h| h.ctx.clone()))
         };
         if let Some(ctx) = live {
             let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());

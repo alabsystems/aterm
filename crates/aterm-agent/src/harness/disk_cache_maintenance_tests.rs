@@ -22,7 +22,7 @@ fn a_borrowed_lifetime_guard_stamps_without_releasing_or_reacquiring_it() {
         super::super::reserve::take_pass(&path).unwrap().is_none(),
         "borrowed claim kept actual exclusion"
     );
-    let stamp_before = read_stamp(dir).unwrap();
+    let stamp_before = read_stamp(dir, STAMP).unwrap();
     let other = aterm_tempfile::tempdir().unwrap();
     let other_path = super::super::reserve::pass_lock_for(other.path());
     let other_guard = super::super::reserve::take_pass(&other_path)
@@ -32,7 +32,7 @@ fn a_borrowed_lifetime_guard_stamps_without_releasing_or_reacquiring_it() {
         claim_held(dir, 1_790_086_400, &other_guard).is_err(),
         "a real guard for another path is no authority here"
     );
-    assert_eq!(read_stamp(dir).unwrap(), stamp_before);
+    assert_eq!(read_stamp(dir, STAMP).unwrap(), stamp_before);
     std::fs::rename(&path, dir.join("old-pass.lock")).unwrap();
     let replacement = super::super::reserve::take_pass(&path).unwrap().unwrap();
     assert!(
@@ -41,12 +41,60 @@ fn a_borrowed_lifetime_guard_stamps_without_releasing_or_reacquiring_it() {
     );
     assert!(claim_held(dir, 1_790_086_400, &held).is_err());
     assert_eq!(
-        read_stamp(dir).unwrap(),
+        read_stamp(dir, STAMP).unwrap(),
         stamp_before,
         "replacement refused before a new stamp"
     );
     drop(replacement);
     drop(held);
+}
+
+/// AN EARLY CLAIM KEEPS AN HOUR FROM ANY SWEEP AND NEVER TAKES THE DAY'S TURN. After a daily
+/// stamp, an early claim under the same guard is refused inside the hour and admitted an hour
+/// on, under its own stamp: a second early claim is refused within the hour of it, and the
+/// daily claim is due a day after its own stamp however often the early one ran (one an hour
+/// before it included), so the holders' measure and the branch-name step keep their day. An
+/// early stamp within the hour also refuses an early claim made right after a daily one ran.
+/// NEGATIVE CONTROLS: an early claim that wrote the daily stamp would leave the daily claim
+/// refused at a day on; one that did not read the daily stamp would be admitted inside its hour.
+#[test]
+fn an_early_claim_keeps_an_hour_from_any_sweep_and_never_takes_the_days_turn() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let path = super::super::reserve::pass_lock_for(home.path());
+    let held = super::super::reserve::take_pass(&path)
+        .unwrap()
+        .expect("lifetime guard");
+    let dir = path.parent().unwrap();
+    let t0 = 1_790_000_000;
+    assert!(claim_held(dir, t0, &held).unwrap());
+    let daily = read_stamp(dir, STAMP).unwrap();
+    assert!(
+        !claim_held_early(dir, t0 + 3_599, &held).unwrap(),
+        "inside the hour of the daily sweep"
+    );
+    assert!(claim_held_early(dir, t0 + 3_600, &held).unwrap());
+    assert!(
+        !claim_held_early(dir, t0 + 3_601, &held).unwrap(),
+        "the early sweep stamped its own hour"
+    );
+    assert_eq!(
+        read_stamp(dir, STAMP).unwrap(),
+        daily,
+        "the day's stamp stays"
+    );
+    let mut at = t0 + 3_600;
+    while at + 3_600 < t0 + 86_400 {
+        at += 3_600;
+        assert!(claim_held_early(dir, at, &held).unwrap(), "hourly at {at}");
+    }
+    assert!(
+        claim_held(dir, t0 + 86_400, &held).unwrap(),
+        "the daily turn comes a day after its own stamp"
+    );
+    assert!(
+        !claim_held_early(dir, t0 + 86_400 + 3_599, &held).unwrap(),
+        "inside the hour of the daily sweep again"
+    );
 }
 
 #[test]

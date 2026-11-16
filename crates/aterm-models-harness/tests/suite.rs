@@ -8,8 +8,6 @@ mod models_account_progress_policy;
 mod models_bound_recipient_journal;
 mod models_custody;
 mod models_disk_discovery_cycle;
-mod models_disk_projected;
-mod models_disk_worker;
 mod models_left;
 mod models_native_closed_watch;
 mod models_native_handoff_hold;

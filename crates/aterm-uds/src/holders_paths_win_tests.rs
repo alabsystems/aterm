@@ -323,7 +323,7 @@ fn a_child_started_in_a_short_spelling_uses_its_folder_and_no_other() {
     let reported = aterm_sysprobe::process_cwd(pid).expect("its working directory");
     let table = aterm_sysprobe::volumes::table();
     assert!(
-        aterm_sysprobe::paths::short_spelled(&reported).is_some(),
+        aterm_path::short_spelled(&reported).is_some(),
         "{reported:?} is short"
     );
     assert_eq!(table.is_under(&reported, &folder), None, "{reported:?}");
@@ -375,7 +375,7 @@ fn a_child_working_through_a_short_spelled_junction_uses_the_directory_it_is_in(
     let pid = child.id();
     let reported = aterm_sysprobe::process_cwd(pid).expect("its working directory");
     assert!(
-        aterm_sysprobe::paths::short_spelled(&reported).is_some(),
+        aterm_path::short_spelled(&reported).is_some(),
         "{reported:?} is short"
     );
 
@@ -403,7 +403,7 @@ fn a_short_spelling_is_spelled_long_on_the_naming_helper() {
     });
     let path = short.join("not-made-yet");
     let normalized = win32_normalized(&path);
-    let through = aterm_sysprobe::paths::short_spelled(&normalized)
+    let through = aterm_path::short_spelled(&normalized)
         .expect("short-spelled")
         .through;
     let dirs = [folder.clone()];
@@ -411,7 +411,7 @@ fn a_short_spelling_is_spelled_long_on_the_naming_helper() {
     assert_eq!(held, None, "a stuck expansion holds {path:?}");
     let spelled = placement_here(&path, &dirs);
     assert_eq!(spelled.under, Some(true), "{path:?}");
-    let key = aterm_sysprobe::paths::windows_key;
+    let key = aterm_path::windows_key;
     assert_eq!(
         key(&spelled.at),
         key(&folder.join("not-made-yet")),

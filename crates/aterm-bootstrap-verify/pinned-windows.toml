@@ -1,0 +1,17 @@
+# get-aterm.ps1's bootstrap verifier pin: the receipts of the release it names, as
+# that release's signed appcast carries them. `targo --unverified ship pin-verifier
+# --windows --from-release` writes this file and apps/aterm-win/get-aterm.ps1's pin
+# lines together, and the tests hold each to the other and to RELEASES.ledger.
+# Never edited by hand.
+schema = 1
+repo = "alabsystems/aterm"
+tag = "v0.203.0"
+build_number = 1794784793
+commit = "ae70037cf1e1ed4475252cf6f4ca55431ef89fd8"
+interface = 2
+
+[[verifier]]
+arch = "x86_64"
+asset = "aterm-bootstrap-verify-0.203.0-windows-x86_64.exe"
+sha256 = "e3c63541ab0e2c63d3c3a98cde700a4edc52e010d8081754927b4e3bae63baa1"
+size = 536064

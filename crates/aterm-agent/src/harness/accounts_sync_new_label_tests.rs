@@ -294,7 +294,7 @@ fn sync_case(case: i64, cli: Cli) -> (i64, i64, i64) {
             (case == 22).then_some("https://example.invalid/fixture.toml"),
             None,
         ),
-        false,
+        SyncCaller::Person,
         NOW,
         (&fetch, &[]),
         || {

@@ -220,7 +220,7 @@ impl LabView {
         me_uuid: Option<&str>,
     ) -> Self {
         let mut lab =
-            Self::read_projected(&view.cells, view.project(&MACHINE), facts, obs, me_uuid);
+            Self::read_projected(&view.cells, &view.project(&MACHINE), facts, obs, me_uuid);
         if let Some(rows) = view.owned.get(registry::ACCOUNT_OBS.name) {
             lab.account_obs = super::sighted::obs_rows(rows);
         }
@@ -236,19 +236,22 @@ impl LabView {
         obs: &OwnedRead,
         me_uuid: Option<&str>,
     ) -> Self {
-        Self::read_projected(cells, cell::project(&MACHINE, cells), facts, obs, me_uuid)
+        Self::read_projected(cells, &cell::project(&MACHINE, cells), facts, obs, me_uuid)
     }
 
-    fn read_projected(
+    /// What [`Self::read_view`] reads but the `account-obs` rows (left empty), with MACHINE's
+    /// rows given already projected (`machines`), so a reader that projects them for its own use
+    /// as well (the shared-file materializer's `typed::view::Projections`) projects them once.
+    pub(crate) fn read_projected(
         cells: &Cells,
-        machines: cell::Projection,
+        machines: &Projection,
         facts: &OwnedRead,
         obs: &OwnedRead,
         me_uuid: Option<&str>,
     ) -> Self {
         let machines: BTreeMap<String, Machine> = machines
             .rows
-            .into_iter()
+            .iter()
             .map(|(pk, row)| {
                 let aliases = row
                     .get("aliases")
@@ -260,16 +263,16 @@ impl LabView {
                     .collect();
                 let machine = Machine {
                     pk: pk.clone(),
-                    label: unconflicted_text(&row, "label"),
-                    nickname: machine_nickname(&row),
+                    label: unconflicted_text(row, "label"),
+                    nickname: machine_nickname(row),
                     aliases,
-                    status: text(&row, "status"),
-                    os: text(&row, "os"),
-                    chip: text(&row, "chip"),
+                    status: text(row, "status"),
+                    os: text(row, "os"),
+                    chip: text(row, "chip"),
                     ram_gb: row.get("ram_gb").and_then(Value::as_u64),
                     live: row.live(),
                 };
-                (pk, machine)
+                (pk.clone(), machine)
             })
             .collect();
         let addresses = cell::project(&ADDRESS, cells);

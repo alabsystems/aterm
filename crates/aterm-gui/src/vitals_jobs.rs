@@ -1434,7 +1434,8 @@ fn job_tabs(
 }
 
 /// What a session's PTY reader read, for the engine: its newest feed that moved the screen, its
-/// newest feed that held a line, the bytes it has read, and the newest OSC 133 block. The reader
+/// newest feed that held a line, the bytes it has read, the newest OSC 133 block, and the program
+/// in front's own report on itself (OSC 7501, [`Self::program`]). The reader
 /// writes it as it reads and feeds ([`Self::read`], [`Self::fed`]); the probe thread reads it at
 /// each pass ([`Self::at_pass`]). Without it a printing `ping` reads quiet, and each command of a
 /// typed `while` loop is a job of its own. A write that moves no cell (a colour reset at rest) is
@@ -1480,6 +1481,10 @@ struct Fed {
     /// clock of the newest pass that found it moved ([`JobFeed::typed_at`]).
     driven: Option<aterm_session::sink::DrivenInput>,
     typed: Option<u64>,
+    /// The newest OSC 7501 report standing as the last feed left it: another program's
+    /// (`ProgramStateReport::other`), else the known programs' while its writer's group holds the
+    /// front (`ProgramStateReport::sign`).
+    program: Option<aterm_core::terminal::program_state::ProgramState>,
 }
 
 #[derive(Clone, Debug)]
@@ -1536,7 +1541,8 @@ impl JobFeed {
     /// only while nothing ran before it. A terminal holding no block (a reset, a clear) leaves an
     /// open one open until the next prompt. The block a newer one replaces is kept as the ended
     /// one with its status. A feed that finds the current block changed stamps the shell's marks
-    /// `now`; a terminal left with no block is none of the shell's.
+    /// `now`; a terminal left with no block is none of the shell's. The newest program's report
+    /// standing is kept as the feed left it ([`Self::program`]).
     pub(crate) fn fed(
         &self,
         term: &aterm_core::terminal::Terminal,
@@ -1552,8 +1558,13 @@ impl JobFeed {
         }
         let current = term.current_block();
         let marks = current.map(|c| (c.id, c.state, c.exit_code));
+        let report = term.program_state();
+        // The newest report standing: a known program's report takes another's away, and
+        // another's leaves the known one standing, so where both stand the other is the newer.
+        let program = report.other.state.or(report.sign());
         let lines = Lines::of(chunk);
         let mut fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        fed.program = program;
         let line = lines.ends && (lines.ended || lines.tail || fed.text);
         fed.text = lines.tail || (fed.text && !lines.ends);
         let marked = marks.is_some() && marks != fed.marks;
@@ -1637,6 +1648,23 @@ impl JobFeed {
             .block
             .as_ref()
             .is_some_and(|block| block.open)
+    }
+
+    /// What the program in front says of itself, as the reader's last feed left it: the newest
+    /// OSC 7501 report standing (another program's, as Muse Code and Kimi Code write under their
+    /// own `app=` word, else the known programs' while its writer's group holds the front,
+    /// `ProgramStateReport::sign`), a turn in progress or a wait; `None` where no program in front
+    /// reports. A shell that marks its commands (OSC 133) and says none runs sits at its prompt
+    /// with no program in front of it: a report standing then is one a program that left wrote
+    /// (killed with no `clear`, carried across a handoff, or read where the host names no front
+    /// group, as on Windows), and is none of the session's. A program stopped there (`^Z`) is in
+    /// front again once its shell runs it (`fg`), and its report is its word again. Read without
+    /// the term lock.
+    pub(crate) fn program(&self) -> Option<aterm_core::terminal::program_state::ProgramState> {
+        let fed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let at_its_prompt =
+            fed.marks.is_some() && !fed.block.as_ref().is_some_and(|block| block.open);
+        fed.program.filter(|_| !at_its_prompt)
     }
 
     /// The feed now: [`Self::at_pass`] with no pass's clock.

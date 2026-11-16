@@ -6,7 +6,8 @@ members = ["crates/*"]
 # Default build/check/test set: every member except publication tools
 # (cutter, Windows signer, atpkg producer/keys, forge), check runners
 # (aterm-verify, aterm-census, libc/Win32 oracles, perf harnesses, lab and its
-# clock library), and aterm-contract-probe (`verify test -p aterm-contract-probe`).
+# clock library), aterm-contract-probe (`verify test -p aterm-contract-probe`) and
+# aterm-mesh-core's three islands crates, which its tests check.
 # `--workspace` and `-p` still reach every member. List new crates here unless
 # they are publication tools or check runners.
 default-members = [
@@ -28,14 +29,14 @@ default-members = [
     "crates/aterm-hash", "crates/aterm-heap-count", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
     "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-land", "crates/aterm-land-trailer", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
-    "crates/aterm-macos-ui", "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-mesh-core-islands", "crates/aterm-mesh-core-islands-no-lost-edit", "crates/aterm-mesh-core-islands-p1", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
+    "crates/aterm-macos-ui", "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-capacity", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-db", "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
     "crates/aterm-models-session", "crates/aterm-models-setup", "crates/aterm-models-swarm", "crates/aterm-models-update",
-    "crates/aterm-observe", "crates/aterm-once-cell", "crates/aterm-parser",
+    "crates/aterm-observe", "crates/aterm-once-cell", "crates/aterm-parser", "crates/aterm-path",
     "crates/aterm-phase", "crates/aterm-png", "crates/aterm-policy", "crates/aterm-predict",
-    "crates/aterm-primer", "crates/aterm-provenance",
+    "crates/aterm-primer", "crates/aterm-process-facts", "crates/aterm-provenance",
     "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-requests", "crates/aterm-restore",
     "crates/aterm-rle", "crates/aterm-repo-storage",
     "crates/aterm-sandbox", "crates/aterm-scene", "crates/aterm-scrollback",
@@ -90,7 +91,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit.
 [workspace.package]
-version = "0.204.0"
+version = "0.205.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -260,12 +261,14 @@ aterm-macos-ui = { path = "crates/aterm-macos-ui" }
 aterm-signin-window = { path = "crates/aterm-signin-window" }
 aterm-observe = { path = "crates/aterm-observe" }
 aterm-parser = { path = "crates/aterm-parser" }
+aterm-path = { path = "crates/aterm-path" }
 aterm-phase = { path = "crates/aterm-phase" }
 # First-party PNG codec (chunk structure, five filters, Adam7, and DEFLATE compressor).
 aterm-png = { path = "crates/aterm-png" }
 aterm-policy = { path = "crates/aterm-policy" }
 aterm-predict = { path = "crates/aterm-predict" }
 aterm-primer = { path = "crates/aterm-primer" }
+aterm-process-facts = { path = "crates/aterm-process-facts" }
 aterm-provenance = { path = "crates/aterm-provenance" }
 aterm-pty = { path = "crates/aterm-pty" }
 # First-party regular-expression engine (parse -> NFA -> bounded Pike VM) with

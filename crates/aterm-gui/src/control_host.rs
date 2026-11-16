@@ -82,16 +82,21 @@ impl<'a> GuiHost<'a> {
 struct SubscriberWait(Subscription);
 
 impl ChangeWait for SubscriberWait {
+    /// Parks on the subscription, which the hang-up bell rings too while it serves
+    /// ([`crate::park::park_on_slot`]): one wait for all that is left while armed, so a caller
+    /// that hangs up ends it at once (a wake its holder answers by asking [`Self::caller_gone`]),
+    /// and [`aterm_control::hangup::HANGUP_POLL`] slices where no arm stands.
     fn wait(&self, timeout: Duration) -> bool {
         let now = std::time::Instant::now();
         let until = now
             .checked_add(timeout)
             .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
-        let woke = crate::park::park(
+        let woke = crate::park::park_on_slot(
             |bound| self.0.wait(bound),
             until,
-            crate::park::Lane::SERVED,
+            crate::park::Lane::SERVED.slotted(),
             &|| false,
+            &self.0.bell(),
         );
         woke == crate::park::Woke::Rang
     }

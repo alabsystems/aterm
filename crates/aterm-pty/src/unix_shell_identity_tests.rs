@@ -275,16 +275,18 @@ fn handler_row(
     let marker = marker.display();
     let dir = scratch.join(name);
     std::fs::create_dir_all(&dir).expect("the row's folder");
+    // Announce readiness from the first prompt, after interactive signal and terminal setup.
+    // Printing from the rc file races the setup that follows that file.
     match name {
         "zsh-trap" => (
             format!("ZDOTDIR='{}' exec /bin/zsh -d -i", dir.display()),
             dir.join(".zshrc"),
-            format!("trap '{work}; print done > {marker}; exit 0' HUP\nprint UP\n"),
+            format!("trap '{work}; print done > {marker}; exit 0' HUP\nPS1=UP\n"),
         ),
         "zsh-zshexit" => (
             format!("ZDOTDIR='{}' exec /bin/zsh -d -i", dir.display()),
             dir.join(".zshrc"),
-            format!("zshexit() {{ {work}; print done > {marker} }}\nprint UP\n"),
+            format!("zshexit() {{ {work}; print done > {marker} }}\nPS1=UP\n"),
         ),
         "bash-exit-trap" => (
             format!(
@@ -292,8 +294,6 @@ fn handler_row(
                 dir.display()
             ),
             dir.join("rc"),
-            // Announce readiness from the first prompt, after Bash has installed its
-            // interactive signal handlers. An `echo` in the rc file races that setup.
             format!("unset HISTFILE\ntrap '{work}; echo done > {marker}' EXIT\nPS1=UP\n"),
         ),
         other => panic!("no row {other}"),
@@ -571,15 +571,10 @@ fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
 #[cfg(target_os = "macos")]
 #[test]
 fn closing_the_original_master_mid_handler_cuts_no_exit_handler() {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::AsRawFd as _;
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     for name in ["zsh-zshexit", "bash-exit-trap"] {
-        let gate_path = scratch.path().join(format!("{name}.fifo"));
-        let path = std::ffi::CString::new(gate_path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: this test creates and owns its FIFO and descriptor.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        let gate = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        assert!(gate >= 0);
+        let (gate_path, gate) = gate_fifo(scratch.path(), name);
         let entered = scratch.path().join(format!("{name}.entered"));
         let marker = scratch.path().join(format!("{name}.done"));
         let work = format!(
@@ -595,32 +590,40 @@ fn closing_the_original_master_mid_handler_cuts_no_exit_handler() {
         let identity = record_spawned_shell(sh.pid);
         assert!(identity.verify());
         hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
+        let deadline = Instant::now() + HANG_DETECTOR;
+        while !entered.exists() && Instant::now() < deadline {
+            let _ = read(sh.master, &mut [0u8; 256]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = entered.exists();
         // SAFETY: the foreground test owns the original master; teardown holds none on macOS.
         unsafe {
             libc::close(sh.master);
         }
+        // The handler stays parked at the FIFO across the close, so this exercises a close
+        // mid-handler. Keep its writer alive until the handler acknowledges the queued line.
+        let wrote = if started {
+            // SAFETY: the gate's owned descriptor is live and the buffer contains three bytes.
+            unsafe { libc::write(gate.as_raw_fd(), b"go\n".as_ptr().cast(), 3) }
+        } else {
+            0
+        };
         let deadline = Instant::now() + HANG_DETECTOR;
-        while !entered.exists() && Instant::now() < deadline {
+        while started && wrote == 3 && !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
+        let finished = marker.exists();
+        drop(gate);
+        end_row(sh.pid, hold);
         assert!(
-            entered.exists(),
-            "{name} entered its cleanup with the original master closed"
+            started,
+            "{name} entered its cleanup before the original master closed"
         );
-        // SAFETY: write the gate only after the handler proved it entered cleanup.
-        assert_eq!(unsafe { libc::write(gate, b"go\n".as_ptr().cast(), 3) }, 3);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        unsafe {
-            libc::close(gate);
-        }
+        assert_eq!(wrote, 3, "the go line reaches the fifo after the close");
         assert!(
-            marker.exists(),
+            finished,
             "{name} ran its exit handler to its end past the master's close"
         );
-        drop(hold);
-        assert!(wait_for_reaps(HANG_DETECTOR), "teardown completed");
     }
 }
 

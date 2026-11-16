@@ -333,3 +333,50 @@ fn late_release_waiter_cannot_enter_after_blocking_drain_seals() {
     assert_eq!(lifetime.0.state.lock().unwrap().operations, 0);
     drained.resume().unwrap();
 }
+
+/// ONE PIECE OF AN OPERATION'S WORK IS CANCELLED BY ITSELF ([`Scope::child`]): cancelling the
+/// child stops the child alone, and everything that stops the operation it was entered under
+/// (its cancellation, its epoch's pause) stops the child too. The child is counted: a pause
+/// waits for it, and for its parent for as long as it lives. NEGATIVE CONTROL: a clone of the
+/// operation's own scope shares its cancellation, so cancelling it stops the whole operation.
+#[test]
+fn a_child_operation_is_cancelled_alone_and_with_its_parent() {
+    // Alone.
+    let lifetime = Lifetime::default();
+    let parent = lifetime.enter().unwrap();
+    let (child, sibling) = (parent.child().unwrap(), parent.child().unwrap());
+    let own = child.cancellation();
+    assert!(own.owned_by(&lifetime));
+    own.cancel();
+    assert!(child.cancelled() && own.cancelled());
+    assert!(
+        !parent.cancelled(),
+        "the operation it was entered under goes on"
+    );
+    assert!(!sibling.cancelled(), "and so does its other work");
+    // CONTROL: the operation's own cancellation, as a clone of its scope carries it, stops
+    // all of it.
+    let clone = parent.clone();
+    clone.cancellation().cancel();
+    assert!(parent.cancelled() && sibling.cancelled());
+    assert!(sibling.cancellation().cancelled());
+
+    // With its parent's epoch, and counted.
+    let lifetime = Lifetime::default();
+    let parent = lifetime.enter().unwrap();
+    let child = parent.child().unwrap();
+    let cancellation = child.cancellation();
+    drop(parent);
+    assert!(
+        !child.cancelled(),
+        "the parent's scope going is not its cancellation"
+    );
+    let pause = lifetime.pause().unwrap();
+    assert!(child.cancelled() && cancellation.cancelled());
+    // The child, and its parent under it, are still counted.
+    let pause = pause.try_wait().unwrap_err();
+    drop(child);
+    assert!(cancellation.retired());
+    pause.try_wait().unwrap().resume().unwrap();
+    assert!(lifetime.enter().is_some());
+}

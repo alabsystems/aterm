@@ -2812,6 +2812,45 @@ fn a_leave_says_it_narrowed_an_open_state() {
     );
 }
 
+/// A verb's change of what a raise is asked over is announced (`announcing`, which every verb
+/// and sync runs in) for the state home the verb keeps the fleet's state in, `places.state`,
+/// which a window of that home registers on, and for no other home (an ear on the name for the
+/// verb's config path stands for one). The post is waited for until the state home's ear heard
+/// it, so notifyd had handled it when the other ear is asked. The scratch paths' names are this
+/// test's alone.
+/// NEGATIVE CONTROL: `announcing` announced for `&places.config`: "timed out after 60s waiting
+/// for: the state home's ear to hear the change".
+#[cfg(target_os = "macos")]
+#[test]
+fn a_verbs_change_is_announced_for_the_state_home_it_keeps() {
+    use aterm_sysprobe::notify::Posts;
+    use aterm_types::fleet_access::FleetAccess;
+    let world = World::new("announce");
+    let places = &world.places;
+    let mut ear = Posts::new(&crate::fleet_access::changed(&places.state)).expect("registers");
+    let mut config_ear =
+        Posts::new(&crate::fleet_access::changed(&places.config)).expect("registers");
+
+    let stated = announcing(places, || {
+        crate::fleet_access::set(
+            &places.state,
+            FleetAccess::Full,
+            crate::fleet_access::By::Cli,
+        )
+    });
+    assert!(stated.is_ok(), "{stated:?}");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the state home's ear to hear the change",
+        || (ear.posted() == Ok(true)).then_some(()),
+    );
+    assert_eq!(
+        config_ear.posted(),
+        Ok(false),
+        "another home's ear hears no change of this one"
+    );
+}
+
 /// `aterm fleet access` READS AND STATES THIS MACHINE'S LEVEL: with no level stored it is Read
 /// Only and a read writes nothing; a level named is written and read back, the one in force
 /// included (stated again, it changes no level, and a raise asked over the state before it is
@@ -9873,7 +9912,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         "a read dials the person's entries and the copy beside them"
     );
     for word in [node.as_str(), by_name.as_str()] {
-        let dialled = drive_fleet_in(&member.places, word, Duration::from_millis(100))
+        let dialled = drive_fleet_in(&member.places, word, HANG)
             .err()
             .expect("nothing listens there");
         assert!(

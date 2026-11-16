@@ -3,23 +3,48 @@
 
 use super::*;
 
+/// The update check's relay hears each settled move once, past this Mac's spread, on a watch of
+/// its own.
+/// MUTANT: a relay built on `watch_at_once` (it hears a move whose spread is not yet due), or one
+/// that takes another consumer's pending route (that consumer's take reads `None`).
 #[test]
-fn updater_gets_its_own_settled_network_changes_without_stealing_other_consumers() {
+fn updater_hears_each_settled_move_once_without_stealing_other_consumers() {
     let moved = Arc::new(Moved::spread_by(Duration::from_secs(30)));
-    let probe = updater_probe(&moved);
+    let mut relay = updater_watch(&moved);
     let mut other = moved.watch();
-    assert!(!probe());
+    assert_eq!(relay_once(&mut relay, Duration::ZERO), None);
     let future = Instant::now() + Duration::from_secs(60);
     moved.tell_at(Woke::Route, future);
-    assert!(!probe(), "the updater respects the network settling delay");
+    assert_eq!(
+        relay_once(&mut relay, Duration::ZERO),
+        None,
+        "the relay respects the network settling delay"
+    );
     moved.tell_at(Woke::Place, Instant::now() - Duration::from_secs(60));
-    assert!(probe());
-    assert!(!probe(), "one check per settled move");
+    assert!(relay_once(&mut relay, Duration::ZERO).is_some());
+    assert_eq!(
+        relay_once(&mut relay, Duration::ZERO),
+        None,
+        "one post per settled move"
+    );
     assert_eq!(
         other.take(),
         Some(Woke::Route),
         "its pending route was not consumed"
     );
+}
+
+/// The relay's own thread posts a move that is due, through the one-minute hang detector.
+/// MUTANT: a relay whose thread is never started or never posts.
+#[test]
+fn the_updater_relay_posts_a_due_move_from_its_own_thread() {
+    let moved = Arc::new(Moved::spread_by(Duration::from_secs(30)));
+    let (posted, heard) = std::sync::mpsc::channel();
+    relay_to_updater(&moved, move || {
+        let _ = posted.send(());
+    });
+    moved.tell_at(Woke::Route, Instant::now() - Duration::from_secs(60));
+    assert_eq!(heard.recv_timeout(HANG), Ok(()), "the relay posts the move");
 }
 
 /// One minute: a wait for something that must happen.

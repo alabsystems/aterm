@@ -246,7 +246,7 @@ const PROVIDER_FLAGS: &[&str] = &["--provider", "--preset", "--base-url", "-c", 
 
 /// The root options that say what a Muse Code run may do unasked: its worker's are its parent's
 /// held to [`WORKER_FLOOR`] ([`worker_flags`]).
-pub(super) const PERMISSION_FLAGS: &[&str] = &[
+const PERMISSION_FLAGS: &[&str] = &[
     "--approval-judge",
     "--approval-mode",
     "--disable-approval",

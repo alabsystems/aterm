@@ -489,7 +489,7 @@ fn a_gesture_an_invoke_drives_opens_by_the_invoking_client() {
     let ctx_of = |app: &App, sid: &str| {
         let g = app.store.read().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(
-            &g.by_sid(&aterm_session::SessionId::new(sid))
+            &g.by_sid(&aterm_session::SessionId::parse(sid).expect("a tab's id"))
                 .expect("its tab")
                 .ctx,
         )

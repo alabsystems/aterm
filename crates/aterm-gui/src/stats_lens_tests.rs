@@ -12,7 +12,7 @@ use crate::stats_deck::paint_tests::{
 use crate::stats_deck::tests::dark_inks;
 use crate::stats_plan::DeckForm;
 use aterm_vitals::Cell;
-use aterm_vitals::explain::{ActivityId, fixtures};
+use aterm_vitals::explain::fixtures;
 use aterm_vitals::history::FREE_BUCKET_S;
 use aterm_vitals::model::{Hog, ProcScope, ProgramGroup, ScopeFig, TopProc, VolumeSample, Writer};
 
@@ -1790,17 +1790,17 @@ fn the_busiest_program_says_how_long_it_has_been_up() {
     };
     assert_eq!(
         busiest(Some(47 * MIN_MS), 0),
-        "rustc \u{d7}9 in Tab 3, 5.9 cores, up 47 min"
+        "rustc \u{d7}9 in Tab 3, 5.9 reported cores, up 47 min"
     );
     assert_eq!(
         busiest(Some(47 * MIN_MS), 1),
-        "rustc \u{d7}9 in Tab 3, 5.9 cores, up \u{2265} 47 min",
+        "rustc \u{d7}9 in Tab 3, 5.9 reported cores, up \u{2265} 47 min",
         "one member's birth unread: the oldest may be older"
     );
     for (young, unborn) in [(Some(5 * MIN_MS), 0), (None, 9)] {
         assert_eq!(
             busiest(young, unborn),
-            "rustc \u{d7}9 in Tab 3, 5.9 cores",
+            "rustc \u{d7}9 in Tab 3, 5.9 reported cores",
             "{young:?}"
         );
     }
@@ -1821,7 +1821,7 @@ fn the_scope_filters_the_lists() {
     let tab = at(Bar::Tab, Instrument::Disk);
     assert!(well(&tab, "Writing now in Tab 2").starts_with("claude in Tab 2, 0.2 MB/s"));
     let aterm = at(Bar::Aterm, Instrument::Cpu);
-    let busiest = well(&aterm, "Busiest now in aterm");
+    let busiest = well(&aterm, "Largest reported CPU in aterm");
     assert!(!busiest.contains("WindowServer"), "{busiest}");
     assert!(busiest.starts_with("rustc \u{d7}9 in Tab 3"), "{busiest}");
     let global = at(Bar::Global, Instrument::Memory);
@@ -1858,11 +1858,11 @@ fn the_memory_list_includes_idle_programs_outside_the_cpu_top() {
             ..pinned(Instrument::Cpu)
         },
     );
-    assert!(!well(&cpu, "Busiest now in Tab 2").contains("idle-worker"));
+    assert!(!well(&cpu, "Largest reported CPU in Tab 2").contains("idle-worker"));
 }
 
 #[test]
-fn the_cpu_lens_keeps_counter_charge_apart_from_confirmed_work() {
+fn reported_cpu_lens_keeps_inherited_charge_apart_from_own_counter_growth() {
     let mut snap = lens_scene(Scene::Calm);
     let cpu = &mut snap.resources[Resource::Cpu.index()];
     cpu.aterm.now = Some(0.259);
@@ -1877,7 +1877,7 @@ fn the_cpu_lens_keeps_counter_charge_apart_from_confirmed_work() {
     }
     let laid = heard(&snap, pinned(Instrument::Cpu));
     let accounting = well(&laid, "CPU accounting");
-    assert!(accounting.contains("≥0.25 confirmed"), "{accounting}");
+    assert!(accounting.contains("0.26 reported"), "{accounting}");
     assert!(
         accounting.contains("counter charge 3.50 cores"),
         "{accounting}"
@@ -2067,8 +2067,8 @@ fn a_split_tabs_program_is_one_row() {
         false,
     );
     assert_eq!(
-        well(&laid, "Busiest now in Tab 1"),
-        "rustc \u{d7}2 in Tab 1, 3.0 cores"
+        well(&laid, "Largest reported CPU in Tab 1"),
+        "rustc \u{d7}2 in Tab 1, 3.0 reported cores"
     );
 }
 
@@ -2111,7 +2111,14 @@ fn each_lens_shows_its_sections() {
     };
     assert_eq!(
         names(Instrument::Cpu),
-        ["Now", "Cores, last 60 s", "Busiest now", "Load", "Over max"]
+        [
+            "Now",
+            "Cores, last 60 s",
+            "Largest reported CPU",
+            "Load",
+            "Over max",
+            "CPU accounting"
+        ]
     );
     assert_eq!(
         names(Instrument::Memory),
@@ -2154,26 +2161,11 @@ fn each_lens_shows_its_sections() {
             .map(|(n, _)| n)
             .collect()
     };
-    assert_eq!(
-        names_of(&trouble),
-        [
-            "Now",
-            "Cores, last 60 s",
-            "Why now",
-            "Busiest now",
-            "Load",
-            "Over max"
-        ],
-        "two columns list the left one first: Why now stacks under Cores"
-    );
-    assert_eq!(
-        heard(&trouble, pinned(Instrument::Cpu)).placed[0],
-        [(0, 1), (4, 0)],
-        "the owner's shell holds Cores at 4 pt a row (93 pt) over Why now's 4 rows (66 pt)"
-    );
+    assert_eq!(names_of(&trouble), names(Instrument::Cpu));
+    assert!(!names_of(&trouble).iter().any(|name| name == "Why now"));
     let m = FaceMetrics::helvetica_neue();
     let grows = |snap: &Snapshot| cpu_doc(two_columns(snap, &m)).sections[0].forms[0].grow;
-    assert!(grows(&snap), "with no Why now, v2's Cores grows");
+    assert!(grows(&snap), "the core history keeps its flexible height");
     let placed = |snap: &Snapshot| {
         let input = input(snap, dark_inks());
         let cpu = pinned(Instrument::Cpu);
@@ -2181,8 +2173,11 @@ fn each_lens_shows_its_sections() {
     };
     let mut v2 = trouble.clone();
     v2.why = None;
-    assert_eq!(placed(&trouble), [vec![(0, 0)], vec![(1, 1), (2, 0)]]);
-    assert_eq!(placed(&trouble), placed(&v2), "CONTROL: v2's lens");
+    assert_eq!(
+        placed(&trouble),
+        placed(&v2),
+        "unqualified cause facts cannot change the layout"
+    );
     let cpu = heard(&snap, pinned(Instrument::Cpu));
     assert!(well(&cpu, "Cores, last 60 s").starts_with("6 Super, 12 Performance; "));
     assert!(well(&cpu, "Load").starts_with("25.7 on 18 cores: ~8 waiting"));
@@ -2608,415 +2603,25 @@ fn two_columns<'d>(snap: &'d Snapshot, m: &'d FaceMetrics) -> Ctx<'d> {
 }
 
 #[test]
-fn why_now_says_what_sys_why_says() {
-    let snap = engine_1032();
-    let a = account_of(WhySubject::Cpu, &[1], &snap);
-    assert!(
-        a.nothing_needed && a.you.role == Role::Minor,
-        "PRECONDITION: {a:?}"
-    );
+fn reported_cpu_lens_keeps_rates_without_window_bounds_or_causes() {
+    let mut snap = engine_1032();
+    let view = &mut snap.resources[Resource::Cpu.index()];
+    view.aterm.now = Some(100.125);
+    view.aterm.cpu_charge = Some(200.0);
+    view.aterm.unread = 1;
     let laid = cpu_for(&snap, &[1]);
-    let said = well(&laid, "Why now");
-    for part in [
-        "Why: Spotlight, after start-up, 1.42 cores.",
-        "3.30 cores busy: macOS services 2.17 \u{b7} others 0.73 \u{b7} aterm 0.40, Tab 1 0.20.",
-        "this tab uses 0.2 of 3.3 cores (6.1%); it is not the cause, easing.",
-        "nothing needed",
-        "Spotlight by its code signature",
-    ] {
-        assert!(said.contains(part), "{part:?}: {said}");
-    }
-    let drawn: Vec<&str> = laid.boxes.iter().map(|b| b.text.as_str()).collect();
-    for text in [
-        "5 s window \u{b7} partial, 9 coalitions",
-        "Spotlight, after start-up",
-        "1.42 cores",
-        "macOS services 2.17 \u{b7} others 0.73 \u{b7} aterm 0.40, Tab 1 0.20",
-        "3.30 cores",
-        "this tab uses 0.2 of 3.3 cores (6.1%); it is not the cause \u{b7} easing",
-    ] {
-        assert!(drawn.contains(&text), "{text:?} is not drawn: {drawn:?}");
-    }
+    let accounting = well(&laid, "CPU accounting");
+    assert!(accounting.contains("100.12 reported"), "{accounting}");
     assert!(
-        drawn
-            .iter()
-            .any(|t| t.contains("Spotlight by its code signature")),
-        "{drawn:?}"
-    );
-}
-
-/// Why now's sub-heading keeps its words while a live window wobbles about a
-/// second (995–1,004 ms from one split tick to the next, §7.2 item 3): the
-/// window is rounded to a tenth first and only then given its form. NEGATIVE
-/// CONTROL: a window that rounds under 1.0 s keeps its decimal.
-#[test]
-fn why_nows_window_keeps_its_words_about_a_second() {
-    for ms in [995, 1_000, 1_004] {
-        let mut snap = engine_1032();
-        let why = snap.why.as_mut().expect("the scene's split");
-        Arc::make_mut(why).window_ns = ms * 1_000_000;
-        let laid = cpu_for(&snap, &[1]);
-        let drawn: Vec<&str> = laid.boxes.iter().map(|b| b.text.as_str()).collect();
-        assert!(
-            drawn.contains(&"1 s window \u{b7} partial, 9 coalitions"),
-            "{ms} ms: {drawn:?}"
-        );
-    }
-    for (ms, words) in [
-        (949, "0.9 s window"),
-        (950, "1 s window"),
-        (4_995, "5 s window"),
-        (5_004, "5 s window"),
-    ] {
-        assert_eq!(window_words(ms * 1_000_000), words, "{ms} ms");
-    }
-}
-
-#[test]
-fn why_nows_split_adds_up_to_its_busy_figure() {
-    assert_eq!(
-        hundredths([2175, 735, 200, 190, 0], 3300),
-        [218, 73, 20, 19, 0]
-    );
-    assert_eq!(
-        hundredths([2170, 730, 450, 0, -50], 3300),
-        [217, 73, 45, 0, -5]
-    );
-    assert_eq!([cents(217), cents(-5), cents(0)], ["2.17", "-0.05", "0.00"]);
-}
-
-#[test]
-fn why_nows_split_keeps_whole_figures_when_narrow() {
-    let snap = engine_1032();
-    let drawn = |lw: f64| -> Vec<String> {
-        cpu_lens(&snap, &[1], lw, false)
-            .boxes
-            .into_iter()
-            .map(|b| b.text)
-            .collect()
-    };
-    let whole = "macOS services 2.17 \u{b7} others 0.73 \u{b7} aterm 0.40";
-    let narrow = drawn(640.0);
-    assert!(narrow.iter().any(|t| t == whole), "{narrow:?}");
-    let wide = drawn(1024.0);
-    assert!(
-        wide.iter().any(|t| *t == format!("{whole}, Tab 1 0.20")),
-        "CONTROL: {wide:?}"
-    );
-}
-
-#[test]
-fn why_now_reads_this_tab_by_all_its_panes() {
-    let snap = engine_1032();
-    let said = |panes: &[u64]| well(&cpu_for(&snap, panes), "Why now").to_owned();
-    let both = said(&[5, 1]);
-    assert!(
-        both.contains("aterm 0.40, Tab 1 0.20.") && both.contains("this tab uses 0.2 of 3.3"),
-        "{both}"
-    );
-    let alone = said(&[5]);
-    assert!(
-        alone.contains("aterm 0.40, Tab 1 not read.")
-            && alone.contains("this tab's share is not read now"),
-        "CONTROL: {alone}"
-    );
-}
-
-#[test]
-fn why_now_shows_only_while_a_cause_is_open() {
-    let shown = |snap: &Snapshot| {
-        cpu_for(snap, &[1])
-            .wells
-            .iter()
-            .any(|(name, _)| name == "Why now")
-    };
-    let open = engine_1032();
-    assert!(shown(&open), "CONTROL: the 10:32 moment shows it");
-    let mut none = open.clone();
-    none.why = None;
-    assert!(!shown(&none));
-    let mut stale = open.clone();
-    stale.at_ns = open.why.as_ref().map_or(0, |f| f.at_ns) + (CLAUSE_STALE_MS + 1) * 1_000_000;
-    assert!(!shown(&stale), "facts older than the clause may ride");
-    let cold = read(&fixtures::spotlight_1032(), 1);
-    assert!(
-        account_of(WhySubject::Cpu, &[1], &cold)
-            .causes
-            .iter()
-            .any(|s| s.cause.id.covering() && s.opened_unix_ms.is_none()),
-        "PRECONDITION: Spotlight holds and has not opened"
-    );
-    assert!(!shown(&cold));
-    let calm = read(&fixtures::calm_1510(), 3);
-    assert!(calm.why.is_some(), "PRECONDITION: the calm Mac's facts");
-    assert!(!shown(&calm));
-    let off = engine(fixtures::lane_off_1032());
-    assert!(off.why.is_some(), "PRECONDITION: the facts by subtraction");
-    assert!(!shown(&off));
-}
-
-fn spotlight_failing(more: u64) -> Snapshot {
-    let calm = fixtures::calm_1510();
-    let scene = fixtures::Scene {
-        mem: calm.mem,
-        thermal: calm.thermal,
-        ..fixtures::spotlight_1032()
-    };
-    let mut failing = scene.clone();
-    for c in failing.coalitions.iter_mut().filter(|c| c.id == 307) {
-        c.qos_over_mc = 640;
-    }
-    let w = scene.window_ms;
-    let then = (4..4 + more).flat_map(|k| {
-        [
-            failing.reading(k * w - failing.sweep_ms, false),
-            failing.reading(k * w, true),
-        ]
-    });
-    let mut v = aterm_vitals::Vitals::new();
-    scene
-        .series(3)
-        .into_iter()
-        .chain(then)
-        .map(|r| v.absorb(&r))
-        .last()
-        .expect("the readings")
-}
-
-#[test]
-fn why_now_stays_while_its_episode_is_open_failing() {
-    let failing = spotlight_failing(1);
-    let a = account_of(WhySubject::Cpu, &[1], &failing);
-    let f = a.facts.as_deref().expect("facts");
-    assert!(
-        f.open
-            .iter()
-            .any(|o| o.id == CauseId::Activity(ActivityId::Spotlight) && !o.holds)
-            && a.headline.map(|h| h.0) == Some(CauseId::Unexplained)
-            && a.causes
-                .iter()
-                .all(|s| !s.cause.id.covering() || s.opened_unix_ms.is_none()),
-        "PRECONDITION: Spotlight open, failing; unexplained holds, not open: {a:?}"
-    );
-    let laid = cpu_for(&failing, &[1]);
-    assert!(
-        well(&laid, "Why now").starts_with("Why: Spotlight, after start-up, was 1.42 cores. "),
-        "{:?}",
-        laid.wells
-    );
-    let drawn: Vec<&str> = laid.boxes.iter().map(|b| b.text.as_str()).collect();
-    for text in ["Spotlight, after start-up", "was 1.42 cores"] {
-        assert!(drawn.contains(&text), "{text:?} is not drawn: {drawn:?}");
-    }
-    assert_eq!(
-        laid.placed[0],
-        [(0, 1), (4, 0)],
-        "Cores keeps its fixed form"
-    );
-    let opened = cpu_for(&spotlight_failing(2), &[1]);
-    assert!(
-        well(&opened, "Why now").starts_with("no cause aterm can name: macOS services"),
-        "CONTROL: open, it is named: {:?}",
-        opened.wells
-    );
-}
-
-#[test]
-fn why_now_bounds_the_tab_and_orders_the_split() {
-    let mut aterm = fixtures::calm_1510();
-    aterm.busy_mc += 1420;
-    for c in aterm.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.mc += 1420;
-    }
-    for p in aterm.procs.iter_mut().filter(|p| p.pid == 1187) {
-        *p = fixtures::Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "aterm", 1500);
-    }
-    let mut services = fixtures::tab2_build_1048();
-    services.busy_mc += 6000;
-    for c in services.coalitions.iter_mut().filter(|c| c.id == 1) {
-        c.mc += 6000;
-    }
-    for p in services.procs.iter_mut().filter(|p| p.pid == 1) {
-        *p = fixtures::Proc::new(
-            p.pid,
-            p.ppid,
-            p.uid,
-            p.coalition,
-            p.birth_ms,
-            "launchd",
-            6900,
-        );
-    }
-    let cases: [(fixtures::Scene, &[u64], &[&str]); 10] = [
-        (
-            fixtures::finished_1032(),
-            &[1],
-            &[
-                "no cause aterm can name: aterm, 3.40 cores.",
-                "busy: aterm 3.40, Tab 1 at least 0.20 \u{b7} macOS services 2.17 \u{b7} others 0.73.",
-                "this tab uses at least 0.2 of 6.3 cores; whether it is the cause is not read now",
-                "no step offered yet",
-            ],
-        ),
-        (
-            fixtures::claude_reaped_1032(),
-            &[1],
-            &[
-                "no cause aterm can name: aterm, 3.40 cores.",
-                "busy: aterm 3.40, Tab 1 at least 0.20 \u{b7} macOS services 2.17 \u{b7} others 0.73.",
-                "whether it is the cause is not read now",
-            ],
-        ),
-        (
-            fixtures::reaped_1032(),
-            &[1],
-            &["\u{b7} unaccounted +0.25."],
-        ),
-        (
-            fixtures::tab_ahead_1032(),
-            &[1],
-            &["aterm 0.45, Tab 1 0.45 \u{b7} unaccounted -0.05."],
-        ),
-        (
-            fixtures::spotlight_late_1032(),
-            &[1],
-            &[
-                "Why: Spotlight, since wake, 3.42 cores.",
-                "busy: others 2.73 \u{b7} macOS services 2.17 \u{b7} aterm 0.40, Tab 1 0.20.",
-            ],
-        ),
-        (
-            fixtures::app_work_1510(),
-            &[1],
-            &["Why: Caffeine \u{b7} Developer ID YD6LEYT6WZ \u{b7} yours, 1.50 cores."],
-        ),
-        (
-            fixtures::tab2_build_1048(),
-            &[1],
-            &["Why: Tab 2's work, 6.00 cores."],
-        ),
-        (
-            fixtures::tab2_build_1048(),
-            &[2],
-            &["this tab is the main cause: 6.0 of 8.2 cores, easing."],
-        ),
-        (services, &[2], &["this tab is part of the cause, easing."]),
-        (aterm, &[1], &["Why: aterm outside tabs, 1.50 cores."]),
-    ];
-    for (scene, panes, parts) in cases {
-        let laid = cpu_for(&engine(scene), panes);
-        let said = well(&laid, "Why now");
-        for part in parts {
-            assert!(said.contains(part), "{part:?}: {said}");
-        }
-    }
-    let inherited = cpu_for(&engine(fixtures::claude_reaped_1032()), &[1]);
-    let why = well(&inherited, "Why now");
-    assert!(!why.contains("Tab 1's work, 3.20"), "{why}");
-    assert!(!why.contains("this tab is the main cause"), "{why}");
-    let accounting = well(&inherited, "CPU accounting");
-    assert!(accounting.contains("≥0.20 confirmed"), "{accounting}");
-    assert!(
-        accounting.contains("counter charge 3.20 cores"),
+        !accounting.contains('≥') && !accounting.contains("confirmed"),
         "{accounting}"
     );
-}
-
-#[test]
-fn why_nows_full_form_marks_only_a_cause_aterm_names() {
-    let inks = dark_inks();
-    let marks = |snap: &Snapshot, words: &str| -> Vec<Option<Rgba>> {
-        let prims = cpu_lens(snap, &[1], 1024.0, true).prims;
-        let text = |p: &DrawPrim| matches!(p, DrawPrim::Text { .. });
-        let at = prims
-            .iter()
-            .position(|p| matches!(p, DrawPrim::Text { s, .. } if s == words))
-            .unwrap_or_else(|| panic!("{words:?} is not drawn"));
-        let from = prims[..at].iter().rposition(text).map_or(0, |k| k + 1);
-        prims[from..at]
-            .iter()
-            .map(|p| match p {
-                DrawPrim::Dot { color, .. } => Some(*color),
-                _ => None,
-            })
-            .collect()
-    };
-    assert_eq!(
-        marks(&engine_1032(), "Spotlight, after start-up"),
-        [Some(rgba(inks.words2, 0xFF)); 3]
-    );
-    let unexplained = marks(
-        &engine(fixtures::liar_1032()),
-        "no cause aterm can name: macOS services, after start-up",
-    );
-    assert!(unexplained.is_empty(), "{unexplained:?}");
-}
-
-#[test]
-fn why_nows_one_line_form_draws_the_cause_mark() {
-    let snap = engine_1032();
-    let m = FaceMetrics::helvetica_neue();
-    let inks = dark_inks();
-    let c = two_columns(&snap, &m);
-    let cw = c.cw;
-    let doc = cpu_doc(c);
-    let why = doc
-        .sections
-        .iter()
-        .find(|s| s.name == "Why now")
-        .expect("Why now");
-    let one = why.forms.last().expect("its one-line form");
-    assert_eq!(one.label.as_deref(), Some("Why now"));
-    let mut pen = Pen {
-        p: Painter::new(&inks, 2.0, 26.0, false),
-        m: &m,
-        inks,
-        ic: false,
-        s: 2.0,
-        ox: 0.0,
-        oy: 0.0,
-        draw: true,
-        line_tab: 0.0,
-        boxes: Vec::new(),
-    };
-    (one.draw)(
-        &mut pen,
-        Place {
-            x: SIDE,
-            y: 0.0,
-            w: cw,
-            h: LINE_H,
-        },
-    );
-    let prims = &pen.p.prims;
-    let texts: Vec<(usize, &str, f32, Rgba)> = prims
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| match p {
-            DrawPrim::Text { s, x, color, .. } => Some((i, s.as_str(), *x, *color)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        texts.iter().map(|t| t.1).collect::<Vec<_>>(),
-        [
-            "Why now",
-            "Spotlight, after start-up; this tab is not the cause"
-        ]
-    );
-    assert_eq!(texts[1].3, rgba(inks.words2, 0xFF));
-    let dots: Vec<(f32, Rgba)> = prims[texts[0].0 + 1..texts[1].0]
-        .iter()
-        .map(|p| match p {
-            DrawPrim::Dot { cx, color, .. } => (*cx, *color),
-            other => panic!("{other:?} between the label and the words"),
-        })
-        .collect();
-    assert_eq!(dots.len(), 3, "{dots:?}");
+    assert!(!laid.wells.iter().any(|(name, _)| name == "Why now"));
+    let spoken = lens_sentence(&snap, Instrument::Cpu, &[1], &LOC);
+    assert!(spoken.contains("reported cores"), "{spoken}");
     assert!(
-        dots.iter()
-            .all(|&(cx, color)| color == rgba(inks.words2, 0xFF) && cx < texts[1].2),
-        "{dots:?}"
+        !spoken.contains("main cause") && !spoken.contains("% of busy"),
+        "{spoken}"
     );
 }
 

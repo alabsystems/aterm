@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_types::macos_setup::{Access, AccessOutcome, access_record};
+use aterm_types::macos_setup::{
+    Access, AccessOutcome, Observation, Standing, Subject, access_record,
+};
 
 fn permissions(on: bool) -> Plan {
     let mut selection = Selection::none();
@@ -29,6 +31,21 @@ fn choose(root: &Path, plan: &Plan) -> u64 {
 fn permission_rows(state: &Path, revision: u64) -> Vec<Row> {
     let records = access_record::read(state, revision);
     let mut grants = access::Grants {
+        // Reapproval varies Full Disk Access's prior choice; every independent setup
+        // requirement is already confirmed in this fixture.
+        additional: [
+            Access::LocalNetwork,
+            Access::NameRule,
+            Access::SpotlightScope,
+            Access::NetworkAuth,
+            Access::NetworkHelper,
+        ]
+        .map(|access| {
+            let mut seen = Observation::unknown(Subject::Access(access));
+            seen.standing = Standing::InPlace;
+            seen.now = Some(access.wanted().into());
+            Some(seen)
+        }),
         fda: access::Fda::NotConfirmed,
         stable: true,
         devtools: access::DevTools::On,

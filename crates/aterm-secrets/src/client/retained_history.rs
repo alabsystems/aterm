@@ -412,12 +412,16 @@ impl History {
         })
     }
 
+    /// The receipt that acknowledges `log` under `config`, where one is due. `serving` says who
+    /// asks ([`log_entries::FrontierFor`]): an acknowledgement under the exclusive state lock,
+    /// or the check of a store before it is written.
     fn plan(
         &self,
         reads: &Reads<'_>,
         config: &Config,
         log: &Log,
         replacement: bool,
+        serving: log_entries::FrontierFor,
     ) -> Result<Option<Vec<u8>>> {
         validate_name(&config.name)?;
         let context = self.context(reads, config, log)?;
@@ -431,7 +435,8 @@ impl History {
         };
         if context.is_none()
             && (!keys.contains(signer)
-                || (!replacement && !log_entries::check_legacy_frontier(reads, config, log)?))
+                || (!replacement
+                    && !log_entries::check_legacy_frontier(reads, config, log, serving)?))
         {
             return Ok(None);
         }
@@ -556,6 +561,16 @@ pub(super) fn claim_ready(paths: &Paths) -> Result<Option<bool>> {
         Some(_) => Err(Error::new("invalid retained membership enrollment")),
         None => Ok(None),
     }
+}
+
+/// Whether this Mac's first receipt is still to be written: no enrollment claim, or a pending one
+/// over a journal that holds no receipt (a first enrollment cut between its claim and its
+/// append), which an exclusive take recovers and then enrolls as it would with none
+/// ([`recover_enrollment`], [`acknowledge_under`]). `false` where a receipt exists, or where the
+/// claim or the journal does not read.
+pub(super) fn first_receipt_due(paths: &Paths) -> bool {
+    read_enrollment(&Reads::new(paths))
+        .is_ok_and(|enrollment| !enrollment.ready && enrollment.history.0.is_empty())
 }
 
 /// What one read of the enrollment claim, and of the journal it establishes, found.
@@ -797,13 +812,17 @@ fn acknowledge_selected(
     } else {
         Arc::new(History::default())
     };
-    if before.plan(reads, config, log, replacement)?.is_none() {
+    let serving = log_entries::FrontierFor::Enrollment;
+    if before
+        .plan(reads, config, log, replacement, serving)?
+        .is_none()
+    {
         return Ok(());
     }
     // Opening completes a previous uncertain append, so its plan reads the files afterwards.
     let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, enrolled, limits())?;
     let mut history = replay(&journal)?;
-    let Some(bytes) = history.plan(&Reads::new(paths), config, log, replacement)? else {
+    let Some(bytes) = history.plan(&Reads::new(paths), config, log, replacement, serving)? else {
         return Ok(());
     };
     // Key associations and the frontier are acknowledged in the same journal frame.
@@ -847,7 +866,13 @@ pub(super) fn validate_configured(
     let reads = Reads::new(paths);
     let history = reads.enrollment()?.history(true)?;
     if eligible(config) {
-        let _ = history.plan(&reads, config, log, afresh)?;
+        let _ = history.plan(
+            &reads,
+            config,
+            log,
+            afresh,
+            log_entries::FrontierFor::Candidate,
+        )?;
     } else {
         let _ = history.context(&reads, config, log)?;
     }
@@ -883,6 +908,16 @@ pub(super) fn fill_contexts(paths: &Paths) {
         journal.append(SUBJECT, frame).unwrap();
     }
     assert_eq!(replay(&journal).unwrap().0.len(), MAX_CONTEXTS);
+}
+
+/// Leave the vault folder as a first enrollment cut after its pending claim and before its
+/// receipt leaves it ([`acknowledge_selected`]): the journal open, the claim pending, nothing
+/// appended.
+#[cfg(test)]
+pub(super) fn cut_first_enrollment(paths: &Paths) {
+    let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, false, limits()).unwrap();
+    journal.finish_open().unwrap();
+    aterm_journal::write_private_durable(&paths.dir, "records.frontiers", PENDING).unwrap();
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -968,10 +1003,14 @@ fn project_selected(
                 "membership history awaits its first durable acknowledgement",
             ));
         }
-        if !replacement && !log_entries::legacy_applied_log_available(reads.state()?, log) {
+        // Before this Mac's first receipt a reader reads only the very log it applied. One that
+        // grew past it is read once a writer shows it still holds that log and enrolls it
+        // (`log_entries::check_legacy_frontier`, at the next exclusive take of the state).
+        let state = reads.state()?;
+        if !replacement && !log_entries::legacy_applied_log_available(state, log) {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipHistoryUnavailable,
-                "the legacy applied membership frontier is unavailable",
+                log_entries::legacy_refusal(reads.paths(), state, log),
             ));
         }
         return Ok(store);

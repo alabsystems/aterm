@@ -163,9 +163,9 @@ fn baked_build(baked: &Path) -> Option<(PathBuf, u64, bool)> {
 /// that does instead.
 ///
 /// # Errors
-/// A lock that does not read, an install that fails or cannot serve this machine, or a build the
-/// store does not hold as the lock names it: the build is refused rather than run on another
-/// compiler.
+/// A lock that does not read, a build lease that cannot be taken, an install that fails or cannot
+/// serve this machine, or a build the store does not hold as the lock names it: the build is
+/// refused rather than run on another compiler.
 pub fn shim_target(
     baked: &Path,
     cwd: &Path,
@@ -197,20 +197,33 @@ fn shim_target_with(
     })?;
     // Resolve and mark under a lease on the build: a gc pass reclaiming it is waited out (and the
     // build found gone), and one that has yet to judge it reads the mark under its gate.
-    let _lease = crate::lease::Subject::build(PROGRAM, lock.build).and_then(|subject| {
+    let subject = crate::lease::Subject::build(PROGRAM, lock.build)
+        .ok_or_else(|| format!("Trust build {} has no lease subject", lock.build))?;
+    let take_lease = || {
         crate::lease::take(
             &prefix,
             &subject,
             "targo for a trust.lock",
             crate::lease::DEFAULT_WAIT,
         )
-        .ok()
-    });
+        .map_err(|why| {
+            format!(
+                "cannot hold Trust build {} while resolving {}: {why}",
+                lock.build,
+                found.path.display()
+            )
+        })
+    };
+    let mut lease = take_lease()?;
     let mut stands = standing(&prefix, lock);
     if !matches!(stands, LockedBuild::Present { .. }) {
         found.unpublished = unpublished(&prefix, lock);
     }
     if stands == LockedBuild::Absent && found.unpublished.is_none() {
+        // Installation needs the build's exclusive mutation gate. A consumer lease on the
+        // missing build would make our own installer refuse it. The installer records recent
+        // use under its store lock; reacquire custody and re-read before resolving its result.
+        drop(lease);
         install(&prefix, lock).map_err(|why| {
             format!(
                 "{} names Trust build {}, which this machine's store does not hold, and its \
@@ -219,8 +232,10 @@ fn shim_target_with(
                 lock.build
             )
         })?;
+        lease = take_lease()?;
         stands = standing(&prefix, lock);
     }
+    let _lease = lease;
     let bin = match stands {
         LockedBuild::Present { bin } => bin,
         // The hop reads no TRUST_STAGE2_BIN: only a dev link, whose shim it passes through

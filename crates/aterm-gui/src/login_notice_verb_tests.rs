@@ -27,19 +27,11 @@ fn the_verb_lists_raises_and_ends_and_refuses_junk() {
     );
     assert_eq!(parse("end", true), Ok(Asked::End));
     assert_eq!(parse("back", true), Ok(Asked::Back));
-    assert_eq!(parse("disk", true), Ok(Asked::Disk(DiskFullCause::Spent)));
-    assert_eq!(
-        parse("disk inodes", true),
-        Ok(Asked::Disk(DiskFullCause::Inodes))
-    );
-    assert!(matches!(
-        notes(&Asked::Disk(DiskFullCause::Spent), "s-1").as_slice(),
-        [HostNote::DiskFull { .. }]
-    ));
+    // The disk-full alert went: a full disk is a record, so nothing raises one here.
+    assert!(parse("disk", true).is_err());
     assert!(parse("si", false).is_err());
     assert!(parse("end", false).is_err());
     assert!(parse("back", false).is_err());
-    assert!(parse("disk", false).is_err());
     assert!(parse("disk full", true).is_err());
     assert!(parse("zz", true).is_err());
     assert!(parse("si a b", true).is_err());

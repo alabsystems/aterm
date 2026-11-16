@@ -160,15 +160,26 @@ enum RootComp {
 pub struct ScratchRoot {
     comps: Vec<RootComp>,
     label: String,
+    /// Its directory was read as a Windows folder ([`windows_components`]): its names are folded
+    /// as Windows compares them, and so is a glob under it.
+    folded: bool,
 }
 
 impl ScratchRoot {
-    /// Exactly this absolute directory.
+    /// Exactly this absolute directory, read as this platform reads a folder
+    /// ([`folder_components`]).
     pub fn dir(path: &Path) -> Option<Self> {
-        let comps = abs_components(&path.to_string_lossy())?;
+        let spelled = path.to_string_lossy();
+        let (comps, folded) = folder_reading(&spelled)?;
+        let label = if folded {
+            spelled.trim_end_matches(['/', '\\'])
+        } else {
+            spelled.trim_end_matches('/')
+        };
         Some(Self {
-            label: path.to_string_lossy().trim_end_matches('/').to_string(),
+            label: label.to_string(),
             comps: comps.into_iter().map(RootComp::Lit).collect(),
+            folded,
         })
     }
 
@@ -177,11 +188,17 @@ impl ScratchRoot {
         Self::glob_under(path, "*")
     }
 
-    /// Any direct child of `path` whose name matches `glob` (`<cwd>/target*`).
+    /// Any direct child of `path` whose name matches `glob` (`<cwd>/target*`); under a Windows
+    /// folder, as Windows compares names.
     pub fn glob_under(path: &Path, glob: &str) -> Option<Self> {
         let mut root = Self::dir(path)?;
-        root.comps.push(RootComp::Glob(glob.to_string()));
-        root.label = format!("{}/{glob}", root.label);
+        let (pattern, sep) = if root.folded {
+            (glob.chars().map(aterm_path::fold_case).collect(), '\\')
+        } else {
+            (glob.to_string(), '/')
+        };
+        root.comps.push(RootComp::Glob(pattern));
+        root.label = format!("{}{sep}{glob}", root.label);
         Some(root)
     }
 
@@ -223,6 +240,7 @@ impl ScratchRoot {
         Some(Self {
             comps,
             label: self.label.clone(),
+            folded: self.folded,
         })
     }
 
@@ -2058,6 +2076,53 @@ pub(crate) fn abs_components(path: &str) -> Option<Vec<String>> {
             c => out.push(c.to_string()),
         }
     }
+    Some(out)
+}
+
+/// The components of an absolute folder as this platform names one, for the folder judgment,
+/// its trust roots and the folder-trust dialogs: on Windows a drive or share folder
+/// ([`windows_components`]), and otherwise, as on unix, a `/`-rooted path ([`abs_components`]).
+pub(crate) fn folder_components(path: &str) -> Option<Vec<String>> {
+    folder_reading(path).map(|(comps, _)| comps)
+}
+
+/// [`folder_components`], and whether it read a Windows folder (its names folded).
+fn folder_reading(path: &str) -> Option<(Vec<String>, bool)> {
+    if cfg!(windows)
+        && let Some(comps) = windows_components(path)
+    {
+        return Some((comps, true));
+    }
+    abs_components(path).map(|comps| (comps, false))
+}
+
+/// The components of an absolute Windows folder, read as Windows compares one
+/// ([`aterm_path::windows_key`]): its root first (a drive, `C:`, or a share,
+/// `\\SERVER\SHARE`), then each name; `\` and `/` both separate, a verbatim prefix (`\\?\`,
+/// `\\?\UNC\`) is read away, and every name is folded to the case Windows compares it in, so
+/// `C:\Users\u\proj`, `c:/users/U/Proj` and `\\?\C:\Users\u\proj` are one folder. `None` for a
+/// path that is no absolute Windows folder (a relative or drive-relative one, `C:proj`), and for
+/// one with a `.` or `..` name, a name that ends in a dot or a space, or an 8.3 short name, whose
+/// folder that key cannot place.
+pub(crate) fn windows_components(path: &str) -> Option<Vec<String>> {
+    let key = aterm_path::windows_key(Path::new(path))?;
+    let (root, rest) = match key.strip_prefix(r"\\") {
+        Some(unc) => {
+            let mut parts = unc.splitn(3, '\\');
+            let (server, share) = (parts.next()?, parts.next()?);
+            (format!(r"\\{server}\{share}"), parts.next().unwrap_or(""))
+        }
+        None => {
+            let (drive, rest) = key.split_at_checked(2)?;
+            (drive.to_string(), rest)
+        }
+    };
+    let mut out = vec![root];
+    out.extend(
+        rest.split('\\')
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+    );
     Some(out)
 }
 

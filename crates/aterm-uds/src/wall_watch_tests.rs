@@ -82,11 +82,30 @@ fn a_libnotify_post_polls_ready_and_reads_as_a_step() {
     assert!(!steps.take(), "and only once");
 }
 
+/// A watch that hears the system's step announcement alone hears a sleep only where a resume is
+/// announced as a step (Linux's timer). macOS's `clock_set` says nothing of a sleep the clock
+/// was not set across, so the owner of such a watch keeps reading its own clocks, and a watch the
+/// test tells by hand counts as hearing each sleep it is told.
+/// NEGATIVE CONTROL: `hears_sleep` read as "either half registered", which is what
+/// [`WallWatch::start`] answers `Some` for, reads true for the steps-only watch on macOS.
+#[test]
+fn a_watch_of_steps_alone_hears_a_sleep_only_where_a_resume_is_a_step() {
+    match WallWatch::steps_only() {
+        Some(watch) => assert_eq!(watch.hears_sleep(), cfg!(target_os = "linux")),
+        None => assert!(
+            !cfg!(any(target_os = "macos", target_os = "linux")),
+            "macOS and Linux announce a step"
+        ),
+    }
+    assert!(WallWatch::by_hand().expect("doorbell").hears_sleep());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn this_mac_announces_its_steps_and_wakes() {
     let watch = WallWatch::start().expect("macOS announces both");
     assert!(watch.steps.is_some(), "clock_set registered");
+    assert!(watch.hears_sleep(), "the power half registered");
     assert_eq!(watch.fds().len(), 2);
     assert!(!watch.take().any(), "nothing moved at start");
 }

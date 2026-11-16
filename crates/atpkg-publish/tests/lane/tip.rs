@@ -526,6 +526,25 @@ impl World {
         (tip::run(&self.fx.ctx, &opts, &deps, &tx), tx)
     }
 
+    /// A real pass on Apple silicon, with what it did whether or not it ends red.
+    fn pass_into(&self) -> (Result<()>, tip::Outcome, Transcript) {
+        let tx = Transcript::memory(tip::ME);
+        let packer = Recording {
+            inner: &self.fx.packer,
+            events: self.backend.events.clone(),
+            broken: None,
+        };
+        let deps = tip::Deps {
+            packer: &packer,
+            backend: &self.backend,
+            notifier: &self.fx.notes,
+        };
+        let opts = tip::Options::new(&self.fx.ctx, false, ARM);
+        let mut outcome = tip::Outcome::default();
+        let result = tip::run_into(&self.fx.ctx, &opts, &deps, &tx, &mut outcome);
+        (result, outcome, tx)
+    }
+
     fn pass(&self) -> (tip::Outcome, Transcript) {
         match self.pass_with(false, None) {
             (Ok(outcome), tx) => (outcome, tx),
@@ -1272,64 +1291,134 @@ fn what_a_source_step_leaves_in_the_tree_is_gone_before_the_build_reads_it() {
 }
 
 #[test]
-fn a_repository_with_no_qualification_list_ships_nothing_and_is_not_a_failure() {
-    let w = World::new("tip-unqualified");
-    w.backend.recipe("ay", recipe("ay", None));
-    let (outcome, tx) = w.pass();
-    assert_eq!(row(&outcome, "ay").fate, Some(Fate::Unqualified));
-    assert!(outcome.enqueued.is_empty() && outcome.failed.is_empty());
+fn a_pinned_active_program_with_no_qualification_list_ends_the_pass_red() {
+    let w = World::new("tip-unlisted");
+    let state = w.state();
+    // nn is pinned (3) and active, and its main moves on to build 4 with no manifest that
+    // spells a list; ay's main qualifies as ever.
+    let dev = w.fx.path("dev/nn");
+    let nn = fixture::commit(&dev, "no list", None);
+    let line = |build: u64, sha: &str| {
+        format!(
+            "nn={build}: its repository declares no [workspace.metadata.atpkg] qualify list at \
+             {} — nothing ships unqualified",
+            &sha[..12]
+        )
+    };
+    // More passes than a failing build gets: the pass is red every time, and nothing is counted
+    // against nn's build or latched.
+    for pass in 0..=tip::BLOCK_AFTER {
+        let (r, outcome, tx) = w.pass_into();
+        let e = r.expect_err("a pinned, active program with no list ends the pass red");
+        assert!(matches!(e, Error::Refused(_)), "{e}");
+        assert!(
+            e.to_string()
+                .contains(&format!("nn at {} (build 4)", &nn[..12])),
+            "the red names the program and its frozen commit: {e}\n{}",
+            tx.text()
+        );
+        let r = row(&outcome, "nn");
+        assert_eq!(r.fate, Some(Fate::Unqualified));
+        assert_eq!(r.decision, Decision::Qualify, "never latched");
+        // Listed under failed, not skipped, and the typed outcome holds it.
+        assert_eq!(outcome.failed, [line(4, &nn)]);
+        assert!(
+            !outcome.skipped.iter().any(|s| s.starts_with("nn")),
+            "{:?}",
+            outcome.skipped
+        );
+        let typed = atpkg_publish::lane::Summary::from(outcome.clone());
+        assert_eq!(typed.held, [line(4, &nn)]);
+        // Every other candidate is still qualified and queued.
+        if pass == 0 {
+            assert_eq!(typed.ready, ["ay=5"], "{}", tx.text());
+        } else {
+            assert_eq!(row(&outcome, "ay").decision, Decision::Enqueued);
+        }
+        assert!(!state.attempts_file("nn", 4).exists());
+        assert!(!state.blocked_file("nn", 4).exists());
+        assert!(
+            !state.dir.join("logs/nn-4").exists(),
+            "no attempt was made, and none is kept"
+        );
+    }
+    // Nothing of nn was packed, staged or queued.
     assert!(
-        outcome
-            .skipped
+        w.fx.packer
+            .legs()
             .iter()
-            .any(|s| s.contains("declares no [workspace.metadata.atpkg] qualify")),
-        "{:?}",
-        outcome.skipped
+            .all(|(program, ..)| program != "nn")
     );
-    assert!(tx.text().contains("nothing ships unqualified"));
-    assert!(w.fx.packer.legs().is_empty() && w.backend.asked().is_empty());
-    assert!(w.queued().is_empty());
+    assert_eq!(w.fx.staging_asset("nn", 4, "pkg-nn-4.toml"), None);
+    assert_eq!(w.queued(), ["ay-5.ready.toml"]);
+    // A commit none of whose manifests spells a list is known by its objects: the pass neither
+    // asks for its recipe nor checks it out.
+    assert!(!w.backend.events().iter().any(|e| e == "metadata nn"));
+    let head = std::fs::read_to_string(state.dir.join("progs/nn/.git/HEAD")).expect("HEAD");
+    assert!(head.starts_with("ref: "), "checked out: {head}");
+    // One notice for the program, however many passes met it; the pass is not noticed again
+    // as a whole.
+    let notes = w.fx.notes.entries();
+    assert_eq!(
+        notes.iter().filter(|n| **n == line(4, &nn)).count(),
+        1,
+        "{notes:?}"
+    );
+    assert!(!notes.iter().any(|n| n.starts_with("FAILED")), "{notes:?}");
+
+    // A new main is a new build: noticed once on its own, and red until the list is declared.
+    let moved = fixture::commit(&dev, "still no list", None);
+    let (r, outcome, _) = w.pass_into();
+    let e = r.expect_err("still no list");
     assert!(
-        !w.state().attempts_file("ay", 5).exists(),
-        "a missing list is the repository's standing, not a failed attempt"
+        e.to_string()
+            .contains(&format!("nn at {} (build 5)", &moved[..12])),
+        "{e}"
     );
-    let logs = w.state().dir.join("logs/ay-5");
-    assert!(!logs.exists(), "no attempt was made, and none is kept");
-    // A malformed list is a defect of that commit: it fails, by what is wrong with it. The
-    // attempt ran no step, and still keeps its receipt in a directory of its own.
+    assert_eq!(outcome.failed, [line(5, &moved)]);
+    let notes = w.fx.notes.entries();
+    assert_eq!(
+        notes.iter().filter(|n| **n == line(5, &moved)).count(),
+        1,
+        "{notes:?}"
+    );
+
+    // A malformed list is a defect of that commit: it fails, by what is wrong with it, and is
+    // counted. The attempt ran no step, and still keeps its receipt in a directory of its own.
+    // With no other candidate queued, every candidate failed, and the red names both.
+    let ay = fixture::commit(&w.fx.path("dev/ay"), "a malformed list", None);
     w.backend.recipe("ay", recipe("ay", Some(&[FMT, BUILD])));
-    let (r, _) = w.pass_with(false, None);
+    let (r, outcome, _) = w.pass_into();
     let e = r.expect_err("a malformed list");
+    assert!(
+        e.to_string().contains("every candidate failed to qualify"),
+        "{e}"
+    );
     assert!(e.to_string().contains(r#"carries no "packed" step"#), "{e}");
-    let receipt = std::fs::read_to_string(logs.join("attempt-1/receipt.json")).expect("kept");
+    assert!(e.to_string().contains(&line(5, &moved)), "{e}");
+    assert_eq!(outcome.failed.len(), 2, "{:?}", outcome.failed);
+    assert!(state.attempts_file("ay", 6).exists());
+    assert!(!state.attempts_file("nn", 5).exists());
+    let receipt =
+        std::fs::read_to_string(state.dir.join("logs/ay-6/attempt-1/receipt.json")).expect("kept");
     let receipt: aterm_json::Value = aterm_json::from_str(&receipt).expect("JSON");
     assert_eq!(receipt["outcome"].as_str(), Some("failed"));
     assert_eq!(receipt["attempt"].as_u64(), Some(1));
 
-    // A commit none of whose manifests spells a list has not joined the lane: the pass learns
-    // that from the commit's objects, and neither checks it out nor asks for its recipe.
-    let dev = w.fx.path("dev/ay");
-    std::fs::write(dev.join("Cargo.toml"), "[workspace]\n").expect("a plain manifest");
-    git(&dev, &["add", "Cargo.toml"]);
-    let plain = fixture::commit(&dev, "no list", None);
-    let recipes = |w: &World| {
-        w.backend
-            .events()
-            .iter()
-            .filter(|e| *e == "metadata ay")
-            .count()
-    };
-    let asked = recipes(&w);
-    let (outcome, _) = w.pass();
-    let ay = row(&outcome, "ay");
-    assert_eq!(ay.frozen.as_ref().expect("frozen").sha, plain);
-    assert_eq!(ay.fate, Some(Fate::Unqualified));
-    assert_eq!(recipes(&w), asked, "no recipe was read");
-    assert_ne!(
-        git(&w.state().dir.join("progs/ay"), &["rev-parse", "HEAD"]),
-        plain,
-        "and the commit was never checked out"
-    );
+    // A manifest that names a list whose recipe carries none is the same standing: the recipe
+    // is read, and no attempt is made or kept. One red names every such program.
+    w.backend.recipe("ay", recipe("ay", None));
+    let (r, outcome, _) = w.pass_into();
+    let e = r.expect_err("no list in either repository");
+    for want in [
+        format!("ay at {} (build 6)", &ay[..12]),
+        format!("nn at {} (build 5)", &moved[..12]),
+    ] {
+        assert!(e.to_string().contains(&want), "{want:?} missing from {e}");
+    }
+    assert_eq!(row(&outcome, "ay").fate, Some(Fate::Unqualified));
+    assert!(!state.dir.join("logs/ay-6/attempt-2").exists());
+    assert!(!state.blocked_file("ay", 6).exists());
 }
 
 #[test]
@@ -1414,7 +1503,9 @@ fn a_dry_run_prints_each_programs_plan_and_writes_nothing() {
 
     // After a real pass too: the dry run borrows the lane's objects and still writes nothing.
     w.backend.recipe("ay", recipe("ay", None));
-    w.pass();
+    w.pass_with(false, None)
+        .0
+        .expect_err("with no list, the real pass ends red");
     let before = listing(&home);
     let (r, tx) = w.pass_with(true, None);
     r.expect("a plan");

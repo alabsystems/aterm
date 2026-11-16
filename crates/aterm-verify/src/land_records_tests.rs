@@ -60,7 +60,10 @@ fn a_spool_cleanup_failure_is_reported_without_losing_a_successful_append() {
         .publish(&world.work, &mut |line| said.push(line.to_owned()))
         .expect("cleanup cannot turn a successful append into an unwritten one");
     assert_eq!(filed(&world.work, T), ["fmt.ok", "lint.ok"]);
-    assert_eq!(mac.dir().pending().unwrap().records, [held.clone()]);
+    assert_eq!(
+        mac.dir().pending().unwrap().records.as_slice(),
+        std::slice::from_ref(&held)
+    );
     assert!(
         said.iter()
             .any(|line| line.contains(&held.path) && line.contains("controlled cleanup refusal")),
@@ -542,6 +545,207 @@ fn a_record_no_append_held_stays_spooled_until_the_next_landing_appends_it() {
         "the line names both the refusal and why the spool keeps none: {:#?}",
         landing.said
     );
+}
+
+/// A conflict returns after keeping its signed records, without starting optional journal
+/// work. A fresh controller reads those exact bytes from disk; its next successful landing
+/// publishes them beside its own records and clears the spool.
+#[test]
+fn a_conflict_keeps_its_records_for_the_next_landing_without_appending() {
+    let world = world_of();
+    let own = commit(&world.work, "shared.txt", &SHARED.replacen('4', "mine", 1));
+    let mac = Mac::new(&world, Some(1));
+    let mut records = mac.records();
+    let first_run = records.run.id.clone();
+    records.append = Box::new(|_, _, _| panic!("a kept conflict must not start an append"));
+    let mut judge = judging("cafe0001", &[]);
+    let stopped = land_on(&world.work, records, |base, tree, poll| {
+        rival_moves(&world, "shared.txt", &SHARED.replacen('4', "theirs", 1));
+        judge(base, tree, poll)
+    });
+    assert_eq!(stopped.code, exit::CONFLICT, "{:#?}", stopped.said);
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), own);
+    assert!(git(&world.work, &["status", "--porcelain"]).contains("UU shared.txt"));
+    assert!(kept_record(&world).is_some());
+    assert!(
+        crate::judged::head(&world.work, REMOTE, crate::judged::deadline())
+            .unwrap()
+            .is_none()
+    );
+
+    let reopened = crate::land_spool::Dir::at(mac.spool.clone());
+    let pending = reopened
+        .pending()
+        .expect("the records survive their controller");
+    assert!(pending.unreadable.is_empty());
+    assert_eq!(mac.spooled(), ["cells.ok", "fmt.ok", "lint.ok", "test.ok"]);
+    let mut end = None;
+    for signed in &pending.records {
+        let signature = if signed.path.starts_with(crate::land_run::DIR) {
+            let read = crate::land_run::Entry::read(&signed.path, &signed.bytes, Origin::Spool)
+                .body
+                .expect("the run record and its signature verify");
+            if read.record.kind == "end" {
+                end = Some(read.record.clone());
+            }
+            read.signature
+        } else {
+            Entry::read(&signed.path, &signed.bytes, Origin::Spool)
+                .body
+                .expect("the verdict and its signature verify")
+                .signature
+        };
+        assert_eq!(
+            signature.map(|signature| signature.key),
+            Some(signer(1).key())
+        );
+    }
+    assert_eq!(
+        end.expect("the conflict has an end record").exit,
+        Some(exit::CONFLICT)
+    );
+
+    super::push::resolve(&world, &[("shared.txt", "resolved\n")]);
+    let mut next = mac.records();
+    next.run.id = "ffffffffffffffffffffffffffffffff".into();
+    assert_ne!(next.run.id, first_run);
+    let branch = crates(&["a"]);
+    let reach = whole_reach(&branch);
+    let landed = land_rounds(
+        &world.work,
+        next,
+        &reach,
+        |_, _, _| panic!("the kept merge needs its round, not another full judgment"),
+        |_, _| super::push::round_green(),
+    );
+    assert_eq!(landed.code, exit::PASS, "{:#?}", landed.said);
+    let head = crate::judged::head(&world.work, REMOTE, crate::judged::deadline())
+        .unwrap()
+        .expect("the next landing delivered the spool");
+    for signed in &pending.records {
+        let output = git_cmd(&world.work)
+            .args(["show", &format!("{head}:{}", signed.path)])
+            .output()
+            .expect("read the appended record");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, signed.bytes, "{}", signed.path);
+    }
+    let remaining = reopened.pending().unwrap();
+    assert!(remaining.records.is_empty());
+    assert!(remaining.unreadable.is_empty());
+}
+
+/// Deferral cannot discard records when the end cannot be saved or durable custody cannot be
+/// confirmed: publication rescues them and preserves the conflict exit. An end record that
+/// cannot be formed must not produce a vacuous assurance that the run was kept.
+#[test]
+fn a_conflict_rescues_records_when_local_custody_is_not_confirmed() {
+    struct RefusedCustody {
+        dir: crate::land_spool::Dir,
+        refuse_end: bool,
+        flushed: Rc<Cell<bool>>,
+    }
+    impl Spool for RefusedCustody {
+        fn put(&self, record: &Signed) -> Result<(), String> {
+            if self.refuse_end
+                && crate::land_run::Filed::parse(&record.path)
+                    .is_ok_and(|filed| filed.kind == crate::land_run::Kind::End)
+            {
+                Err("controlled end persistence refusal".into())
+            } else {
+                self.dir.put(record)
+            }
+        }
+        fn flush(&self) -> Result<(), String> {
+            self.flushed.set(true);
+            Err("controlled durability confirmation refusal".into())
+        }
+        fn pending(&self) -> Result<crate::land_spool::Pending, String> {
+            self.dir.pending()
+        }
+        fn done(&self, record: &Signed) -> Result<(), String> {
+            self.dir.done(record)
+        }
+    }
+    for refuse_end in [true, false] {
+        let world = world_of();
+        commit(&world.work, "shared.txt", &SHARED.replacen('4', "mine", 1));
+        let mac = Mac::new(&world, Some(1));
+        let mut records = mac.records();
+        let flushed = Rc::new(Cell::new(false));
+        records.spool = Box::new(RefusedCustody {
+            dir: mac.dir(),
+            refuse_end,
+            flushed: flushed.clone(),
+        });
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let observed = delivered.clone();
+        let mut append = records.append;
+        records.append = Box::new(move |root, signed, at| {
+            *observed.borrow_mut() = signed.to_vec();
+            append(root, signed, at)
+        });
+        let mut judge = judging("cafe0003", &[]);
+        let stopped = land_on(&world.work, records, |base, tree, poll| {
+            rival_moves(&world, "shared.txt", &SHARED.replacen('4', "theirs", 1));
+            judge(base, tree, poll)
+        });
+        assert_eq!(stopped.code, exit::CONFLICT, "{:#?}", stopped.said);
+        if !refuse_end {
+            assert!(flushed.get(), "the confirmation refusal was exercised");
+        }
+        let end = delivered
+            .borrow()
+            .iter()
+            .find(|signed| {
+                crate::land_run::Filed::parse(&signed.path)
+                    .is_ok_and(|filed| filed.kind == crate::land_run::Kind::End)
+            })
+            .expect("the append rescues the end despite unconfirmed custody")
+            .clone();
+        let read = crate::land_run::Entry::read(&end.path, &end.bytes, Origin::Journal)
+            .body
+            .expect("the rescued end reads");
+        assert_eq!(read.record.exit, Some(exit::CONFLICT));
+        let head = crate::judged::head(&world.work, REMOTE, crate::judged::deadline())
+            .unwrap()
+            .expect("the rescue reached the journal");
+        let output = git_cmd(&world.work)
+            .args(["show", &format!("{head}:{}", end.path)])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, end.bytes);
+        assert!(mac.dir().pending().unwrap().records.is_empty());
+
+        if !refuse_end {
+            let mut absent = mac.records();
+            absent.run.id = "not-a-run-id".into();
+            absent.signer = None;
+            let mut said = Vec::new();
+            records::finish(
+                &Git {
+                    root: &world.work,
+                    make: &git_cmd,
+                },
+                &mut absent,
+                &mut |line| said.push(line.to_owned()),
+                exit::CONFLICT,
+                records::Delivery::DeferIfKept,
+            );
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("end record was not written")),
+                "{said:#?}"
+            );
+            assert!(
+                !said
+                    .iter()
+                    .any(|line| line.contains("its next land appends them")),
+                "{said:#?}"
+            );
+        }
+    }
 }
 
 /// A verifier older than `run-planned` (its rows carry no key) has its FAIL rows recorded

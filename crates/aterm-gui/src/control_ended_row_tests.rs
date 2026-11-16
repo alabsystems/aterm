@@ -88,3 +88,95 @@ fn task_and_result_answer_from_an_ended_sessions_row() {
         "ERR no such session\n"
     );
 }
+
+/// Which reader of an ended row [`row_disk_reads_release_the_store_guard`] drives.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum RowReader {
+    /// `control::ended_record`, behind `@<sid> result` and `task`.
+    Ended,
+    /// `control::hosts_or_keeps_in`, the window node serve's fleet lookup.
+    Hosts,
+    /// `control::keeps_ended_row`, the fleet drive gate's `ended`.
+    DriveGate,
+}
+
+/// A row read blocked on the state volume must not hold up the window's store writer.
+#[cfg(unix)]
+fn row_disk_reads_release_the_store_guard(reader_kind: RowReader) {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let store = crate::session_store::new_store();
+        let table = SessionTable::at(dir.path().to_path_buf());
+        table.serve(&store);
+        assert!(table.loaded_within(Duration::from_secs(60)));
+        let sid = aterm_session::SessionId::generate();
+        let path = dir.path().join(format!("{}.toml", sid.as_str()));
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated pathname in this test's owned directory.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let read_store = store.clone();
+        let read_sid = sid.clone();
+        let (done, seen) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            match reader_kind {
+                RowReader::Hosts => {
+                    super::hosts_or_keeps_in(&read_store, &read_sid);
+                }
+                RowReader::DriveGate => {
+                    super::keeps_ended_row(&read_store, &read_sid);
+                }
+                RowReader::Ended => {
+                    super::ended_record(
+                        &read_store,
+                        &Selector::parse(read_sid.as_str()),
+                        Scope::Owner,
+                    );
+                }
+            }
+            done.send(()).unwrap();
+        });
+        // Opening the writer proves the reader is in file I/O. Keep it there until after the
+        // lock assertion, but release it even if that assertion will fail.
+        let (connected, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            connected.send(()).unwrap();
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the lock was inspected");
+            writer.write_all(b"not a row").unwrap();
+        });
+        ready
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the row reader opened the FIFO");
+        let free = store.try_write().is_ok();
+        release.send(()).unwrap();
+        seen.recv_timeout(Duration::from_secs(60))
+            .expect("the read ends after the writer closes its pipe");
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(free, "disk I/O holds no store read guard ({reader_kind:?})");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ended_row_disk_reads_release_the_store_guard() {
+    row_disk_reads_release_the_store_guard(RowReader::Ended);
+}
+
+#[cfg(unix)]
+#[test]
+fn ended_row_fleet_lookup_releases_the_store_guard() {
+    row_disk_reads_release_the_store_guard(RowReader::Hosts);
+}
+
+#[cfg(unix)]
+#[test]
+fn ended_row_drive_gate_lookup_releases_the_store_guard() {
+    row_disk_reads_release_the_store_guard(RowReader::DriveGate);
+}

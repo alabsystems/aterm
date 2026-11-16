@@ -840,6 +840,31 @@ impl MarkReq {
 }
 
 impl SessionLog {
+    /// THE RECORD STREAM'S ONE WRITE ARM: a mark a harness record stands for, at `node` (the
+    /// session with none). Every one is stamped here with all four of `holder=<the claim's
+    /// holder>`, `src=harness`, `conf=claim` and `by=<the tab's own session>`, so no writer of
+    /// a stream row can leave one out; a holder that is no ID writes nothing. It neither reads
+    /// nor spends the mark limiter: the stream's own bucket (`control_stream.rs`) is the only
+    /// budget a record has, and a session's `mark` budget is not the harness's to use up.
+    pub(crate) fn stream_mark(
+        &mut self,
+        kind: Kind,
+        node: Option<Node>,
+        fields: Fields,
+        holder: &str,
+        by: Actor,
+        at: Stamp,
+    ) -> Option<u64> {
+        let fields = fields.id(Key::Holder, holder).ok()?;
+        let mut mark = Mark::new(kind, Src::Harness, aterm_slog::Conf::Claim)
+            .by(by)
+            .fields(fields);
+        if let Some(node) = node {
+            mark = mark.at(node);
+        }
+        self.log.mark(mark, at).ok()
+    }
+
     /// WRITE A CLAIM (design §7.4): `req` by `by` (the connection's actor),
     /// `re` already checked. A `desc` is written by [`Self::claim_desc`].
     pub(crate) fn mark_claim(

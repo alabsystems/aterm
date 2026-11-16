@@ -289,13 +289,6 @@ pub(crate) mod bulk {
             attr_buf_size: usize,
             options: u64,
         ) -> libc::c_int;
-        fn fgetattrlist(
-            fd: libc::c_int,
-            attr_list: *mut AttrList,
-            attr_buf: *mut libc::c_void,
-            attr_buf_size: usize,
-            options: libc::c_uint,
-        ) -> libc::c_int;
         fn getattrlistat(
             fd: libc::c_int,
             path: *const libc::c_char,
@@ -521,33 +514,10 @@ pub(crate) mod bulk {
         })
     }
 
-    /// `ATTR_DIR_ENTRYCOUNT` of an open directory, without listing it.
+    /// `ATTR_DIR_ENTRYCOUNT` of an open directory, without listing it
+    /// (`aterm_dirfd::dir_entry_count`, the one `fgetattrlist` call of it).
     pub(crate) fn entry_count(fd: BorrowedFd<'_>) -> Result<u32, i32> {
-        let mut al = AttrList {
-            bitmapcount: ATTR_BIT_MAP_COUNT,
-            reserved: 0,
-            commonattr: 0,
-            volattr: 0,
-            dirattr: ATTR_DIR_ENTRYCOUNT,
-            fileattr: 0,
-            forkattr: 0,
-        };
-        let mut buf = [0u8; 16];
-        // SAFETY: a live descriptor, a valid attrlist, a 16-byte writable buffer.
-        let r = unsafe {
-            fgetattrlist(
-                fd.as_raw_fd(),
-                &raw mut al,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                0,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
-        }
-        let mut rd = Rd { b: &buf, at: 4 };
-        rd.u32().ok_or(libc::EIO)
+        aterm_dirfd::dir_entry_count(fd).map_err(|e| e.raw_os_error())
     }
 
     /// `ATTR_DIR_ENTRYCOUNT` of the directory `name` in `dir`, not following a link, without

@@ -162,7 +162,12 @@ fn an_edge_sees_only_the_sessions_it_may_read() {
     let grant = |app: &crate::App, op: Op| {
         let ctx = &app.pool.get(sibling).expect("the sibling").ctx;
         let mut table = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
-        table.grant(SessionId::new("s-src"), ctx.self_id.clone(), op, ctx.nonce)
+        table.grant(
+            SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(0x5c_0001)),
+            ctx.self_id.clone(),
+            op,
+            ctx.nonce,
+        )
     };
     let read = Scope::Edge(grant(&app, Op::ReadScreen));
     let write = Scope::Edge(grant(&app, Op::WriteInput));

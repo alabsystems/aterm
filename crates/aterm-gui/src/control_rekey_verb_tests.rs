@@ -70,7 +70,7 @@ fn rekey_is_owner_class_and_names_its_tab() {
 fn rekey_is_issued_only_while_the_named_shell_leads_the_foreground() {
     let led = leader();
     let pid = led.child.id();
-    let sid = aterm_session::SessionId::new("s-00000000000000000002");
+    let sid = aterm_session::SessionId::parse("s-00000000000000000002").expect("a legacy tab id");
     let mut healthy = Terminal::new(24, 80);
     healthy.set_require_shell_integration_nonce(true);
     healthy.authorize_shell_integration([3; 32]);

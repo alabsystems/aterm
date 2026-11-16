@@ -158,7 +158,7 @@ fn a_complete_summary_requires_a_clean_log_eof() {
 fn present_obligation_records_must_parse_before_any_measurement_is_kept() {
     let scratch = crate::test_scratch_dir("obligation-record-errors");
     for name in ["alpha", "beta"] {
-        fs::write(scratch.path().join(format!("{name}@1.0.0.log")), DONE).unwrap();
+        testing::write_log(&scratch.path().join(format!("{name}@1.0.0.log")), DONE);
         fs::write(scratch.path().join(format!("{name}@1.0.0.log.rc")), "1\n").unwrap();
     }
     let valid = crate::trust_oblig::Record {
@@ -624,7 +624,7 @@ fn the_lanes_budget_mark_is_read_into_the_facts() {
         ("beta@2.0.0", "1", Some("\n")),
         ("gamma@3.0.0", "1", None),
     ] {
-        fs::write(dir.join(format!("{spec}.log")), DONE).unwrap();
+        testing::write_log(&dir.join(format!("{spec}.log")), DONE);
         fs::write(dir.join(format!("{spec}.log.rc")), rc).unwrap();
         if let Some(mark) = mark {
             fs::write(dir.join(format!("{spec}.log.budget")), mark).unwrap();
@@ -991,11 +991,10 @@ fn conclude_files_only_what_a_release_may_read() {
     let slots = w.root.join("troot");
     fs::create_dir_all(slots.join("j0/debug/deps")).unwrap();
     fs::create_dir_all(&logs).unwrap();
-    fs::write(
-        logs.join("alpha@1.0.0.log"),
+    testing::write_log(
+        &logs.join("alpha@1.0.0.log"),
         "  Summary: 3 proved, 0 failed (3 total)\nCoverage: 2/2 eligible function bodies verified (complete)\n",
-    )
-    .unwrap();
+    );
     fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
     fs::write(logs.join(".trustd-grants"), "1\n").unwrap();
     let dep = slots.join("j0/debug/deps/alpha-1.d");
@@ -1123,7 +1122,7 @@ fn an_unreadable_log_prevents_conclusion_and_ratchet_changes() {
     let w = World::new("unreadable-log");
     w.commit(&[(RATCHET, &floor(3))]);
     let logs = w.root.join("logs");
-    fs::create_dir_all(logs.join("alpha@1.0.0.log")).unwrap();
+    fs::create_dir_all(logs.join("alpha@1.0.0.log.zst")).unwrap();
     fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
     let ratchet = fs::read(w.work().join(RATCHET)).unwrap();
     for update in [Update::NONE, Update::RAISE] {
@@ -1174,7 +1173,7 @@ fn unreadable_floor_inputs_prevent_measurement_and_publication() {
                 ]);
                 let logs = w.root.join("logs");
                 fs::create_dir(&logs).unwrap();
-                fs::write(logs.join("alpha@1.0.0.log"), DONE).unwrap();
+                testing::write_log(&logs.join("alpha@1.0.0.log"), DONE);
                 fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
                 let broken = w.work().join(target);
                 if directory {
@@ -1463,6 +1462,77 @@ fn the_judge_holds_floors_as_the_lane_did() {
     );
     assert_eq!(why.word, "FAIL");
     assert!(why.report.contains("TOTAL-ABOVE-ROW(>2)"), "{}", why.report);
+}
+
+/// DC-08: `trust log` takes one library, by name or `name@version`, and at most one
+/// `--target-root DIR`. NEGATIVE CONTROL: a second library, a flag it does not take, a
+/// `--target-root` given twice or with no directory, and no library at all are each refused,
+/// naming what was wrong.
+#[test]
+fn the_log_verb_takes_one_library_and_a_target_root() {
+    let parse = |args: &[&str]| parse_cmd(&mut std::iter::once("log").chain(args.iter().copied()));
+    assert_eq!(
+        parse(&["alpha"]),
+        Ok(TrustCmd::Log {
+            lib: "alpha".into(),
+            root: None,
+        })
+    );
+    assert_eq!(
+        parse(&["--target-root", "/r", "alpha@1.0.0"]),
+        Ok(TrustCmd::Log {
+            lib: "alpha@1.0.0".into(),
+            root: Some(PathBuf::from("/r")),
+        })
+    );
+    for (args, said) in [
+        (&["alpha", "beta"][..], "\"beta\""),
+        (&["alpha", "--obligations"], "\"--obligations\""),
+        (
+            &["alpha", "--target-root", "/r", "--target-root", "/s"],
+            "twice",
+        ),
+        (&["alpha", "--target-root"], "needs a directory"),
+        (&["alpha", "--target-root", "--x"], "needs a directory"),
+        (&[], "names one library"),
+    ] {
+        let why = parse(args).unwrap_err();
+        assert!(why.contains(said), "{args:?}: {why}");
+    }
+}
+
+/// DC-08: a check's log is read from its stored form alone (`<name@version>.log.zst`,
+/// decompressed): with none, the error names it; a stored log whose frame has not ended fails at
+/// its end rather than read as whole; a symlink in its place is refused. NEGATIVE CONTROL: a
+/// plain log beside it, as a lane before stored logs wrote one, is never read: a reader that
+/// fell back to it would find a log, and its summary.
+#[test]
+fn a_checks_log_is_read_from_its_stored_form_alone() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let log = dir.path().join("alpha@1.0.0.log");
+    fs::write(&log, "Summary: 1 proved, 0 failed (2 total)\n").unwrap();
+    let missing = open_log(&log).err().unwrap();
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        missing.to_string().contains("alpha@1.0.0.log.zst"),
+        "{missing}"
+    );
+    testing::write_log(&log, "Summary: 3 proved, 0 failed (4 total)\n");
+    let summary = Measured::of_log(open_log(&log).unwrap(), "0")
+        .unwrap()
+        .summary;
+    assert!(summary.contains("3 proved"), "{summary}");
+    let zst = fs::read(stored_log(&log)).unwrap();
+    fs::write(stored_log(&log), &zst[..zst.len() - 4]).unwrap();
+    let unended = Measured::of_log(open_log(&log).unwrap(), "0").unwrap_err();
+    assert_eq!(
+        unended.kind(),
+        std::io::ErrorKind::UnexpectedEof,
+        "{unended}"
+    );
+    fs::remove_file(stored_log(&log)).unwrap();
+    std::os::unix::fs::symlink(&log, stored_log(&log)).unwrap();
+    assert!(open_log(&log).is_err(), "a symlink is refused");
 }
 
 /// `trust judge --reason`, as `trust run`'s, needs `--update-ratchet` and words: a blank one
@@ -1887,7 +1957,7 @@ fn measured_check(
     let scratch = crate::test_scratch_dir("check");
     let dir = scratch.path();
     let beside = |ext: &str| dir.join(format!("{spec}.log{ext}"));
-    fs::write(beside(""), log).unwrap();
+    testing::write_log(&beside(""), log);
     fs::write(beside(".rc"), "1\n").unwrap();
     if let Some(p) = pace {
         fs::write(beside(".pace"), format!("{}\n", p.text())).unwrap();
@@ -3546,7 +3616,7 @@ fn a_run_targo_refused_a_path_in_files_nothing() {
         slots.display(),
     );
     let run = |log: &str, rc: &str| {
-        fs::write(logs.join("alpha@1.0.0.log"), log).unwrap();
+        testing::write_log(&logs.join("alpha@1.0.0.log"), log);
         fs::write(logs.join("alpha@1.0.0.log.rc"), rc).unwrap();
         let mut p = Plan::parse(&plan).unwrap();
         conclude(&w.cli(), &w.work(), &mut p, Update::NONE).unwrap()

@@ -186,8 +186,9 @@ impl Registry {
             crate::admission::deadline(),
             |session, catalog| projection_descriptor(config, session, catalog),
             |session, store, scope, compiled, custody, _, validate| {
+                count_admission(AdmissionCount::Observation, 1);
                 let log = Log::read_with(session, store, scope, decode)?;
-                let view = View::read(compiled.table, session, &log);
+                let view = View::read(compiled.table, session, &log)?;
                 let read = ProjectionRead::read(session, scope, &view, custody)?;
                 include_source(config, session.paths(), session.trust(), scope)?;
                 (validate.current)()?;
@@ -278,8 +279,9 @@ impl Registry {
             deadline,
             |session, catalog| projection_descriptor(config, session, catalog),
             |session, store, scope, compiled, custody, look, validate| {
-                let log = Log::read_with(session, store, scope, decode)?;
-                let view = View::read(compiled.table, session, &log);
+                count_admission(AdmissionCount::Read, 1);
+                let log = Log::read_with(session, store, scope, admitted_decode)?;
+                let view = View::read(compiled.table, session, &log)?;
                 let source = ProjectionRead::read(session, scope, &view, custody)?;
                 #[cfg(test)]
                 let compare = PROJECTION_MUTANT.get() != 1;
@@ -344,6 +346,110 @@ fn include_source(
         return Err(Error::new("native registry source is excluded"));
     }
     Ok(())
+}
+
+/// The strict reads of the registry this process made since it started, and what its receipt
+/// admissions read ([`admission_counts`]). Each count only rises, so a reader takes two readings
+/// and subtracts. They decide nothing: no read, admission or schedule consults them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionCounts {
+    /// Admissions that held both replicas and began the registry's strict read
+    /// ([`Registry::with_admitted_projection`]); one refused before that is not counted.
+    pub reads: u64,
+    /// Registry records those reads handed to the decoder: each retained record that carries a
+    /// payload and is no removal cutoff, once per read. A record a roll carried is decoded again
+    /// from the row that holds it when the view is read (`crate::att::archived_ops`); that
+    /// second decode is not counted.
+    pub records: u64,
+    /// Those records' payload bytes.
+    pub bytes: u64,
+    /// Strict reads of the registry that were no admission ([`Registry::observe_projection`]),
+    /// each counted once it held both replicas and began its read; one refused before that is
+    /// not counted, and neither are the records it decoded. It is the same whole read of the
+    /// log and the view as an admission's.
+    pub observations: u64,
+}
+
+/// One of [`AdmissionCounts`]' counts.
+#[derive(Clone, Copy)]
+enum AdmissionCount {
+    Read,
+    Record,
+    Byte,
+    Observation,
+}
+
+static ADMISSION_COUNTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(test)]
+thread_local! {
+    /// The calling thread's own counts ([`admission_counts_here`]).
+    static ADMISSION_COUNTS_HERE: [std::cell::Cell<u64>; 4] =
+        const { [const { std::cell::Cell::new(0) }; 4] };
+}
+
+/// Add `n` to `which`.
+fn count_admission(which: AdmissionCount, n: u64) {
+    ADMISSION_COUNTS[which as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    ADMISSION_COUNTS_HERE.with(|here| {
+        let cell = &here[which as usize];
+        cell.set(cell.get() + n);
+    });
+}
+
+/// [`decode`] for an admission's read of the registry's log, counting the record it is handed
+/// and that record's payload bytes. The answer is [`decode`]'s own; no other read of the
+/// registry passes this function, so none is counted.
+fn admitted_decode(payload: &[u8]) -> Result<Command> {
+    count_admission(AdmissionCount::Record, 1);
+    count_admission(AdmissionCount::Byte, payload.len() as u64);
+    decode(payload)
+}
+
+/// The counts now ([`AdmissionCounts`]).
+#[must_use]
+pub fn admission_counts() -> AdmissionCounts {
+    let read = |which: AdmissionCount| {
+        ADMISSION_COUNTS[which as usize].load(std::sync::atomic::Ordering::Relaxed)
+    };
+    AdmissionCounts {
+        reads: read(AdmissionCount::Read),
+        records: read(AdmissionCount::Record),
+        bytes: read(AdmissionCount::Byte),
+        observations: read(AdmissionCount::Observation),
+    }
+}
+
+/// Add `by` to the process's counts ([`admission_counts`]), so a test of a reader in another
+/// crate (the window's `metrics`) can tell each count from the others. The calling thread's
+/// own counts are left as they were: nothing was read.
+#[cfg(any(test, debug_assertions))]
+pub fn add_admission_counts_for_test(by: AdmissionCounts) {
+    for (which, n) in [
+        (AdmissionCount::Read, by.reads),
+        (AdmissionCount::Record, by.records),
+        (AdmissionCount::Byte, by.bytes),
+        (AdmissionCount::Observation, by.observations),
+    ] {
+        ADMISSION_COUNTS[which as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// [`admission_counts`] of what the calling thread itself did, so a test reads its own counts
+/// beside the tests that admit in the same binary: an admission reads on the thread that asks
+/// for it.
+#[cfg(test)]
+fn admission_counts_here() -> AdmissionCounts {
+    let read =
+        |which: AdmissionCount| ADMISSION_COUNTS_HERE.with(|here| here[which as usize].get());
+    AdmissionCounts {
+        reads: read(AdmissionCount::Read),
+        records: read(AdmissionCount::Record),
+        bytes: read(AdmissionCount::Byte),
+        observations: read(AdmissionCount::Observation),
+    }
 }
 
 #[cfg(test)]

@@ -158,12 +158,8 @@ under CI (`CI` set), and it is none of these: `--help` or `-h`, a Command Line T
 install, a program built into aterm, a pass a program waits behind (`--wait-lock`), or
 one that says `--no-init`. Type `--no-init` to skip it; an AI CLI's Install button,
 `aterm ai doctor` and `aterm ai login` pass it, since each installs as one step of its
-own. At this Mac's screen, until macOS has answered whether aterm may use the local
-network, that run leaves the look for the vault, and any reach of a vault at a URL this
-Mac is in, to System State or to an `aterm init` you type, so it never puts that question
-on screen (a vault at a path is no network use, and one already in sync needs no reach,
-so both read as anywhere else); over ssh, where macOS asks nothing, it looks at once, as
-an `aterm init` you type there does.
+own. That run uses the same LAN path as an `aterm init` you type, at this Mac or over ssh.
+It raises no Local Network question.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -2202,7 +2198,8 @@ KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
                              no launch, install or network; exit 1 unless ready
   aterm pkg run <tool> [args…]
                              run the store binary with its declared environment (what
-                             `aterm <tool>` does)
+                             `aterm <tool>` does); a word a harness leads (kimi, grok)
+                             runs under that harness once it is installed
   aterm pkg uninstall <program> | --all
                              remove one program, or the whole toolset (`--all` holds until
                              `install --default-set`)
@@ -2245,9 +2242,12 @@ HOW IT WORKS & GOTCHAS
     command line already names a permission mode; `--yolo` is an alias for that flag.
     Codex resume/fork, profiles and model config overrides also get that default.
     The agent's own updater (`claude update`) runs `aterm pkg update <program>`.
-    kimi, grok and muse take all of this from their harnesses (kimi-alab, grok-alab,
-    muse-alab), which their twins hand each launch to as typed; without its harness a
-    launch runs the vendor CLI as typed.
+    kimi and grok take all of this from their harnesses (kimi-alab, grok-alab), which
+    their twins and `aterm kimi`/`aterm grok` hand each launch to as typed; without its
+    harness a launch runs the vendor CLI as typed. muse keeps aterm's own twin rules until
+    muse-alab leads it (once its harness-proof passes): its flags are `--disable-approval
+    --disable-sandbox --trust-workspace --disable-request-user-input`, put behind `exec`
+    or `resume`; a line starting with an option the twin does not know runs as typed.
   * Inside an aterm session, claude starts its fullscreen renderer from its first launch
     (`CLAUDE_CODE_NO_FLICKER=1`), unless the launch names a renderer: that variable or
     `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` set, a `"tui"` key in your own settings.json
@@ -3507,6 +3507,14 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   `m<N>` in it (`m27` of `MacbookAir-m27-…`, never a chip's `M5`). A short name two Macs
   answer to is refused, naming both; a word no peer answers to is refused, except by
   `survey --host`, which looks it up as a host.
+  Run local commands with your own shell/background tools. If a command needs another
+  Mac, state that concrete need before spawning. Its existing drive grant and Full
+  Access let you open a plain shell without an AI worker:
+  aterm ctl --host <h> spawn cwd=/absolute 'why=<concrete other-host need>'
+  aterm ctl --host <h> @<sid> turn '<command>'
+                             use the returned sid; read the completed block and its exit
+                             status with `blocks` and `blocktext`. For shell ownership and
+                             bounded read/wait forms, see `aterm ctl help spawn fleet`.
   aterm ctl --host <h> spawn agent=<word> [model=<m>] [effort=<level>] [autopilot=land|cruise]
                        [cwd=<abs-path>|'cwd=~/<path>'] - < task
                              a running session's Autopilot is set with `@<sid> meta set autopilot`;

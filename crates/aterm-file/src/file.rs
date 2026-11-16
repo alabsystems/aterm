@@ -12,8 +12,10 @@
 //!   snapshot only by one whose frontier admits it over the old one ([`Frontier::admits_over`])
 //!   and whose bytes a read takes, records the pass's word either way (`live` only where the
 //!   snapshot is that pass's read), and records nothing at all once another pass has recorded
-//!   since this one opened custody. Where the old frontier cannot be read, only the newest
-//!   home's read replaces the snapshot.
+//!   since this one looked ([`File::look`]). Where the old frontier cannot be read, only the
+//!   newest home's read replaces the snapshot. It writes a file only where its bytes differ, so
+//!   a pass that changes nothing writes nothing, unless another pass's look is outstanding:
+//!   then it moves the count of passes alone, so that pass records nothing.
 //!
 //! A read answers this Mac's own writes too: [`File::read`] lays the intents waiting in the
 //! outbox over the snapshot (`crate::outbox`), and [`File::published`] is the snapshot alone.
@@ -126,13 +128,6 @@ impl File {
             .ok()
             .flatten()
             .and_then(|bytes| State::decode(&bytes))
-    }
-
-    /// The count of passes that have recorded: what a pass notes before it opens custody
-    /// ([`Self::record`]).
-    #[must_use]
-    pub fn look(&self) -> u64 {
-        self.state().map_or(0, |state| state.seq)
     }
 
     /// What the snapshot here was projected from.
@@ -316,6 +311,16 @@ impl File {
             })
             .unwrap_or_default()
     }
+
+    /// SHA-256 of the history file's bytes, lower-case hex, as the status records the history
+    /// a pass wrote ([`State::history`]); `None` where it is missing or does not read.
+    #[must_use]
+    pub fn history_digest(&self) -> Option<String> {
+        read_bounded(&self.root.history(&self.name))
+            .ok()
+            .flatten()
+            .map(|bytes| sha_hex(&bytes))
+    }
 }
 
 /// What one materializer pass found for one file.
@@ -335,16 +340,29 @@ pub struct Opened {
     /// never live.
     pub newest: bool,
     pub frontier: Frontier,
-    /// The projection rules' version.
-    pub projection: u32,
-    /// Cells left out for a credential-shaped value.
-    pub withheld: u64,
-    /// Records of the file's collection the replica holds inert: refused when the snapshot was
-    /// built, kept in history with their authors.
-    pub inert: u64,
-    /// The projection, or `None` where the pass saw the frontier was the snapshot's and
-    /// projected nothing again.
-    pub projected: Option<Projected>,
+    /// The digest of everything the projection reads (the materializer's key): a snapshot
+    /// recorded at a key is that key's projection, and a read at the same key projects the
+    /// same snapshot again.
+    pub key: [u8; 32],
+    /// What the pass made of the read.
+    pub projection: Projection,
+}
+
+/// What a pass that opened custody made of its read.
+#[derive(Clone, Debug)]
+pub enum Projection {
+    /// It projected the read.
+    Fresh(Box<Projected>),
+    /// It projected nothing: the status records the snapshot at the pass's key, and the
+    /// snapshot the status names (its revision, extension and content, [`State::snapshot`])
+    /// and the history it names are on disk. Recording checks the key against
+    /// the status under the file's lock, and records `held` (custody) where it differs.
+    Unchanged,
+    /// It projected nothing: the last pass did not take its read for this reason, and nothing
+    /// the reason rests on has moved since. Recording judges the reason again from the
+    /// frontiers it compares and the key the status kept, and keeps the snapshot whatever it
+    /// finds: a reason it cannot confirm is recorded as `held` (custody), with no reason kept.
+    Kept(Kept),
 }
 
 /// One projection of the replica.
@@ -358,6 +376,11 @@ pub struct Projected {
     /// The baseline of this projection, written beside the snapshot under its revision
     /// ([`File::baseline`]): the candidates a write made against this snapshot observed.
     pub baseline: Option<Vec<u8>>,
+    /// Cells left out for a credential-shaped value.
+    pub withheld: u64,
+    /// Records of the file's collection the replica holds inert: refused when the snapshot was
+    /// built, kept in history with their authors.
+    pub inert: u64,
 }
 
 /// How many revisions' baselines are kept.
@@ -371,17 +394,57 @@ pub enum Recorded {
     /// The pass opened custody and its projection was not taken: the snapshot stays as it was
     /// and the word recorded is `held`, never `live`.
     Kept(Kept),
-    /// Another pass recorded after this one opened custody: this one recorded nothing, neither
-    /// snapshot nor word.
+    /// What the pass found is what the files here already say (its status but for the count of
+    /// passes and their time, its frontier, snapshot, baseline, history and face), and no other
+    /// pass's look was outstanding: it wrote nothing, the status included.
+    Settled,
+    /// What the pass found is what the files here already say, and another pass had looked
+    /// without recording: it wrote the status alone, the count of passes moved, so that pass,
+    /// whose read may be older than this one's, records nothing.
+    Fenced,
+    /// The count of passes moved since this one looked: another pass recorded or fenced it.
+    /// This one recorded nothing, neither snapshot nor word.
     Raced,
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The durable writes ([`aterm_uds::atomic_file::write`]) this thread's recordings made: a
+    /// frontier, baseline, snapshot, history, face or status each, counted (never timed).
+    static PUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The modes this thread set on a shared file's folders, made or found with another mode
+    /// (`private_dir`): a look's or a recording's, and an outbox change's, which makes the same
+    /// folders first.
+    static CHMODS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many durable writes this thread's recordings ([`File::record`]) have made: `aterm-db`'s
+/// idle-hour drive reads it before and after each materializer pass.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_puts() -> usize {
+    PUTS.with(std::cell::Cell::get)
+}
+
+/// How many folder modes this thread has set on shared files' folders, a look's
+/// ([`File::look`]), a recording's ([`File::record`]) or an outbox change's: `aterm-db`'s
+/// idle-hour drive reads it before and after each materializer pass.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_chmods() -> usize {
+    CHMODS.with(std::cell::Cell::get)
 }
 
 #[cfg(any(unix, windows))]
 mod write {
     use super::{
-        BASELINES, File, HISTORY, MAX_BYTES, Opened, Pass, Recorded, read_bounded, sha_hex,
+        BASELINES, File, HISTORY, MAX_BYTES, Opened, Pass, Projected, Projection, Recorded,
+        read_bounded, sha_hex,
     };
-    use crate::{Kept, Snapshot, State, Why, Word};
+    use crate::{Frontier, Kept, Snapshot, State, Why, Word};
+    use aterm_uds::file_lock::LockFile;
     use std::{
         io,
         path::Path,
@@ -391,13 +454,44 @@ mod write {
     /// How long a pass waits for another that is recording the same file.
     const LOCK_WAIT: Duration = Duration::from_secs(10);
 
+    /// What a pass notes before it opens custody ([`File::look`]) and hands to
+    /// [`File::record`]: the count of passes that had recorded, and its lease, a shared lock of
+    /// the file's look lock (`Root::looking`) held from the look until the record takes the
+    /// note. While the lease is held, a recording that changes nothing still moves the count.
+    #[derive(Debug)]
+    pub struct Look {
+        seq: u64,
+        lease: LockFile,
+    }
+
+    impl Look {
+        /// The count of passes that had recorded when the pass looked.
+        #[must_use]
+        pub const fn seq(&self) -> u64 {
+            self.seq
+        }
+    }
+
+    /// Make `dir` and every folder above it that is missing, each the owner's alone (0700),
+    /// and set its mode only where it has another: a folder already private is not changed.
+    /// The mode compared is the one a chmod sets, a linked folder's own (`set_permissions`
+    /// follows the link, as `metadata` does).
     fn private_dir(dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+            if std::fs::metadata(dir)?.permissions().mode() & 0o7777 != 0o700 {
+                #[cfg(any(test, debug_assertions))]
+                super::CHMODS.with(|chmods| chmods.set(chmods.get() + 1));
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(dir)?;
         Ok(())
     }
 
@@ -408,7 +502,19 @@ mod write {
                 "the test stops the pass before this write",
             ));
         }
+        #[cfg(any(test, debug_assertions))]
+        super::PUTS.with(|puts| puts.set(puts.get() + 1));
         aterm_uds::atomic_file::write(path, bytes, 0o600)
+    }
+
+    /// [`put`] `bytes` at `path` unless `there`, what the file held when the pass took the
+    /// lock, is the same bytes; whether it wrote.
+    fn put_new(path: &Path, bytes: &[u8], there: Option<&[u8]>) -> io::Result<bool> {
+        if there == Some(bytes) {
+            return Ok(false);
+        }
+        put(path, bytes)?;
+        Ok(true)
     }
 
     impl File {
@@ -421,12 +527,37 @@ mod write {
             private_dir(&root.state_dir(name))
         }
 
-        /// Write the baseline of revision `rev` and drop the ones older than the newest
-        /// [`BASELINES`].
-        fn write_baseline(&self, rev: u64, bytes: &[u8]) -> io::Result<()> {
+        /// Note the count of passes that have recorded, before a pass opens custody, with the
+        /// pass's lease on the file's look lock (`Root::looking`), which [`Self::record`]
+        /// takes with the note. The lease is taken before the count is read, so a recording
+        /// that changed nothing and found no lease ([`Recorded::Settled`]) is one this look
+        /// comes after. It waits only for such a recording's try of the lock, which never
+        /// waits.
+        ///
+        /// # Errors
+        /// The file's folders cannot be made, or its look lock cannot be opened or locked.
+        pub fn look(&self) -> io::Result<Look> {
+            self.make_dirs()?;
+            let lease = LockFile::share(
+                &self.root.looking(&self.name),
+                Instant::now() + LOCK_WAIT,
+                "another pass is recording this shared file",
+            )?;
+            Ok(Look {
+                seq: self.state().map_or(0, |state| state.seq),
+                lease,
+            })
+        }
+
+        /// Write the baseline of revision `rev` where the one there holds other bytes, and then
+        /// drop the ones older than the newest [`BASELINES`]; whether it wrote.
+        fn write_baseline(&self, rev: u64, bytes: &[u8]) -> io::Result<bool> {
             let dir = self.root.baselines(&self.name);
             private_dir(&dir)?;
-            put(&self.root.baseline(&self.name, rev), bytes)?;
+            let path = self.root.baseline(&self.name, rev);
+            if !put_new(&path, bytes, read_bounded(&path).ok().flatten().as_deref())? {
+                return Ok(false);
+            }
             let mut revs: Vec<u64> = std::fs::read_dir(&dir)?
                 .flatten()
                 .filter_map(|entry| {
@@ -445,28 +576,45 @@ mod write {
                     _ => {}
                 }
             }
-            Ok(())
+            Ok(true)
         }
 
-        /// Record one pass, which noted [`File::look`] as `look` before it opened custody.
+        /// Record one pass, which took `look` ([`File::look`]) before it opened custody.
         ///
-        /// Under the file's lock: a pass whose `look` is no longer the recorded count records
-        /// nothing ([`Recorded::Raced`]), so a view of live custody taken before a fence never
-        /// turns the fenced pass's `held` into `live`. A refusal leaves the snapshot as it was
-        /// and records its word. An open replaces the snapshot only where its frontier admits
-        /// it over the old one and its bytes are ones a read takes, keeps the revision where the
-        /// content is the same, and records `live` only where the snapshot now is that read's:
-        /// a projection not taken ([`Recorded::Kept`]) records `held`. The rule fails closed: a
-        /// snapshot whose frontier file is missing or does not read is replaced only by the
+        /// Under the file's lock: a pass whose look's count is no longer the recorded count
+        /// records nothing ([`Recorded::Raced`]), so a view of live custody taken before a
+        /// fence never turns the fenced pass's `held` into `live`. A refusal leaves the
+        /// snapshot as it was and records its word. An open replaces the snapshot only where
+        /// its frontier admits it over the old one and its bytes are ones a read takes, keeps
+        /// the revision where the content is the same, and records `live` only where the
+        /// snapshot now is that read's: a projection not taken ([`Recorded::Kept`]) records
+        /// `held`, and so does a pass that projected nothing ([`Projection::Unchanged`]) at a
+        /// key other than the one the status records the snapshot at. A projection too large to
+        /// take records its key, and a pass at that key that projected nothing
+        /// ([`Projection::Kept`]) keeps the snapshot for the same reason. The rule fails closed:
+        /// a snapshot whose frontier file is missing or does not read is replaced only by the
         /// newest home's read, never by a fenced home's, and a frontier too large for the next
         /// pass to read back is not written, nor the snapshot with it. The face is written
         /// beside each snapshot written, and again where it is missing; an edited face is left
         /// alone.
         ///
+        /// Each file is written only where its bytes differ from the ones there: the frontier,
+        /// the baseline (whose folder is pruned only after one is written), the history and the
+        /// face by their bytes, and the snapshot by its revision and content, so a projection
+        /// of the same content keeps the file and the time it was written. Where the next
+        /// status would equal the one there but for the count of passes and their time, and no
+        /// other file was written, the pass let go of its lease and tries the look lock alone:
+        /// taken, no other pass's look is outstanding, and it writes nothing
+        /// ([`Recorded::Settled`]); not taken (or not to be tried), it writes the status with
+        /// the count moved ([`Recorded::Fenced`]), the `SharedFile` model's `Materialize`
+        /// making an outstanding look stale. Neither lock waits on the other: a looker holds
+        /// its lease and may wait for this lock, and a recorder holds this lock and only tries
+        /// the look lock, never waiting.
+        ///
         /// The writes are separate renames, in an order a pass killed between any two is safe
         /// in: the frontier first (a newer frontier beside an older snapshot only refuses
-        /// more, and the next pass, whose status still names the older fingerprint, projects
-        /// again), then the projection's baseline where it has one (a baseline beside an older
+        /// more, and the next pass, whose status still names the older key, projects again),
+        /// then the projection's baseline where it has one (a baseline beside an older
         /// snapshot of the same revision names candidates that snapshot's writers did not
         /// observe, which only holds a write the next pass would have let through), then the
         /// snapshot, the history and the face, and the status last. The face
@@ -477,22 +625,30 @@ mod write {
         ///
         /// # Errors
         /// A local file or folder cannot be written, or another pass held the lock too long.
-        pub fn record(&self, look: u64, pass: Pass, now_ms: u64) -> io::Result<Recorded> {
+        pub fn record(&self, look: Look, pass: Pass, now_ms: u64) -> io::Result<Recorded> {
             let (root, name) = (&self.root, &self.name);
             self.make_dirs()?;
-            let _lock = aterm_uds::file_lock::LockFile::take(
+            let _lock = LockFile::take(
                 &root.lock(name),
                 Instant::now() + LOCK_WAIT,
                 "another pass is recording this shared file",
             )?;
-            let mut state = self.state().unwrap_or_default();
-            if state.seq != look {
+            let Look { seq, lease } = look;
+            let before = self.state().unwrap_or_default();
+            if before.seq != seq {
                 return Ok(Recorded::Raced);
             }
-            // The snapshot here before this pass writes anything.
+            let mut state = before.clone();
+            // The snapshot and the frontier file here before this pass writes anything.
             let held = self.snapshot().ok().flatten();
-            let mut replaced = None;
+            let sidecar_there = read_bounded(&root.frontier(name)).ok().flatten();
+            // Whether this pass wrote or removed a file beside the status.
+            let mut wrote = false;
+            let mut replaced = false;
+            // The snapshot this pass's projection left, where it took one.
+            let mut taken = None;
             state.kept = None;
+            let kept_key = state.kept_key.take();
             match pass {
                 Pass::Refused { word, why } => {
                     state.word = Some(word);
@@ -502,152 +658,217 @@ mod write {
                     let Opened {
                         newest,
                         frontier,
+                        key,
                         projection,
-                        withheld,
-                        inert,
-                        projected,
                     } = *opened;
+                    let key = aterm_codec::hex::encode_lower(&key);
                     // A snapshot whose frontier is not here to compare (removed, damaged,
                     // another build's) is replaced only by the newest home's read: a fenced
                     // home's cannot be shown to be no older, so it is behind.
                     let admitted = held.is_none()
-                        || self
-                            .frontier()
+                        || sidecar_there
+                            .as_deref()
+                            .and_then(Frontier::decode)
                             .map_or(newest, |old| frontier.admits_over(&old));
                     let sidecar = frontier.encode();
                     let mut written = None;
+                    // The snapshot is this read's: the status names the read's key.
+                    let mut current = false;
                     if !admitted {
                         state.kept = Some(Kept::Behind);
                     } else if sidecar.len() as u64 > MAX_BYTES {
                         // The next pass could not read it back, and would then compare its
                         // read with nothing.
                         state.kept = Some(Kept::TooLarge);
-                    } else if let Some(projected) = projected {
-                        let mut snapshot = projected.snapshot;
-                        snapshot.rev = match &held {
-                            Some(old) if old.content() == snapshot.content() => old.rev,
-                            Some(old) => old.rev.saturating_add(1),
-                            None => state.rev.saturating_add(1),
-                        };
-                        let bytes = snapshot.encode();
-                        if bytes.len() as u64 > MAX_BYTES {
-                            // A read would refuse it: the last snapshot a read takes stays.
-                            state.kept = Some(Kept::TooLarge);
-                        } else {
-                            written =
-                                Some((snapshot, bytes, projected.history, projected.baseline));
+                    } else {
+                        match projection {
+                            Projection::Fresh(mut projected) => {
+                                let snapshot = &mut projected.snapshot;
+                                snapshot.rev = match &held {
+                                    Some(old) if old.content() == snapshot.content() => old.rev,
+                                    Some(old) => old.rev.saturating_add(1),
+                                    None => state.rev.saturating_add(1),
+                                };
+                                let bytes = snapshot.encode();
+                                if bytes.len() as u64 > MAX_BYTES {
+                                    // A read would refuse it: the last snapshot a read takes
+                                    // stays, and a pass at the same key does not project it
+                                    // again.
+                                    state.kept = Some(Kept::TooLarge);
+                                    state.kept_key = Some(key.clone());
+                                } else {
+                                    written = Some((bytes, projected));
+                                }
+                            }
+                            Projection::Unchanged => {
+                                current = state.key.as_deref() == Some(key.as_str());
+                            }
+                            Projection::Kept(Kept::TooLarge)
+                                if kept_key.as_deref() == Some(key.as_str()) =>
+                            {
+                                state.kept = Some(Kept::TooLarge);
+                                state.kept_key = kept_key;
+                            }
+                            // The reason no longer holds (the frontier file was removed, or
+                            // the kept key is not this read's), and nothing was projected: the
+                            // snapshot is not this read's, and the next pass judges again.
+                            Projection::Kept(_) => {}
                         }
                     }
-                    if state.kept.is_none() {
-                        put(&root.frontier(name), &sidecar)?;
-                        if let Some((snapshot, bytes, history, baseline)) = written {
-                            if let Some(baseline) = baseline {
-                                self.write_baseline(snapshot.rev, &baseline)?;
-                            }
-                            put(&root.snapshot(name), &bytes)?;
-                            let skip = history.len().saturating_sub(HISTORY);
-                            let mut lines = String::new();
-                            for entry in &history[skip..] {
-                                lines.push_str(&entry.to_string());
-                                lines.push('\n');
-                            }
-                            put(&root.history(name), lines.as_bytes())?;
-                            state.rev = snapshot.rev;
-                            state.rows = snapshot.rows.len() as u64;
-                            state.complete = snapshot.complete;
-                            state.kind.clone_from(&snapshot.kind);
-                            state.ext.clone_from(&snapshot.ext);
-                            state.withheld = withheld;
-                            state.inert = Some(inert);
-                            state.projection = projection;
-                            self.write_face(&mut state, &snapshot, held.as_ref())?;
-                            replaced = Some(snapshot);
+                    if let Some((bytes, projected)) = written {
+                        let Projected {
+                            snapshot,
+                            history,
+                            baseline,
+                            withheld,
+                            inert,
+                        } = *projected;
+                        wrote |= put_new(&root.frontier(name), &sidecar, sidecar_there.as_deref())?;
+                        if let Some(baseline) = baseline {
+                            wrote |= self.write_baseline(snapshot.rev, &baseline)?;
                         }
+                        // The content here already, at its revision: the file and the time
+                        // it was written stay.
+                        let same = held.as_ref().is_some_and(|old| {
+                            old.rev == snapshot.rev
+                                && old.ext == snapshot.ext
+                                && old.content() == snapshot.content()
+                        });
+                        if !same {
+                            put(&root.snapshot(name), &bytes)?;
+                            (wrote, replaced) = (true, true);
+                        }
+                        let skip = history.len().saturating_sub(HISTORY);
+                        let mut lines = String::new();
+                        for entry in &history[skip..] {
+                            lines.push_str(&entry.to_string());
+                            lines.push('\n');
+                        }
+                        let path = root.history(name);
+                        let there = read_bounded(&path).ok().flatten();
+                        wrote |= put_new(&path, lines.as_bytes(), there.as_deref())?;
+                        state.rev = snapshot.rev;
+                        state.snapshot = Some(aterm_codec::hex::encode_lower(&snapshot.content()));
+                        state.rows = snapshot.rows.len() as u64;
+                        state.complete = snapshot.complete;
+                        state.kind.clone_from(&snapshot.kind);
+                        state.ext.clone_from(&snapshot.ext);
+                        state.withheld = withheld;
+                        state.inert = Some(inert);
+                        state.key = Some(key);
+                        state.history = Some(sha_hex(lines.as_bytes()));
+                        wrote |= self.write_face(&mut state, &snapshot, held.as_ref())?;
+                        taken = Some(snapshot);
+                        current = true;
+                    } else if current {
+                        wrote |= put_new(&root.frontier(name), &sidecar, sidecar_there.as_deref())?;
+                    }
+                    if current {
                         state.fingerprint = aterm_codec::hex::encode_lower(&frontier.fingerprint());
                         state.era = frontier.era;
                         state.generation = frontier.generation;
                         state.records = frontier.ids.len() as u64;
                     }
-                    (state.word, state.why) = match (newest, state.kept) {
+                    (state.word, state.why) = match (newest, current) {
                         // A fenced home's records are held whatever became of the projection.
                         (false, _) => (Some(Word::Held), Some(Why::Succession)),
-                        (true, None) => (Some(Word::Live), None),
+                        (true, true) => (Some(Word::Live), None),
                         // The snapshot is not this read's: it is not called live.
-                        (true, Some(_)) => (Some(Word::Held), Some(Why::Custody)),
+                        (true, false) => (Some(Word::Held), Some(Why::Custody)),
                     };
                 }
             }
-            if replaced.is_none()
+            if taken.is_none()
                 && let Some(snapshot) = &held
                 && self.face_missing(&state, snapshot)
             {
                 state.ext.clone_from(&snapshot.ext);
-                self.write_face(&mut state, snapshot, held.as_ref())?;
+                wrote |= self.write_face(&mut state, snapshot, held.as_ref())?;
+            }
+            // The count and the time are all that differ from the status there: the pass
+            // changed nothing. It writes nothing where no other pass's look is outstanding.
+            let mut fenced = false;
+            if !wrote && state == before {
+                drop(lease);
+                match LockFile::try_take(&root.looking(name)) {
+                    Ok(Some(_alone)) => return Ok(Recorded::Settled),
+                    // Another pass's lease, or a look lock that could not be tried: the count
+                    // moves, which every look still outstanding finds.
+                    Ok(None) | Err(_) => fenced = true,
+                }
             }
             state.seq = state.seq.saturating_add(1);
             state.pass_ms = now_ms;
             put(&root.state(name), &state.encode())?;
-            Ok(match state.kept {
-                Some(kept) => Recorded::Kept(kept),
-                None => Recorded::Recorded {
-                    replaced: replaced.is_some(),
-                },
+            Ok(if fenced {
+                Recorded::Fenced
+            } else if let Some(kept) = state.kept {
+                Recorded::Kept(kept)
+            } else {
+                Recorded::Recorded { replaced }
             })
         }
 
-        /// Whether no face of `snapshot` is on disk.
+        /// Whether no face of `snapshot` is on disk: nothing there at its path, by the
+        /// metadata a read of it follows (a link to nothing is missing too).
         fn face_missing(&self, state: &State, snapshot: &Snapshot) -> bool {
             let ext = if state.ext.is_empty() {
                 &snapshot.ext
             } else {
                 &state.ext
             };
-            matches!(read_bounded(&self.root.face(&self.name, ext)), Ok(None))
+            matches!(
+                std::fs::metadata(self.root.face(&self.name, ext)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
         }
 
-        /// Write `snapshot`'s face unless the face there holds bytes no pass wrote: bytes that
-        /// are neither the ones `state` records nor the rendering of `held`, the snapshot that
-        /// was here when this pass took the lock. A face too large for the grid that opens it
-        /// is not written, and the one a pass wrote before it is removed: programs still read
-        /// the snapshot.
+        /// Write `snapshot`'s face where the face there holds other bytes, unless it holds
+        /// bytes no pass wrote: bytes that are neither the ones `state` records nor the
+        /// rendering of `held`, the snapshot that was here when this pass took the lock. A face
+        /// too large for the grid that opens it is not written, and the one a pass wrote before
+        /// it is removed: programs still read the snapshot. Whether it wrote or removed one.
         fn write_face(
             &self,
             state: &mut State,
             snapshot: &Snapshot,
             held: Option<&Snapshot>,
-        ) -> io::Result<()> {
+        ) -> io::Result<bool> {
             let path = self.root.face(&self.name, &snapshot.ext);
-            let (there, ours) = match read_bounded(&path) {
-                Ok(None) => (false, true),
-                Ok(Some(bytes)) => (
-                    true,
-                    state.face.as_deref() == Some(&sha_hex(&bytes))
-                        || held.is_some_and(|held| held.face().as_bytes() == bytes),
-                ),
-                Err(_) => (true, false),
+            let Ok(there) = read_bounded(&path) else {
+                // A face that cannot be read is no pass's to replace.
+                return Ok(false);
             };
+            let ours = there.as_deref().is_none_or(|bytes| {
+                state.face.as_deref() == Some(&sha_hex(bytes))
+                    || held.is_some_and(|held| held.face().as_bytes() == bytes)
+            });
             if !ours {
-                return Ok(());
+                return Ok(false);
             }
             let text = snapshot.face();
             if text.len() as u64 > crate::MAX_FACE_BYTES {
-                if there {
-                    match std::fs::remove_file(&path) {
-                        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                            return Err(error);
-                        }
-                        _ => {}
-                    }
-                }
                 state.face = None;
-                return Ok(());
+                if there.is_none() {
+                    return Ok(false);
+                }
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                        return Err(error);
+                    }
+                    _ => {}
+                }
+                return Ok(true);
             }
-            put(&path, text.as_bytes())?;
+            let wrote = put_new(&path, text.as_bytes(), there.as_deref())?;
             state.face = Some(sha_hex(text.as_bytes()));
-            Ok(())
+            Ok(wrote)
         }
     }
 }
+
+#[cfg(any(unix, windows))]
+pub use write::Look;
 
 /// Where this crate's tests stop a pass: the writes of a recording, counted on the thread
 /// that makes them.

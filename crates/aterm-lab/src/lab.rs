@@ -1842,9 +1842,9 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     put("home/.claude/.claude.json", &claude_json);
     if o.reroute {
         // A reroute lab's `claude` is found by name too, outside the lab's launcher, which sets
-        // `CLAUDE_CONFIG_DIR`: a Claude Code that aterm starts with no starter of its own (the
-        // disk worker's plain `claude`) reads the default `~/.claude.json`, so it is laid as well,
-        // or that Claude Code opens on its first-run onboarding.
+        // `CLAUDE_CONFIG_DIR`: a Claude Code started as plain `claude`, with no starter of its
+        // own, reads the default `~/.claude.json`, so it is laid as well, or that Claude Code
+        // opens on its first-run onboarding.
         put("home/.claude.json", &claude_json);
     }
     put(

@@ -1674,7 +1674,7 @@ fn headlines_say_the_state_in_the_designs_words() {
     assert_eq!(line(&status_of("checking")).text, "Checking this Mac…");
     assert_eq!(
         line(&status_of("running")).text,
-        "Setting up this Mac… 10 of 15"
+        "Setting up this Mac… 15 of 20"
     );
     let needs = line(&status_of("needs-you"));
     assert_eq!(needs.text, "Needs you: Full Disk Access");
@@ -4563,8 +4563,8 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
         let progress = node("system-state/progress");
         assert_eq!(progress.role(), Role::ProgressIndicator, "{width}");
         assert_eq!(progress.label(), Some("Setup progress"), "{width}");
-        assert_eq!(progress.numeric_value(), Some(10.0), "{width}");
-        assert_eq!(progress.max_numeric_value(), Some(15.0), "{width}");
+        assert_eq!(progress.numeric_value(), Some(15.0), "{width}");
+        assert_eq!(progress.max_numeric_value(), Some(20.0), "{width}");
     }
 
     let dock = Subject::Setting(Setting::Dock);
@@ -4574,7 +4574,7 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
     cold.observing = vec![(spotlight, None, false), (dock, None, false)];
     let mut page = page_reading(&cold);
     let hero = hero_of(&page);
-    assert_eq!((hero.done, hero.total), (1, 15));
+    assert_eq!((hero.done, hero.total), (1, 20));
     assert!(hero.as_last_read);
     assert!(!page.headline().set_up);
     let compiled = compile(&page, &SystemStateViewState::default(), 999.0, 900.0);
@@ -4593,7 +4593,7 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
         .clone();
     assert_eq!(progress.label(), Some("Setup progress as last read"));
     assert_eq!(progress.numeric_value(), Some(1.0));
-    assert_eq!(progress.max_numeric_value(), Some(15.0));
+    assert_eq!(progress.max_numeric_value(), Some(20.0));
     cold.observed
         .push(reading(dock, Standing::InPlace, Some("Current Dock")).stamped(1_700_000_000));
     cold.observing.retain(|(subject, _, _)| *subject != dock);
@@ -7814,4 +7814,36 @@ fn a_withheld_reading_is_no_failure_and_no_set_up_mac() {
         failed.owes_a_read(1_700_000_000 + aterm_types::macos_setup::READING_STANDS_SECS + 1),
         "a private read past its age is owed again"
     );
+}
+
+#[test]
+fn every_new_setup_requirement_is_visible_and_prevents_a_ready_page() {
+    for access in [
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
+    ] {
+        let subject = Subject::Access(access);
+        let mut status = with_readings(
+            Selection::all(),
+            vec![reading(subject, Standing::NeedsYou, Some("Incomplete"))],
+        );
+        let rows = super::rows(&status, Selection::all());
+        let row = rows.iter().find(|row| row.subject == subject).unwrap();
+        assert!(row.managed);
+        assert_eq!(row.standing, Some(Standing::NeedsYou));
+        assert_eq!(row.open, Some(access));
+        assert!(
+            super::headline(&status, &rows, status.plan.as_ref())
+                .text
+                .contains("Needs you")
+        );
+        status.observed[0].standing = Standing::Unknown;
+        assert_ne!(
+            super::row_view(subject, &status, Selection::all()).chip,
+            Some(Chip::InPlace)
+        );
+    }
 }

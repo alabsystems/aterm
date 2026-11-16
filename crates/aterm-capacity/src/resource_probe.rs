@@ -31,7 +31,7 @@ pub enum ProbeRejection {
 /// What one try at a shared observation found ([`ResourceProbe::capture_at`]).
 pub enum Capture {
     /// The observation, which may reject envelopes until it expires.
-    Observed(ResourceProbe),
+    Observed(Box<ResourceProbe>),
     /// Another admission held the ledger's lock at that instant, its pid where it wrote one:
     /// nothing was read, no claim was laid, and a later try may observe.
     Turn(Option<u32>),
@@ -46,7 +46,7 @@ impl Capture {
     #[must_use]
     pub fn observed(self) -> Option<ResourceProbe> {
         match self {
-            Capture::Observed(probe) => Some(probe),
+            Capture::Observed(probe) => Some(*probe),
             Capture::Turn(_) | Capture::Unsupported => None,
         }
     }
@@ -181,7 +181,7 @@ impl ResourceProbe {
             &reading,
         );
         let records: Vec<_> = records.into_iter().cloned().collect();
-        Ok(Capture::Observed(Self {
+        Ok(Capture::Observed(Box::new(Self {
             captured,
             now,
             pid,
@@ -190,7 +190,7 @@ impl ResourceProbe {
             records,
             used,
             wide,
-        }))
+        })))
     }
 
     /// Whether the caller must obtain a new observation for its next pass.

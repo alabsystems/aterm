@@ -22,9 +22,17 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          bound), the bytes signed in 24 hours with the two
                                          Macs that signed most, and the time to the bound at
                                          that rate (`unread` where not measured)
-  aterm secrets repair [--json]         migrate outdated managed vault services to this installed
-                                         release, with their arguments, health checks and rollback;
-                                         explicit pins and off records remain in force
+  aterm secrets repair [--json]         migrate outdated managed vault services to this
+                                         installed release, with their arguments, health
+                                         checks and rollback (explicit pins and off records
+                                         remain in force), and, where this Mac's membership
+                                         records are not the ones its applied vault version
+                                         names, accept the verified records it holds as they
+                                         are: they may lack records this Mac applied, and its
+                                         secrets then read as those records have them, older
+                                         values included (records that only gained some need
+                                         no repair: a vault pass enrolls them; records that
+                                         lack ones that version was written at are refused)
   aterm secrets join [<url>|<path>] [--name <host>] [--password-stdin]
         [--no-agent] [--no-wait]         join a vault (neither: the ALab vault; a trailing
                                          #<signer key> pins its signer, else confirm the
@@ -2574,7 +2582,7 @@ mod unix {
     ) -> (Vec<aterm_json::Value>, bool) {
         let (service_rows, service_complete) = repair_with(repair);
         let (outcome, detail, frontier_complete) = match frontier() {
-            Ok(true) => ("repaired", "re-acknowledged the verified local membership log; previous state retained beside state.toml".to_owned(), true),
+            Ok(true) => ("repaired", "accepted the verified local membership log as the applied one, as it is: it may lack records this Mac applied; previous state retained beside state.toml".to_owned(), true),
             Ok(false) => ("unchanged", "the applied membership frontier matches the verified local log".to_owned(), true),
             Err(error) => (
                 if error.kind() == crate::ErrorKind::TimedOut { "unavailable" } else { "failed" },
@@ -3139,7 +3147,7 @@ mod unix {
             }
         };
         match outcome {
-            SyncOutcome::Applied { seq, report } => {
+            SyncOutcome::Applied { seq, report, .. } => {
                 // The harness reads this line's seq and its failed count (`Vault::of_sync`). An
                 // apply writes no file, so none fails.
                 println!(

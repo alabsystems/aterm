@@ -51,15 +51,42 @@ fn the_pressure_key_reads_a_documented_level_and_rereads_on_change() {
     }
     assert!(post(&name), "notifyd takes the post");
     // notifyd delivers the post on its own time: a one-minute hang detector.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while quiet.state() != Ok(42) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the post never arrived"
-        );
-        aterm_uds::deadline::poll_yield();
-    }
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the post to arrive", || {
+        (quiet.state() == Ok(42)).then_some(())
+    });
     assert_eq!(quiet.get_states, 2, "control: one post, one read");
+}
+
+/// A [`Posts`] hears a post of its own name once and no post of another name, and its first
+/// look (taken as it registers) is spent: nothing was posted since. A post of the other name
+/// waits until that name's own ear heard it, so notifyd had handled it when this ear is asked.
+#[cfg(target_os = "macos")]
+#[test]
+fn posts_hears_its_own_name_and_no_other() {
+    let named = |which: &str| {
+        std::ffi::CString::new(format!(
+            "com.aterm.sysprobe.test.posts-{which}-{}",
+            std::process::id()
+        ))
+        .expect("a name without NUL")
+    };
+    let (mine, other) = (named("mine"), named("other"));
+    let mut ear = Posts::new(&mine).expect("registers");
+    let mut other_ear = Posts::new(&other).expect("registers");
+    assert_eq!(ear.posted(), Ok(false), "the first look is spent");
+
+    let heard = |ear: &mut Posts, what: &str| {
+        // notifyd delivers the post on its own time: a one-minute hang detector.
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (ear.posted() == Ok(true)).then_some(())
+        });
+    };
+    assert!(post(&other));
+    heard(&mut other_ear, "the other name's post");
+    assert_eq!(ear.posted(), Ok(false), "another name's post is not heard");
+    assert!(post(&mine));
+    heard(&mut ear, "its own post");
+    assert_eq!(ear.posted(), Ok(false), "one post, heard once");
 }
 
 /// Off macOS a watch says it has no source, never a level, and a post goes nowhere.

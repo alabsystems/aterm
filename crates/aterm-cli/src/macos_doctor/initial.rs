@@ -3916,6 +3916,11 @@ pub(super) fn init_grants(
         Access::FullDiskAccess,
         Access::DeveloperTools,
         Access::Debugger,
+        Access::LocalNetwork,
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkAuth,
+        Access::NetworkHelper,
         Access::Accessibility,
     ]
     .into_iter()
@@ -3957,6 +3962,13 @@ fn init_grant(
                 if why.as_deref() == Some(aterm_types::macos_setup::DEBUGGER_NOT_ASKED) =>
             {
                 aterm_types::macos_setup::DEBUGGER_NOT_ASKED.to_owned()
+            }
+            Access::LocalNetwork
+            | Access::NameRule
+            | Access::SpotlightScope
+            | Access::NetworkAuth
+            | Access::NetworkHelper => {
+                why.unwrap_or_else(|| "Finish this step in aterm's System State page".into())
             }
             Access::Debugger => "setup's one Mac password, which aterm asks for by itself as \
                                  setup begins, turns it on (`aterm init --only base.clt` asks \

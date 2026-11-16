@@ -272,7 +272,7 @@ fn exit_ids(store: &crate::session_store::Store) -> Vec<u64> {
         .collect()
 }
 
-/// `exit <id> ` as `exit <idK> `, `ids` naming each row's id in order: an id is its end's unix µs.
+/// `exit <id> ` as `exit <idK> `, `ids` naming each row's id in order: an id orders rows and pages `since=`, and need not be the end's time.
 fn mask_ids(text: &str, ids: &[u64]) -> String {
     let mut out = text.to_string();
     for (k, id) in ids.iter().enumerate() {

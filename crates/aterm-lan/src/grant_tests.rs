@@ -323,3 +323,22 @@ fn the_labs_allowance_reads_back_as_macos_answer_for_that_code_alone() {
             .contains("for this account")
     );
 }
+
+#[test]
+fn authorization_distinguishes_unanswered_denied_and_unreadable() {
+    let privacy = privacy(USER);
+    let code = team_code();
+    assert_eq!(
+        authorization(&archive(&privacy, true, &[(ID, None, true, false)]), &code),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        authorization(&archive(&privacy, true, &[(ID, None, true, true)]), &code),
+        Ok(Some(false))
+    );
+    assert_eq!(
+        authorization(&archive(&privacy, true, &[(ID, None, false, true)]), &code),
+        Ok(None)
+    );
+    assert!(authorization(b"broken", &code).is_err());
+}

@@ -661,6 +661,19 @@ impl Mailbox {
             .collect()
     }
 
+    /// The subject and body of the inbox-group record queued for the loop at bus offset `off`:
+    /// read off the bus, not yet handled (`Bridge::unhanded_landing`). A reset empties the face
+    /// and a push under an earlier reader's generation is refused, so only the current reader's
+    /// records answer.
+    pub(crate) fn inbox_queued_at(&self, off: u64) -> Option<(String, Vec<u8>)> {
+        self.lock()
+            .inbox
+            .records
+            .iter()
+            .find(|((at, ..), ..)| *at == off)
+            .map(|((_, subject, body), ..)| (subject.clone(), body.clone()))
+    }
+
     /// Current incarnation of broker source `s` for stamping a new reader.
     #[must_use]
     pub fn broker_generation(&self, s: Source) -> u64 {

@@ -8093,3 +8093,96 @@ fn glass_columns_maps_and_swallows_side_by_side_panes_on_the_same_row() {
     assert!(!glass.swallows(22, 61 + 20));
     assert_eq!(glass.grid_col(22, 61 + 20), 61 + 20);
 }
+
+/// The composer as the fenced write reads it: typed text is a draft; an empty composer, or
+/// Claude Code's dim placeholder with the caret at its start, is none.
+#[test]
+fn a_draft_is_read_off_the_composer_as_the_fenced_write_reads_it() {
+    let rule = "\u{2500}".repeat(60);
+    let screen = |line: &str| vec![rule.clone(), format!("\u{276f} {line}"), rule.clone()];
+    assert!(draft_in(&screen("fix the flaky test"), (1, 20), |_| false));
+    assert!(!draft_in(&screen(""), (1, 2), |_| false));
+    assert!(
+        !draft_in(&screen("Try \"refactor this\""), (1, 2), |row| row == 1),
+        "the dim placeholder"
+    );
+    assert!(
+        draft_in(&screen("Try \"refactor this\""), (1, 2), |_| false),
+        "the same words typed"
+    );
+    assert!(
+        !draft_in(&["$ ls".to_owned()], (0, 4), |_| false),
+        "no composer drawn"
+    );
+}
+
+/// A live screen's composer is read off its terminal: its rows, its cursor and its first
+/// glyph's cell. Typed text is a draft; an empty composer is none; Claude Code's placeholder,
+/// drawn dim with the cursor home, is none; and a screen scrolled back is not read at all.
+/// Negative controls: the placeholder's words drawn plain are a draft, so the dim cell is what
+/// reads them as none (a `draft_shown` that asks no cell fails the placeholder), and the same
+/// screen scrolled home again is read, so the scroll is what withheld the answer (a
+/// `draft_shown` that reads a scrolled-back screen fails `None`).
+#[test]
+fn a_live_screens_draft_is_read_off_its_terminal_and_never_while_scrolled_back() {
+    let rule = "\u{2500}".repeat(60);
+    let mut t = aterm_core::terminal::Terminal::new(6, 80);
+    for _ in 0..10 {
+        t.process(b"history\r\n");
+    }
+    let draw = |t: &mut aterm_core::terminal::Terminal, line: &str, col: usize| {
+        let mut out = String::new();
+        for (row, text) in [rule.as_str(), line, rule.as_str(), "", "", ""]
+            .into_iter()
+            .enumerate()
+        {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K{text}", row + 1));
+        }
+        out.push_str(&format!("\x1b[2;{}H", col + 1));
+        t.process(out.as_bytes());
+    };
+    draw(&mut t, "\u{276f} fix the flaky test", 20);
+    assert_eq!(draft_shown(&t), Some(true), "typed text");
+    draw(&mut t, "\u{276f} ", 2);
+    assert_eq!(draft_shown(&t), Some(false), "an empty composer");
+    draw(&mut t, "\u{276f} \x1b[2mTry \"refactor this\"\x1b[22m", 2);
+    assert_eq!(draft_shown(&t), Some(false), "the dim placeholder");
+    draw(&mut t, "\u{276f} Try \"refactor this\"", 2);
+    assert_eq!(draft_shown(&t), Some(true), "CONTROL: the same words typed");
+    t.scroll_display(1);
+    assert!(t.grid().display_offset() > 0, "the screen is scrolled back");
+    assert_eq!(draft_shown(&t), None, "a scrolled-back screen is not read");
+    t.scroll_display(-1);
+    assert_eq!(draft_shown(&t), Some(true), "CONTROL: scrolled home again");
+}
+
+/// The composer's first glyph is read past a caret the program draws over it, as the fenced
+/// write reads it: Claude Code draws its suggestion's first glyph inverse and the rest dim, and
+/// a typed draft's first glyph inverse and the rest plain.
+#[test]
+fn the_composers_first_glyph_is_read_past_a_drawn_caret() {
+    use aterm_core::grid::CellFlags;
+    let at = |cells: Vec<(usize, CellFlags)>| {
+        move |col: usize| cells.iter().find(|(c, _)| *c == col).map(|(_, f)| *f)
+    };
+    let (dim, plain, inverse) = (CellFlags::DIM, CellFlags::empty(), CellFlags::INVERSE);
+    assert!(glyph_dim(at(vec![(2, dim)])), "dim at the caret");
+    assert!(
+        glyph_dim(at(vec![(2, inverse), (3, dim)])),
+        "a suggestion under a drawn caret"
+    );
+    assert!(
+        !glyph_dim(at(vec![(2, inverse), (3, plain)])),
+        "a typed draft under a drawn caret"
+    );
+    assert!(
+        glyph_dim(at(vec![
+            (2, inverse.union(CellFlags::WIDE)),
+            (3, plain),
+            (4, dim),
+        ])),
+        "past a wide glyph"
+    );
+    assert!(!glyph_dim(at(vec![(2, plain)])));
+    assert!(!glyph_dim(at(Vec::new())), "no cell");
+}

@@ -6,6 +6,7 @@
 //! crashed instance's warm spare, against the live and closed tabs a reading holds.
 
 use super::*;
+use aterm_process_facts::left::{Lin, Marks};
 
 /// launchd's pid version in these facts.
 const LAUNCHD: i32 = 1;

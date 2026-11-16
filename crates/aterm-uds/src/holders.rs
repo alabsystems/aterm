@@ -2055,8 +2055,10 @@ pub use paths::{
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to
 /// make a race certain), refuse chosen descriptor reads (`EPERM`), read a dead vnode as unknown
-/// (for a negative control), and read a process's working directory as a dead vnode (a scratch
-/// folder standing in for a volume force-unmounted under it).
+/// (for a negative control), and have chosen reads of a process's executable, working directory
+/// or short BSD record fail as chosen (a working directory read as a dead vnode stands a
+/// scratch folder in for a volume force-unmounted under it; an executable read's `ESRCH`, a
+/// process with no text vnode).
 #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
 mod hook {
     use std::cell::Cell;
@@ -2073,6 +2075,23 @@ mod hook {
     #[cfg(test)]
     type Refusing = (i32, Vec<(i32, usize)>);
 
+    /// A read of one process that [`answering`] makes fail.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Read {
+        /// Its executable (`proc_pidpath`).
+        Exe,
+        /// Its working directory (`PROC_PIDVNODEPATHINFO`).
+        Cwd,
+        /// Its short BSD record (`PROC_PIDT_SHORTBSDINFO`), which confirms an exit.
+        Short,
+    }
+
+    /// Each read [`answering`] makes fail, innermost last: the read, its pid, the failure it
+    /// answers and the reads left to answer so.
+    #[cfg(test)]
+    type Answering = Vec<(Read, i32, Failed, usize)>;
+
     thread_local! {
         #[cfg(test)]
         static AFTER_LISTING: RefCell<Option<Hook>> = const { RefCell::new(None) };
@@ -2080,22 +2099,45 @@ mod hook {
         static REFUSING: RefCell<Option<Refusing>> = const { RefCell::new(None) };
         static DEAD_AS_UNKNOWN: Cell<bool> = const { Cell::new(false) };
         #[cfg(test)]
-        static CWD_DEAD: Cell<Option<i32>> = const { Cell::new(None) };
+        static ANSWERING: RefCell<Answering> = const { RefCell::new(Vec::new()) };
     }
 
-    /// Run `f` with reads of `pid`'s working directory returning `ENOENT`.
+    /// Run `f` with this thread's first `reads` reads `read` of `pid` failing as `failed`
+    /// ([`ALWAYS`]: every read).
     #[cfg(test)]
-    pub fn reading_cwd_dead<R>(pid: i32, f: impl FnOnce() -> R) -> R {
-        CWD_DEAD.with(|d| d.set(Some(pid)));
+    pub fn answering<R>(
+        read: Read,
+        pid: i32,
+        failed: Failed,
+        reads: usize,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        ANSWERING.with(|a| a.borrow_mut().push((read, pid, failed, reads)));
         let out = f();
-        CWD_DEAD.with(|d| d.set(None));
+        ANSWERING.with(|a| {
+            let mut a = a.borrow_mut();
+            if let Some(at) = a.iter().rposition(|&(r, p, ..)| (r, p) == (read, pid)) {
+                a.remove(at);
+            }
+        });
         out
     }
 
-    /// Whether this thread reads `pid`'s working directory as a dead vnode.
+    /// How this thread's read `read` of `pid` fails instead of reading ([`answering`]), counting
+    /// it; `None` when it reads.
     #[cfg(test)]
-    pub(super) fn cwd_dead(pid: i32) -> bool {
-        CWD_DEAD.with(Cell::get) == Some(pid)
+    pub(super) fn answer(read: Read, pid: i32) -> Option<Failed> {
+        ANSWERING.with(|a| {
+            let mut a = a.borrow_mut();
+            let (.., failed, left) = a
+                .iter_mut()
+                .rev()
+                .find(|(r, p, _, left)| (*r, *p) == (read, pid) && *left > 0)?;
+            if *left != ALWAYS {
+                *left -= 1;
+            }
+            Some(*failed)
+        })
     }
 
     /// Run `f` with dead-vnode `ENOENT` results treated as unknown failures.
@@ -2116,7 +2158,7 @@ mod hook {
     }
 
     /// The `reads` for [`refusing`] that refuses every read, as the kernel refuses a vnode it
-    /// keeps from this process.
+    /// keeps from this process, and for [`answering`] that fails every read.
     #[cfg(test)]
     pub const ALWAYS: usize = usize::MAX;
 

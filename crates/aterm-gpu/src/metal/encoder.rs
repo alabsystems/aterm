@@ -44,6 +44,10 @@ pub(crate) struct RenderPassDesc<'a> {
 #[path = "encoder_blit_census_tests.rs"]
 pub(crate) mod blit_census;
 
+#[cfg(test)]
+#[path = "encoder_render_census_tests.rs"]
+pub(crate) mod render_census;
+
 /// Test-only census of the FFI calls a device-loss refusal must precede: the `commandBuffer` mints in [`EncodeSession::begin`] and `Frame::present`, and the swapchain's `nextDrawable`.
 #[cfg(test)]
 #[path = "encoder_queue_ffi_census_tests.rs"]
@@ -224,6 +228,8 @@ impl<'s> CommandBuffer<'s> {
                     .to_owned()
             })?
         };
+        #[cfg(test)]
+        render_census::note();
         let pass = PassEncoder {
             enc,
             _cb: self,
@@ -791,6 +797,8 @@ impl Drop for PassEncoder<'_, '_> {
 #[derive(Debug)]
 pub(crate) struct CbProbe {
     cb: Obj,
+    #[cfg(test)]
+    test_outcome: Option<loss::CbOutcome>,
 }
 
 impl CbProbe {
@@ -799,16 +807,31 @@ impl CbProbe {
     pub(crate) fn of(sub: &Submitted) -> Self {
         Self {
             cb: sub.cb.clone_retained(),
+            #[cfg(test)]
+            test_outcome: None,
         }
     }
 
     /// `None` while the command buffer is still in flight, `Some(outcome)` once terminal.
     #[inline]
     pub(crate) fn try_terminal(&self) -> Option<loss::CbOutcome> {
+        #[cfg(test)]
+        if let Some(outcome) = self.test_outcome {
+            return match outcome {
+                loss::CbOutcome::Unfinished { .. } => None,
+                terminal => Some(terminal),
+            };
+        }
+
         match loss::outcome_of(self.cb.id()) {
             loss::CbOutcome::Unfinished { .. } => None,
             terminal => Some(terminal),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn override_outcome_for_test(&mut self, outcome: loss::CbOutcome) {
+        self.test_outcome = Some(outcome);
     }
 
     /// Block until terminal — the tap's `finish` drain, off the hot path by definition.

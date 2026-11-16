@@ -459,6 +459,7 @@ impl App {
             serious_mode: self.serious_mode_enabled(),
             fullscreen,
             maximized,
+            navigator_shown: window.is_some_and(|ws| ws.dock.wanted_cells() != 0),
             front_tab_split: window
                 .and_then(|ws| ws.tab_set.active())
                 .is_some_and(|tab| tab.root.len() > 1),
@@ -536,6 +537,7 @@ impl App {
             rain_on: terminal.is_some_and(|t| self.session_rain_enabled(t.session)),
             kitty_favourited: self.kitty_log.is_favourite(promotable),
             front_tab_split: self.front_tab_split(),
+            navigator_shown: self.front().is_some_and(|ws| ws.dock.wanted_cells() != 0),
             can_rewind: front.is_some_and(|wid| self.front_can_rewind(wid)),
             aos_attached: self
                 .front()

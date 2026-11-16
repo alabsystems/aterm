@@ -229,10 +229,12 @@ pub struct Need {
 }
 
 impl Need {
-    /// Whether it was OBSERVED, not claimed: raised by a record of its own (a box, a wall, a run's failure, the session's close, the owner's attention flag), never by a `need` mark a consumer wrote, which any author can write. Its word is one a fold can raise as observed ([`may_observe`]), whatever a snapshot or a mark from another source names.
+    /// Whether it was OBSERVED, not claimed: raised by a record of its own (a box, a wall, a run's failure, the session's close, the owner's attention flag), never by a `need` mark a consumer wrote, which any author can write. Its word is one a fold can raise as observed ([`may_observe`]), whatever a snapshot or a mark from another source names. A need the session's own program raised over its record stream (`src=harness`) is observed too, though the stream writes it as a claim: the program says of its own box, question or wall what the screen reader would read off it. The rule reads `src`, never `conf`, because a need seeded from a snapshot keeps its source and loses its confidence.
     #[must_use]
     pub fn observed(&self) -> bool {
-        self.src != Src::Mark && self.conf != Conf::Claim && may_observe(self.word)
+        self.src != Src::Mark
+            && (self.conf != Conf::Claim || self.src == Src::Harness)
+            && may_observe(self.word)
     }
 }
 
@@ -1269,7 +1271,11 @@ impl Fold {
                         conf: r.conf,
                         t: r.t,
                     };
-                    if self.st.phase.src != Src::Screen || self.st.phase.word == "-" {
+                    // A phase the screen reader or the session's own harness gave stands until it
+                    // reads `-`: the shell's status never displaces it.
+                    if !matches!(self.st.phase.src, Src::Screen | Src::Harness)
+                        || self.st.phase.word == "-"
+                    {
                         self.st.phase = phase.clone();
                     }
                     self.shell_phase = Some(phase);
@@ -1417,10 +1423,14 @@ pub fn starts_epoch(r: &Rec, ep: u32) -> bool {
         && r.f.get_u(Key::Epoch).is_some_and(|e| e > u64::from(ep))
 }
 
-/// The need words a `need` mark may raise (§7.4): `review`, `decision`, `help`, and `escalated` from the owner's attention flag (`src=meta`, §7.1).
+/// The need words a `need` mark may raise (§7.4): `review`, `decision`, `help`, and `escalated` from the owner's attention flag (`src=meta`, §7.1). The session's own harness (`src=harness`) may also raise what its program shows: a box (`approval:<kind>`), a `question` or a wall (`wall:<kind>`), each a word [`may_observe`] declares. What only aterm sees (`unresponsive`, `failure`, `exited`, `escalated`) no harness mark raises.
 #[must_use]
 pub fn mark_may_raise(src: Src, word: &str) -> bool {
-    matches!(word, "review" | "decision" | "help") || (word == "escalated" && src == Src::Meta)
+    matches!(word, "review" | "decision" | "help")
+        || (word == "escalated" && src == Src::Meta)
+        || (src == Src::Harness
+            && may_observe(word)
+            && !matches!(word, "unresponsive" | "failure" | "exited" | "escalated"))
 }
 
 /// THE NODE A `need` MARK'S NEED IS BOUND TO (§7.1; fix E3, finding E2E-3): the session's
@@ -1476,25 +1486,28 @@ pub fn need_raised(r: &Rec) -> Option<&'static str> {
     }
 }
 
-/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src` (naming need `word`, or every need) lifts `need`. A step's own need (its box, question, wall or stall) ends only with its step; a need a mark raised is lifted wherever it is bound, a step's escalation included ([`mark_need_node`], fix E3); a consumer's clear (`src=mark`) lifts only a consumer's need.
+/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src` (naming need `word`, or every need) lifts `need`. A step's own need (its box, question, wall or stall) ends only with its step; a need a mark raised is lifted wherever it is bound, a step's escalation included ([`mark_need_node`], fix E3); a consumer's clear (`src=mark`) lifts only a consumer's need, and a harness's clear (`src=harness`) only a need its stream raised.
 #[must_use]
 pub fn clear_lifts(src: Src, by: Actor, word: Option<&str>, need: &Need) -> bool {
     word.is_none_or(|w| need.word == w)
         && (need.node.lvl != Lvl::Step || need.kind == Kind::Need)
         && (need.by == by || by.overrides(&need.by))
         && (src != Src::Mark || need.src == Src::Mark)
+        && (src != Src::Harness || need.src == Src::Harness)
 }
 
-/// THE NEED PRECEDENCE (§7.1), lower first: a need raised by a mark ranks last whatever its word, so a claim never outranks an observation — a proven author's ([`Actor::is_proven`]) first among claims, an Owner client's next, any other author's last, so a flood of other authors' needs gives way before the harness's when the needs are full; every other need ranks by its word ([`need_rank`]).
+/// THE NEED PRECEDENCE (§7.1), lower first: a need raised by a mark ranks last whatever its word, so a claim never outranks an observation — a proven author's ([`Actor::is_proven`]) first among claims, an Owner client's next, any other author's last, so a flood of other authors' needs gives way before the harness's when the needs are full; every other need ranks by its word ([`need_rank`]). A need the session's own harness raised (`src=harness`, whatever its word or confidence: a snapshot keeps only the source) ranks between the two: after every need aterm observed, before every other claim.
 #[must_use]
 pub fn need_precedence(n: &Need) -> u8 {
-    if n.src == Src::Mark || (n.conf == Conf::Claim && n.src != Src::Meta) {
+    if n.src == Src::Harness {
+        8
+    } else if n.src == Src::Mark || (n.conf == Conf::Claim && n.src != Src::Meta) {
         if n.by.is_proven() {
-            7
-        } else if n.by == Actor::Ctl {
-            8
-        } else {
             9
+        } else if n.by == Actor::Ctl {
+            10
+        } else {
+            11
         }
     } else {
         need_rank(n.word)

@@ -83,7 +83,11 @@ fn a_handed_off_observer_permit_cannot_authorize_submit_or_issue_more_authority(
             frame.extend(submission.encode().unwrap());
         }
         wire::write_frame(&client, &frame, deadline).unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        // The worker may already have refused the frame and closed its end, and then macOS
+        // answers the half-close ENOTCONN: the refusal below is what the test reads.
+        if let Err(error) = client.shutdown(std::net::Shutdown::Write) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotConnected, "{error}");
+        }
         assert_eq!(
             worker.join().unwrap().unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied,

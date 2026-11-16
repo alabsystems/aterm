@@ -1917,6 +1917,64 @@ fn a_write_may_name_a_seed_row_no_pass_has_written_here() {
     );
 }
 
+/// The resolution's digest separates two resolutions that bind one (roster, writer) apart: the
+/// writer seated as another machine, or as none, digests otherwise, so the shared files' key
+/// moves with any binding (`file::materialize`'s `key`). Two Writers write the registry, and
+/// Mac 0's resolution of it binds each to its machine.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `Resolved::digest` passing over its bindings (the loop
+/// that hashes them removed), each rebound resolution digested as the first:
+/// `assertion `left != right` failed: another machine`.
+#[test]
+fn the_resolved_digest_separates_any_binding() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    append_history_at(
+        &here,
+        Command::Write {
+            request: [91; 16],
+            changes: machine(MC),
+        },
+        2_000,
+    );
+    repair_new_registry(&lab);
+    append_history_at(
+        &Handle::at(lab.paths[1].clone(), &REGISTRY),
+        Command::Write {
+            request: [92; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        3_000,
+    );
+    repair_registry(&lab, 6);
+    let table = here.compiled.table;
+    let resolved =
+        application::observe_store(&here.paths, here.descriptor(), |session, store, scope| {
+            let log = Log::read_with(session, store, scope, decode)?;
+            Resolved::read(table, session, &log)
+        })
+        .unwrap();
+    let writers: Vec<(Digest, Actor)> = resolved.writers().copied().collect();
+    assert_eq!(
+        writers
+            .iter()
+            .map(|(_, writer)| *writer)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2,
+        "CONTROL: both Writers' operations are eligible here: {writers:?}"
+    );
+    let first = resolved.digest();
+    assert_eq!(first, resolved.clone().digest(), "a digest is a function");
+    for (roster, writer) in writers {
+        for (machine, why) in [(Some([0xee; 16]), "another machine"), (None, "no seat")] {
+            let rebound = resolved.clone().rebound(roster, writer, machine);
+            assert_ne!(rebound.digest(), first, "{why}");
+        }
+    }
+}
+
 /// A table's history reads in pages. Paging with a cursor serves every entry once, in history's
 /// order; the filters keep a page to one collection, row, column, writer or kind; each entry
 /// carries the kind aterm-db decides (a facts-only record is aterm's, a mixed record the first

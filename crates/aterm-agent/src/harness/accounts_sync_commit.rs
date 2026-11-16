@@ -821,7 +821,14 @@ impl Store {
             source_policy,
             outbox: None,
         };
-        self.publish_plan_scoped(held, Scope::default(), plan, &[], source, || Ok(()))?;
+        self.publish_plan_scoped(
+            held,
+            Scope::default(),
+            plan,
+            &[],
+            (source, Admits::EveryPlan),
+            || Ok(()),
+        )?;
         Ok(changed)
     }
 
@@ -896,7 +903,7 @@ impl Store {
             note,
             None,
             Some(|state: &mut State| edit(state).map_err(SyncError::from)),
-            (None, || Ok(())),
+            (None, Admits::EveryPlan, || Ok(())),
         )
         .map(|(events, _)| events)
         .map_err(SyncError::into_message)
@@ -929,7 +936,7 @@ impl Store {
                 StateTarget::Fleet(fleet.0, fleet.1)
             }),
             Some(edit),
-            (None, || Ok(())),
+            (None, Admits::EveryPlan, || Ok(())),
         )
         .map(|(_, changed)| changed)
     }
@@ -950,7 +957,7 @@ impl Store {
             note,
             Some(StateTarget::Roster(target, retire)),
             Some(|state: &mut State| edit(state).map_err(SyncError::from)),
-            (None, || Ok(())),
+            (None, Admits::EveryPlan, || Ok(())),
         )
         .map(|(_, changed)| changed)
     }
@@ -966,10 +973,19 @@ impl Store {
         target: SyncTarget<'_>,
         retire: bool,
     ) -> Result<bool, String> {
-        self.transact_roster_admitted_held(held, now, note, target, retire, None)
-            .map_err(SyncError::into_message)
+        self.transact_roster_admitted_held(
+            held,
+            now,
+            note,
+            target,
+            retire,
+            (None, Admits::EveryPlan),
+        )
+        .map_err(SyncError::into_message)
     }
 
+    /// A roster-only publication: the state is kept exactly and no state edit runs. `source`
+    /// is asked to admit the plans `admits` names ([`Admits`]).
     pub(in crate::harness) fn transact_roster_admitted_held(
         &self,
         held: &Lock,
@@ -977,9 +993,17 @@ impl Store {
         note: &mut Option<String>,
         target: SyncTarget<'_>,
         retire: bool,
-        source: Option<&super::super::alab_roster::ReceiptGuard>,
+        (source, admits): (Option<&super::super::alab_roster::ReceiptGuard>, Admits),
     ) -> Result<bool, SyncError> {
-        self.transact_roster_prepared_held(held, now, note, target, retire, (source, || Ok(())))
+        self.transact_state_images_held(
+            held,
+            now,
+            note,
+            Some(StateTarget::Roster(target, retire)),
+            None::<fn(&mut State) -> Result<Vec<Event>, SyncError>>,
+            (source, admits, || Ok(())),
+        )
+        .map(|(_, changed)| changed)
     }
 
     /// Validate and encode before the caller's final admission check. Every file
@@ -1002,7 +1026,7 @@ impl Store {
             note,
             Some(StateTarget::Roster(target, retire)),
             None::<fn(&mut State) -> Result<Vec<Event>, SyncError>>,
-            (source, auxiliary),
+            (source, Admits::EveryPlan, auxiliary),
         )
         .map(|(_, changed)| changed)
     }
@@ -1014,8 +1038,9 @@ impl Store {
         note: &mut Option<String>,
         target: Option<StateTarget<'_>>,
         edit: Option<impl FnOnce(&mut State) -> Result<Vec<Event>, SyncError>>,
-        (source, auxiliary): (
+        (source, admits, auxiliary): (
             Option<&super::super::alab_roster::ReceiptGuard>,
+            Admits,
             impl FnOnce() -> Result<(), String>,
         ),
     ) -> Result<(Vec<Event>, bool), SyncError> {
@@ -1193,7 +1218,7 @@ impl Store {
             },
             plan,
             &events,
-            source,
+            (source, admits),
             auxiliary,
         )?;
         if let Some(notes) = notes {
@@ -2166,7 +2191,7 @@ impl Store {
             },
             plan,
             &events,
-            source,
+            (source, Admits::EveryPlan),
             auxiliary,
         )?;
         super::super::journal::publish(&notes);
@@ -2292,7 +2317,7 @@ impl Store {
         scope: Scope<'_>,
         plan: Plan,
         events: &[Event],
-        source: Option<&super::super::alab_roster::ReceiptGuard>,
+        (source, admits): (Option<&super::super::alab_roster::ReceiptGuard>, Admits),
         auxiliary: impl FnOnce() -> Result<(), String>,
     ) -> Result<bool, SyncError> {
         let prepared = PreparedPublication::new(self, held, scope, plan, !events.is_empty())?;
@@ -2300,8 +2325,16 @@ impl Store {
         // Neither phase object owns a callback. In particular, persisting an
         // intent cannot replay this auxiliary work while a source guard is held.
         auxiliary()?;
+        // A plan that changes nothing saves no receipt and replays no image, under the
+        // guard or outside it: `persist` makes its local checks and returns `None`.
+        let source = source.filter(|_| changed || admits == Admits::EveryPlan);
         let pending = match source {
-            Some(source) => source.with_admitted(|| prepared.persist())?,
+            Some(source) => {
+                super::super::accounts_upkeep_counts::count(
+                    super::super::accounts_upkeep_counts::Event::ReceiptAdmission,
+                );
+                source.with_admitted(|| prepared.persist())?
+            }
             None => prepared.persist()?,
         };
         if let Some(pending) = pending {
@@ -2309,6 +2342,22 @@ impl Store {
         }
         Ok(changed)
     }
+}
+
+/// Which plans a publication asks its source's receipt guard to admit
+/// (`Store::publish_plan_scoped`). A publication with no guard asks nothing under either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::harness) enum Admits {
+    /// Every plan, one that changes nothing included: the caller's answer "nothing changed"
+    /// then comes from a source its guard admitted.
+    EveryPlan,
+    /// Only a plan that changes something: an event, a login directory to make, or an image
+    /// whose bytes differ. A plan that changes nothing is persisted without asking the guard.
+    /// It writes no file under either rule. They differ where the guard would refuse (the
+    /// source moved, or cannot be read): under [`Self::EveryPlan`] the publication fails with
+    /// the guard's retryable error, under this one it answers "nothing changed". For a caller
+    /// that decides nothing from that answer.
+    Changes,
 }
 
 #[cfg(any(test, debug_assertions))]

@@ -100,6 +100,9 @@ impl Fixture {
             )
             .env_remove("DISABLE_AUTOUPDATER")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
+            .env_remove("KIMI_CODE_NO_AUTO_UPDATE")
+            .env_remove("ATERM_NO_HARNESS")
+            .env_remove("ATERM_PARENT_SESSION_ID")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -220,4 +223,74 @@ fn run_answers_self_update_help_with_the_builds_environment() {
         format!("{}\n", atpkg::selfupdate::help_line(row)),
         "the one note, nothing else: {shown}"
     );
+}
+
+/// `atpkg run` (what `aterm kimi` runs) HANDS A WORD A HARNESS LEADS TO ITS `bin/` SHIM, whose
+/// hand-off runs the launch under that harness as a typed `kimi` does: kimi's row keeps no
+/// launcher block since HX-09b, so `aterm kimi upgrade` reaches kimi-alab's `run -- upgrade`,
+/// which answers it, never Kimi Code's own updater; each gets the build's declared environment
+/// though the shim was laid without it. CONTROL: before kimi-alab is installed, and under the
+/// shim's `--no-harness`, the store build runs the words as typed.
+#[test]
+fn run_hands_a_word_a_harness_leads_to_that_harness() {
+    let fx = Fixture::new("led");
+    let script = |dir: &std::path::Path, tool: &str| {
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let exe = dir.join("bin").join(tool);
+        std::fs::write(
+            &exe,
+            format!("#!/bin/sh\necho \"{tool}: [${{KIMI_CODE_NO_AUTO_UPDATE-unset}}] $*\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        atpkg::activate::install_shims_env(
+            &fx.layout,
+            dir,
+            &[tool.to_string()],
+            atpkg::activate::Aliases::Off,
+            &atpkg::shim_env::ShimEnv::NONE,
+        )
+        .unwrap();
+        atpkg::store::mark_build_ready(dir).unwrap();
+    };
+    let kimi = fx.layout.build_dir("kimi", BUILD);
+    script(&kimi, "kimi");
+    std::fs::write(
+        kimi.with_file_name(format!("{BUILD}.shim-env")),
+        "KIMI_CODE_NO_AUTO_UPDATE=1\n",
+    )
+    .unwrap();
+    // bin/kimi as a pass lays it: the twin prelude, with its hand-off to kimi-alab.
+    atpkg::activate::reconcile_agents(&fx.layout);
+    let shim = fx
+        .layout
+        .shim(&atpkg::store::ToolName::new("kimi").unwrap());
+    let body = std::fs::read_to_string(&shim).unwrap();
+    assert!(
+        body.contains("bin/kimi-alab' run -- \"$@\""),
+        "PRECONDITION: bin/kimi hands its launch to kimi-alab:\n{body}"
+    );
+    let run = |args: &[&str]| {
+        let mut argv = vec!["run", "kimi", "--"];
+        argv.extend_from_slice(args);
+        let out = fx.run(&aterm_tempfile::bin_exe("atpkg"), &argv);
+        assert!(out.status.success(), "{args:?}: {}", describe(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(
+        run(&["upgrade"]),
+        "kimi: [1] upgrade\n",
+        "no kimi-alab installed"
+    );
+    script(&fx.layout.build_dir("kimi-alab", BUILD), "kimi-alab");
+    assert_eq!(
+        run(&["upgrade"]),
+        "kimi-alab: [1] run -- upgrade\n",
+        "the harness gets `run --` and the words as typed"
+    );
+    assert_eq!(
+        run(&["-m", "k2", "fix it"]),
+        "kimi-alab: [1] run -- -m k2 fix it\n"
+    );
+    assert_eq!(run(&["--no-harness", "upgrade"]), "kimi: [1] upgrade\n");
 }

@@ -21,30 +21,37 @@ fn census(root: &Path) -> Vec<Finding> {
             .collect()
     })
 }
-#[test]
-fn actual_census_rejects_missing_bullet_and_double_entry_then_accepts_valid_fragment() {
+/// `path` holding `text` gives a release-notes finding at `line` of that fragment; the
+/// same fragment rewritten as one entry with its continuation gives none.
+fn refused_at(text: &str, line: usize) {
     let root = checkout();
     let path = root.path().join("changes/fixed/session-note.md");
-    for (text, line) in [
-        ("The repaired behavior.\n", 1),
-        ("- First.\n- Second.\n", 2),
-    ] {
-        std::fs::write(&path, text).unwrap();
-        let found = census(root.path());
-        assert!(
-            found
-                .iter()
-                .any(|finding| finding.path == "changes/fixed/session-note.md"
-                    && finding.line == line),
-            "{found:?}"
-        );
-    }
+    std::fs::write(&path, text).unwrap();
+    let found = census(root.path());
+    assert!(
+        found
+            .iter()
+            .any(|finding| finding.path == "changes/fixed/session-note.md" && finding.line == line),
+        "{found:?}"
+    );
     std::fs::write(
         path,
         "- The repaired behavior.\n  Its continuation ships unchanged.\n",
     )
     .unwrap();
     assert!(census(root.path()).is_empty());
+}
+
+/// RL-22: a fragment without its `- ` first line, which stopped the 0.202.0 cut at step 1, is
+/// a census finding, so `verify land` refuses it before it reaches main.
+#[test]
+fn census_refuses_a_tree_with_a_changelog_fragment_without_its_dash_line() {
+    refused_at("The repaired behavior.\n", 1);
+}
+
+#[test]
+fn census_refuses_a_fragment_holding_two_entries() {
+    refused_at("- First.\n- Second.\n", 2);
 }
 #[test]
 fn actual_census_reads_case_variants_and_hidden_nested_paths_instead_of_skipping_them() {

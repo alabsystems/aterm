@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::perf::driver::built_executable;
 
 #[test]
 fn the_built_aterm_is_the_binary_cargo_reports() {
@@ -14,12 +15,12 @@ fn the_built_aterm_is_the_binary_cargo_reports() {
     ]
     .join("\n");
     assert_eq!(
-        built_binary(&messages, "aterm"),
+        built_executable(&messages, "aterm", "bin"),
         Ok(PathBuf::from("/w/target/opt-test/aterm"))
     );
-    assert!(built_binary(&messages, "aterm-ctl").is_err());
+    assert!(built_executable(&messages, "aterm-ctl", "bin").is_err());
     let nameless = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"aterm"},"executable":null}"#;
-    assert!(built_binary(nameless, "aterm").is_err());
+    assert!(built_executable(nameless, "aterm", "bin").is_err());
     assert_eq!(
         built_executable(&messages, "fabric_bench", "bench"),
         Ok(PathBuf::from(

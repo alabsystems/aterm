@@ -55,7 +55,7 @@ fn commit_only_objects_do_not_shortcut_raw_named_or_batch_source_completion() {
         .git_remote_for_tests("fixture-dev/app", &bare)
         .build();
     let slug = common::slug("fixture-dev/app");
-    for operation in ["raw", "named", "batch"] {
+    for operation in ["raw", "named", "batch", "batch-oid"] {
         let target = world.path().join(format!("{operation}.git"));
         host_git(
             world.path(),
@@ -95,6 +95,12 @@ fn commit_only_objects_do_not_shortcut_raw_named_or_batch_source_completion() {
                 &slug,
                 &target,
                 fetch_rows(&[("refs/heads/main", "refs/agh/complete", &oid)]),
+                true,
+            ),
+            "batch-oid" => GitRun::fetch_batch(
+                &slug,
+                &target,
+                fetch_rows(&[(&oid, "refs/agh/complete", &oid)]),
                 true,
             ),
             _ => unreachable!(),
@@ -1089,6 +1095,304 @@ fn main_lends_only_its_complete_snapshot_despite_an_unrelated_partial_ref() {
         assert_eq!(
             host_git(&target, &["rev-parse", "refs/agh/partial"]),
             partial
+        );
+    }
+}
+
+/// An exact batch's requested graph is complete even when another local ref is not.
+/// The private ref must still be published, without transferring or importing the cached data.
+#[test]
+fn literal_batch_reuses_complete_roots_despite_an_unrelated_partial_ref() {
+    let world = KeptWorld(Some(World::canonical("batch-local-complete")));
+    let bare = bare_repo(world.path(), "app");
+    let work = world.path().join("app-work");
+    std::fs::write(work.join("payload"), b"complete requested bytes\n").unwrap();
+    host_git(&work, &["add", "payload"]);
+    host_git(&work, &["commit", "--quiet", "-m", "complete root"]);
+    host_git(&work, &["push", "--quiet", bare.to_str().unwrap(), "main"]);
+    let oid = host_git(&bare, &["rev-parse", "main"]);
+    let target = world.path().join("target.git");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            "--no-hardlinks",
+            bare.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(work.join("unrelated"), b"absent unrelated tree\n").unwrap();
+    host_git(&work, &["add", "unrelated"]);
+    host_git(&work, &["commit", "--quiet", "-m", "unrelated partial"]);
+    let partial = host_git(&work, &["rev-parse", "HEAD"]);
+    let partial_tree = host_git(&work, &["rev-parse", "HEAD^{tree}"]);
+    let raw = super::raw_blob_tests::git_input(&work, &["cat-file", "commit", &partial], None);
+    assert!(raw.status.success());
+    let inserted = super::raw_blob_tests::git_input(
+        &target,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        Some(&raw.stdout),
+    );
+    assert!(inserted.status.success());
+    host_git(&target, &["update-ref", "refs/agh/partial", &partial]);
+    assert!(
+        !super::raw_blob_tests::git_input(&target, &["cat-file", "-t", &partial_tree], None)
+            .status
+            .success()
+    );
+    assert!(
+        host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"])
+            .lines()
+            .all(|line| !line.starts_with('?'))
+    );
+    let head = std::fs::read(target.join("HEAD")).unwrap();
+    let config = std::fs::read(target.join("config")).unwrap();
+    std::fs::write(target.join("FETCH_HEAD"), b"keep fetch head\n").unwrap();
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    gh.run_git(&GitRun::fetch_batch(
+        &common::slug("fixture-dev/app"),
+        &target,
+        fetch_rows(&[(&oid, "refs/agh/pinned", &oid)]),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        host_git(
+            &target,
+            &["for-each-ref", "--format=%(refname) %(objectname)"]
+        ),
+        format!("refs/agh/partial {partial}\nrefs/agh/pinned {oid}\nrefs/heads/main {oid}")
+    );
+    assert_eq!(
+        host_git(&target, &["show", "refs/agh/pinned:payload"]),
+        "complete requested bytes"
+    );
+    let data_steps: Vec<_> = gh
+        .fx()
+        .children_run()
+        .into_iter()
+        .filter(|spec| {
+            spec.args.iter().any(|arg| {
+                arg == "init" || arg == "fetch" || arg == "pack-objects" || arg == "index-pack"
+            })
+        })
+        .collect();
+    assert!(
+        data_steps.is_empty(),
+        "complete local roots need no transfer or import: {data_steps:?}"
+    );
+    assert_eq!(std::fs::read(target.join("HEAD")).unwrap(), head);
+    assert_eq!(std::fs::read(target.join("config")).unwrap(), config);
+    assert_eq!(
+        std::fs::read(target.join("FETCH_HEAD")).unwrap(),
+        b"keep fetch head\n"
+    );
+    assert!(!target.join("objects/info/alternates").exists());
+    assert!(
+        !super::raw_blob_tests::git_input(&target, &["cat-file", "-t", &partial_tree], None)
+            .status
+            .success(),
+        "an unrelated incomplete ref is neither requested nor hydrated"
+    );
+}
+
+fn historical_batch_source() -> (KeptWorld, PathBuf, String, String, String) {
+    let world = KeptWorld(Some(World::canonical("batch-local-history")));
+    let bare = bare_repo(world.path(), "app");
+    let work = world.path().join("app-work");
+    let base = host_git(&bare, &["rev-parse", "main"]);
+    std::fs::write(work.join("payload"), b"required historical body\n").unwrap();
+    host_git(&work, &["add", "payload"]);
+    host_git(&work, &["commit", "--quiet", "-m", "historical body"]);
+    let historical = host_git(&work, &["rev-parse", "HEAD:payload"]);
+    std::fs::write(work.join("payload"), b"selected checkout body\n").unwrap();
+    host_git(&work, &["commit", "--quiet", "-am", "selected body"]);
+    host_git(&work, &["push", "--quiet", bare.to_str().unwrap(), "main"]);
+    host_git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+    let oid = host_git(&bare, &["rev-parse", "main"]);
+    (world, bare, base, oid, historical)
+}
+
+/// A present commit and selected checkout do not prove historical closure. Every requested
+/// root must be complete before a literal batch can reuse local objects without transfer.
+#[test]
+fn literal_batch_completes_missing_historical_bodies_and_every_requested_root() {
+    let (world, bare, base, oid, historical) = historical_batch_source();
+    let slug = common::slug("fixture-dev/app");
+    for mixed in [false, true] {
+        let target = world.path().join(format!("target-{mixed}.git"));
+        host_git(
+            world.path(),
+            &["init", "--quiet", "--bare", target.to_str().unwrap()],
+        );
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &bare)
+            .build();
+        gh.run_git(&GitRun::fetch_ref(
+            &slug,
+            &target,
+            &oid,
+            "refs/agh/selected",
+            true,
+            agh::git::FetchScope::SelectedCheckout { cache: None },
+        ))
+        .unwrap();
+        assert_eq!(
+            host_git(&target, &["show", "refs/agh/selected:payload"]),
+            "selected checkout body"
+        );
+        assert!(
+            host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"])
+                .lines()
+                .any(|line| line == format!("?{historical}"))
+        );
+        assert!(
+            host_git(
+                &target,
+                &["rev-list", "--objects", &base, "--missing=print"]
+            )
+            .lines()
+            .all(|line| !line.starts_with('?')),
+            "the first mixed root is complete"
+        );
+        let before = gh.fx().children_run().len();
+        let rows = if mixed {
+            fetch_rows(&[
+                (&base, "refs/agh/base", &base),
+                (&oid, "refs/agh/pinned", &oid),
+            ])
+        } else {
+            fetch_rows(&[(&oid, "refs/agh/pinned", &oid)])
+        };
+        gh.run_git(&GitRun::fetch_batch(&slug, &target, rows, true))
+            .unwrap();
+        assert_eq!(host_git(&target, &["rev-parse", "refs/agh/pinned"]), oid);
+        if mixed {
+            assert_eq!(host_git(&target, &["rev-parse", "refs/agh/base"]), base);
+        }
+        assert_eq!(
+            host_git(&target, &["cat-file", "blob", &historical]),
+            "required historical body"
+        );
+        assert!(
+            host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"])
+                .lines()
+                .all(|line| !line.starts_with('?'))
+        );
+        assert!(
+            gh.fx()
+                .children_run()
+                .iter()
+                .skip(before)
+                .any(|spec| spec.args.iter().any(|arg| arg == "fetch")),
+            "an incomplete requested closure must use normal transfer"
+        );
+    }
+}
+
+/// A shallow boundary introduced after type inventory cannot hide a missing ancestor's body
+/// from the full-closure proof. Either acquisition refuses before publication or completes it.
+#[test]
+fn a_shallow_boundary_created_after_type_inventory_cannot_hide_missing_history() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{OnceLock, Weak};
+
+    let (world, bare, _, oid, historical) = historical_batch_source();
+    let target = world.path().join("shallow-race.git");
+    host_git(
+        world.path(),
+        &["init", "--quiet", "--bare", target.to_str().unwrap()],
+    );
+    let slug = common::slug("fixture-dev/app");
+    let seed = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    seed.run_git(&GitRun::fetch_ref(
+        &slug,
+        &target,
+        &oid,
+        "refs/agh/selected",
+        true,
+        agh::git::FetchScope::SelectedCheckout { cache: None },
+    ))
+    .unwrap();
+    assert!(!target.join("shallow").exists());
+    assert!(
+        !super::raw_blob_tests::git_input(&target, &["cat-file", "-t", &historical], None)
+            .status
+            .success(),
+        "the original historical body is actually absent"
+    );
+    let shallow = target.join("shallow");
+    let boundary = format!("{oid}\n");
+    let changed = shallow.clone();
+    let bytes = boundary.clone();
+    let injected = Arc::new(AtomicBool::new(false));
+    let happened = Arc::clone(&injected);
+    let effects = Arc::new(OnceLock::<Weak<Fx>>::new());
+    let observed = Arc::clone(&effects);
+    let fx = Arc::new(
+        Fx::simulated(live_start()).with_git_child_observer_for_tests(move |span| {
+            let fx = observed.get().and_then(Weak::upgrade).unwrap();
+            let specs = fx.children_run();
+            if specs[span.ordinal]
+                .args
+                .iter()
+                .any(|arg| arg == "--batch-check=%(objectname) %(objecttype)")
+                && !happened.swap(true, Ordering::SeqCst)
+            {
+                assert_eq!(span.code, Some(0), "the type inventory completed");
+                std::fs::write(&changed, &bytes).unwrap();
+            }
+        }),
+    );
+    assert!(effects.set(Arc::downgrade(&fx)).is_ok());
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .fx(fx)
+        .build();
+    let result = gh.run_git(&GitRun::fetch_batch(
+        &slug,
+        &target,
+        fetch_rows(&[(&oid, "refs/agh/pinned", &oid)]),
+        true,
+    ));
+    assert!(
+        injected.load(Ordering::SeqCst),
+        "the boundary race was exercised"
+    );
+    assert_eq!(std::fs::read(&shallow).unwrap(), boundary.as_bytes());
+    if result.is_ok() {
+        assert_eq!(host_git(&target, &["rev-parse", "refs/agh/pinned"]), oid);
+        assert_eq!(
+            host_git(&target, &["cat-file", "blob", &historical]),
+            "required historical body"
+        );
+        assert!(
+            gh.fx()
+                .children_run()
+                .iter()
+                .any(|spec| spec.args.iter().any(|arg| arg == "fetch")),
+            "the incomplete original graph needs a real transfer"
+        );
+    } else {
+        assert!(
+            !super::raw_blob_tests::git_input(
+                &target,
+                &["rev-parse", "--verify", "refs/agh/pinned"],
+                None
+            )
+            .status
+            .success(),
+            "a refused acquisition publishes no pin"
         );
     }
 }

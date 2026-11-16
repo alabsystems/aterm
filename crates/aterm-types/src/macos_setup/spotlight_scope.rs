@@ -231,6 +231,26 @@ pub fn owed(reads: &dyn Reads) -> bool {
     }
 }
 
+/// Whether Spotlight needs its first setup. Extending an existing receipt is explicit work:
+/// a new checkout must not reopen the administrator prompt at an update or restart.
+#[must_use]
+pub fn automatic_owed(reads: &dyn Reads) -> bool {
+    owed(reads) && listed(reads, RECEIPT).is_ok_and(|receipt| receipt.is_empty())
+}
+
+/// The first-setup decision on this Mac, with no prompt.
+#[must_use]
+pub fn automatic_owed_here() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        automatic_owed(&Live)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// How long [`Live`] waits for `mdutil -s` before the state counts as unread.
 #[cfg(unix)]
 const STATUS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);

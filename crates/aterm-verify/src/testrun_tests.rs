@@ -311,7 +311,7 @@ fn dispatch_among_claims(
         let mut claim = None;
         let started = d.next_with(0.0, &mut |b| {
             claim = waiters
-                .poll_with(b.index, need_of(b), &machine, &enter)
+                .poll_with(b.index, need_of(b), &machine, enter)
                 .expect("the dispatch's request is polled");
             claim.is_some()
         });
@@ -378,7 +378,7 @@ fn dispatch_among_claims(
         // It runs; every other process looks.
         look(&mut others, &mut events);
         if successor != Successor::AfterTheRelease {
-            waiters.hand_over(&d, b.index, false, &need_of, &machine, &enter);
+            waiters.hand_over(&d, b.index, false, &need_of, &machine, enter);
         }
         stands("before the release");
         if successor == Successor::AtThePlace && d.queued().next().is_some() {
@@ -398,7 +398,7 @@ fn dispatch_among_claims(
         // The gap a look of another process falls in.
         look(&mut others, &mut events);
         if successor == Successor::AfterTheRelease {
-            waiters.hand_over(&d, b.index, false, &need_of, &machine, &enter);
+            waiters.hand_over(&d, b.index, false, &need_of, &machine, enter);
         }
         d.finish(b.index).expect("it ran");
     }

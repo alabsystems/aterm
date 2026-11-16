@@ -3350,16 +3350,11 @@ fn take_held_panes(
         let sid = carry
             .sid
             .as_deref()
+            .and_then(SessionId::parse)
             .filter(|sid| {
-                crate::keeper_link::valid_sid(sid)
-                    && !handed.iter().any(|(_, handed)| handed == sid)
-                    && !panes.iter().any(|pane| {
-                        pane.sid
-                            .as_ref()
-                            .is_some_and(|taken| taken.as_str() == *sid)
-                    })
-            })
-            .map(SessionId::new);
+                !handed.iter().any(|(_, handed)| *handed == sid.as_str())
+                    && !panes.iter().any(|pane| pane.sid.as_ref() == Some(sid))
+            });
         panes.push(HeldPane {
             local_id,
             sid,
@@ -6056,6 +6051,9 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
             let Some(sc) = rec.screen.as_ref() else {
                 return refuse_incoming_session(rec.local_id, "carried no screen");
             };
+            let Some(sid) = SessionId::parse(&rec.sid) else {
+                return refuse_incoming_session(rec.local_id, "carried no session's ID");
+            };
             let meta = parse_checkpoint_meta(sc);
             let followed_no_scrollback = rec.history_dropped > 0
                 && !rec.history_withheld
@@ -6141,7 +6139,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     local_id: rec.local_id,
                     master,
                     pid,
-                    sid: SessionId::new(rec.sid.clone()),
+                    sid,
                     nonce: LaunchNonce::generate(),
                     checkpoint,
                     control,

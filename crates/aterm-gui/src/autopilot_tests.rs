@@ -227,7 +227,6 @@ fn the_chips_follow_the_designs_table_and_cycle_in_order() {
     assert_eq!(PENDING_GLYPH.chars().collect::<Vec<_>>(), [IN_FLIGHT]);
     assert!(AutopilotView::Cruise.carries() && AutopilotView::Land.carries());
     assert!(!AutopilotView::Off.carries() && !AutopilotView::MasterOff.carries());
-    assert_eq!(AutopilotView::ALL.len(), 6);
     for view in AutopilotView::ALL {
         for supervised in [false, true] {
             let glass = match view {

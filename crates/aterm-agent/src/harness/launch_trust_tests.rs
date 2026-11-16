@@ -9,7 +9,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::*;
-#[cfg(unix)]
 use crate::supervise::config::Approve;
 
 /// A test's wait for something that must happen: a hang detector, never a budget.
@@ -38,7 +37,8 @@ fn words(list: &[&str]) -> Vec<String> {
 }
 
 /// A scratch world: a user home, a Claude home, a folder to launch in and a build's path, all
-/// under one resolved root.
+/// under one resolved root, spelled as a launch's folder is spelled ([`resolved`]: on Windows a
+/// drive folder, `C:\Users\…\Temp\…`, with no verbatim prefix).
 struct World {
     _tmp: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -54,7 +54,7 @@ impl World {
             .prefix(&format!("aterm-launch-trust-{tag}-"))
             .tempdir()
             .expect("a scratch root");
-        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let root = resolved(tmp.path()).expect("resolved");
         let (home, claude_home, folder) = (
             root.join("home"),
             root.join("claude-home"),
@@ -105,15 +105,38 @@ impl World {
     }
 }
 
+/// `key` as Claude Code spells a `projects` key (its `normalizePathForConfigKey`): the folder, on
+/// Windows with `/` for every `\` (`C:/Users//u/proj`). Spelled here apart from
+/// [`key_spelling`], which [`the_trust_key_is_spelled_as_claude_code_files_it`] holds to the
+/// same spelling.
+fn claude_spelling(key: &Path) -> String {
+    let spelled = key.to_string_lossy();
+    if cfg!(windows) {
+        spelled.replace('\\', "/")
+    } else {
+        spelled.into_owned()
+    }
+}
+
 /// A profile that records trust for each of `keys`, as Claude Code writes an entry.
 fn profile_trusting(keys: &[&Path]) -> String {
-    let entries: Vec<String> = keys
+    profile_of(
+        &keys
+            .iter()
+            .map(|key| claude_spelling(key))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// A profile that records trust for each of the keys `spelled`, each spelled as given.
+fn profile_of(spelled: &[String]) -> String {
+    let entries: Vec<String> = spelled
         .iter()
         .map(|key| {
             format!(
                 "{}:{{\"allowedTools\":[],\"hasTrustDialogAccepted\":true,\
                  \"hasClaudeMdExternalIncludesApproved\":false}}",
-                crate::supervise::journal::json_str(&key.to_string_lossy())
+                crate::supervise::journal::json_str(key)
             )
         })
         .collect();
@@ -606,9 +629,8 @@ fn nothing_is_started_where_there_is_nothing_to_settle() {
 /// claims. None of them is journaled: each is the policy's own, and each names its reason.
 /// CONTROL: the default policy, over a session with no word of its own, no hold and no
 /// supervisor but a window's own host, answers as the folder judgment does ([`gate`] over no
-/// session's facts), which names none of those reasons: it trusts the folder on unix
-/// ([`nothing_is_started_where_the_policy_gives_no_leave`]) and none on Windows
-/// (ATERM-KI-1115-31415).
+/// session's facts), which names none of those reasons: it trusts the folder
+/// ([`nothing_is_started_where_the_policy_gives_no_leave`]).
 #[test]
 fn nothing_is_started_where_the_policy_or_the_session_refuses_before_any_folder() {
     let w = World::new("refuses");
@@ -726,13 +748,9 @@ fn nothing_is_started_where_the_policy_or_the_session_refuses_before_any_folder(
 /// NOR WHERE THE POLICY TRUSTS NO FOLDER HERE: `approve = "none"`, and `approve = "safe"` with
 /// no trust root over the folder; nor where the folder is already recorded. None of them is
 /// journaled: each is the policy's own. CONTROLS: the default policy trusts the folder, and so
-/// does a session whose own word is on over a table that is off. Unix's: the folder judgment
-/// ([`approval::trust_folder_rule`]) reads `/`-rooted folders alone, as the folder-trust
-/// dialog's own reading does, and the key a record is read under is spelled as Unix spells it,
-/// so on Windows no folder is trusted (ATERM-KI-1115-31415); the refusals made before any folder
-/// is judged run on every platform
-/// ([`nothing_is_started_where_the_policy_or_the_session_refuses_before_any_folder`]).
-#[cfg(unix)]
+/// does a session whose own word is on over a table that is off. On every platform: on Windows
+/// the folder is a drive folder, read as Windows reads one ([`approval::trust_folder_rule`]), and
+/// its record is Claude Code's `C:/…` key.
 #[test]
 fn nothing_is_started_where_the_policy_gives_no_leave() {
     let w = World::new("leave");
@@ -824,9 +842,8 @@ fn nothing_is_started_where_the_policy_gives_no_leave() {
 /// one the session's starter trusted, is settled under the dialog's safe rule, and under
 /// `approve = "all"` any other folder under the full-power one, so the row booked names the rule
 /// that would have answered the dialog (the table itself is pinned against the dialog's
-/// decision in the policy's own tests). Unix's: on Windows the folder judgment trusts no folder
-/// (ATERM-KI-1115-31415).
-#[cfg(unix)]
+/// decision in the policy's own tests). On every platform: on Windows the root is spelled as a
+/// config may spell one there (`C:\…\aterm-launch-trust-gate-…/wor*`, either separator).
 #[test]
 fn the_gate_names_the_rule_the_dialog_would_be_answered_under() {
     let w = World::new("gate");
@@ -1176,9 +1193,8 @@ fn the_sessions_facts_are_read_from_its_meta_and_status_replies() {
 /// ([`session_gate`]), before any folder is judged: no reply, and a `meta` that is no `OK`, are
 /// no reading ([`Gate::Unread`]), and a session whose own Autopilot word is off is refused.
 /// CONTROL: a session with no word of its own, no hold and no other supervisor answers as the
-/// folder judgment over its facts does ([`gate`]), which is neither: it trusts the folder on
-/// unix ([`the_gate_over_the_sessions_facts_trusts_by_them`]) and none on Windows
-/// (ATERM-KI-1115-31415).
+/// folder judgment over its facts does ([`gate`]), which is neither: it trusts the folder
+/// ([`the_gate_over_the_sessions_facts_trusts_by_them`]).
 #[test]
 fn the_gate_over_no_reading_or_an_off_word_trusts_nothing() {
     let seen = |meta: String, status: String| Seen { meta, status };
@@ -1223,10 +1239,8 @@ fn the_gate_over_no_reading_or_an_off_word_trusts_nothing() {
 
 /// THE GATE OVER THE SESSION'S FACTS TRUSTS BY THEM ([`session_gate`]): the default policy
 /// trusts the folder of a session with no word of its own, and under `approve = "safe"` the
-/// folder the session's starter trusted. Unix's: on Windows the folder judgment trusts no folder
-/// (ATERM-KI-1115-31415); what the gate refuses before any folder is judged runs on every
-/// platform ([`the_gate_over_no_reading_or_an_off_word_trusts_nothing`]).
-#[cfg(unix)]
+/// folder the session's starter trusted, as the window's reply spells it (on Windows a drive
+/// folder).
 #[test]
 fn the_gate_over_the_sessions_facts_trusts_by_them() {
     let seen = |meta: String, status: String| Seen { meta, status };
@@ -1258,9 +1272,7 @@ fn the_gate_over_the_sessions_facts_trusts_by_them() {
 /// A RELAUNCH LINE IS SETTLED UNDER THE CLAUDE HOME IT NAMES: a line that moves a session to a
 /// second Claude home is settled against that home's profile, with the build started under the
 /// line's own variables and none of this process's AI variables. CONTROL: the same line under a
-/// home that already records the folder starts nothing. Unix's: on Windows the folder judgment
-/// trusts no folder, so nothing is started (ATERM-KI-1115-31415).
-#[cfg(unix)]
+/// home that already records the folder starts nothing.
 #[test]
 fn a_relaunch_line_is_settled_under_the_claude_home_it_names() {
     let w = World::new("relaunch");
@@ -1668,5 +1680,506 @@ fn a_start_that_recorded_nothing_stands_for_a_time_and_is_then_asked_again() {
         let later = ask(now + stands);
         assert!(!matches!(later, Attested::Stands(_)), "{tag}: {later:?}");
         assert_eq!(starts(), 3, "{tag}: asked again once its time had come");
+    }
+}
+
+/// THE KEY IS SPELLED AS CLAUDE CODE FILES IT: on unix the folder itself; on Windows the folder
+/// with no verbatim prefix and `/` for every `\` (`C:/Users//u/proj`, a share's `//server/share/p`),
+/// the spelling Claude Code's profiles on a Windows host hold.
+#[test]
+fn the_trust_key_is_spelled_as_claude_code_files_it() {
+    if cfg!(windows) {
+        for (key, spelled) in [
+            (r"C:\Users\u\proj", "C:/Users//u/proj"),
+            (r"\\?\C:\Users\u\proj", "C:/Users//u/proj"),
+            (r"\\?\UNC\server\share\p", "//server/share/p"),
+            (r"\\server\share\p", "//server/share/p"),
+        ] {
+            assert_eq!(
+                key_spelling(Path::new(key)).as_deref(),
+                Some(spelled),
+                "{key}"
+            );
+        }
+    } else {
+        for key in ["/w/proj", "/w/a b/c\\d"] {
+            assert_eq!(key_spelling(Path::new(key)).as_deref(), Some(key), "{key}");
+        }
+    }
+    let w = World::new("spelling");
+    assert_eq!(
+        key_spelling(&w.folder).as_deref(),
+        Some(claude_spelling(&w.folder).as_str())
+    );
+}
+
+/// ON WINDOWS A RECORD NAMES ITS FOLDER AS WINDOWS COMPARES FOLDERS: Claude Code's `C:/…` key is
+/// the record of the folder `C:\…`, and so is the key of another case of it (its drive, its
+/// names), its `\` spelling and its verbatim one, since Windows reads them as one folder.
+/// CONTROL: the key of a folder beside it, of a folder above it and of a folder below it are no
+/// record of it. MUTANT: a record read by its spelling alone, `\` as `/`, fails the other case.
+#[cfg(windows)]
+#[test]
+fn a_windows_record_is_read_as_windows_compares_folders() {
+    let w = World::new("windows-record");
+    let profile = w.profile();
+    let spelled = claude_spelling(&w.folder);
+    assert!(
+        spelled.contains('/') && !spelled.contains('\\'),
+        "{spelled}"
+    );
+    let other_case: String = spelled
+        .chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect();
+    assert_ne!(other_case, spelled);
+    for key in [
+        spelled.clone(),
+        other_case,
+        w.folder.to_string_lossy().into_owned(),
+        format!(r"\\?\{}", w.folder.display()),
+    ] {
+        std::fs::write(&profile, profile_of(std::slice::from_ref(&key))).expect("the profile");
+        assert!(recorded(&profile, &w.folder), "{key}");
+    }
+    for key in [
+        format!("{spelled}2"),
+        claude_spelling(&w.root),
+        claude_spelling(&w.folder.join("child")),
+    ] {
+        std::fs::write(&profile, profile_of(std::slice::from_ref(&key))).expect("the profile");
+        assert!(!recorded(&profile, &w.folder), "{key}");
+    }
+}
+
+/// ON WINDOWS THE GATE READS A DRIVE FOLDER AS WINDOWS COMPARES NAMES: a trust root spelled in
+/// another case, with `/` for `\`, or verbatim holds the launch's folder under `approve = "safe"`,
+/// and so does the starter's folder spelled in another case; a launch whose folder is spelled
+/// verbatim and in another case is settled as its resolved folder (the disk's own spelling, no
+/// verbatim prefix), which the build is started in and attests. CONTROL: a root whose name the
+/// folder's only begins with (`wor`), a root beside the folder (`work2`), a root on another
+/// drive and the folder's parent as the starter's trust nothing. MUTANT: names compared unfolded
+/// fail the cased roots.
+#[cfg(windows)]
+#[test]
+fn the_gate_reads_a_windows_folder_as_windows_compares_names() {
+    let w = World::new("windows-gate");
+    let root = w.root.to_string_lossy().into_owned();
+    let ask = |roots: &[String], trusted: Option<&Path>, cwd: &Path| {
+        gate(
+            &Policy {
+                config: &SupervisorConfig {
+                    approve: Approve::Safe,
+                    trust_roots: roots.to_vec(),
+                    ..SupervisorConfig::default()
+                },
+                autopilot: None,
+                trusted_cwd: trusted,
+                home: Some(&w.home),
+                uid: 502,
+            },
+            cwd,
+        )
+    };
+    for spec in [
+        format!(r"{}\WORK", root.to_uppercase()),
+        format!("{}/work", root.to_lowercase().replace('\\', "/")),
+        format!(r"\\?\{root}\Wor*"),
+    ] {
+        assert_eq!(
+            ask(std::slice::from_ref(&spec), None, &w.folder),
+            Gate::Trusts(approval::RULE_TRUST_DIALOG),
+            "{spec}"
+        );
+    }
+    let starter = PathBuf::from(w.folder.to_string_lossy().to_lowercase());
+    assert_eq!(
+        ask(&[], Some(&starter), &w.folder),
+        Gate::Trusts(approval::RULE_TRUST_DIALOG)
+    );
+    let other_drive = if root.starts_with(['C', 'c']) {
+        "D"
+    } else {
+        "C"
+    };
+    for (what, roots, trusted) in [
+        ("a name it begins", vec![format!(r"{root}\wor")], None),
+        ("a folder beside it", vec![format!(r"{root}\work2")], None),
+        (
+            "another drive",
+            vec![format!(r"{other_drive}{}\work", &root[1..])],
+            None,
+        ),
+        (
+            "its parent as the starter's",
+            Vec::new(),
+            Some(w.root.as_path()),
+        ),
+    ] {
+        assert!(
+            matches!(ask(&roots, trusted, &w.folder), Gate::Refuses(_)),
+            "{what}"
+        );
+    }
+    // A launch whose folder is spelled verbatim, in another case, is settled as its resolved one.
+    let spelled = PathBuf::from(format!(
+        r"\\?\{}",
+        w.folder.to_string_lossy().to_uppercase()
+    ));
+    let (argv, env) = (words(&["claude"]), w.env());
+    let vendor = Fake::recording(&w.profile());
+    let mut notes = Notes::default();
+    let roots = [format!(r"{root}\wor*")];
+    let settled = settle(
+        &Launch {
+            cwd: &spelled,
+            ..w.launch(&argv, &env)
+        },
+        &|cwd| ask(&roots, None, cwd),
+        &vendor,
+        &mut notes,
+        DEADLINE,
+    );
+    assert_eq!(
+        settled,
+        Settled::Recorded {
+            rule: approval::RULE_TRUST_DIALOG,
+            by: "Claude Code 2.1.323".to_string()
+        }
+    );
+    let calls = vendor.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].cwd, w.folder);
+    assert_eq!(calls[0].directory, w.folder.to_string_lossy());
+    assert!(recorded(&w.profile(), &w.folder));
+}
+
+/// ON WINDOWS THE SAFE RULES SETTLE NO FOLDER WHOSE WAY TELLS NAMES APART BY CASE: under a
+/// directory that does (WSL makes every one so), `work` and `WORK` are two folders, and a trust
+/// root naming `work`, folding case, would hold either; so nothing is started for either and the
+/// policy's refusal names that, as the folder-trust dialog escalates it. CONTROLS: the same root
+/// over the same folder in a directory that folds case settles it; and under the directory that
+/// tells case the full-power rule (`approve = "all"` with no root), which compares no names,
+/// settles it.
+#[cfg(windows)]
+#[test]
+fn a_windows_folder_under_a_case_telling_directory_is_not_settled_by_a_root() {
+    let w = World::new("windows-case");
+    let (argv, env) = (words(&["claude"]), w.env());
+    for (dir, tells) in [(w.root.join("exact"), true), (w.root.join("folded"), false)] {
+        std::fs::create_dir(&dir).expect("the directory");
+        if tells {
+            aterm_sysprobe::set_case_sensitive_dir(&dir, true).expect("it tells case");
+        }
+        let (lower, upper) = (dir.join("work"), dir.join("WORK"));
+        std::fs::create_dir(&lower).expect("work");
+        assert_eq!(
+            std::fs::create_dir(&upper).is_ok(),
+            tells,
+            "WORK beside work"
+        );
+        for (approve, roots) in [
+            (Approve::Safe, vec![lower.to_string_lossy().into_owned()]),
+            (Approve::All, Vec::new()),
+        ] {
+            let config = SupervisorConfig {
+                approve,
+                trust_roots: roots,
+                ..SupervisorConfig::default()
+            };
+            let policy = Policy {
+                config: &config,
+                autopilot: None,
+                trusted_cwd: None,
+                home: Some(&w.home),
+                uid: 502,
+            };
+            let _ = std::fs::remove_file(w.profile());
+            let vendor = Fake::recording(&w.profile());
+            let mut notes = Notes::default();
+            let settled = settle(
+                &Launch {
+                    cwd: &upper,
+                    ..w.launch(&argv, &env)
+                },
+                &|cwd| gate(&policy, cwd),
+                &vendor,
+                &mut notes,
+                DEADLINE,
+            );
+            if tells && approve == Approve::Safe {
+                assert_eq!(settled, Settled::Gated(CASE_TOLD));
+                assert!(vendor.calls().is_empty(), "nothing was started");
+            } else {
+                let rule = if approve == Approve::Safe {
+                    approval::RULE_TRUST_DIALOG
+                } else {
+                    approval::RULE_TRUST_ANY
+                };
+                assert_eq!(
+                    settled,
+                    Settled::Recorded {
+                        rule,
+                        by: "Claude Code 2.1.323".to_string()
+                    },
+                    "CONTROL: tells {tells}, {approve:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The process environment a Windows stand-in needs to start (`SystemRoot`, `PATH` and the
+/// rest), with `w`'s own Claude home and stand-in folder over it and no AI variable of this
+/// process's.
+#[cfg(windows)]
+fn windows_env(w: &World) -> Vec<(String, String)> {
+    let own: Vec<(String, String)> = w
+        .env()
+        .into_iter()
+        .filter(|(name, _)| name != "PATH")
+        .collect();
+    let mut env: Vec<(String, String)> = std::env::vars()
+        .filter(|(name, _)| {
+            !aterm_types::domain::is_ai_env_var(name)
+                && !own.iter().any(|(set, _)| set.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    env.extend(own);
+    env
+}
+
+/// A Windows stand-in for the build: `claude.cmd` in `w`'s root running the PowerShell `script`
+/// on its own stdin and stdout (Windows PowerShell, which every Windows holds).
+#[cfg(windows)]
+fn stub_powershell(w: &World, script: &str) -> PathBuf {
+    let ps1 = w.root.join("stub.ps1");
+    std::fs::write(&ps1, script).expect("the script");
+    let system = std::env::var("SystemRoot").expect("SystemRoot");
+    stub_cmd(
+        w,
+        &format!(
+            "@\"{system}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile \
+             -NonInteractive -ExecutionPolicy Bypass -File \"{}\"\r\n",
+            ps1.display()
+        ),
+    )
+}
+
+/// A Windows stand-in for the build: `claude.cmd` in `w`'s root with the batch `body`.
+#[cfg(windows)]
+fn stub_cmd(w: &World, body: &str) -> PathBuf {
+    let cmd = w.root.join("claude.cmd");
+    std::fs::write(&cmd, body).expect("the stand-in");
+    cmd
+}
+
+/// The answer a PowerShell stand-in prints: Claude Code 2.1.323's, with `recorded` as its flag.
+#[cfg(windows)]
+fn ps_answer(recorded: bool) -> String {
+    format!(
+        "[Console]::Out.WriteLine('{{\"type\":\"control_response\",\"response\":{{\"subtype\":\
+         \"success\",\"request_id\":\"aterm-trust\",\"response\":{{\"pid\":1,\
+         \"claude_code_version\":\"2.1.323\",\"workspace_trust_recorded\":{recorded}}}}}}}')\n\
+         [Console]::Out.Flush()\n"
+    )
+}
+
+/// A Windows start's own deadline where a test does not judge it: so long that no machine's
+/// load reaches it, the test's own wait ([`awaited`]) being the hang detector.
+#[cfg(windows)]
+const UNJUDGED: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `work`'s result, run on a thread of its own and awaited while what this process started
+/// works: a Windows stand-in (PowerShell's start alone) takes what a loaded machine gives it, so
+/// the wait is a minute without its progress, never a latency budget.
+///
+/// # Panics
+/// Panics where `work` panicked, or where what this process started made no progress for a
+/// minute before `work` ended.
+#[cfg(windows)]
+fn awaited<T: Send + 'static>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tell, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tell.send(work());
+    });
+    let got = aterm_spec::wait::until_while_descendants_work(what, || match told.try_recv() {
+        Ok(value) => Some(Some(value)),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+    });
+    got.unwrap_or_else(|| panic!("{what}: its thread panicked"))
+}
+
+/// ON WINDOWS THE HEADLESS START IS THE WARM START HANDED ONE LINE AND LEFT TO EXIT BY ITSELF:
+/// the build runs once in the folder (its plain spelling, as Claude Code reads its key from it),
+/// reads exactly the one `initialize` line on its stdin, and what it prints before its answer
+/// is read past; the trust its profile then holds (under Claude Code's `C:/…` key) is booked.
+/// Its answer read, its stdin is closed and it finishes what it was doing: the stand-in writes a
+/// file only after its stdin ended, and the start returns only once it has. MUTANT: the job
+/// ended at the answer leaves no such file.
+#[cfg(windows)]
+#[test]
+fn the_windows_headless_start_is_handed_one_request_line_and_left_to_finish() {
+    let w = std::sync::Arc::new(World::new("start-win"));
+    let build = stub_powershell(
+        &w,
+        &format!(
+            "$o = $env:STUB_OUT\n\
+             [IO.File]::WriteAllText(\"$o\\cwd\", [Environment]::CurrentDirectory)\n\
+             $line = [Console]::In.ReadLine()\n\
+             [IO.File]::WriteAllText(\"$o\\stdin\", $line + \"`n\")\n\
+             [Console]::Out.WriteLine('starting up')\n\
+             [Console]::Error.WriteLine('a warning')\n\
+             [Console]::Out.WriteLine('{{\"type\":\"system\",\"subtype\":\"init\"}}')\n\
+             $key = [Environment]::CurrentDirectory.Replace('\\', '/')\n\
+             [IO.File]::WriteAllText(\"$env:CLAUDE_CONFIG_DIR\\.claude.json\", \
+             '{{\"projects\":{{\"' + $key + '\":{{\"hasTrustDialogAccepted\":true}}}}}}')\n\
+             {}\
+             $null = [Console]::In.ReadToEnd()\n\
+             [IO.File]::WriteAllText(\"$o\\finished\", 'finished')\n",
+            ps_answer(true)
+        ),
+    );
+    let state = w.root.join("state");
+    let settled = {
+        let (w, state) = (std::sync::Arc::clone(&w), state.clone());
+        awaited("the headless start's settling", move || {
+            let (argv, env) = (words(&["claude"]), windows_env(&w));
+            let mut book = DriveBook {
+                state: Some(state),
+                sid: "s-0123".to_string(),
+            };
+            settle(
+                &Launch {
+                    build: Some(&build),
+                    ..w.launch(&argv, &env)
+                },
+                &trusts,
+                &StoreVendor,
+                &mut book,
+                UNJUDGED,
+            )
+        })
+    };
+    assert_eq!(
+        settled,
+        Settled::Recorded {
+            rule: approval::RULE_TRUST_ANY,
+            by: "Claude Code 2.1.323".to_string()
+        }
+    );
+    let read = |name: &str| std::fs::read_to_string(w.root.join(name)).expect(name);
+    assert_eq!(read("cwd"), w.folder.to_string_lossy());
+    assert_eq!(
+        read("stdin"),
+        request_line(&w.folder.to_string_lossy()),
+        "exactly the one request line"
+    );
+    assert_eq!(
+        read("finished"),
+        "finished",
+        "the start was left to finish after its stdin closed"
+    );
+    let rows = std::fs::read_to_string(state.join("drive/s-0123.jsonl")).expect("the ledger");
+    assert_eq!(rows.lines().count(), 1, "{rows}");
+    assert!(rows.contains("recorded before launch by Claude Code 2.1.323"));
+}
+
+/// ON WINDOWS A BUILD THAT REFUSES, ENDS UNANSWERED, ANSWERS WHAT CANNOT BE READ OR CANNOT START
+/// records nothing, with its reason: Claude Code's own answer is a decline, and a start that
+/// gave none a failure. A build that never answers is ended at the deadline, with the deadline
+/// as its reason, and not before it; and so is one that never reads its request, however long
+/// the request line (a folder's path longer than a pipe holds): its write waits on a thread of
+/// its own while the deadline runs. MUTANT: the request written before the deadline's wait never
+/// returns from the long line.
+#[cfg(windows)]
+#[test]
+fn a_windows_build_that_refuses_or_ends_unanswered_is_a_refusal() {
+    let declined = format!(
+        "$line = [Console]::In.ReadLine()\n{}$null = [Console]::In.ReadToEnd()\n",
+        ps_answer(false)
+    );
+    let partial = "$line = [Console]::In.ReadLine()\n[Console]::Out.Write('{\"type\":\
+                   \"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\
+                   \"aterm-trust\",\"response\":{\"workspace_trust_recorded\":tr')\n";
+    for (tag, script, said) in [
+        (
+            "false",
+            Some(declined),
+            Attested::Declined("Claude Code 2.1.323 recorded nothing for this folder".to_string()),
+        ),
+        (
+            "old",
+            None,
+            Attested::Failed("Claude Code ended without answering".to_string()),
+        ),
+        (
+            "partial",
+            Some(partial.to_string()),
+            Attested::Failed("Claude Code's answer could not be read".to_string()),
+        ),
+    ] {
+        let got = awaited(tag, move || {
+            let w = World::new(tag);
+            let build = match script {
+                Some(script) => stub_powershell(&w, &script),
+                None => stub_cmd(
+                    &w,
+                    "@echo error: unknown option --input-format 1>&2\r\n@exit /b 1\r\n",
+                ),
+            };
+            let folder = w.folder.to_string_lossy().into_owned();
+            start(&build, &w.folder, &windows_env(&w), &folder, UNJUDGED)
+        });
+        assert_eq!(got, said, "{tag}");
+    }
+    let w = World::new("missing");
+    let folder = w.folder.to_string_lossy().into_owned();
+    let said = start(&w.build, &w.folder, &windows_env(&w), &folder, UNJUDGED);
+    assert!(
+        matches!(&said, Attested::Failed(why) if why.starts_with("Claude Code could not be started")),
+        "{said:?}"
+    );
+    for (n, long) in [(0, false), (1, true)] {
+        let (said, waited, bytes) = awaited("a start that is never answered", move || {
+            let w = World::new(if long { "hang-long" } else { "hang" });
+            // A build that neither reads its stdin nor ends by itself: it waits, idle, on a
+            // signal nobody sends (its name this process's own) until its job is ended.
+            let build = stub_cmd(
+                &w,
+                &format!(
+                    "@\"%SystemRoot%\\System32\\waitfor.exe\" atermnever{}n{n}\r\n",
+                    std::process::id()
+                ),
+            );
+            let folder = w.folder.to_string_lossy().into_owned();
+            let directory = if long {
+                format!("{folder}\\{}", "x".repeat(256 * 1024))
+            } else {
+                folder
+            };
+            let deadline = Duration::from_millis(1500);
+            let began = std::time::Instant::now();
+            let said = start(&build, &w.folder, &windows_env(&w), &directory, deadline);
+            (
+                said,
+                began.elapsed() >= deadline,
+                request_line(&directory).len(),
+            )
+        });
+        assert!(!long || bytes > 64 * 1024, "longer than a pipe holds");
+        assert_eq!(
+            said,
+            Attested::Failed("Claude Code did not answer within 1500 ms".to_string()),
+            "a request of {bytes} bytes"
+        );
+        assert!(waited, "ended before its deadline");
     }
 }

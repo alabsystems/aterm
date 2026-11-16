@@ -90,6 +90,7 @@ pub use models_peer_selection::peer_selection_model;
 pub use models_records_capacity::records_capacity_model;
 pub use models_records_file::records_file_model;
 pub use models_retained_frontier::{
-    retained_commit_model, retained_frontier_model, retained_replay_model,
+    first_enrollment_liveness, first_enrollment_model, retained_commit_model,
+    retained_frontier_model, retained_replay_model,
 };
 pub use models_role::role_retention_model;

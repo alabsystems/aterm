@@ -45,11 +45,11 @@ dependencies = [
 
 [[package]]
 name = "alab-policy"
-version = "0.8.1"
+version = "0.9.1"
 
 [[package]]
 name = "alab-wire"
-version = "0.8.1"
+version = "0.9.1"
 dependencies = [
  "libc",
 ]
@@ -165,7 +165,7 @@ version = "0.2.2"
 
 [[package]]
 name = "aterm"
-version = "0.204.0"
+version = "0.205.0"
 dependencies = [
  "agh",
  "alab-policy",
@@ -197,9 +197,6 @@ dependencies = [
  "aterm-log",
  "aterm-machines",
  "aterm-mesh",
- "aterm-mesh-core-islands",
- "aterm-mesh-core-islands-no-lost-edit",
- "aterm-mesh-core-islands-p1",
  "aterm-metrics",
  "aterm-models-harness",
  "aterm-models-session",
@@ -225,6 +222,7 @@ dependencies = [
  "aterm-uds",
  "aterm-update",
  "aterm-update-core",
+ "aterm-vitals",
  "aterm-winres",
  "atpkg",
  "libc",
@@ -301,6 +299,7 @@ dependencies = [
  "aterm-net",
  "aterm-netplace",
  "aterm-observe",
+ "aterm-path",
  "aterm-phase",
  "aterm-primer",
  "aterm-pty",
@@ -504,6 +503,7 @@ dependencies = [
  "aterm-digest",
  "aterm-durable",
  "aterm-json",
+ "aterm-lan",
  "aterm-lexicon",
  "aterm-link",
  "aterm-machines",
@@ -511,6 +511,7 @@ dependencies = [
  "aterm-models-setup",
  "aterm-netplace",
  "aterm-primer",
+ "aterm-process-facts",
  "aterm-pty",
  "aterm-render",
  "aterm-sandbox",
@@ -973,7 +974,6 @@ dependencies = [
  "aterm-models-harness",
  "aterm-models-misc",
  "aterm-models-native",
- "aterm-models-release",
  "aterm-models-render",
  "aterm-models-session",
  "aterm-models-swarm",
@@ -983,11 +983,13 @@ dependencies = [
  "aterm-objc",
  "aterm-observe",
  "aterm-parser",
+ "aterm-path",
  "aterm-phase",
  "aterm-png",
  "aterm-policy",
  "aterm-predict",
  "aterm-primer",
+ "aterm-process-facts",
  "aterm-provenance",
  "aterm-pty",
  "aterm-render",
@@ -1330,6 +1332,7 @@ dependencies = [
  "aterm-keeper",
  "aterm-log",
  "aterm-objc",
+ "aterm-process-facts",
  "aterm-pty",
  "aterm-repo-storage",
  "aterm-repository-progress",
@@ -1466,20 +1469,7 @@ dependencies = [
 name = "aterm-models"
 version = "0.0.0"
 dependencies = [
- "agh",
- "aterm-agent",
- "aterm-capacity",
- "aterm-cli",
- "aterm-core",
  "aterm-cores",
- "aterm-db",
- "aterm-db-core",
- "aterm-effects",
- "aterm-gpu",
- "aterm-grid",
- "aterm-gui",
- "aterm-keeper",
- "aterm-mesh",
  "aterm-models-agh",
  "aterm-models-aos",
  "aterm-models-atpkg",
@@ -1497,20 +1487,8 @@ dependencies = [
  "aterm-models-setup",
  "aterm-models-swarm",
  "aterm-models-update",
- "aterm-pty",
- "aterm-render",
- "aterm-restore",
- "aterm-sandbox",
- "aterm-search",
- "aterm-secrets",
- "aterm-selection",
- "aterm-session",
  "aterm-spec",
  "aterm-tempfile",
- "aterm-types",
- "aterm-update",
- "aterm-update-core",
- "aterm-vz",
 ]
 
 [[package]]
@@ -1694,6 +1672,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-path"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-phase"
 version = "0.0.0"
 dependencies = [
@@ -1753,6 +1735,10 @@ dependencies = [
  "aterm-tempfile",
  "aterm-types",
 ]
+
+[[package]]
+name = "aterm-process-facts"
+version = "0.0.0"
 
 [[package]]
 name = "aterm-provenance"
@@ -1820,6 +1806,7 @@ dependencies = [
  "aterm-verify",
  "aterm-win32",
  "aterm-winship",
+ "aterm-zstd",
  "atpkg",
  "atpkg-keys",
  "libc",
@@ -2148,6 +2135,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-spec-closure"
+version = "0.0.0"
+dependencies = [
+ "agh",
+ "aterm-agent",
+ "aterm-capacity",
+ "aterm-cli",
+ "aterm-core",
+ "aterm-db",
+ "aterm-db-core",
+ "aterm-effects",
+ "aterm-gpu",
+ "aterm-grid",
+ "aterm-gui",
+ "aterm-keeper",
+ "aterm-mesh",
+ "aterm-models",
+ "aterm-pty",
+ "aterm-render",
+ "aterm-restore",
+ "aterm-sandbox",
+ "aterm-search",
+ "aterm-secrets",
+ "aterm-selection",
+ "aterm-session",
+ "aterm-spec",
+ "aterm-tempfile",
+ "aterm-types",
+ "aterm-update",
+ "aterm-update-core",
+ "aterm-vz",
+]
+
+[[package]]
 name = "aterm-spec-macros"
 version = "0.0.0"
 dependencies = [
@@ -2179,6 +2200,7 @@ dependencies = [
  "aterm-durable",
  "aterm-json",
  "aterm-objc",
+ "aterm-path",
  "aterm-spec",
  "aterm-tempfile",
  "aterm-uds",
@@ -2240,6 +2262,7 @@ name = "aterm-toolchain"
 version = "0.0.0"
 dependencies = [
  "aterm-digest",
+ "aterm-path",
  "aterm-spec",
  "aterm-sysprobe",
  "aterm-tempfile",
@@ -2294,6 +2317,8 @@ dependencies = [
  "aterm-bench",
  "aterm-dirfd",
  "aterm-durable",
+ "aterm-path",
+ "aterm-process-facts",
  "aterm-spec",
  "aterm-stamp",
  "aterm-sysprobe",
@@ -2385,6 +2410,7 @@ dependencies = [
  "aterm-models-misc",
  "aterm-net",
  "aterm-png",
+ "aterm-process-facts",
  "aterm-pty",
  "aterm-seal",
  "aterm-serde",
@@ -2411,6 +2437,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-hash",
  "aterm-models-misc",
+ "aterm-process-facts",
  "aterm-spec",
 ]
 
@@ -2433,7 +2460,6 @@ dependencies = [
  "aterm-toml",
  "aterm-uds",
  "aterm-vz-agent",
- "atpkg",
  "libc",
 ]
 
@@ -2618,6 +2644,7 @@ dependencies = [
  "aterm-json",
  "aterm-log",
  "aterm-models-atpkg",
+ "aterm-path",
  "aterm-primer",
  "aterm-pty",
  "aterm-regex",

@@ -5,7 +5,7 @@
 //! read is never a zero; this Mac and an unregistered answer are rows; no agents row carries an
 //! address; and where an account is expected comes from the registry's preferences alone.
 
-use super::command::{print, print_schema, shown, sources_line};
+use super::command::{print, print_schema, sources_line};
 use super::fixture;
 use super::fold::{AGENTS_KEEP_MS, FleetTables, Inputs, REACH_KEEP_MS, Source, fold};
 use super::read::{
@@ -14,7 +14,7 @@ use super::read::{
     word,
 };
 use super::rows::{
-    self, AccountRef, Cell, EvidenceHow, ObservedState, Reach, Row, UNREGISTERED, Via, WindowState,
+    self, AccountRef, EvidenceHow, ObservedState, Reach, UNREGISTERED, Via, WindowState,
 };
 use super::{
     Folder, HELD_FLEET_UNREAD, HELD_NO_HISTORY, HELD_PARTIAL, HELD_READ_FAILED, HELD_STALE,
@@ -24,12 +24,13 @@ use crate::alab::journal::event::{Event, SIGNIN_ENDED, SIGNIN_IN, SIGNIN_OUT};
 use crate::alab::journal::place::{Placed, Why};
 use crate::alab::journal::seen::{Claimed, Seen, SignedIn};
 use crate::alab::view::{Account, LabView, Machine, MachineNickname, Preference};
+use crate::relation::{Cell, Row};
 use crate::typed::{cell, grid, keys};
 use aterm_json::Value;
 use aterm_types::network_state::{
     HistoryState, NetworkObservation, NetworkStateSnapshot, Visibility,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -232,7 +233,7 @@ fn cell_of<R: Row>(row: &R, column: &str) -> Cell {
 
 fn shown_of<R: Row>(row: &R, column: &str) -> String {
     let at = R::SCHEMA.position(column).expect("a column of the schema");
-    shown(&R::SCHEMA.columns[at].column.ty, &row.cells()[at])
+    row.cells()[at].shown(&R::SCHEMA.columns[at].column.ty)
 }
 
 /// A printed TSV table as its lines' cells, the header first.
@@ -710,7 +711,7 @@ fn no_address_appears_in_an_agents_row() {
     }
 
     // A login another writer's build stored though it is no address reads the same on both
-    // faces: withheld. NEGATIVE CONTROL: with `cell_json` giving every cell's own JSON, the
+    // faces: withheld. NEGATIVE CONTROL: with `Cell::json` giving every cell's own JSON, the
     // JSON face prints the stored text and the first assertion fails for `json=true`.
     const STORED: &str = concat!("ghp", "_cccccccccccccccccccccccc");
     let mut odd = tables.clone();
@@ -2883,6 +2884,129 @@ fn a_plan_is_the_registrys_where_stated_else_the_newest_observed_and_a_mismatch_
     assert!(kept(&fixture, "accounts", &["plan_source=observed"]) > 0);
     assert!(kept(&fixture, "accounts", &["plan_mismatch=true"]) > 0);
     assert!(kept(&fixture, "accounts", &["plan_mismatch=false"]) > 0);
+}
+
+/// A STATED PLAN THAT ADDS A TIER TO THE OBSERVED ONE IS NO MISMATCH. A CLI reports its plan's
+/// word and no tier, so an account stated as `anthropic-max-20x` that a Mac saw on `max` is on
+/// the plan the registry states; a stated key that is another plan (`anthropic-max-5x` beside
+/// an observed `pro`), or that only begins with the observed word (`openai-prolite` beside an
+/// observed `pro`), still differs, and both plans are shown either way.
+/// NEGATIVE CONTROLS: with `plans_differ` comparing the two keys for equality (as before), the
+/// Max 20x row reads `left: ["anthropic-max-20x", "anthropic-max", "true"]`; with it taking any
+/// stated key the observed one begins, the Pro Lite row reads
+/// `left: ["openai-prolite", "openai-pro", "false"]`.
+#[test]
+fn a_stated_plan_that_adds_a_tier_to_the_observed_one_is_no_mismatch() {
+    let now_s = NOW / 1_000;
+    let (mut lab, mut pks) = lab_with_accounts(&["a", "b"]);
+    let mut codex = account("codex", "c@lab.example", "codex-c");
+    codex.plan = Some("openai-prolite".to_owned());
+    pks.push(codex.pk.clone());
+    lab.accounts.insert(codex.pk.clone(), codex);
+    for (pk, plan) in [(0, "anthropic-max-20x"), (1, "anthropic-max-5x")] {
+        if let Some(row) = lab.accounts.get_mut(&pks[pk]) {
+            row.plan = Some(plan.to_owned());
+        }
+    }
+    let plan_seen = |pk: &str, cli: &str, plan: &str| {
+        logged(
+            UUID,
+            aterm_json::json!({"a": pk, "c": cli, "k": "plan-seen", "src": "cli-output",
+                "t": now_s - 10, "plan": plan}),
+        )
+    };
+    let seen = Seen::of_events(
+        &[
+            plan_seen(&pks[0], "claude", "max"),
+            plan_seen(&pks[1], "claude", "pro"),
+            plan_seen(&pks[2], "codex", "pro"),
+        ],
+        now_s,
+    );
+    let tables = tables(&Inputs {
+        lab: live(lab, NOW),
+        journal: live(seen, NOW),
+        ..Inputs::default()
+    });
+    let shown: BTreeMap<&str, [String; 3]> = tables
+        .accounts
+        .iter()
+        .map(|row| {
+            (
+                row.account.as_str(),
+                [
+                    shown_of(row, "plan"),
+                    shown_of(row, "plan_observed"),
+                    shown_of(row, "plan_mismatch"),
+                ],
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown[pks[0].as_str()],
+        ["anthropic-max-20x", "anthropic-max", "false"]
+    );
+    assert_eq!(
+        shown[pks[1].as_str()],
+        ["anthropic-max-5x", "anthropic-pro", "true"]
+    );
+    assert_eq!(
+        shown[pks[2].as_str()],
+        ["openai-prolite", "openai-pro", "true"]
+    );
+    assert_eq!(kept(&tables, "accounts", &["plan_mismatch=true"]), 2);
+}
+
+/// AN OBSERVED PLAN THAT CARRIES ITS TIER IS COMPARED WITH IT. A Mac that saw `max-20x` agrees
+/// with an account stated on Max 20x, differs from one stated on Max 5x, and differs from one
+/// stated on the tierless `anthropic-max`: the registry states less than the Mac saw.
+/// NEGATIVE CONTROL: with `plans_differ` also accepting an observed key that extends the
+/// stated one, the tierless row reads `left: ["anthropic-max-20x", "false"]`.
+#[test]
+fn an_observed_tier_is_compared_with_the_stated_one() {
+    let now_s = NOW / 1_000;
+    let (mut lab, pks) = lab_with_accounts(&["a", "b", "c"]);
+    let stated = ["anthropic-max-20x", "anthropic-max-5x", "anthropic-max"];
+    for (pk, plan) in pks.iter().zip(stated) {
+        if let Some(row) = lab.accounts.get_mut(pk) {
+            row.plan = Some(plan.to_owned());
+        }
+    }
+    let events: Vec<_> = pks
+        .iter()
+        .map(|pk| {
+            logged(
+                UUID,
+                aterm_json::json!({"a": pk, "c": "claude", "k": "plan-seen",
+                    "src": "cli-output", "t": now_s - 10, "plan": "max-20x"}),
+            )
+        })
+        .collect();
+    let tables = tables(&Inputs {
+        lab: live(lab, NOW),
+        journal: live(Seen::of_events(&events, now_s), NOW),
+        ..Inputs::default()
+    });
+    let mismatch: BTreeMap<&str, [String; 2]> = tables
+        .accounts
+        .iter()
+        .map(|row| {
+            (
+                row.account.as_str(),
+                [
+                    shown_of(row, "plan_observed"),
+                    shown_of(row, "plan_mismatch"),
+                ],
+            )
+        })
+        .collect();
+    for (pk, differs) in pks.iter().zip(["false", "true", "true"]) {
+        assert_eq!(
+            mismatch[pk.as_str()],
+            ["anthropic-max-20x", differs],
+            "{pk}"
+        );
+    }
 }
 
 /// One Mac's sign-in word for an account, as the journal's read holds it.

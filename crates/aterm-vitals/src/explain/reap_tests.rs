@@ -417,7 +417,7 @@ fn terminal_transport_custody_survives_truncated_and_missing_process_sweeps() {
         r.step(&now);
         assert_eq!((r.tab(), r.all()), (100, 100));
         assert_eq!(
-            r.ledger.totals().floor_since(&base, 1).0,
+            r.ledger.totals().reported_since(&base, 1).0,
             40 * MS,
             "a deferred whole sweep uses its actual broader adoption interval"
         );
@@ -455,7 +455,7 @@ fn delayed_native_receipts_never_recharge_an_old_wait_or_create_new_pending_debt
             after.all, base.all,
             "the receipt cannot add old raw CPU a second time"
         );
-        assert_eq!(after.floor_since(&base, 1), (0, true));
+        assert_eq!(after.reported_since(&base, 1), (0, true));
         assert!(after.since(&base, 1).1);
         assert_eq!(r.ledger.row(ATERM).unwrap().pending_ns, 0);
         assert_eq!(
@@ -498,7 +498,7 @@ fn a_fresh_exit_does_not_place_an_unobserved_old_lifetime_in_this_window() {
     r.native_incomplete = false;
     r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
     assert_eq!((r.tab(), r.all()), (0, 100));
-    assert_eq!(r.ledger.totals().floor_since(&base, 1), (0, true));
+    assert_eq!(r.ledger.totals().reported_since(&base, 1), (0, true));
 }
 
 #[test]
@@ -511,7 +511,7 @@ fn an_unpositioned_native_receipt_is_consumed_as_diagnostic_evidence_only() {
     let base = r.ledger.totals();
     r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
     assert_eq!((r.tab(), r.all()), (0, 100));
-    assert_eq!(r.ledger.totals().floor_since(&base, 1), (0, true));
+    assert_eq!(r.ledger.totals().reported_since(&base, 1), (0, true));
     assert!(r.ledger.pending_terminals.is_empty());
     assert_eq!(
         r.ledger.native_sequences.get(&r.native_terminals[0].host),
@@ -546,12 +546,12 @@ fn native_birth_uses_the_kernel_clock_and_requires_a_strict_new_birth() {
         let proved = if start == 3000 { 100 } else { 0 };
         assert_eq!(r.tab(), proved);
         assert_eq!(r.all(), 100);
-        assert_eq!(r.ledger.totals().floor_since(&base, 1).0, proved * MS);
+        assert_eq!(r.ledger.totals().reported_since(&base, 1).0, proved * MS);
     }
 }
 
 #[test]
-fn an_own_cpu_counter_read_after_an_unread_step_starts_a_new_floor_baseline() {
+fn an_own_cpu_counter_read_after_an_unread_step_starts_a_new_reported_baseline() {
     let mut r = Run::new();
     r.step(&sweep(0, &[p(300, SHELL, 10, 0)]));
     r.step(&sweep(0, &[p(300, SHELL, 30, 0)]));
@@ -566,14 +566,14 @@ fn an_own_cpu_counter_read_after_an_unread_step_starts_a_new_floor_baseline() {
     r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
     let recovered = r.ledger.totals();
     assert_eq!(
-        recovered.floor_since(&gap, 1),
+        recovered.reported_since(&gap, 1),
         (0, true),
         "the 70ms since the last readable counter spans more than this rate window"
     );
     assert!(recovered.since(&gap, 1).1);
     r.step(&sweep(0, &[p(300, SHELL, 120, 0)]));
     assert_eq!(
-        r.ledger.totals().floor_since(&recovered, 1),
+        r.ledger.totals().reported_since(&recovered, 1),
         (20 * MS, false)
     );
 }
@@ -586,21 +586,21 @@ fn a_decreasing_own_counter_preserves_its_maximum_until_a_new_baseline_is_read()
     let before = r.ledger.totals();
     r.step(&sweep(0, &[p(300, SHELL, 50, 0)]));
     let rollback = r.ledger.totals();
-    assert_eq!(rollback.floor_since(&before, 1), (0, true));
+    assert_eq!(rollback.reported_since(&before, 1), (0, true));
     assert!(rollback.since(&before, 1).1);
     r.step(&sweep(0, &[p(300, SHELL, 110, 0)]));
     let recovered = r.ledger.totals();
     assert_eq!(
-        recovered.floor_since(&rollback, 1),
+        recovered.reported_since(&rollback, 1),
         (0, true),
         "110 is a new baseline, not 60ms of new work after the invalid 50ms counter"
     );
     assert!(recovered.since(&rollback, 1).1);
     r.step(&sweep(0, &[p(300, SHELL, 120, 0)]));
     let after = r.ledger.totals();
-    assert_eq!(after.floor_since(&recovered, 1), (10 * MS, false));
+    assert_eq!(after.reported_since(&recovered, 1), (10 * MS, false));
     assert_eq!(
-        after.all_floor,
+        after.all_reported,
         110 * MS,
         "previously proved lifetime CPU is never counted twice"
     );
@@ -653,9 +653,9 @@ fn a_native_final_does_not_double_a_descendant_still_listed_from_an_earlier_read
             (160, 160),
             "the final child160 may already include the listed descendant100; aggregate={aggregate}"
         );
-        assert_eq!(r.ledger.totals().floor_since(&base, 1).0 / MS, 100);
+        assert_eq!(r.ledger.totals().reported_since(&base, 1).0 / MS, 100);
         assert!(r.ledger.totals().since(&base, 1).1);
-        assert!(r.ledger.totals().floor_since(&base, 1).1);
+        assert!(r.ledger.totals().reported_since(&base, 1).1);
     }
 }
 
@@ -708,7 +708,7 @@ fn an_ordinary_later_parent_read_deduplicates_the_older_child_snapshot() {
 }
 
 #[test]
-fn own_floor_keeps_panes_separate_and_retains_a_closed_panes_logical_remainder() {
+fn own_reported_keeps_panes_separate_and_retains_a_closed_panes_logical_remainder() {
     let mut ledger = ReapLedger::default();
     let mut tabs = vec![tab(1, SHELL), tab(2, 201)];
     tabs[1].tab = 1;
@@ -761,23 +761,23 @@ fn own_floor_keeps_panes_separate_and_retains_a_closed_panes_logical_remainder()
     let base = ledger.totals();
     step(&mut ledger, 2000, &input(500, 250), &tabs);
     let now = ledger.totals();
-    assert_eq!(now.pane_floor_since(&base, 1), 500 * MS);
-    assert_eq!(now.pane_floor_since(&base, 2), 250 * MS);
-    assert_eq!(now.floor_since(&base, 1).0, 750 * MS);
+    assert_eq!(now.pane_reported_since(&base, 1), 500 * MS);
+    assert_eq!(now.pane_reported_since(&base, 2), 250 * MS);
+    assert_eq!(now.reported_since(&base, 1).0, 750 * MS);
     tabs.remove(0);
     tabs[0].tab = 2;
     step(&mut ledger, 3000, &input(600, 300), &tabs);
     let later = ledger.totals();
-    assert_eq!(later.pane_floor_since(&now, 2), 50 * MS);
+    assert_eq!(later.pane_reported_since(&now, 2), 50 * MS);
     assert_eq!(
-        later.floor_since(&now, 2).0,
+        later.reported_since(&now, 2).0,
         150 * MS,
         "the closed pane's orphan stays in its logical tab without becoming the surviving pane's own work"
     );
 }
 
 #[test]
-fn coalition_floor_reuses_only_an_observed_unchanged_exec_version() {
+fn coalition_reported_reuses_only_an_observed_unchanged_exec_version() {
     let mut ledger = ReapLedger::default();
     let tabs = [tab(1, SHELL)];
     for (at, cpu, coalition, version) in [
@@ -824,14 +824,14 @@ fn coalition_floor_reuses_only_an_observed_unchanged_exec_version() {
         });
     }
     let totals = ledger.totals();
-    assert_eq!(totals.coalition_floors.get(&400), Some(&(150 * MS)));
-    assert_eq!(totals.coalition_floors.get(&500), Some(&(50 * MS)));
-    assert_eq!(totals.unmapped_floor, 100 * MS);
-    assert_eq!(totals.all_floor, 300 * MS);
+    assert_eq!(totals.coalition_reported.get(&400), Some(&(150 * MS)));
+    assert_eq!(totals.coalition_reported.get(&500), Some(&(50 * MS)));
+    assert_eq!(totals.unmapped_reported, 100 * MS);
+    assert_eq!(totals.all_reported, 300 * MS);
 }
 
 #[test]
-fn own_floor_does_not_keep_a_foreign_process_after_delegated_custody_ends() {
+fn own_reported_does_not_keep_a_foreign_process_after_delegated_custody_ends() {
     use crate::model::Membership;
     let mut ledger = ReapLedger::default();
     let tabs = [tab(1, SHELL)];
@@ -879,7 +879,7 @@ fn own_floor_does_not_keep_a_foreign_process_after_delegated_custody_ends() {
             truncated: false,
         });
     }
-    assert_eq!(ledger.totals().all_floor, 0);
+    assert_eq!(ledger.totals().all_reported, 0);
     assert_eq!(ledger.totals().all, 0);
 }
 
@@ -896,27 +896,30 @@ fn readable_owned_cpu_keeps_its_real_other_uid_and_unrelated_processes_stay_out(
         ],
     ));
     assert_eq!((r.tab(), r.all()), (100, 100));
-    assert_eq!(r.ledger.totals().floor_since(&base, 1), (100 * MS, false));
+    assert_eq!(
+        r.ledger.totals().reported_since(&base, 1),
+        (100 * MS, false)
+    );
     assert!(r.ledger.row(400).is_none());
 }
 
 #[test]
-fn own_cpu_floor_never_inherits_a_hidden_auto_reaping_child_charge() {
+fn own_cpu_reported_growth_never_inherits_a_hidden_auto_reaping_child_charge() {
     let mut r = Run::new();
     r.step(&sweep(0, &[]));
     let base = r.ledger.totals();
     r.step(&[p(ATERM, 1, 0, 0), p(SHELL, ATERM, 10, 200)]);
     let total = r.ledger.totals();
     assert_eq!(total.since(&base, 1).0 / MS, 210);
-    assert_eq!(total.floor_since(&base, 1), (10 * MS, true));
-    assert_eq!(total.own_floor_since(&base), (0, false));
+    assert_eq!(total.reported_since(&base, 1), (10 * MS, true));
+    assert_eq!(total.own_reported_since(&base), (0, false));
     r.tabs.clear();
     let before_close = r.ledger.totals();
     r.step(&[p(ATERM, 1, 5, 0), p(SHELL, ATERM, 20, 200)]);
     assert_eq!(
-        r.ledger.totals().own_floor_since(&before_close).0 / MS,
+        r.ledger.totals().own_reported_since(&before_close).0 / MS,
         15,
-        "folded historical tab floor does not become current own-scope work"
+        "folded historical tab observations does not become current own-scope work"
     );
 }
 
@@ -1483,13 +1486,13 @@ fn a_process_with_no_birth_read_needs_a_source_cut_to_prove_current_cpu() {
         r.cpu_cut_boot = source_cut.then_some(10_000);
         let job = p(310, 300, 40, 0).started(start).unborn();
         r.step(&sweep(0, &[p(300, SHELL, 0, 0).started(3_000), job]));
-        let (floor, ambiguous) = r.ledger.totals().floor_since(&base, 1);
+        let (floor, ambiguous) = r.ledger.totals().reported_since(&base, 1);
         (since(&r, &base, 1), (floor / MS, ambiguous))
     };
     assert_eq!(
         run(9_000, false),
         ((40, true), (0, true)),
-        "the reconciled counter charge stays known without a current own-CPU floor"
+        "the reconciled counter charge stays known without a current own-counter observation"
     );
     assert_eq!(run(2_500, false), ((0, true), (0, true)));
     assert_eq!(
@@ -1500,7 +1503,7 @@ fn a_process_with_no_birth_read_needs_a_source_cut_to_prove_current_cpu() {
 }
 
 /// A first counter whose birth predates the previous cut may include earlier CPU. Retain its
-/// reconciled charge separately while withholding an unproved current lifetime floor.
+/// reconciled charge separately while withholding an unproved current published-growth baseline.
 #[test]
 fn a_process_first_seen_after_a_sweep_boundary_keeps_its_interval_uncertainty() {
     let run = |start| {
@@ -1513,7 +1516,7 @@ fn a_process_first_seen_after_a_sweep_boundary_keeps_its_interval_uncertainty() 
             ..p(310, 300, 1_039, 0).started(start)
         };
         r.step(&sweep(0, &[p(300, SHELL, 0, 0), spawned]));
-        let (floor, ambiguous) = r.ledger.totals().floor_since(&base, 1);
+        let (floor, ambiguous) = r.ledger.totals().reported_since(&base, 1);
         (since(&r, &base, 1), (floor / MS, ambiguous))
     };
     assert_eq!(
@@ -1771,7 +1774,11 @@ fn work_a_live_unread_process_reaped_waits_for_it_to_go() {
     // The shell's own 1,000 ms job.
     let base = r.ledger.totals();
     r.step(&shell(1_000));
-    assert_eq!(since(&r, &base, 1), (1_000, false));
+    assert_eq!(
+        since(&r, &base, 1),
+        (1_000, true),
+        "the shell's charge counts once while the live sudo's own CPU stays unread"
+    );
     // The sudo exits; the shell reaps it (its 5 ms, and 410's 450).
     let base = r.ledger.totals();
     r.step(&[p(ATERM, 1, 0, 0), p(SHELL, ATERM, 0, 1_000 + 455)]);
@@ -1801,12 +1808,20 @@ fn work_held_under_a_member_that_ran_sudo_waits_for_the_sudo() {
     // The monitor exits; the sudo reaps it and lives on.
     let base = r.ledger.totals();
     r.step(&sweep(0, &[sudo]));
-    assert_eq!(since(&r, &base, 1), (0, false));
+    assert_eq!(
+        since(&r, &base, 1),
+        (0, true),
+        "zero charge growth does not complete the unread sudo's own-counter coverage"
+    );
     // The shell's own 1,000 ms job.
     let shell = |child| [p(ATERM, 1, 0, 0), p(SHELL, ATERM, 0, child)];
     let base = r.ledger.totals();
     r.step(&[&shell(1_000)[..], &[sudo]].concat());
-    assert_eq!(since(&r, &base, 1), (1_000, false));
+    assert_eq!(
+        since(&r, &base, 1),
+        (1_000, true),
+        "the held child's charge stays counted once, independently of unread own CPU"
+    );
     // The sudo exits; the shell reaps it (its 5 ms, and 410's 450).
     let base = r.ledger.totals();
     r.step(&shell(1_000 + 455));

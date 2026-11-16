@@ -182,8 +182,8 @@ impl Settles {
 
 /// WHAT A LINE THE LOOP HOLDS IN CUSTODY LETS THE HOST DO (`IdlePoint::line_held`,
 /// ATERM-KI-1101-3): the worker read the line, or may yet, and drew none of it. Whichever it is,
-/// a relaunch's carry-on and the ask to free disk space wait, kept owed, for as long as the line
-/// stands, and the host's steps that type nothing go on; the upgrade's step is held as each says.
+/// a relaunch's carry-on waits, kept owed, for as long as the line stands, and the host's steps
+/// that type nothing go on; the upgrade's step is held as each says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineHeld {
     /// The line may still come: unread, read within its minute or not at rest, or no read can say

@@ -22,6 +22,7 @@ fn there() -> bool {
 const LANE: Lane = Lane {
     slice,
     hung_up: there,
+    bell: None,
 };
 
 fn old_park(sub: &Subscription, until: Instant, mut look: impl FnMut() -> bool) -> usize {

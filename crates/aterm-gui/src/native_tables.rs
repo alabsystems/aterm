@@ -31,21 +31,25 @@
 //! - **Cell bar.** One line over the grid of every table the rail lists, a row high, at every
 //!   width (never over Check or the narrow page's list of tables, which are no table's grid).
 //!   The grid gives the bar that row of its own room, so nothing else on the page moves for
-//!   it; in a window so short that the grid would be left under three lines (a narrow
-//!   page's grid as it stands with a row selected), the bar gives way and the grid keeps the
-//!   room. Whether it stands is the window's to say, judged as if changes waited to be
-//!   written and the line under the grid stood one row high: no selection and no staged
-//!   change takes the bar away or brings it back. It says
+//!   it; in a window so short that the grid under it would not keep its name, type and group
+//!   lines and one whole row (a narrow page's grid as it stands with a row selected), the bar
+//!   gives way and the grid keeps the room. Whether it stands is the window's to say, judged
+//!   as if changes waited to be written and the line under the grid stood three lines high:
+//!   no selection and no staged change takes the bar away or brings it back, and a line under
+//!   the grid that wraps further takes its room from the grid's, down to the three lines the
+//!   grid keeps without the bar, so the bar never pushes the page past the window. It says
 //!   which cell is selected (its row's key and its column; what of the row's own key tells it
 //!   apart, dimmed, where another row shows that key too; a range's rows and columns), the
 //!   cell's whole value as the grid shows it and nothing the grid does not (a secret's cell
 //!   reads its entry name or its mask there too; a day reads as its date) and the cell's
 //!   state where it has one. What a column holds is not said here: the line under its name
 //!   says it of every column at once (Types). A state is what the grid marks on the cell: typed
-//!   and not written, with what the registry holds (one the check refuses reads so too: its
-//!   rule is the pane's to say); how many values a conflict has; that a Mac
-//!   reports another value, in the words the grid's cell speaks; a value a newer aterm wrote;
-//!   in a past table what the cell holds now and who wrote that; a linked count's table. Of
+//!   and not written, with what the registry holds (one the check or a Write refuses reads
+//!   `refused` first, in the grid's tag's word and ink: its rule is the pane's to say); how
+//!   many values a conflict has; that a Mac reports another value, in the words the grid's
+//!   cell speaks; a value a newer aterm wrote; in a past table what the cell holds now and who
+//!   wrote that. A linked count's value is its count; how many rows of which table name the
+//!   row is the line under the grid's to say. Of
 //!   the value the cell holds the bar names no writer and no time: where that value came
 //!   from is said once, by the line under the grid. A range says how many of its cells are
 //!   filled, and of whole numbers their sum, least and most. The cell whose value is said is
@@ -106,6 +110,14 @@
 //!   `refused` on its cell, with the rule in the pane, as a cell the Write was refused at does;
 //!   the Write bar counts them, and a Write holds back each table that has one, writing the
 //!   rest.
+//! - **Columns.** The tools row's Columns button (`Columns 15 of 21`) opens a list of the
+//!   table's columns under their groups, each with a mark where the grid draws it and how many
+//!   of the rows the lifecycle filter shows of the whole table fill it; a press hides or shows
+//!   one. The columns no row fills fold into one stub at the end of their group (`5 EMPTY`),
+//!   which a press unfolds; a switch in the list turns the fold off. Each header wears its fill
+//!   as a bar along its foot. Copy, ranges, Tab's path and the arrows take the drawn columns
+//!   alone, and a column with a change not written or a refused cell is never hidden or folded.
+//!   The choice is the view's, per table, while the tab lives ([`native_tables_columns`]).
 //! - **Blue** means only "not yet written" ([`StyleRef::Unwritten`], the palette's one fixed
 //!   [`crate::native_appearance::NOT_WRITTEN`], never the accent): a staged cell, its staged
 //!   words in the cell bar and the pane, the rail's count of them, the Write bar. Nothing else
@@ -145,6 +157,9 @@ use crate::native_ui::{
     SemanticValue, StyleRef, TextFieldSpec, TextSpec, UiContent, UiKey, UiNode, UiTree,
 };
 use crate::native_workers::{one_line, text_width};
+
+#[path = "native_tables_columns.rs"]
+mod native_tables_columns;
 
 /// The page's name, on its tab and its heading.
 pub(crate) const TABLES_TITLE: &str = "Tables";
@@ -283,9 +298,23 @@ pub(crate) struct Shown {
     /// When the Mac that states it says it saw it (an owned row's `at`): what a Mac states of
     /// itself is an observation, and this is when it was made.
     pub(crate) seen_ms: Option<u64>,
-    /// The words the row a one-row reference names is known by (a machine's label, an
-    /// account's provider and address), where the read knows them.
-    pub(crate) names: Option<String>,
+    /// The key a one-row reference holds, where the cell is one: `text` then says the words its
+    /// row is known by ([`rows::Targets`]), and a Write, a copy and an open cell take this.
+    pub(crate) refers: Option<String>,
+    /// The grid's text of a value the page edits and `text` says in words (a time as its date):
+    /// a Write, a copy and an open cell take this, and the cell bar names no key for it.
+    pub(crate) holds: Option<String>,
+}
+
+impl Shown {
+    /// What the cell holds as the grid text writes it: a reference's key, else the grid's text
+    /// of a value said in words, else what it shows.
+    pub(crate) fn value(&self) -> &str {
+        self.refers
+            .as_deref()
+            .or(self.holds.as_deref())
+            .unwrap_or(&self.text)
+    }
 }
 
 /// What a Mac states of a cell of the owner's table, read beside what the cell holds: a stated
@@ -307,6 +336,8 @@ impl Observed {
     /// the causal order (the operation's hlc) stands, and only between statements no order
     /// tells apart the later claimed time. A Mac whose clock runs ahead never holds the cell
     /// past a statement made after its own.
+    // Read only by the unix-only table store (`tables_store::Read::observed`).
+    #[cfg(unix)]
     pub(crate) fn supersedes(&self, held: &Self) -> bool {
         (self.by.hlc, self.at_ms) > (held.by.hlc, held.at_ms)
     }
@@ -324,7 +355,7 @@ impl Observed {
 pub(crate) enum ColumnKind {
     /// A whole number: ordered by its value, and set at the right of its cell.
     Number,
-    /// A time or a day, which the grid shows as its number: ordered by its value.
+    /// A time or a day, which the page shows as its date: ordered by its value.
     Time,
     /// Words: ordered without regard to case, a run of digits in them by its value (`m9`
     /// before `m55`).
@@ -348,17 +379,22 @@ pub(crate) struct SheetColumn {
     pub(crate) key: bool,
 }
 
-/// The compiled table and collection a cells sheet was read from: what the save's own reading
-/// of a grid ([`aterm_db::typed::grid::plan`]) checks a staged cell against.
-#[derive(Clone, Copy, Debug)]
+/// The compiled table and collection a cells sheet was read from, with the table's cells as
+/// that read found them: what the save's own reading of a grid
+/// ([`aterm_db::typed::grid::plan`]) checks a staged cell against, and a new row's key is
+/// derived from as the save derives it.
+#[derive(Clone, Debug)]
 pub(crate) struct Schema {
-    pub(crate) table: &'static aterm_db::typed::Table,
+    pub(crate) compiled: &'static crate::tables_store::Compiled,
     pub(crate) collection: &'static aterm_db::typed::Collection,
+    pub(crate) cells: std::sync::Arc<aterm_db::typed::cell::Cells>,
 }
 
 impl PartialEq for Schema {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.table, other.table) && self.collection == other.collection
+        std::ptr::eq(self.compiled, other.compiled)
+            && self.collection == other.collection
+            && std::sync::Arc::ptr_eq(&self.cells, &other.cells)
     }
 }
 
@@ -413,6 +449,12 @@ pub(crate) struct Sheet {
     /// What a staged cell of a cells sheet is checked against as it is staged; `None` for an
     /// owned sheet, which stages nothing.
     pub(crate) schema: Option<Schema>,
+    /// How its rows are added, retired, ended and restored ([`rows`]); `None` for a sheet with
+    /// no lifecycle (an owned one), whose rows the page neither adds nor retires.
+    pub(crate) life: Option<rows::RowLife>,
+    /// The live rows of any table that name each row of this one, by its key: what a retire of
+    /// it waits for (`aterm_db::typed::check::referrers`).
+    pub(crate) referrers: BTreeMap<String, Vec<rows::Referrer>>,
 }
 
 /// A cell that changed after the point a past read is at.
@@ -449,18 +491,33 @@ pub(crate) struct Snapshot {
     /// The past point this read is at; `None` for the table as it is.
     pub(crate) at: Option<AsOf>,
     pub(crate) read_ms: u64,
+    /// Why this Mac cannot write the registry, where it cannot
+    /// (`aterm_db::att::Handle::cannot_write`): the page then takes no edit, and the Write bar's
+    /// place says this.
+    pub(crate) cannot_write: Option<String>,
+    /// The rows a reference may name, by collection: what a reference cell shows and chooses
+    /// from ([`rows::Targets`]).
+    pub(crate) targets: rows::Targets,
 }
 
 /// One collection's staged cells and the export they were staged against.
 pub(crate) struct Staged {
     pub(crate) base: Base,
     pub(crate) cells: BTreeMap<(String, String), String>,
+    /// Its new rows, each by the key the page gives it until it is written ([`rows::NEW`]) with
+    /// its typed cells by column, in the order they were added.
+    pub(crate) born: Vec<(String, BTreeMap<String, String>)>,
 }
 
 /// What one Write did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Wrote {
     pub(crate) cells: usize,
+    /// How many rows were born.
+    pub(crate) added: usize,
+    /// Each new row a table's save took, by its table, the key the page gave it
+    /// ([`rows::NEW`]) and the key it was born under.
+    pub(crate) born: Vec<(String, String, String)>,
     /// Cells another writer changed since the read: kept staged, never written over.
     pub(crate) kept: Vec<(String, String, String)>,
     /// Cells the table's rules or types refused, with the rule; nothing of that table was written.
@@ -527,6 +584,16 @@ pub(crate) struct TablesApp {
     /// Whether a view shows Check: the reader works check out only while one does
     /// ([`crate::native_tables_check`]).
     checking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The new rows not written, by sheet, each under the key the page gives it ([`rows::NEW`]),
+    /// in the order they were added: each read shows them under its sheet's rows.
+    born: Vec<(&'static str, String)>,
+    /// How many new rows the page has keyed: each gets the next number.
+    born_count: u64,
+    /// The new rows the Write in flight carried.
+    sent_born: Vec<(&'static str, String)>,
+    /// Each new row's key as the save would derive it from its staged cells now, where the
+    /// save's reading of them refuses nothing ([`crate::tables_store::Reading::keys`]).
+    born_keys: BTreeMap<(&'static str, String), String>,
 }
 
 impl TablesApp {
@@ -661,6 +728,10 @@ impl TablesApp {
             shown: true,
             reads: 0,
             checking,
+            born: Vec::new(),
+            born_count: 0,
+            sent_born: Vec::new(),
+            born_keys: BTreeMap::new(),
         };
         let _ = app.work.send(Work::Read);
         Ok(app)
@@ -737,6 +808,7 @@ impl TablesApp {
                 if moved {
                     self.asked = self.asked.saturating_sub(1);
                 }
+                self.show_born();
                 self.drop_stranded();
                 self.recheck();
             }
@@ -795,10 +867,10 @@ impl TablesApp {
     }
 
     /// Whether a Write can carry a cell staged at `sheet`, `pk`, `column`: the page edits it
-    /// ([`Self::takes`]: its column is one the export a Write is compared against holds), and
-    /// its row is a live one of that export's.
+    /// ([`Self::takes`], or it is a row's lifecycle the pane stages), and its row is one of that
+    /// export's, or a new row the page holds.
     fn writable(&self, sheet: &str, pk: &str, column: &str) -> bool {
-        self.takes(sheet, pk, column)
+        (self.takes(sheet, pk, column) || self.stages_life(sheet, pk, column))
             && self
                 .sheet(sheet)
                 .is_some_and(|s| s.rows.iter().any(|r| r.pk == pk))
@@ -830,6 +902,29 @@ impl TablesApp {
         });
         let staged = &self.staged;
         self.seen.retain(|at, _| staged.contains_key(at));
+        // A new row the Write carried is now a row of the table, under its own key, unless its
+        // table was not written. A cell of it staged while the Write was out is an edit of that
+        // row now, never a row of its own.
+        let sent_born = std::mem::take(&mut self.sent_born);
+        self.born.retain(|(sheet, pk)| {
+            !sent_born.iter().any(|(s, p)| s == sheet && p == pk)
+                || unwritten.iter().any(|c| c.as_str() == *sheet)
+        });
+        for (table, new, pk) in &wrote.born {
+            let late: Vec<At> = self
+                .staged
+                .keys()
+                .filter(|(s, p, _)| s == table && p == new)
+                .cloned()
+                .collect();
+            for at in late {
+                if let Some(text) = self.staged.remove(&at) {
+                    self.seen.remove(&at);
+                    self.staged.insert((at.0, pk.clone(), at.2), text);
+                }
+            }
+        }
+        self.show_born();
         self.refused = wrote
             .refused
             .iter()
@@ -839,6 +934,11 @@ impl TablesApp {
             1 => "Wrote 1 cell".to_owned(),
             n => format!("Wrote {n} cells"),
         }];
+        match wrote.added {
+            0 => {}
+            1 => words.push("added 1 row".to_owned()),
+            n => words.push(format!("added {n} rows")),
+        }
         if !wrote.kept.is_empty() {
             words.push(format!(
                 "{} changed elsewhere since the read, kept here",
@@ -864,15 +964,23 @@ impl TablesApp {
         self.snapshot.as_ref().and_then(|s| s.at.as_ref())
     }
 
-    /// Whether the page may move to another point: nothing staged or being written, which a
-    /// past table could not take.
+    /// Whether the page may move to another point: nothing staged, added or being written, which
+    /// a past table could not take.
     fn movable(&self) -> bool {
-        self.staged.is_empty() && !self.writing
+        self.staged.is_empty() && self.born.is_empty() && !self.writing
     }
 
-    /// Whether the page takes no edit: it shows a past point, or is moving to another one.
+    /// Whether the page takes no edit: it shows a past point, or is moving to another one, or
+    /// this Mac cannot write the registry ([`Self::cannot_write`]).
     fn fixed(&self) -> bool {
-        self.asked > 0 || self.as_of().is_some()
+        self.asked > 0 || self.as_of().is_some() || self.cannot_write().is_some()
+    }
+
+    /// Why this Mac cannot write the registry, as the last read found it, where it cannot.
+    pub(crate) fn cannot_write(&self) -> Option<&str> {
+        self.snapshot
+            .as_ref()
+            .and_then(|s| s.cannot_write.as_deref())
     }
 
     /// Read the table as of `at` (as it is, where `None`); with cells not written, say why not.
@@ -909,6 +1017,22 @@ impl TablesApp {
             .iter()
             .find(|listed| listed.name == name)
             .map(|listed| listed.title)
+    }
+
+    /// The words row `pk` of collection `name` is known by, where the last read holds it: as a
+    /// reference to it reads where its row may change ([`rows::Target::short`]), else as its
+    /// pane names it ([`rows::row_name`]).
+    pub(crate) fn row_words(&self, name: &str, pk: &str) -> Option<String> {
+        let target = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.targets.get(name)?.rows.get(pk));
+        if let Some(target) = target {
+            return Some(target.short.clone());
+        }
+        let sheet = self.sheet(name)?;
+        let row = sheet.rows.iter().find(|row| row.pk == pk)?;
+        rows::row_name(self, sheet, row, None)
     }
 
     /// Whether a view shows Check: on, the reader works check out at each read from now, and
@@ -957,6 +1081,13 @@ impl TablesApp {
         let Some(sheet) = self.sheet(sheet) else {
             return false;
         };
+        // A new row is typed where the grid types one: every column it does not hold read only.
+        if rows::is_new(pk) {
+            return sheet
+                .life
+                .as_ref()
+                .is_some_and(|life| life.born_columns.iter().any(|c| c == column));
+        }
         !sheet.owned
             && sheet.columns.iter().any(|c| c.name == column && c.editable)
             && !sheet
@@ -983,6 +1114,7 @@ impl TablesApp {
             return;
         }
         let mut checked = BTreeMap::new();
+        let mut born_keys = BTreeMap::new();
         if let Some(snapshot) = &self.snapshot {
             for sheet in &snapshot.sheets {
                 let cells: BTreeMap<(String, String), String> = self
@@ -994,12 +1126,32 @@ impl TablesApp {
                 if cells.is_empty() {
                     continue;
                 }
-                for ((pk, column), rule) in crate::tables_store::refusals(sheet, &cells) {
+                let reading = crate::tables_store::refusals(sheet, &cells);
+                for ((pk, column), rule) in reading.refused {
                     checked.insert((sheet.name.to_owned(), pk, column), rule);
+                }
+                for (new, key) in reading.keys {
+                    born_keys.insert((sheet.name, new), key);
                 }
             }
         }
+        // What the save's rules for references refuse, which no one table's grid can see.
+        for (at, rule) in self.reference_refusals() {
+            checked.entry(at).or_insert(rule);
+        }
+        // A new row's key cannot be made while a cell it is made from is refused: that cell says
+        // why, once, and the row's lifecycle says what stops its key only when nothing else does.
+        let refused_cells: BTreeSet<(String, String)> = checked
+            .keys()
+            .filter(|(_, pk, column)| rows::is_new(pk) && column != aterm_db::typed::LIFECYCLE)
+            .map(|(sheet, pk, _)| (sheet.clone(), pk.clone()))
+            .collect();
+        checked.retain(|(sheet, pk, column), _| {
+            column != aterm_db::typed::LIFECYCLE
+                || !refused_cells.contains(&(sheet.clone(), pk.clone()))
+        });
         self.checked = checked;
+        self.born_keys = born_keys;
         self.checked_of = Some((self.reads, self.staged.clone()));
     }
 
@@ -1027,7 +1179,12 @@ impl TablesApp {
             .sheet(sheet)
             .and_then(|s| s.rows.iter().find(|r| r.pk == pk))
             .and_then(|r| r.cells.get(column));
-        let written = shown.is_some_and(|c| c.values.is_empty() && c.text == text);
+        // A new row's cell left empty is one it was never given.
+        let written = if rows::is_new(pk) {
+            text.trim().is_empty()
+        } else {
+            shown.is_some_and(|c| c.values.is_empty() && c.value() == text)
+        };
         self.refused.remove(&at);
         self.note = None;
         if written {
@@ -1078,9 +1235,10 @@ impl TablesApp {
     }
 
     /// Whether Keep may stage one of a conflicted cell's values: a cell the page writes, whose
-    /// values it shows as they are stored.
+    /// values it shows as they are stored, a row's lifecycle among them (no cell types it, but
+    /// a conflict in it is settled only by keeping one of its values).
     fn keepable(&self, sheet: &str, pk: &str, column: &str) -> bool {
-        !self.fixed() && self.takes(sheet, pk, column)
+        !self.fixed() && (self.takes(sheet, pk, column) || self.stages_life(sheet, pk, column))
     }
 
     /// Write the staged cells, each table's in one save; a table with a staged cell the check
@@ -1096,6 +1254,7 @@ impl TablesApp {
         let held: BTreeSet<&str> = self.checked.keys().map(|(c, ..)| c.as_str()).collect();
         let mut staged: Vec<Staged> = Vec::new();
         let mut sent = BTreeMap::new();
+        let mut sent_born = Vec::new();
         for (at, text) in &self.staged {
             let (collection, pk, column) = at;
             if held.contains(collection.as_str()) {
@@ -1110,10 +1269,26 @@ impl TablesApp {
                     staged.push(Staged {
                         base: sheet.base.clone(),
                         cells: BTreeMap::new(),
+                        born: Vec::new(),
                     });
                     staged.len() - 1
                 }
             };
+            // A new row's cells go as one row of the grid, its key left for the save to derive.
+            if rows::is_new(pk) {
+                let born = &mut staged[index].born;
+                let row = match born.iter().position(|(key, _)| key == pk) {
+                    Some(row) => row,
+                    None => {
+                        born.push((pk.clone(), BTreeMap::new()));
+                        sent_born.push((sheet.name, pk.clone()));
+                        born.len() - 1
+                    }
+                };
+                born[row].1.insert(column.clone(), text.clone());
+                sent.insert(at.clone(), text.clone());
+                continue;
+            }
             // The cell is compared against what it held when it was staged, not this read.
             let Some(cell) = staged[index]
                 .base
@@ -1137,9 +1312,11 @@ impl TablesApp {
             self.note = held_back;
             return;
         }
+        rows::order(self, &mut staged);
         if self.work.send(Work::Write(staged)).is_ok() {
             self.writing = true;
             self.sent = sent;
+            self.sent_born = sent_born;
             self.note = None;
         }
     }
@@ -1175,8 +1352,9 @@ pub(crate) struct Editing {
     pub(crate) choice: Option<Choice>,
 }
 
-/// The rows a sheet shows, top down, worked out once for each read, find and sort: a staged
-/// cell, a key and a redraw leave it as it is, so a row never moves under the selection.
+/// The rows a sheet shows, top down, worked out once for each read, find, sort and filter: a
+/// staged cell, a key and a redraw leave it as it is, so a row never moves under the selection,
+/// but for a row the filter leaves out, which shows while a change to it is staged.
 #[derive(Default)]
 struct Order {
     /// What it was worked out from: the sheet, the read ([`TablesApp::reads`]), the find's
@@ -1193,7 +1371,14 @@ struct Order {
     built: u64,
 }
 
-type OrderOf = (&'static str, u64, String, Option<(String, bool)>);
+type OrderOf = (
+    &'static str,
+    u64,
+    String,
+    Option<(String, bool)>,
+    rows::Filter,
+    BTreeSet<String>,
+);
 
 /// A range's other corner: the cell it began at, among the rows as they stood then.
 struct Corner {
@@ -1223,6 +1408,8 @@ pub(crate) struct TablesViewState {
     pub(crate) narrow: Cell<bool>,
     /// The Check view ([`crate::native_tables_check`]).
     pub(crate) check: crate::native_tables_check::CheckView,
+    /// Which columns the grid draws, and the list that chooses them ([`native_tables_columns`]).
+    columns: native_tables_columns::ColumnsView,
     /// The pane's Keep and Undo buttons, top down, as it last laid them out, each with where it
     /// stands in the pane's list: the arrows move among them, scrolling the one reached into
     /// view.
@@ -1258,6 +1445,9 @@ pub(crate) struct TablesViewState {
     /// view state, kept across reads and written nowhere. A sheet not named shows its rows in
     /// the order the registry holds them.
     sort: BTreeMap<String, (String, bool)>,
+    /// Which rows each sheet shows by their lifecycle ([`rows::Filter`]): view state, kept
+    /// across reads. A sheet not named shows its live rows.
+    pub(crate) life: BTreeMap<&'static str, rows::Filter>,
 }
 
 impl Default for TablesViewState {
@@ -1276,6 +1466,7 @@ impl Default for TablesViewState {
             picking: false,
             narrow: Cell::new(false),
             check: crate::native_tables_check::CheckView::default(),
+            columns: native_tables_columns::ColumnsView::default(),
             pane_keys: std::cell::RefCell::new(Vec::new()),
             rail_scroll: 0.0,
             rail_limit: Cell::new(0.0),
@@ -1294,6 +1485,7 @@ impl Default for TablesViewState {
             resizing: None,
             anchor: None,
             sort: BTreeMap::new(),
+            life: BTreeMap::new(),
         }
     }
 }
@@ -1326,13 +1518,16 @@ pub(crate) const PICKER: &str = "tables/picker";
 
 /// Whether `key` is one of the pane's Keep or Undo buttons, which the arrows move among.
 fn pane_action(key: &str) -> bool {
-    key.starts_with(KEEP) || key.starts_with(UNDO)
+    key.starts_with(KEEP) || key.starts_with(UNDO) || key.starts_with(rows::PANE)
 }
 
 impl TablesViewState {
     /// Scroll an `act` on a cell, a header or its edge outside the grid's room into view; whether
     /// anything moved.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey) -> bool {
+        if let Some(moved) = self.reveal_columns_control(key.as_str()) {
+            return moved;
+        }
         if let Some(name) = key.as_str().strip_prefix(SHEET) {
             let rail = self.rail_scroll;
             self.rail_reveal(name.split('/').next().unwrap_or(name));
@@ -1411,31 +1606,42 @@ impl TablesViewState {
         self.order.borrow().rows.len()
     }
 
-    /// Work [`Self::order`] out where the read, the find or the sort it was worked out from is
-    /// no longer the one in force.
+    /// Work [`Self::order`] out where the read, the find, the sort, the filter or the rows a
+    /// staged change shows it was worked out from are no longer the ones in force.
     fn put_in_order(&self, app: &TablesApp, sheet: &Sheet) {
         let find = self.find.value().trim().to_lowercase();
+        let filter = self.filter(sheet);
         let of: OrderOf = (
             sheet.name,
             app.reads,
             find,
             self.sort.get(sheet.name).cloned(),
+            filter,
+            // The rows the filter leaves out that a staged change shows (a retire, an end or a
+            // restore pressed, a cell typed): each leaves once its last change is taken back,
+            // and the fills stop counting it ([`Self::life_shows`]). A row the filter admits
+            // shows whatever is staged in it, so a typed cell moves no row.
+            rows::shown_by_staging(app, sheet, filter),
         );
         if self.order.borrow().of.as_ref() == Some(&of) {
             return;
         }
         let find = of.2.as_str();
+        let staged = |row: &SheetRow| {
+            app.staged
+                .keys()
+                .any(|(c, p, _)| c == sheet.name && *p == row.pk)
+        };
         let mut rows: Vec<usize> = sheet
             .rows
             .iter()
             .enumerate()
+            // A row the lifecycle filter leaves out still shows while a change to it is staged.
+            .filter(|(_, row)| self.life_shows(app, sheet, row))
             .filter(|(_, row)| {
                 find.is_empty()
                     || row.pk.starts_with(find)
-                    || app
-                        .staged
-                        .keys()
-                        .any(|(c, p, _)| c == sheet.name && *p == row.pk)
+                    || staged(row)
                     || sheet.columns.iter().any(|column| {
                         column.group != Group::Linked
                             && row
@@ -1685,6 +1891,10 @@ impl TablesViewState {
         if !self.shown_rows(app, sheet).iter().any(|row| row.pk == pk) {
             self.find = TextInputState::new(String::new());
         }
+        // A row the lifecycle filter leaves out (a retired one a finding names) shows among all.
+        if !self.shown_rows(app, sheet).iter().any(|row| row.pk == pk) {
+            self.life.insert(name, rows::Filter::All);
+        }
         self.select(pk, &column);
         if moved {
             // The columns' places are the last sheet's until this one is laid out.
@@ -1739,7 +1949,7 @@ impl TablesViewState {
             if shown.is_some_and(|c| !c.values.is_empty()) {
                 String::new()
             } else {
-                shown.map(|c| c.text.clone()).unwrap_or_default()
+                shown.map(|c| c.value().to_owned()).unwrap_or_default()
             }
         });
         let opens = crate::native_tables_choices::opens(compiled);
@@ -1759,8 +1969,17 @@ impl TablesViewState {
         let choice = compiled
             .compiled
             .filter(|_| opens == Opens::List)
-            .and_then(|c| Choice::of(c, &seed));
-        let mut input = TextInputState::new(seed.clone());
+            .and_then(|c| match c.ty {
+                // A reference opens on the rows of its target, read by their words.
+                aterm_db::typed::Ty::Ref(to) => rows::choice(app, to, c.null, &seed),
+                _ => Choice::of(c, &seed),
+            });
+        // The field shows the marked choice as it reads: a row by its words, not its key.
+        let shows = choice
+            .as_ref()
+            .and_then(Choice::marked_said)
+            .map_or_else(|| seed.clone(), str::to_owned);
+        let mut input = TextInputState::new(shows);
         input.select_all();
         self.anchor = None;
         self.editing = Some(Editing {
@@ -1780,7 +1999,7 @@ impl TablesViewState {
             && let Some(choice) = editing.choice.as_mut()
         {
             choice.step(by);
-            if let Some(word) = choice.marked() {
+            if let Some(word) = choice.marked_said() {
                 editing.input = TextInputState::new(word.to_owned());
                 editing.input.select_all();
             }
@@ -1796,7 +2015,7 @@ impl TablesViewState {
         let Some(choice) = editing.choice.as_mut() else {
             return false;
         };
-        let Some(word) = choice.words.get(n).copied() else {
+        let Some(word) = choice.said.get(n).cloned() else {
             return true;
         };
         choice.at = Some(n);
@@ -1806,7 +2025,7 @@ impl TablesViewState {
             editing.input = TextInputState::new(text);
             self.focus(EDIT);
         } else {
-            editing.input = TextInputState::new(word.to_owned());
+            editing.input = TextInputState::new(word);
             self.close_edit(app, false);
         }
         true
@@ -1907,7 +2126,11 @@ impl TablesViewState {
             None => 0,
             Some(at) => (at as i64 + i64::from(rows)).clamp(0, shown.len() as i64 - 1) as usize,
         };
-        let names: Vec<&str> = ordered(sheet).iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = self
+            .shown_columns(app, sheet)
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         let column_at = self
             .column
             .as_ref()
@@ -1925,7 +2148,7 @@ impl TablesViewState {
     fn stands(&self, app: &TablesApp) -> Option<(usize, usize, usize, usize)> {
         let sheet = app.sheet(self.sheet)?;
         let shown = self.shown_rows(app, sheet);
-        let columns = ordered(sheet);
+        let columns = self.shown_columns(app, sheet);
         let row = shown
             .iter()
             .position(|r| Some(&r.pk) == self.row.as_ref())?;
@@ -1990,7 +2213,7 @@ impl TablesViewState {
                     .keys
                     .iter()
                     .position(|key| *key == corner.pk)?,
-                ordered(sheet)
+                self.shown_columns(app, sheet)
                     .iter()
                     .position(|c| c.name == corner.column)?,
             ))
@@ -2212,6 +2435,9 @@ fn edit(input: &mut TextInputState, event: TextInputEvent) {
 impl TablesApp {
     /// The page's reducer, apart from the runtime's bookkeeping.
     fn act(&mut self, view: &mut TablesViewState, event: AppEvent) -> bool {
+        if let Some(done) = native_tables_columns::act(self, view, &event) {
+            return done;
+        }
         match event {
             #[cfg(any(a11y_tree, test))]
             AppEvent::RevealControl(key) => view.reveal_listed_control(&key),
@@ -2291,6 +2517,9 @@ impl TablesApp {
                     return true;
                 }
                 if let Some(done) = crate::native_tables_check::act(self, view, &key) {
+                    return done;
+                }
+                if let Some(done) = rows::act(self, view, &key) {
                     return done;
                 }
                 if key == PICKER {
@@ -2437,6 +2666,8 @@ impl TablesApp {
                         self.staged.clear();
                         self.seen.clear();
                         self.refused.clear();
+                        self.born.clear();
+                        self.show_born();
                         self.note = None;
                         true
                     }
@@ -2729,7 +2960,7 @@ impl TablesApp {
             return Vec::new();
         };
         let shown = view.shown_rows(self, sheet);
-        let names = ordered(sheet);
+        let names = view.shown_columns(self, sheet);
         rows.map(|row| {
             columns
                 .clone()
@@ -2763,7 +2994,7 @@ impl TablesApp {
                                 .iter()
                                 .find(|row| row.pk == *pk)
                                 .and_then(|row| row.cells.get(column))
-                                .map(|cell| cell.text.clone())
+                                .map(|cell| cell.value().to_owned())
                                 .unwrap_or_default()
                         });
                         tsv_field(&text)
@@ -2827,7 +3058,7 @@ impl TablesApp {
         };
         // The cell each field lands on, where the sheet has one there.
         let shown = view.shown_rows(self, sheet);
-        let names = ordered(sheet);
+        let names = view.shown_columns(self, sheet);
         let lands = |row: usize, column: usize| {
             let (row, column) = (shown.get(row)?, names.get(column)?);
             Some(Landing {
@@ -2943,13 +3174,19 @@ impl NativeAppModel for TablesApp {
         if let Some(shown) = self.current(view) {
             view.sheet = shown;
         }
+        let open = view.columns.open;
         let acted = self.act(view, event);
+        // The selection moves off a column no longer drawn; and a list of columns the event
+        // closed repaints, whatever the page made of the event itself.
+        let settled = view.settle_columns(self) || open != view.columns.open;
         self.recheck();
+        if acted || settled {
+            view.common.presentation_revision = view.common.presentation_revision.wrapping_add(1);
+            cx.repaint(DamageRegion::All);
+        }
         if !acted {
             return EventResult::Bubble;
         }
-        view.common.presentation_revision = view.common.presentation_revision.wrapping_add(1);
-        cx.repaint(DamageRegion::All);
         EventResult::Handled
     }
 
@@ -3024,6 +3261,18 @@ pub(crate) fn scale() -> f32 {
 
 pub(crate) fn row_height() -> f32 {
     28.0 * scale().max(1.0)
+}
+
+/// How tall the grid's group line and its type line stand, over and under its header line.
+fn head_line() -> f32 {
+    22.0 * scale().max(1.0)
+}
+
+/// What the grid keeps over and under its rows ([`grid`]): its rules (three points), the
+/// group line, the header line and the type line. A grid `height` tall leaves its rows that
+/// height less this; [`page`] weighs the cell bar on it.
+fn grid_chrome() -> f32 {
+    3.0 + 2.0 * head_line() + row_height()
 }
 
 pub(crate) fn group(key: impl Into<std::sync::Arc<str>>) -> UiNode {
@@ -3369,7 +3618,7 @@ fn rail(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiN
             step(&mut tall, 22.0 * scale());
         }
         let key = format!("{SHEET}{name}");
-        let count = app.sheet(name).map(|s| s.rows.len());
+        let count = app.sheet(name).map(rows::counted);
         let staged = app.staged_in(name);
         let count_words = count.map_or_else(String::new, |n| n.to_string());
         let count_w = text_width(&count_words, SemanticRole::Text, StyleRef::Note);
@@ -3595,20 +3844,45 @@ fn edge(column: &SheetColumn) -> UiNode {
 /// row numbers and the key column at its left; every row the find leaves is listed under them.
 #[expect(clippy::too_many_lines, reason = "one grid, laid out in one pass")]
 fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, height: f32) -> UiNode {
-    let columns = ordered(sheet);
+    // The columns the grid draws, each folded group's stub after its last
+    // ([`native_tables_columns`]); a range counts the drawn columns alone.
+    let stubs = view.stubs(app, sheet);
+    let columns = view.laid_columns(app, sheet, &stubs);
+    let drawn_at: Vec<Option<usize>> = columns
+        .iter()
+        .scan(0_usize, |n, column| {
+            Some((!native_tables_columns::is_stub(column)).then(|| {
+                *n += 1;
+                *n - 1
+            }))
+        })
+        .collect();
     let mut widths = widths(app, view, sheet, &columns);
     let line = row_height();
-    let head_line = 22.0 * scale().max(1.0);
+    let head_line = head_line();
     let rows = view.shown_rows(app, sheet);
     // The frame rules the grid's four sides: a point at each.
     let room_across = (width - 2.0).max(1.0);
     // The row numbers stay at the left, then the key column (the first), at most half of what
     // is left; the rest scroll across in the room beside them.
-    let gutter = (text_width(
-        &rows.len().max(1).to_string(),
-        SemanticRole::Text,
-        StyleRef::Primary,
-    ) + 16.0)
+    // A row added, retired, ended or restored and not yet written says so in its number's seat.
+    let row_words: Vec<Option<&'static str>> = rows
+        .iter()
+        .map(|row| app.row_word(sheet, &row.pk))
+        .collect();
+    let gutter = (row_words
+        .iter()
+        .flatten()
+        .map(|word| text_width(word, SemanticRole::Text, StyleRef::Unwritten))
+        .fold(
+            text_width(
+                &rows.len().max(1).to_string(),
+                SemanticRole::Text,
+                StyleRef::Primary,
+            ),
+            f32::max,
+        )
+        + 16.0)
         .max(36.0 * scale())
         .min(room_across * 0.25);
     let after_gutter = (room_across - gutter).max(1.0);
@@ -3627,6 +3901,7 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             spans.push((column.name.clone(), at, at + w));
             at += w;
         }
+        view.columns.laid_out(sheet.name);
         *view.drawn.borrow_mut() = columns
             .iter()
             .zip(&widths)
@@ -3725,6 +4000,10 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
     )];
     let sorted = view.sorted(sheet);
     for (column, w) in columns.iter().zip(&widths) {
+        if native_tables_columns::is_stub(column) {
+            headers.push(native_tables_columns::stub_head(column, *w));
+            continue;
+        }
         // A header is a press that sorts by its column: its name says so, in the words a
         // cell's is said in, and how the column is sorted; its face wears a drawn mark.
         let key = format!("{HEAD}{}", column.name);
@@ -3750,15 +4029,26 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     .layout(Layout::default().width(Length::Fixed(mark_w))),
             );
         }
+        // How many rows fill the column: a bar along the header's foot, said in its name.
+        let fill = view.fill(app, sheet, &column.name);
+        let filled = view.fill_rows(app, sheet);
         headers.push(head_cell(
             format!("{key}/seat"),
             *w,
             vec![
-                press(&key, format!("Sort by {}{said}", field_words(column))),
+                press(
+                    &key,
+                    format!(
+                        "Sort by {}{said}, {}",
+                        field_words(column),
+                        native_tables_columns::fill_words(fill, filled)
+                    ),
+                ),
                 group(format!("{key}/face"))
                     .layout(Layout::row().padding(Insets::symmetric(10.0, 0.0)))
                     .children(face)
                     .paint_only_tree(),
+                native_tables_columns::fill_bar(&key, fill, filled, *w),
                 edge(column),
             ],
         ));
@@ -3768,6 +4058,10 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
     let mut types = vec![head_cell("tables/type/#/seat".into(), gutter, Vec::new())];
     for (column, w) in columns.iter().zip(&widths) {
         let key = format!("tables/type/{}", column.name);
+        if native_tables_columns::is_stub(column) {
+            types.push(head_cell(format!("{key}/seat"), *w, Vec::new()));
+            continue;
+        }
         let words = crate::native_tables_choices::type_words(column, |name| app.title_of(name));
         types.push(head_cell(
             format!("{key}/seat"),
@@ -3779,7 +4073,7 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             )],
         ));
     }
-    let room = (height - 3.0 - 2.0 * head_line - line).max(0.0);
+    let room = (height - grid_chrome()).max(0.0);
     let limit = (rows.len() as f32 * line - room).max(0.0);
     let was = view.room.replace(room);
     view.limit.set(limit);
@@ -3809,14 +4103,18 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         let selected = view.row.as_deref() == Some(row.pk.as_str());
         let mut cells = Vec::with_capacity(columns.len() + 1);
         let number_key = format!("tables/num/{}", row.pk);
+        let row_word = row_words[n];
         let number = if near_row {
-            // On the header ground, where the note's ink reads and the tertiary one does not.
-            let style = if selected {
+            // On the header ground, where the note's ink reads and the tertiary one does not; a
+            // row's word for a change not written in the not-written ink.
+            let style = if row_word.is_some() {
+                StyleRef::Unwritten
+            } else if selected {
                 StyleRef::Primary
             } else {
                 StyleRef::Note
             };
-            let words = (n + 1).to_string();
+            let words = row_word.map_or_else(|| (n + 1).to_string(), str::to_owned);
             let words_w = text_width(&words, SemanticRole::Text, style).min(gutter - 12.0);
             vec![
                 group(format!("{number_key}/row"))
@@ -3843,11 +4141,16 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             if at > 0 {
                 left += w;
             }
+            // A folded group's stub is blank down its rows.
+            if native_tables_columns::is_stub(column) {
+                cells.push(native_tables_columns::stub_cell(column, &row.pk, *w, line));
+                continue;
+            }
             let at_n = at;
             // A cell a range holds beside the selected one.
-            let ranged = range
-                .as_ref()
-                .is_some_and(|(rows, columns)| rows.contains(&n) && columns.contains(&at));
+            let ranged = range.as_ref().is_some_and(|(rows, columns)| {
+                rows.contains(&n) && drawn_at[at].is_some_and(|at| columns.contains(&at))
+            });
             let key = cell_key(&row.pk, &column.name);
             let at = (sheet.name.to_owned(), row.pk.clone(), column.name.clone());
             let shown = row.cells.get(&column.name);
@@ -3873,12 +4176,19 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     ),
                 );
             } else {
-                if staged.is_some() && near {
+                // The lifecycle cell carries the row's word for a change not written: a new row
+                // is born live, though no cell of it says so yet.
+                let life_word = row_word.filter(|_| column.name == aterm_db::typed::LIFECYCLE);
+                if (staged.is_some() || life_word.is_some()) && near {
                     seat.push(styled(format!("{key}/staged"), StyleRef::Unwritten));
                 }
+                // A reference staged reads as the row it names, as a written one does.
                 let text = staged
-                    .cloned()
-                    .unwrap_or_else(|| shown.map(|c| c.text.clone()).unwrap_or_default());
+                    .map(|key| rows::reads(app, column, key))
+                    .unwrap_or_else(|| match life_word {
+                        Some(_) if rows::is_new(&row.pk) => aterm_db::typed::grid::LIVE.to_owned(),
+                        _ => shown.map(|c| c.text.clone()).unwrap_or_default(),
+                    });
                 let conflict = staged.is_none() && shown.is_some_and(|c| !c.values.is_empty());
                 // A value the save cannot take: the rule it breaks, said at the cell.
                 let refusal = app.refusal(&at);
@@ -3906,7 +4216,12 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 if conflict {
                     spoken.push_str(&format!(", {} values", shown.map_or(0, |c| c.values.len())));
                 }
-                if staged.is_some() {
+                // A new row's word says what its lifecycle's value does not; a retire's or a
+                // restore's would only say its value again.
+                if let Some(word) = life_word.filter(|_| rows::is_new(&row.pk)) {
+                    spoken.push_str(&format!(", {word}"));
+                }
+                if staged.is_some() || life_word.is_some() {
                     spoken.push_str(", not written");
                 }
                 if let Some(rule) = refusal {
@@ -3937,11 +4252,19 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 };
                 if near {
                     let mut face = Vec::new();
-                    if refusal.is_some() || conflict || changed || reported.is_some() {
+                    if refusal.is_some()
+                        || life_word.is_some()
+                        || conflict
+                        || changed
+                        || reported.is_some()
+                    {
                         let n = shown.map_or(0, |c| c.values.len());
-                        // A refusal is said in the danger ink, over any other tag the cell has.
+                        // A refusal is said in the danger ink, over any other tag the cell has;
+                        // then the row's word for a change not written, in that ink.
                         let (tag, tag_style) = if refusal.is_some() {
                             ("refused".to_owned(), StyleRef::Danger)
+                        } else if let Some(word) = life_word {
+                            (word.to_owned(), StyleRef::Unwritten)
                         } else if conflict {
                             (format!("{n} values"), StyleRef::Chip)
                         } else if changed {
@@ -3999,16 +4322,18 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
     }
     if rows.is_empty() {
         let words_now = if sheet.rows.is_empty() {
-            "No rows"
+            "No rows".to_owned()
+        } else if view.find.value().trim().is_empty() {
+            view.filter(sheet).none_words()
         } else {
-            "No row has these words"
+            "No row has these words".to_owned()
         };
         lines.push(
             padded(
                 "tables/rows/none/seat".into(),
                 fitted(
                     "tables/rows/none",
-                    words_now,
+                    &words_now,
                     StyleRef::Note,
                     room_across - 20.0,
                 ),
@@ -4046,8 +4371,14 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         && let Some(choice) = editing.choice.as_ref()
     {
         let under = 1.0 + 2.0 * head_line + line;
+        let label = sheet
+            .columns
+            .iter()
+            .find(|c| c.name == editing.column)
+            .map_or_else(|| editing.column.clone(), field_words);
         over.push(crate::native_tables_choices::list(
             choice,
+            &format!("Choices for {label}"),
             editing.input.value(),
             (x, under + top, w),
             (room + under, line),
@@ -4136,11 +4467,13 @@ struct BarWords {
     /// The cell's value as the grid shows it; none for a range, for no selection and for a
     /// cell the grid does not show.
     value: Option<Run>,
-    /// The cell's state, where the grid marks one: not written, conflicted, a Mac reports
-    /// another value, written by a newer aterm, changed since (with who wrote what it holds
-    /// now), a linked count's table; a range's count and sum; that the find leaves the cell's
-    /// row out. Never who wrote the value the cell holds or when: the line under the grid
-    /// says where that value came from ([`provenance`]).
+    /// The cell's state, where the grid marks one: not written, with what the registry holds
+    /// (and `refused` first where the check or a Write refuses it); conflicted, or written by
+    /// a newer aterm; a Mac reports another value; changed since (with who wrote what it
+    /// holds now); a range's count of cells and of filled ones and, over whole numbers, their
+    /// sum, least and most; that the find leaves the cell's row out. None for a linked count,
+    /// whose count is its value. Never who wrote the value the cell holds or when: the line
+    /// under the grid says where that value came from ([`provenance`]).
     state: Vec<Run>,
 }
 
@@ -4225,6 +4558,17 @@ fn address_runs(sheet: &Sheet, row: &SheetRow, column: &SheetColumn) -> Vec<Run>
     // The column's words are a run of their own, the last: a line too narrow for the address
     // cuts the row's words before them ([`run_rooms`]).
     let column = run(format!("\u{b7} {}", field_words(column)), StyleRef::Primary);
+    // A row added here and not yet written has no key a person knows: it is the new row, as
+    // its pane's title says ([`rows::is_new`]).
+    if rows::is_new(&row.pk) {
+        return vec![
+            run(
+                format!("New {}", sheet.singular.to_lowercase()),
+                StyleRef::Primary,
+            ),
+            column,
+        ];
+    }
     if name.is_empty() {
         return vec![run(row.pk.as_str(), StyleRef::Primary), column];
     }
@@ -4271,18 +4615,6 @@ fn range_words(texts: &[&str], numbers: bool) -> String {
         }
     }
     words
-}
-
-/// A LINKED ROWS cell's words, in the cell bar and in the line under the grid: how many live
-/// rows of the table titled `from` name this row, from the count the cell shows (nothing for
-/// none). A conflicted cell of that table is counted once for each of its values that names
-/// the row.
-fn linked_words(count: &str, from: &str) -> String {
-    match count {
-        "" => format!("No live row of {from} names this row"),
-        "1" => format!("1 live row of {from} names this row"),
-        n => format!("{n} live rows of {from} name this row"),
-    }
 }
 
 /// What a Mac reports of a cell, as the grid's cell speaks it and the cell bar says it:
@@ -4333,12 +4665,14 @@ const NOT_FOUND: &str = "not among the rows found";
 /// read no longer holds) is no cell here, as it is none to that line.
 ///
 /// The state is what the grid marks on the cell, in the grid's order: a staged cell is not
-/// written (and nothing else is said of it, as its grid cell wears no other mark); a conflict
-/// says how many values; a Mac that reports another value is named with what it reports
-/// ([`reports_words`], the words the grid's cell speaks, under [`disagrees`], the grid's own
-/// rule); in a past table a cell changed since says what it holds now and who wrote that
-/// ([`since_runs`]). Who wrote the value the cell holds, and when, is not said here: the line
-/// under the grid says it ([`provenance`]).
+/// written, and `refused` first where the check or a Write refused it ([`TablesApp::refusal`]),
+/// as the grid's tag says it over every other (nothing else is said of it, as its grid cell
+/// wears no other mark); a conflict says how many values; a linked count has none, its
+/// sentence being the line under the grid's; a Mac that reports another value is named with
+/// what it reports ([`reports_words`], the words the grid's cell speaks, under [`disagrees`],
+/// the grid's own rule); in a past table a cell changed since says what it holds now and who
+/// wrote that ([`since_runs`]). Who wrote the value the cell holds, and when, is not said
+/// here: the line under the grid says it ([`provenance`]).
 fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords {
     // The staged words of this sheet, by row and column.
     let staged: BTreeMap<(&str, &str), &str> = app
@@ -4350,7 +4684,7 @@ fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords
     // A range, while its rows stand as they did when it was grown.
     if let Some((rows, across)) = view.range(app).filter(|_| view.corner().is_some()) {
         let shown = view.shown_rows(app, sheet);
-        let columns = ordered(sheet);
+        let columns = view.shown_columns(app, sheet);
         let (tall, wide) = (rows.clone().count(), across.clone().count());
         if tall * wide > 1 {
             let texts: Vec<&str> = rows
@@ -4385,7 +4719,7 @@ fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords
     let selected = view.stands(app).and_then(|(row, column, ..)| {
         Some((
             *view.shown_rows(app, sheet).get(row)?,
-            *ordered(sheet).get(column)?,
+            *view.shown_columns(app, sheet).get(column)?,
         ))
     });
     let Some((row, column)) = selected else {
@@ -4414,20 +4748,22 @@ fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords
     let stored = shown.map_or("", |cell| cell.text.as_str());
     let mut state = Vec::new();
     let value = if let Some(text) = staged.get(&(row.pk.as_str(), column.name.as_str())) {
-        state.push(run(
-            format!("not written \u{b7} holds {}", value_words(stored)),
-            StyleRef::Note,
-        ));
-        run(value_words(text), StyleRef::Unwritten)
+        // A value the check or a Write refused reads so first, in the grid's own word and ink;
+        // the rule it breaks is the pane's to say.
+        let unwritten = format!("not written \u{b7} holds {}", value_words(stored));
+        let at = (sheet.name.to_owned(), row.pk.clone(), column.name.clone());
+        if app.refusal(&at).is_some() {
+            state.push(run("refused", StyleRef::Danger));
+            state.push(run(format!("\u{b7} {unwritten}"), StyleRef::Note));
+        } else {
+            state.push(run(unwritten, StyleRef::Note));
+        }
+        run(typed_words(column, text), StyleRef::Unwritten)
     } else {
-        if column.group == Group::Linked {
-            let from = column
-                .links
-                .as_deref()
-                .and_then(|table| app.sheet(table))
-                .map_or("another table", |other| other.title);
-            state.push(run(linked_words(stored, from), StyleRef::Note));
-        } else if let Some(shown) = shown.filter(|cell| !cell.values.is_empty()) {
+        // A linked count has no state here: the count is its value, and how many rows of
+        // which table it counts is the line under the grid's to say, as the type line names
+        // the table.
+        if let Some(shown) = shown.filter(|cell| !cell.values.is_empty()) {
             state.push(run(
                 format!("{} values \u{b7} no clock picks one", shown.values.len()),
                 StyleRef::Note,
@@ -4616,8 +4952,8 @@ const VALUE_KEEPS: f32 = 0.55;
 /// its whole value and its state where the grid marks one ([`bar_words`]); what its column
 /// holds is the type line's to say, under the column's name
 /// ([`crate::native_tables_choices::type_words`]). It is there whether or not a cell is selected or a change is staged, so
-/// the grid never moves for either; only a window too short for it over three lines of grid
-/// has none ([`page`]).
+/// the grid never moves for either; only a window too short for it over the grid's own lines
+/// and a whole row has none ([`page`]).
 ///
 /// The address stands at its own width; the value takes the room beside it and the state's
 /// words what the value leaves, cut at their end, and are left out where that is no room for
@@ -4748,11 +5084,15 @@ fn cell_bar(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32) 
 }
 
 fn write_bar(app: &TablesApp, width: f32) -> Option<UiNode> {
+    let h = 40.0 * scale().max(1.0);
+    // Where this Mac cannot write, the bar's place says why, and nothing offers a Write.
+    if let Some(why) = app.cannot_write() {
+        return Some(rows::cannot_write(app, why, width, h));
+    }
     let n = app.staged.len();
     if n == 0 && app.note.is_none() {
         return None;
     }
-    let h = 40.0 * scale().max(1.0);
     if n == 0 {
         let note = app.note.clone().unwrap_or_default();
         return Some(
@@ -4780,14 +5120,16 @@ fn write_bar(app: &TablesApp, width: f32) -> Option<UiNode> {
         StyleRef::Secondary,
         !app.writing,
     );
+    // The name a reader hears starts with the words the button shows.
+    let write_label = if app.writing {
+        "Writing\u{2026}"
+    } else {
+        "Write"
+    };
     let write = button(
         WRITE,
-        if app.writing {
-            "Writing\u{2026}"
-        } else {
-            "Write"
-        },
-        &format!("Write {count}"),
+        write_label,
+        &format!("{write_label} {count}"),
         StyleRef::Unwritten,
         !app.writing,
     );
@@ -4857,6 +5199,19 @@ fn value_words(text: &str) -> String {
     }
 }
 
+/// What is typed into `column`, staged and not written, in the words its cell says a held value
+/// by: a time's number as its date ([`stamp_words`]), as the registry's holds reads beside it;
+/// else as typed ([`value_words`]).
+fn typed_words(column: &SheetColumn, typed: &str) -> String {
+    match column.compiled.map(|c| &c.ty) {
+        Some(aterm_db::typed::Ty::Time) => typed
+            .trim()
+            .parse::<u64>()
+            .map_or_else(|_| value_words(typed), stamp_words),
+        _ => value_words(typed),
+    }
+}
+
 /// A field's name in the pane: `Nickname`, `Ram gb`.
 fn field_words(column: &SheetColumn) -> String {
     let lower = column.label.to_lowercase();
@@ -4908,12 +5263,19 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         ),
         line,
     );
-    let name = columns
-        .first()
-        .and_then(|c| row.cells.get(&c.name))
-        .map(|c| c.text.clone())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| row.pk.clone());
+    let new = rows::is_new(&row.pk);
+    // A new row is named as one until it is written, so a link's is not read as its machine.
+    let name = if new {
+        format!("New {}", sheet.singular.to_lowercase())
+    } else {
+        rows::row_name(app, sheet, row, None).unwrap_or_else(|| row.pk.clone())
+    };
+    // A new row has no key until the save derives it.
+    let id = if new {
+        "Its key is made when it is written".to_owned()
+    } else {
+        row.pk.clone()
+    };
     push(
         &mut children,
         UiNode::new(
@@ -4929,9 +5291,21 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
     );
     push(
         &mut children,
-        fitted("tables/pane/id", &row.pk, StyleRef::Note, inner),
+        fitted("tables/pane/id", &id, StyleRef::Note, inner),
         line,
     );
+    // The row's lifecycle: what retiring, ending or restoring it does, what holds a retire back,
+    // and what a new row cannot be given here.
+    // Then each row its references name, a press away.
+    for (node, h, action) in rows::pane_lines(app, sheet, row, inner, line)
+        .into_iter()
+        .chain(rows::reference_lines(app, sheet, row, inner, line))
+    {
+        if let Some(action) = action {
+            actions.push((action, tall.get(), tall.get() + h));
+        }
+        push(&mut children, node, h);
+    }
     let now = aterm_time::unix_millis().unwrap_or(0);
     // Each conflicted cell: every value, its writer, and a Keep.
     for column in &columns {
@@ -5032,17 +5406,26 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             let at = (sheet.name.to_owned(), row.pk.clone(), column.name.clone());
             let shown = row.cells.get(&column.name);
             let staged = app.staged.get(&at);
+            // A new row is born live, as its lifecycle cell in the grid says, though nothing is
+            // staged there.
+            let born_live = new && column.name == aterm_db::typed::LIFECYCLE;
             if staged.is_none()
+                && !born_live
                 && shown.is_none_or(|c| c.text.is_empty())
                 && app.refusal(&at).is_none()
             {
                 empty.push(field_words(column));
                 continue;
             }
-            let text = staged
-                .cloned()
-                .unwrap_or_else(|| shown.map(|c| c.text.clone()).unwrap_or_default());
-            let value_style = if staged.is_some() {
+            let text = if born_live {
+                aterm_db::typed::grid::LIVE.to_owned()
+            } else {
+                staged.map_or_else(
+                    || shown.map(|c| c.text.clone()).unwrap_or_default(),
+                    |key| rows::reads(app, column, key),
+                )
+            };
+            let value_style = if staged.is_some() || born_live {
                 StyleRef::Unwritten
             } else {
                 StyleRef::Plain
@@ -5264,12 +5647,17 @@ fn row_history(sheet: &Sheet, pk: &str) -> Vec<([u8; 32], Author, Vec<String>)> 
     for written in &sheet.written {
         let mut lines = Vec::new();
         for cell in written.cells.iter().filter(|c| c.pk == pk) {
+            // A birth reads as one: the row's lifecycle first set live.
+            if cell.column == aterm_db::typed::LIFECYCLE
+                && cell.now == aterm_db::typed::grid::LIVE
+                && !last.contains_key(aterm_db::typed::LIFECYCLE)
+            {
+                lines.insert(0, "Row \u{2192} added".to_owned());
+                last.insert(aterm_db::typed::LIFECYCLE, aterm_db::typed::grid::LIVE);
+                continue;
+            }
+            // The import columns are not shown.
             let Some(column) = sheet.columns.iter().find(|c| c.name == cell.column) else {
-                // The row's lifecycle and import columns are not shown; a birth reads as one.
-                if cell.column == "row" && cell.now == "live" && !last.contains_key("row") {
-                    lines.insert(0, "Row \u{2192} added".to_owned());
-                    last.insert("row", "live");
-                }
                 continue;
             };
             let was = last.get(cell.column.as_str()).copied().unwrap_or("");
@@ -5452,7 +5840,7 @@ fn disagrees(shown: Option<&Shown>, seen: &Observed) -> bool {
         return false;
     };
     if shown.values.is_empty() {
-        (shown.by.is_some() || !shown.text.is_empty()) && differs(seen, &[&shown.text])
+        (shown.by.is_some() || !shown.text.is_empty()) && differs(seen, &[shown.value()])
     } else {
         let held: Vec<&str> = shown.values.iter().map(|(v, _)| v.as_str()).collect();
         differs(seen, &held)
@@ -5465,6 +5853,18 @@ fn differs(seen: &Observed, texts: &[&str]) -> bool {
     !texts
         .iter()
         .any(|text| !text.is_empty() && *text == seen.text)
+}
+
+/// A LINKED ROWS cell's words in the line under the grid ([`provenance`]): how many live rows
+/// of the table titled `from` name this row, from the count the cell shows (nothing for none).
+/// A conflicted cell of that table is counted once for each of its values that names the row.
+/// The cell bar says the count alone, as the cell does.
+fn linked_words(count: &str, from: &str) -> String {
+    match count {
+        "" => format!("No live row of {from} names this row"),
+        "1" => format!("1 live row of {from} names this row"),
+        n => format!("{n} live rows of {from} name this row"),
+    }
 }
 
 /// Where the selected cell's value came from, in plain words: for what a Mac states, when it
@@ -5540,7 +5940,7 @@ pub(crate) fn provenance(
     {
         let mut words = format!(
             "{field}: {} set here, not written; the registry holds {}",
-            value_words(typed),
+            typed_words(column, typed),
             value_words(text)
         );
         if let Some(seen) = seen {
@@ -5580,11 +5980,11 @@ pub(crate) fn provenance(
         }
         return (said, words);
     }
-    // The words a reference's row is known by, where the cell shows its key.
+    // The key a reference holds, where the cell shows its row's words.
     let named = shown
-        .and_then(|c| c.names.as_deref())
-        .filter(|words| *words != text)
-        .map_or_else(String::new, |words| format!(" ({words})"));
+        .and_then(|c| c.refers.as_deref())
+        .filter(|key| *key != text)
+        .map_or_else(String::new, |key| format!(" ({key})"));
     let by = shown.and_then(|c| c.by.as_ref());
     // What a Mac states of itself is an observation: when it saw it, and which Mac.
     if sheet.owned
@@ -5692,6 +6092,12 @@ fn provenance_line(
     )
 }
 
+/// How tall one line of the line under the grid ([`provenance_line`]) stands at most: in the
+/// body face, the largest any text of its role is set in, whichever style [`Said::style`] picks.
+fn said_line() -> f32 {
+    crate::native_about::wrapped_line_height(SemanticRole::Text, StyleRef::Plain)
+}
+
 /// The width under which the page stands in one column: the rail is one table picker
 /// ([`PICKER`]) and the pane sits below the grid (docs/DESIGN-tables-app-2026-11-14.md §3.6).
 pub(crate) const WIDE: f32 = 900.0;
@@ -5794,7 +6200,10 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
         }
     } else {
         let (title, singular_count) = sheet.map_or((TABLES_TITLE, String::new()), |s| {
-            (s.title, rows_words(view.shown_count(app, s), s.rows.len()))
+            (
+                s.title,
+                rows_words(view.shown_count(app, s), rows::admitted(app, view, s)),
+            )
         });
         let count_w =
             text_width(&singular_count, SemanticRole::Text, StyleRef::Note).min(main_w * 0.4);
@@ -5822,23 +6231,37 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
         let said_h = said.as_ref().map_or(said_least, |(_, h)| *h);
         // Whether the cell bar stands is the window's to say (its height, its width and the
         // text scale), never the selection's or a staged change's: it is judged on the room the
-        // grid would have under a write bar and a line of one row, whether or not either is
-        // there, and on a narrow page on half of that, as the grid stands with a row selected.
-        // So typing into a cell, or selecting one whose line wraps, neither takes the bar away
-        // nor brings it back.
+        // grid would have under a write bar and three lines of the line under the grid, whether
+        // or not either is there, and on a narrow page on half of that, as the grid stands with
+        // a row selected. The bar stands where that room holds it and, under it, the grid's own
+        // lines ([`grid_chrome`]) and one whole row, so the row the grid keeps in view shows
+        // whole. So typing into a cell, or selecting one whose line wraps, neither takes the
+        // bar away nor brings it back, and while the line wraps onto three lines or fewer the
+        // grid under the bar keeps its whole row and the write bar ends inside the window.
         let cell_line = row_height();
-        let steady = room - write_h - said_least - 10.0;
-        let barred = (if narrow { steady * 0.5 } else { steady }) - cell_line >= line * 3.0;
+        let under_bar = grid_chrome() + row_height();
+        let said_judged = (3.0 * said_line()).max(said_least);
+        let steady = room - write_h - said_judged - 10.0;
+        let barred = (if narrow { steady * 0.5 } else { steady }) >= cell_line + under_bar;
         room -= bar_h + said_h + 10.0;
         // Narrow, with a row selected, the grid takes half what is left and the row's pane the
-        // rest below it; with none, the grid takes it all. Under its bar it keeps three lines.
+        // rest below it; with none, the grid takes it all, and never less than three lines.
+        // Under its bar the grid keeps its own lines and a whole row as far as the room holds
+        // them: a line wrapped onto more than three lines takes its room from the grid's, down
+        // to the three lines a page without the bar keeps, so the bar never pushes the write bar
+        // past the window's foot.
         let below_row = narrow && view.row.is_some();
-        let floor = line * 3.0 + if barred { cell_line } else { 0.0 };
+        let floor = if barred {
+            (cell_line + under_bar).min(room.max(line * 3.0))
+        } else {
+            line * 3.0
+        };
         let grid_h = if below_row { room * 0.5 } else { room }.max(floor);
         // The cell bar stands on the grid, a row high, at every width, in the room worked out
         // above for the grid: the grid gives the bar that row, once, so the line under it and
         // a narrow page's pane stand where they would without the bar. In a window too short
-        // for the bar over three lines of grid the bar gives way and the grid keeps the room.
+        // for the bar over the grid's lines and a row the bar gives way and the grid keeps the
+        // room.
         let sheet_h = if barred { grid_h - cell_line } else { grid_h };
         match (sheet, &app.unread) {
             (Some(sheet), _) => {
@@ -5889,16 +6312,25 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
         columns.push(rail(app, view, rail_w, height));
     }
     // `main_w` is the room inside the column's padding.
-    columns.push(
-        group("tables/main")
-            .layout(
-                Layout::column()
-                    .gap(10.0)
-                    .width(Length::Fixed(main_w + 32.0))
-                    .padding(Insets::all(16.0)),
-            )
-            .children(main),
-    );
+    let main = group("tables/main")
+        .layout(
+            Layout::column()
+                .gap(10.0)
+                .width(Length::Fixed(main_w + 32.0))
+                .padding(Insets::all(16.0)),
+        )
+        .children(main);
+    // The open list of columns, over the main column under the tools row's Columns button.
+    let list = sheet
+        .filter(|_| view.columns.open && !(narrow && view.picking) && !view.check.open)
+        .map(|sheet| {
+            let under = 16.0 + head_h + 10.0 + line + 4.0 + 2.0;
+            native_tables_columns::list(app, view, sheet, (16.0 + main_w, under, height - 16.0))
+        });
+    columns.push(match list {
+        Some(list) => native_tables_columns::over(main, list, main_w + 32.0),
+        None => main,
+    });
     // Narrow, the pane is below and laid out there: laying it out again here would set its
     // scroll's limit and its keys for a pane not drawn.
     let beside = if narrow {
@@ -5936,8 +6368,17 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
     UiTree::new(root)
 }
 
-/// The line of tools over the grid: the find, and in a past table which point it is, how much
-/// changed since, and the way back to now.
+/// The line of tools over the grid: the find; for a table with a lifecycle, which rows it shows
+/// by it and, as it is now, the way to add one or who adds one; in a past table which point it
+/// is, how much changed since, and the way back to now; and at its right end the Columns button.
+///
+/// Every tool has a width of its own and none runs past the row or over the next one, at any
+/// width and text size. Where the row is short of room it is given up in this order: the find,
+/// down to a width a find is still typed in at ease; the Columns button's count (it paints
+/// `Columns` alone where anything more would be given up beside the count); what stands between
+/// the lifecycle filter and the button (the Add, who adds a row, the words naming a past point),
+/// cut; the rest of the find; then the filter, Now and the Columns button themselves, whose
+/// labels are then cut.
 fn tools(
     app: &TablesApp,
     view: &TablesViewState,
@@ -5945,15 +6386,12 @@ fn tools(
     main_w: f32,
     line: f32,
 ) -> UiNode {
-    let find_w = 220.0 * scale().max(1.0);
-    let find_w = find_w.min(main_w * 0.5);
-    let mut tools = vec![
-        field(FIND, "Find", &view.find, view)
-            .layout(Layout::default().width(Length::Fixed(find_w))),
-    ];
-    if let Some(at) = app.as_of() {
-        let now_ms = aterm_time::unix_millis().unwrap_or(0);
-        // The cells the past grid shows and marks: a row born since has no line there.
+    const GAP: f32 = 12.0;
+    let past = app.as_of();
+    let now_ms = aterm_time::unix_millis().unwrap_or(0);
+    // A past point's words: who wrote it, when, and how many of the cells the past grid shows
+    // changed since (a row born since has no line there).
+    let words = past.map(|at| {
         let changed = sheet.map_or(0, |s| {
             s.rows
                 .iter()
@@ -5974,32 +6412,117 @@ fn tools(
             1 => " \u{b7} 1 cell changed since".to_owned(),
             n => format!(" \u{b7} {n} cells changed since"),
         });
-        let now_w = crate::native_ui::native_button_label_width("Now") + 24.0;
-        tools.push(fitted(
-            "tables/asof",
-            &words,
-            StyleRef::Plain,
-            (main_w - find_w - now_w - 24.0).max(1.0),
-        ));
+        words
+    });
+    // What each tool takes whole: what stands between the filter and the Columns button, the
+    // find, the lifecycle filter (a past point's too, since it picks that point's rows as well),
+    // Now, and the Columns button.
+    let between = match &words {
+        Some(words) => Some(text_width(words, SemanticRole::Text, StyleRef::Plain)),
+        None => sheet.and_then(|s| rows::add_width(app, s)),
+    };
+    let find = (220.0 * scale().max(1.0)).min(main_w * 0.5);
+    let filter = sheet.and_then(|s| rows::filter_width(view, s));
+    let now = past.map(|_| crate::native_ui::native_button_label_width("Now") + 24.0);
+    let wants = |short: bool| {
+        [
+            between,
+            Some(find),
+            filter,
+            now,
+            sheet.map(|s| native_tables_columns::control_width(app, view, s, short)),
+        ]
+    };
+    // The order the row gives up room in, each step taking it from one tool down to a width: the
+    // find to the width it still finds in at ease, what stands between, the find to a point,
+    // then the filter, Now and the Columns button.
+    let steps = [
+        (1, (120.0 * scale().max(1.0)).min(find)),
+        (0, 1.0),
+        (1, 1.0),
+        (2, 1.0),
+        (3, 1.0),
+        (4, 1.0),
+    ];
+    // The gaps between the tools: the Columns button has a space of its own before it, which
+    // fills what the others leave.
+    let parts = wants(false).iter().flatten().count() + usize::from(sheet.is_some());
+    let room = main_w - GAP * parts.saturating_sub(1) as f32;
+    // The Columns button's count goes where more than the find's ease would be given up beside it.
+    let (mut widths, took) = give_up(room, wants(false), &steps);
+    let short = sheet.is_some() && took.is_some_and(|step| step > 0);
+    if short {
+        widths = give_up(room, wants(true), &steps).0;
+    }
+    let [between_w, find_w, filter_w, now_w, control_w] = widths;
+    let mut tools = vec![
+        field(FIND, "Find", &view.find, view)
+            .layout(Layout::default().width(Length::Fixed(find_w.unwrap_or(find)))),
+    ];
+    if let (Some(sheet), Some(w)) = (sheet, filter_w)
+        && let Some(filter) = rows::filter_tool(view, sheet, w)
+    {
+        tools.push(filter);
+    }
+    match (&words, sheet, between_w) {
+        (Some(words), _, Some(w)) => tools.push(fitted("tables/asof", words, StyleRef::Plain, w)),
+        // The table as it is: the way to add a row, or who adds one.
+        (None, Some(sheet), Some(w)) => tools.extend(rows::add_tool(app, sheet, w)),
+        _ => {}
+    }
+    if let Some(w) = now_w {
+        let mut now = button(
+            NOW,
+            "Now",
+            "Show the table as it is now",
+            StyleRef::Secondary,
+            true,
+        );
+        now.layout.width = Length::Fixed(w);
         tools.push(
             group("tables/now-seat")
                 .layout(
                     Layout::row()
-                        .width(Length::Fixed(now_w))
+                        .width(Length::Fixed(w))
                         .padding(Insets::symmetric(0.0, 3.0)),
                 )
-                .children(vec![button(
-                    NOW,
-                    "Now",
-                    "Show the table as it is now",
-                    StyleRef::Secondary,
-                    true,
-                )]),
+                .children(vec![now]),
         );
     }
+    if let (Some(sheet), Some(w)) = (sheet, control_w) {
+        tools.push(group("tables/tools/lead").layout(Layout::default().width(Length::Fill)));
+        tools.push(native_tables_columns::control(app, view, sheet, short, w));
+    }
     group("tables/tools")
-        .layout(Layout::row().gap(12.0).height(Length::Fixed(line + 4.0)))
+        .layout(Layout::row().gap(GAP).height(Length::Fixed(line + 4.0)))
         .children(tools)
+}
+
+/// The widths of tools that each want `wants` (`None`: not on the row), fitted to `room`: each
+/// of `steps` in turn takes room from one tool (by its place in `wants`) down to a width, until
+/// they fit or the steps run out; and the last step that took any.
+fn give_up<const N: usize>(
+    room: f32,
+    wants: [Option<f32>; N],
+    steps: &[(usize, f32)],
+) -> ([Option<f32>; N], Option<usize>) {
+    let mut widths = wants;
+    let mut over = widths.iter().flatten().sum::<f32>() - room;
+    let mut took = None;
+    for (step, (at, least)) in steps.iter().enumerate() {
+        if over <= 0.0 {
+            break;
+        }
+        if let Some(w) = widths.get_mut(*at).and_then(Option::as_mut) {
+            let gives = (*w - least).max(0.0).min(over);
+            if gives > 0.0 {
+                *w -= gives;
+                over -= gives;
+                took = Some(step);
+            }
+        }
+    }
+    (widths, took)
 }
 
 pub(crate) trait FixedHeight {
@@ -6012,6 +6535,9 @@ impl FixedHeight for UiNode {
         self
     }
 }
+
+#[path = "native_tables_rows.rs"]
+pub(crate) mod rows;
 
 #[cfg(all(test, unix))]
 #[path = "native_tables_tests.rs"]

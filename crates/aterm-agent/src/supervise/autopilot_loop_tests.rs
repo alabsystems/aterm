@@ -2414,6 +2414,220 @@ fn an_off_park_wakes_on_land_and_types_it_at_once() {
     );
 }
 
+/// What one Off park ([`Session::park_while_off`]) of a minute asked its host, and what it noted:
+/// a tab whose word is Off, its screen read once before the park, on a host whose waits take
+/// `autopilot=` (`takes_word`) and answer it (`!deaf`), with `writes` landing that many
+/// milliseconds after its first wait.
+fn off_park(
+    takes_word: bool,
+    deaf: bool,
+    screens: Vec<Vec<String>>,
+    writes: &[(u64, MetaWrite)],
+) -> (Vec<String>, Notes) {
+    parked_off(
+        "off",
+        Duration::from_secs(60),
+        takes_word,
+        deaf,
+        screens,
+        writes,
+    )
+}
+
+/// [`off_park`] with the stored word `stored` (`-`: `meta` names the word unset, the Off the
+/// config's) and the park's deadline `park` on.
+fn parked_off(
+    stored: &'static str,
+    park: Duration,
+    takes_word: bool,
+    deaf: bool,
+    screens: Vec<Vec<String>>,
+    writes: &[(u64, MetaWrite)],
+) -> (Vec<String>, Notes) {
+    let mut m = Mock::new(screens);
+    m.autopilot = Some(stored);
+    m.takes_word = takes_word;
+    m.word_deaf = deaf;
+    m.meta_writes = writes
+        .iter()
+        .map(|&(ms, w)| (Duration::from_millis(ms), w))
+        .collect();
+    m.stall_sleep = Some(OFF_REST);
+    let meta = m.meta_line();
+    let mut notes = Notes::default();
+    let from = {
+        let mut s = virtual_session(&mut m, None);
+        s.note_meta(&meta);
+        let seq = s.screen().expect("a read").seq;
+        let from = s.ctl.requests.len();
+        let deadline = s.fx.mono() + park;
+        let opts = under(owners_policy());
+        assert_eq!(s.park_while_off(seq, deadline, &opts, &mut notes), Ok(()));
+        from
+    };
+    (m.requests[from..].to_vec(), notes)
+}
+
+/// ATERM-KI-1108-2: AN OFF PARK ON A HOST THAT ANSWERS THE SESSION'S WORD WAKES ONLY FOR WHAT IT
+/// WAITS FOR. Its first wait carries a word other than the stored one, which the host answers at
+/// once; from then on it waits whole, so a minute's park is two waits and no `meta` read, where it
+/// was twelve of each. A host that takes the token and never answers it (a build before the
+/// server's slice 10a), and one that refuses it, are stepped every [`OFF_STEP`] with the word read
+/// at each step, as before. A switch is heard at once and read once its settle has passed, and a
+/// screen that moves is read with the word, as before, its idle wait an [`OFF_STEP`] at most.
+/// NEGATIVE CONTROLS (each run, then undone): every step [`OFF_STEP`] long fails the first count
+/// with 13 waits; a timeout that skips the read whatever `word_at` holds never reads the switch, so
+/// no UNPARKED; the idle wait at the park's whole step asks `timeout 59999`; and a park that trusts
+/// `Caps::await_autopilot` alone reads no word on the deaf host.
+#[test]
+fn an_off_park_on_a_host_that_answers_the_word_waits_whole_and_reads_no_word() {
+    let waits = |asked: &[String]| asked.iter().filter(|r| r.starts_with("await seq ")).count();
+    let metas = |asked: &[String]| asked.iter().filter(|r| *r == "meta").count();
+
+    let (asked, notes) = off_park(true, false, vec![idle_screen()], &[]);
+    assert_eq!((waits(&asked), metas(&asked)), (2, 0), "{asked:#?}");
+    assert!(
+        asked[0].ends_with(" autopilot=cruise") && asked[1].ends_with(" autopilot=off"),
+        "the first wait asks with another word, the next carries the stored one: {asked:#?}"
+    );
+    assert!(
+        !notes.noted.iter().any(|l| l.starts_with("UNPARKED")),
+        "{:#?}",
+        notes.noted
+    );
+
+    // Controls: a host that takes the token and never answers it, and one that refuses it.
+    for (takes_word, deaf, tag) in [(true, true, "deaf"), (false, false, "refused")] {
+        let (asked, _) = off_park(takes_word, deaf, vec![idle_screen()], &[]);
+        let steps = usize::try_from(60 / OFF_STEP.as_secs()).unwrap();
+        assert!(
+            waits(&asked) >= steps && metas(&asked) == steps,
+            "{tag}: stepped every OFF_STEP, the word read at each: {asked:#?}"
+        );
+    }
+
+    // A switch is heard at once, read once its settle has passed, and unparks the park.
+    let (asked, notes) = off_park(
+        true,
+        false,
+        vec![idle_screen()],
+        &[(30_000, MetaWrite::Autopilot(Some("cruise")))],
+    );
+    let unparked = notes
+        .noted
+        .iter()
+        .find_map(|l| l.strip_prefix("UNPARKED seq="))
+        .unwrap_or_else(|| panic!("unparked: {:#?} {asked:#?}", notes.noted));
+    let after: u64 = unparked
+        .split_once(" autopilot=cruise after ")
+        .and_then(|(_, ms)| ms.strip_suffix(" ms"))
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("{unparked}"));
+    let switched = Duration::from_secs(30) + WORD_SETTLE;
+    assert!(
+        Duration::from_millis(after) >= switched
+            && Duration::from_millis(after) < switched + OFF_STEP,
+        "read once the switch stood its settle: {after} ms {asked:#?}"
+    );
+    let read = asked
+        .iter()
+        .position(|r| r == "meta")
+        .expect("the word read");
+    assert!(
+        asked[..read]
+            .iter()
+            .any(|r| r.starts_with("await seq ") && r.ends_with(" autopilot=cruise")),
+        "the settle's wait carries the new word before the read: {asked:#?}"
+    );
+
+    // A screen that moves is read, its idle wait an OFF_STEP at most, and no word with it: the
+    // seq and idle waits carried the word, and so does the whole wait after it.
+    let (asked, _) = off_park(true, false, vec![idle_screen(), busy_screen()], &[]);
+    let idle: Vec<&String> = asked
+        .iter()
+        .filter(|r| r.starts_with("await idle "))
+        .collect();
+    assert_eq!(
+        idle,
+        [&format!(
+            "await idle {IDLE_MS} timeout {} autopilot=off",
+            OFF_STEP.as_millis()
+        )],
+        "{asked:#?}"
+    );
+    let at = asked.iter().position(|r| r == idle[0]).unwrap();
+    assert!(
+        asked[at..].iter().any(|r| r.starts_with("text ")),
+        "the moved screen read: {asked:#?}"
+    );
+    assert_eq!(
+        (waits(&asked), metas(&asked)),
+        (3, 0),
+        "the ask, the wait the screen moved, the whole wait after it: {asked:#?}"
+    );
+}
+
+/// A PARK ON A HOST THAT ANSWERS THE WORD WAITS AT MOST [`OFF_REST`] AT A TIME, the longest a host
+/// holds a wait, however far off its deadline: a park of 25 minutes asks once, then waits 600 s,
+/// 600 s and what is left of the 300 s after them, and reads no word.
+/// NEGATIVE CONTROL: the heard park's step not capped at `OFF_REST` (`longest` taken as the
+/// deadline's distance) asks the deadline's whole distance in its first whole wait, which the
+/// three waits' shape refuses.
+#[test]
+fn an_off_park_waits_at_most_off_rest_at_a_time() {
+    let park = Duration::from_secs(25 * 60);
+    let (asked, _) = parked_off("off", park, true, false, vec![idle_screen()], &[]);
+    let timeouts: Vec<u128> = asked
+        .iter()
+        .filter(|r| r.starts_with("await seq "))
+        .filter_map(|r| r.split_once(" timeout "))
+        .filter_map(|(_, rest)| rest.split_whitespace().next()?.parse().ok())
+        .collect();
+    let rest = OFF_REST.as_millis();
+    assert!(
+        matches!(&timeouts[1..], &[a, b, c] if a == rest && b == rest && c > 0 && c <= rest / 2),
+        "the ask, then 600 s, 600 s and the rest: {timeouts:?} {asked:#?}"
+    );
+    assert!(!asked.iter().any(|r| r == "meta"), "{asked:#?}");
+}
+
+/// A WORD `meta` NAMES UNSET IS THE STORED WORD AN OFF PARK KEEPS (`-`, the Off the config's): the
+/// park's first wait asks with Cruise, the host's answer `OK autopilot -` names the stored word, so
+/// nothing moved, and the whole wait after it carries `autopilot=-` and reads no word.
+/// NEGATIVE CONTROL: the answer read with no `-` for the unset word (`read.map_or("", …)` in
+/// `Session::park_proving`) takes it for a switch, and the waits after it are not the one whole
+/// wait that carries `autopilot=-`.
+#[test]
+fn an_off_park_over_an_unset_word_keeps_it_and_reads_none() {
+    let (asked, notes) = parked_off(
+        "-",
+        Duration::from_secs(60),
+        true,
+        false,
+        vec![idle_screen()],
+        &[],
+    );
+    let waits: Vec<&String> = asked
+        .iter()
+        .filter(|r| r.starts_with("await seq "))
+        .collect();
+    assert!(
+        waits.len() == 2
+            && waits[0].ends_with(" autopilot=cruise")
+            && waits[1].ends_with(" autopilot=-"),
+        "{asked:#?}"
+    );
+    assert!(!asked.iter().any(|r| r == "meta"), "{asked:#?}");
+    assert!(
+        !notes
+            .noted
+            .iter()
+            .any(|l| l.contains("Autopilot word moved")),
+        "{:#?}",
+        notes.noted
+    );
+}
+
 #[test]
 fn a_write_that_leaves_the_word_wakes_no_wait_at_rest() {
     for (write, tag) in [

@@ -38,7 +38,7 @@ fn meta_used(meta: &std::fs::Metadata) -> Option<SystemTime> {
     Some(newest)
 }
 
-fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
+pub(super) fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     let mut newest = meta_used(&meta)?;
     if meta.is_dir() && depth > 0 {

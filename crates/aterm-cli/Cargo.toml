@@ -20,6 +20,7 @@ aterm-pty = { workspace = true }
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-sandbox = { workspace = true }
 aterm-containment = { workspace = true }
+aterm-lan = { workspace = true }
 # Font/face and built-in theme introspection for diagnostic subcommands.
 aterm-render = { workspace = true }
 aterm-stamp = { workspace = true }
@@ -66,6 +67,7 @@ aterm-uds = { workspace = true }
 # lists from (`sys::View::ALL`, `sys::UNAVAILABLE_WORDS`, the jobs engine's classes and
 # verdicts). A pure model crate with no dependencies.
 aterm-vitals = { workspace = true }
+aterm-process-facts = { workspace = true }
 # `aterm.toml` parser for `aterm doctor` and `show-config`.
 aterm-toml = { workspace = true }
 # `aterm help sys machine` reads THIS machine at the moment of the call (its OS and CPU

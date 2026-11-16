@@ -81,7 +81,8 @@ fn a_bare_run_is_every_floor_lane_and_no_arena_lane() {
             Lane::VteEngine,
             Lane::VteMarks,
             Lane::CliStart,
-            Lane::FabricCounts
+            Lane::FabricCounts,
+            Lane::FilesIdle
         ]
     );
     assert!(cli.record.is_empty());
@@ -332,6 +333,21 @@ fn fabric_counts_is_an_unclaimed_floor_lane_with_fixed_worlds() {
     let why = parse(&args("fabric-counts --burst 9")).unwrap_err();
     assert_eq!(why, "`--burst` is read only by fabric; name one of them");
     assert!(parse(&args("fabric-counts --json-out /tmp/c.json")).is_err());
+}
+
+/// `files-idle` is a floor lane in the bare run that takes no quiet claim, records, and reads no
+/// option: its drive is fixed, so its counts compare.
+/// NEGATIVE CONTROL: with `Lane::FilesIdle` left out of `takes_quiet_claim`'s exceptions, ``
+/// assertion failed: !Lane::FilesIdle.takes_quiet_claim() ``.
+#[test]
+fn files_idle_is_an_unclaimed_floor_lane_with_a_fixed_drive() {
+    assert_eq!(Lane::FilesIdle.kind(), Kind::Floor);
+    assert!(!Lane::FilesIdle.takes_quiet_claim());
+    assert!(!Lane::FilesIdle.opens_windows());
+    assert!(parse(&[]).expect("parses").lanes.contains(&Lane::FilesIdle));
+    let cli = parse(&args("--record files-idle")).expect("parses");
+    assert_eq!(cli.record, [Lane::FilesIdle]);
+    assert!(parse(&args("files-idle --json-out /tmp/f.json")).is_err());
 }
 
 #[test]

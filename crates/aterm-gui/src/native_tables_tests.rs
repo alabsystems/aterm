@@ -72,7 +72,7 @@ pub(crate) fn render(app: &App) -> CompiledUi {
 }
 
 /// The page compiled for a window `width` wide.
-fn render_wide(app: &App, width: f32) -> CompiledUi {
+pub(crate) fn render_wide(app: &App, width: f32) -> CompiledUi {
     let viewport = LogicalRect::new(0.0, 0.0, width, VIEWPORT.height);
     tree_in(app, viewport).compile(viewport).unwrap()
 }
@@ -127,7 +127,7 @@ pub(crate) fn settle(app: &mut App) {
         .settle();
 }
 
-fn settle_write(app: &mut App) {
+pub(crate) fn settle_write(app: &mut App) {
     app.native_runtime
         .tables_mut()
         .expect("the Tables page is open")
@@ -609,10 +609,14 @@ pub(crate) fn one_sheet(nickname: Shown) -> Snapshot {
                 rows: Vec::new(),
             },
             schema: None,
+            life: None,
+            referrers: BTreeMap::new(),
         }],
         check: None,
         at: None,
         read_ms: 0,
+        cannot_write: None,
+        targets: rows::Targets::new(),
     }
 }
 
@@ -1252,15 +1256,23 @@ fn a_cell_changed_elsewhere_after_staging_is_not_written_over() {
     );
 }
 
-/// A cell whose Write names a row its table does not hold (`merged_into` naming a machine that
-/// is not there) is refused by the registry's save: the page shows the rule on that cell's
-/// field, keeps the cell staged, and the registry holds nothing of it.
-/// NEGATIVE CONTROL: with `Compiled::rules` answering the table's guard alone
-/// (`typed::check::missing_row` not called), the Write lands and no refusal is shown: `` the
-/// refusal is on the cell: None ``.
+/// A cell naming a row its table does not hold (`merged_into` naming a machine that is not
+/// there) is refused as it is staged, by the rule the registry's save refuses it with
+/// (`typed::check::missing_row`, which aterm-db's own tests hold the save to): the page shows
+/// the rule on that cell's field, keeps the cell staged, the cell bar reads it `refused` as its
+/// cell's tag does, the Write holds its table back, and the registry holds nothing of it.
+/// NEGATIVE CONTROLS: with `TablesApp::recheck` leaving out `reference_refusals`, the cell stands
+/// unrefused until a Write: `` the refusal is on the cell: None ``. With `bar_words` never asking
+/// `TablesApp::refusal` (its refused arm never taken), the bar reads the cell as one Write will
+/// write: `` left: Some("not written · holds empty") right: Some("refused · not written · holds
+/// empty") ``.
 #[test]
-fn a_write_naming_a_missing_row_shows_the_refusal_on_the_cell() {
+fn a_cell_naming_a_missing_row_is_refused_before_write() {
     let lab = two_macs();
+    let before = Handle::at(lab.paths[0].clone(), &REGISTRY)
+        .history()
+        .unwrap()
+        .len();
     let mut app = App::headless_for_test();
     app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
     settle(&mut app);
@@ -1273,29 +1285,45 @@ fn a_write_naming_a_missing_row_shows_the_refusal_on_the_cell() {
         Some(SemanticInput::Text("mc-00000000000000ff".into())),
     );
     key_in(&mut app, TextInputEvent::Submit);
-    act(&mut app, WRITE, None);
-    settle_write(&mut app);
-
     let ui = render(&app);
     let refused = said(&ui, "tables/pane/refused/merged_into");
-    assert_eq!(
-        refused.as_deref(),
-        Some("no such machine row"),
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|r| shows(r, "names no row of Machines; choose one from its list")),
         "the refusal is on the cell: {refused:?}"
     );
     assert_eq!(
         cell_says(&ui, MC, "merged_into"),
-        "mc-00000000000000ff, not written, refused: no such machine row",
+        "mc-00000000000000ff, not written, refused: names no row of Machines; choose one from \
+         its list",
         "and the cell says it"
     );
-    let merged = Handle::at(lab.paths[0].clone(), &REGISTRY)
-        .view()
-        .unwrap()
-        .project(&MACHINE)
-        .rows[MC]
-        .get("merged_into")
-        .cloned();
-    assert_eq!(merged, None, "the registry holds nothing of it");
+    // The cell bar reads it refused, as the cell's tag does, and leaves the rule to the pane.
+    if view_of(&app).row.as_deref() != Some(MC) {
+        act(&mut app, &cell, None);
+    }
+    let ui = render(&app);
+    assert_eq!(bar(&ui, "value").as_deref(), Some("mc-00000000000000ff"));
+    assert_eq!(
+        bar(&ui, "state").as_deref(),
+        Some("refused \u{b7} not written \u{b7} holds empty")
+    );
+    act(&mut app, WRITE, None);
+    assert!(
+        said(&render(&app), "tables/note")
+            .or_else(|| said(&render(&app), "tables/bar/note"))
+            .is_some_and(|n| n.contains("Machines")),
+        "the Write holds the table back"
+    );
+    assert_eq!(
+        Handle::at(lab.paths[0].clone(), &REGISTRY)
+            .history()
+            .unwrap()
+            .len(),
+        before,
+        "the registry holds nothing of it"
+    );
 }
 
 fn machine_at(pk: &str, column: &str, value: aterm_json::Value) -> aterm_db::database::Change {
@@ -1905,7 +1933,7 @@ pub(crate) fn presented(app: &mut App) -> CompiledUi {
 }
 
 /// The window pixel of the page's point `(x, y)`.
-fn window_px(app: &mut App, x: f32, y: f32) -> (f64, f64) {
+pub(crate) fn window_px(app: &mut App, x: f32, y: f32) -> (f64, f64) {
     presented(app);
     let (_, view) = app.active_native_view(WID).unwrap();
     let artifact = app.retained_native_leaf_artifact(WID, view, true).unwrap();
@@ -1916,7 +1944,7 @@ fn window_px(app: &mut App, x: f32, y: f32) -> (f64, f64) {
 }
 
 /// Put the pointer on the middle of `key` as the window shows it.
-fn point_at(app: &mut App, key: &str) {
+pub(crate) fn point_at(app: &mut App, key: &str) {
     let ui = presented(app);
     let at = ui
         .hits
@@ -2054,6 +2082,112 @@ fn dragging_a_header_edge_resizes_its_column() {
         app.native_runtime.tables_mut().unwrap().staged.is_empty(),
         "a width stages nothing"
     );
+}
+
+/// Chrome changes and tab switching finish the owned drag, including the page's width baseline.
+#[test]
+fn a_dock_or_tab_change_finishes_a_native_column_drag() {
+    use aterm_window::event::{ElementState, MouseButton};
+    use std::time::Instant;
+    for change in ["show", "hide", "tab"] {
+        let mut app = open_with(narrow_sheet(4, 6));
+        let size = app.window_frame_px_for(WID, 24, 140);
+        app.on_resize(WID, size);
+        let now = Instant::now();
+        if change == "hide" {
+            app.set_dock_at(WID, 30, now)
+                .expect("a 140-column window takes the dock");
+        }
+        let native_tab = app.windows[&WID].tab_set.active_index().unwrap();
+        let (_, view) = app.active_native_view(WID).unwrap();
+        let width = |app: &mut App| place(&presented(app), "tables/head/c1/seat").width;
+        let before = width(&mut app);
+        let scale = app
+            .retained_native_leaf_artifact(WID, view, true)
+            .unwrap()
+            .scale;
+        point_at(&mut app, "tables/edge/c1");
+        let (x, y) = app.windows[&WID].last_cursor_px;
+        app.on_mouse_input(WID, ElementState::Pressed, MouseButton::Left);
+        assert!(
+            app.windows[&WID].native_drag.is_some(),
+            "a real column edge owns the drag"
+        );
+        assert!(app.windows[&WID].native_button_owners.contains(&Some(view)));
+        assert!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .pressed
+                .is_some()
+        );
+        app.on_cursor_moved(WID, x + 12.0 * scale, y);
+        let retained = width(&mut app);
+        assert_eq!(retained, before + 12.0);
+
+        match change {
+            "show" => app
+                .set_dock_at(WID, 30, now + Duration::from_secs(1))
+                .expect("a 140-column window takes the dock"),
+            "hide" => app
+                .set_dock_at(WID, 0, now + Duration::from_secs(1))
+                .expect("a hide is never refused"),
+            "tab" => app.switch_tab_in(WID, 0),
+            _ => unreachable!(),
+        }
+        assert!(
+            app.windows[&WID].native_drag.is_none(),
+            "{change} retires host drag capture"
+        );
+        assert_eq!(app.windows[&WID].page_buttons, 0);
+        assert!(
+            app.windows[&WID]
+                .native_button_owners
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .pressed
+                .is_none()
+        );
+        if change == "tab" {
+            assert!(
+                app.active_native_view(WID).is_none(),
+                "settlement cannot restore the old tab's focus"
+            );
+        }
+        app.on_cursor_moved(WID, x + 80.0 * scale, y);
+        if change == "tab" {
+            app.switch_tab_in(WID, native_tab);
+        } else {
+            assert_eq!(
+                app.windows[&WID].dock.cells,
+                if change == "show" { 30 } else { 0 }
+            );
+        }
+        assert_eq!(
+            width(&mut app),
+            retained,
+            "settled motion cannot keep sizing the column"
+        );
+
+        point_at(&mut app, "tables/edge/c1");
+        let (x, y) = app.windows[&WID].last_cursor_px;
+        app.on_mouse_input(WID, ElementState::Pressed, MouseButton::Left);
+        app.on_cursor_moved(WID, x + 5.0 * scale, y);
+        assert_eq!(
+            width(&mut app),
+            retained + 5.0,
+            "{change}: a new drag starts at the retained width"
+        );
+        app.on_mouse_input(WID, ElementState::Released, MouseButton::Left);
+        assert_eq!(width(&mut app), retained + 5.0);
+    }
 }
 
 /// A double press on a column's header edge, or a press of it from the keyboard, fits the column
@@ -2203,7 +2337,7 @@ fn a_header_press_sorts_ascending_then_descending_then_stored_order() {
     assert_eq!(order(&app), [0, 1, 2, 3, 4]);
     assert_eq!(
         said(&ui, head).as_deref(),
-        Some("Sort by C1"),
+        Some("Sort by C1, 4 of 5 rows hold a value"),
         "a header's name says what its press does"
     );
     let node = ui.semantic(&UiKey::new(head.to_owned())).unwrap();
@@ -2226,12 +2360,12 @@ fn a_header_press_sorts_ascending_then_descending_then_stored_order() {
     let ui = render(&app);
     assert_eq!(
         said(&ui, head).as_deref(),
-        Some("Sort by C1, sorted ascending")
+        Some("Sort by C1, sorted ascending, 4 of 5 rows hold a value")
     );
     assert_eq!(mark(&app, "c1"), Some(StyleRef::SortUp));
     assert_eq!(
         said(&ui, "tables/head/label").as_deref(),
-        Some("Sort by Label"),
+        Some("Sort by Label, 5 of 5 rows hold a value"),
         "one column is sorted at a time"
     );
 
@@ -2250,7 +2384,7 @@ fn a_header_press_sorts_ascending_then_descending_then_stored_order() {
     let ui = render(&app);
     assert_eq!(
         said(&ui, head).as_deref(),
-        Some("Sort by C1, sorted descending")
+        Some("Sort by C1, sorted descending, 4 of 5 rows hold a value")
     );
     assert_eq!(mark(&app, "c1"), Some(StyleRef::SortDown));
 
@@ -2271,14 +2405,17 @@ fn a_header_press_sorts_ascending_then_descending_then_stored_order() {
     );
     assert_eq!(
         said(&render(&app), head).as_deref(),
-        Some("Sort by C1, sorted descending")
+        Some("Sort by C1, sorted descending, 5 of 5 rows hold a value")
     );
 
     // An accessibility client's press: the order the registry holds.
     act(&mut app, head, None);
     assert_eq!(order(&app), [0, 1, 2, 3, 4], "the stored order again");
     let ui = render(&app);
-    assert_eq!(said(&ui, head).as_deref(), Some("Sort by C1"));
+    assert_eq!(
+        said(&ui, head).as_deref(),
+        Some("Sort by C1, 5 of 5 rows hold a value")
+    );
     assert_eq!(mark(&app, "c1"), None);
 
     // Another column's header takes the order over from the first.
@@ -2287,10 +2424,13 @@ fn a_header_press_sorts_ascending_then_descending_then_stored_order() {
     act(&mut app, "tables/head/label", None);
     assert_eq!(order(&app), [4, 3, 2, 1, 0], "m4 down to m0");
     let ui = render(&app);
-    assert_eq!(said(&ui, head).as_deref(), Some("Sort by C1"));
+    assert_eq!(
+        said(&ui, head).as_deref(),
+        Some("Sort by C1, 5 of 5 rows hold a value")
+    );
     assert_eq!(
         said(&ui, "tables/head/label").as_deref(),
-        Some("Sort by Label, sorted descending")
+        Some("Sort by Label, sorted descending, 5 of 5 rows hold a value")
     );
 
     let tables = app.native_runtime.tables_mut().unwrap();
@@ -2601,7 +2741,7 @@ fn a_range_of_cells_copies_as_tab_separated_lines() {
 }
 
 /// The style node `key`'s words are set in.
-fn style_of(tree: &UiTree, key: &str) -> Option<StyleRef> {
+pub(crate) fn style_of(tree: &UiTree, key: &str) -> Option<StyleRef> {
     fn find<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
         if node.key.as_str() == key {
             return Some(node);
@@ -3040,7 +3180,7 @@ fn a_pointers_press_on_a_header_leaves_the_keys_on_the_selected_cell() {
     app.on_mouse_input(WID, ElementState::Released, MouseButton::Left);
     assert_eq!(
         said(&render(&app), "tables/head/c2").as_deref(),
-        Some("Sort by C2, sorted ascending"),
+        Some("Sort by C2, sorted ascending, 4 of 4 rows hold a value"),
         "the press sorted"
     );
     assert_eq!(
@@ -3079,13 +3219,13 @@ fn a_pointers_press_on_a_header_leaves_the_keys_on_the_selected_cell() {
     press_key(&mut app, NamedKey::Enter);
     assert_eq!(
         said(&render(&app), head).as_deref(),
-        Some("Sort by C1, sorted ascending")
+        Some("Sort by C1, sorted ascending, 4 of 4 rows hold a value")
     );
     assert_eq!(selected(&app).3, head, "the keyboard stays on the header");
     press_key(&mut app, NamedKey::Enter);
     assert_eq!(
         said(&render(&app), head).as_deref(),
-        Some("Sort by C1, sorted descending")
+        Some("Sort by C1, sorted descending, 4 of 4 rows hold a value")
     );
 
     // A column's edge from the keyboard: its name says what its press does, and Left and
@@ -3226,7 +3366,7 @@ fn saves_key_writes_the_staged_cells() {
 }
 
 /// Every theme aterm ships, as the native pages read it.
-fn shipped_themes() -> Vec<(String, aterm_render::Theme)> {
+pub(crate) fn shipped_themes() -> Vec<(String, aterm_render::Theme)> {
     let builtins = aterm_types::scheme::builtin_names()
         .into_iter()
         .filter_map(|name| Some((name.to_owned(), aterm_types::scheme::builtin(name)?)));
@@ -3616,7 +3756,7 @@ fn the_tables_page_lists_every_registry_collection() {
     assert!(said(&ui, "tables/sheet/archived").is_none());
     assert_eq!(
         said(&ui, "tables/sheet/machine-facts").as_deref(),
-        Some("Mac facts: 1 row"),
+        Some("Machine facts: 1 row"),
         "the carried facts row, read as its owned row"
     );
 
@@ -3693,12 +3833,12 @@ fn sheets_with_provenance(nickname_by: &str, ago: u64) -> Snapshot {
             text: "M4 Pro".into(),
             by: mac.clone(),
             at_ms: now - ago,
-            from: "Mac facts",
+            from: "Machine facts",
         },
     );
     let mut facts = machine.clone();
     facts.name = "machine-facts";
-    facts.title = "Mac facts";
+    facts.title = "Machine facts";
     facts.owned = true;
     facts.observed.clear();
     facts.columns.truncate(1);
@@ -3720,8 +3860,8 @@ fn sheets_with_provenance(nickname_by: &str, ago: u64) -> Snapshot {
     .collect();
     snapshot.listed.push(crate::tables_store::Listed {
         name: "machine-facts",
-        title: "Mac facts",
-        singular: "Mac's facts",
+        title: "Machine facts",
+        singular: "Machine's facts",
         face: aterm_db::typed::Face::Mac,
         owned: true,
     });
@@ -3794,7 +3934,7 @@ fn the_line_under_the_grid_says_where_a_value_came_from() {
     let both = said(&ui, "tables/said/words").unwrap();
     assert!(
         both.starts_with("Chip: M2 set at m55 on ")
-            && both.ends_with(" \u{b7} m22 reports M4 Pro (Mac facts), 4 min ago"),
+            && both.ends_with(" \u{b7} m22 reports M4 Pro (Machine facts), 4 min ago"),
         "both are said: {both}"
     );
     let tree_now = tree(&app);
@@ -3892,7 +4032,7 @@ fn the_line_tells_a_setting_from_an_observation_in_every_case() {
     assert_eq!(tag, "SET", "the Mac agrees: {words}");
     assert!(
         words.starts_with("Chip: set at m55 on ")
-            && words.ends_with(" \u{b7} m22 reports the same (Mac facts), 4 min ago"),
+            && words.ends_with(" \u{b7} m22 reports the same (Machine facts), 4 min ago"),
         "{words}"
     );
 
@@ -3901,7 +4041,7 @@ fn the_line_tells_a_setting_from_an_observation_in_every_case() {
     assert_eq!(tag, "DIFFERS", "{words}");
     assert!(
         words.starts_with("Chip: cleared at m55 on ")
-            && words.ends_with(" \u{b7} m22 reports M4 Pro (Mac facts), 4 min ago"),
+            && words.ends_with(" \u{b7} m22 reports M4 Pro (Machine facts), 4 min ago"),
         "who cleared it stays: {words}"
     );
 
@@ -3913,7 +4053,7 @@ fn the_line_tells_a_setting_from_an_observation_in_every_case() {
         (tag.as_str(), words.as_str()),
         (
             "SEEN",
-            "Chip: not set here; m22 reports M4 Pro (Mac facts), 4 min ago"
+            "Chip: not set here; m22 reports M4 Pro (Machine facts), 4 min ago"
         ),
         "nothing was written"
     );
@@ -3932,12 +4072,12 @@ fn the_line_tells_a_setting_from_an_observation_in_every_case() {
     assert!(
         words.starts_with("Chip: 2 values, none chosen: M2 set at m55 on ")
             && words.contains("; M3 set at m73 on ")
-            && words.ends_with(" \u{b7} m22 reports M4 Pro (Mac facts), 4 min ago"),
+            && words.ends_with(" \u{b7} m22 reports M4 Pro (Machine facts), 4 min ago"),
         "a conflict still says what the Mac reports: {words}"
     );
     let (tag, words) = line_of("chip", |s| conflicted(s, "M4 Pro"));
     assert_eq!(tag, "VALUES", "one of the values is the Mac's: {words}");
-    assert!(words.ends_with("m22 reports the same (Mac facts), 4 min ago"));
+    assert!(words.ends_with("m22 reports the same (Machine facts), 4 min ago"));
 
     // A staged cell.
     let mut app = open_with(sheets_with_provenance("m55", 270_000));
@@ -3952,7 +4092,7 @@ fn the_line_tells_a_setting_from_an_observation_in_every_case() {
         said(&ui, "tables/said/words").as_deref(),
         Some(
             "Chip: M5 set here, not written; the registry holds M2 \u{b7} m22 reports M4 Pro \
-             (Mac facts), 4 min ago"
+             (Machine facts), 4 min ago"
         ),
         "a staged cell still says what the Mac reports"
     );
@@ -4008,7 +4148,7 @@ fn the_newest_observation_is_the_latest_in_causal_order() {
             ..author(label, at_ms)
         },
         at_ms,
-        from: "Mac facts",
+        from: "Machine facts",
     };
     // m1's clock runs a day ahead; m2 stated after it, having seen its statement.
     let ahead = seen("m1", 1_000, 1_000 + 86_400_000);
@@ -4214,7 +4354,7 @@ fn a_read_names_what_each_mac_reports_and_each_reference_row() {
     assert!(
         words.starts_with(&format!("Chip: Apple M2 set at {label} "))
             && words.contains(&format!(
-                " \u{b7} {label} reports Apple M4 Pro (Mac facts), "
+                " \u{b7} {label} reports Apple M4 Pro (Machine facts), "
             )),
         "the Mac's chip is read: {words}"
     );
@@ -4240,7 +4380,7 @@ fn a_read_names_what_each_mac_reports_and_each_reference_row() {
     assert_eq!(cell_says(&ui, "codex", "~key"), "codex", "a CLI's own name");
     assert_eq!(
         said(&ui, "tables/head/~key").as_deref(),
-        Some("Sort by Cli")
+        Some("Sort by Cli, 7 of 7 rows hold a value")
     );
     let key = rect(&ui, "tables/cell/codex/~key");
     let provider = rect(&ui, "tables/cell/codex/provider");
@@ -4487,7 +4627,7 @@ fn bar_clipped(ui: &CompiledUi) -> Vec<String> {
 
 /// Every seat the cell bar speaks, whole, in the order it says them: together they read as one
 /// sentence.
-fn bar_says(ui: &CompiledUi) -> Vec<String> {
+pub(crate) fn bar_says(ui: &CompiledUi) -> Vec<String> {
     ui.semantics
         .iter()
         .filter(|node| {
@@ -4498,7 +4638,7 @@ fn bar_says(ui: &CompiledUi) -> Vec<String> {
 }
 
 /// The words node `key` paints, whether or not the tree lists it.
-fn painted_words(ui: &CompiledUi, key: &str) -> Option<String> {
+pub(crate) fn painted_words(ui: &CompiledUi, key: &str) -> Option<String> {
     ui.paint
         .iter()
         .find(|node| node.key.as_str() == key)
@@ -4512,11 +4652,15 @@ fn painted_words(ui: &CompiledUi, key: &str) -> Option<String> {
 /// says of the selected cell which it is (its row's key, its column) and its whole value where
 /// the grid's cell cuts it; who wrote the value and when is the line under the grid's to say,
 /// and what its column holds the type line's under the column's name: the bar names none of
-/// them. A linked count says which table's rows
-/// it counts and how many name this row, in the words the line under the grid says it. The bar
-/// is there before a cell is selected, so the grid does not move when one is.
+/// them. A linked count reads its count in the bar, as in its cell; which table's rows it counts
+/// and how many name this row is the line under the grid's sentence alone. The bar is there
+/// before a cell is selected, so the grid does not move when one is.
 /// NEGATIVE CONTROL: with `linked_words` wording one row as it words several (its `"1"` arm
-/// removed), the count reads `` "1 live rows of Machines name this row" ``.
+/// removed), the line under the grid reads `` left: Some("1 live rows of Machines name this
+/// row") ``. With `bar_words` putting the linked count's sentence back in the bar's state (a
+/// `Group::Linked` arm pushing `linked_words`), the bar says the line's sentence too: `` left:
+/// ["m9 · Machines · merged into", "1", "1 live row of Machines names this row"] right: ["m9 ·
+/// Machines · merged into", "1"] ``.
 #[test]
 fn the_cell_bar_names_the_selected_cell_and_its_whole_value() {
     // Wider than a column starts out.
@@ -4600,7 +4744,8 @@ fn the_cell_bar_names_the_selected_cell_and_its_whole_value() {
         "a shorter address leaves the value where it was"
     );
 
-    // A linked count: which table's rows it counts, and how many of them name this row.
+    // A linked count: the bar says the count, as its cell does; how many rows of which table
+    // name this row is the line under the grid's sentence, and the type line names the table.
     act(
         &mut app,
         &format!("tables/cell/{MC}/~machine.merged_into"),
@@ -4609,11 +4754,12 @@ fn the_cell_bar_names_the_selected_cell_and_its_whole_value() {
     let ui = render(&app);
     assert_eq!(
         bar_says(&ui),
-        [
-            "m9 \u{b7} Machines \u{b7} merged into",
-            "1",
-            "1 live row of Machines names this row",
-        ]
+        ["m9 \u{b7} Machines \u{b7} merged into", "1"],
+        "the bar leaves the line's sentence to the line"
+    );
+    assert_eq!(
+        said(&ui, "tables/said/words").as_deref(),
+        Some("1 live row of Machines names this row")
     );
     // The row merged into it is named by none.
     act(
@@ -4621,17 +4767,13 @@ fn the_cell_bar_names_the_selected_cell_and_its_whole_value() {
         &format!("tables/cell/{MERGED}/~machine.merged_into"),
         None,
     );
+    let ui = render(&app);
     assert_eq!(
-        bar_says(&render(&app)),
-        [
-            "m10 \u{b7} Machines \u{b7} merged into",
-            "empty",
-            "No live row of Machines names this row",
-        ]
+        bar_says(&ui),
+        ["m10 \u{b7} Machines \u{b7} merged into", "empty"]
     );
-    // The line under the grid says the count in the same words.
     assert_eq!(
-        said(&render(&app), "tables/said/words").as_deref(),
+        said(&ui, "tables/said/words").as_deref(),
         Some("No live row of Machines names this row")
     );
     assert_eq!(

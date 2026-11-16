@@ -2,10 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! THE GRAMMAR OF A TAB ID'S TEXT, the one every reader of a tab ID takes: `t` and 10 lower-case
-//! Crockford base32 characters (`tqn5r6e0148`), shown as its first 5 (`tqn5r`). The `s-` and 20
-//! lower-case hex digits a tab opened before the `t` form keeps are no tab ID here: aterm reads
-//! them apart, only from its own shells (`aterm_types::tab_id::is_legacy`). It is strict: lower
-//! case only, none of Crockford's aliases (`i`, `l`, `o`, `u`), exact lengths. The go-ahead reads another session's name in a reply by it; aterm's tab ID type
+//! Crockford base32 characters (`tqn5r6e0148`), shown as its first 5 (`tqn5r`). It is strict:
+//! lower case only, none of Crockford's aliases (`i`, `l`, `o`, `u`), exact lengths. The `s-`
+//! and 20 lower-case hex digits a tab opened before the `t` form keeps are no tab ID by it
+//! ([`is_tab_id`] refuses them): aterm reads such an ID apart, from its own shells
+//! (`aterm_types::tab_id::is_legacy`), and the go-ahead, which reads another session's name in
+//! a reply by this grammar and its shown form, also takes a legacy one named there by 6 to 20
+//! of its hex digits (`go_ahead::session_id`). aterm's tab ID type
 //! (`aterm_types::tab_id::TabId`), which mints, parses and shows an ID, is built on it.
 
 /// The 32 characters of a tab ID after its `t`, in value order: Crockford's base32 alphabet in

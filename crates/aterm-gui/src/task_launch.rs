@@ -754,7 +754,7 @@ pub(crate) fn layout_sids(layout: &crate::restore::RestoreManifest) -> Vec<Sessi
                     leaf.sid
                         .as_deref()
                         .filter(|sid| crate::restore::carried_sid(sid))
-                        .map(SessionId::new),
+                        .and_then(SessionId::parse),
                 );
             });
         }
@@ -801,6 +801,49 @@ pub(crate) struct RestoredTasks {
     named: Vec<PathBuf>,
 }
 
+/// A one-shot restore sweep shared with the App's quit. The load worker uses the restore's
+/// live-result snapshot, so closing a tab before the load ends cannot remove its carried result.
+#[derive(Clone)]
+pub(crate) struct PendingRestoredSweep {
+    inner: std::sync::Arc<std::sync::Mutex<Option<RestoredSweep>>>,
+}
+
+struct RestoredSweep {
+    tasks: RestoredTasks,
+    dir: PathBuf,
+    kept: Kept,
+}
+
+impl PendingRestoredSweep {
+    pub(crate) fn new(tasks: RestoredTasks, store: &Store) -> Self {
+        let sweep = crate::task_record::tasks_dir().map(|dir| {
+            let kept = Kept::of(store, &dir);
+            RestoredSweep { tasks, dir, kept }
+        });
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(sweep)),
+        }
+    }
+
+    pub(crate) fn run(&self) {
+        let sweep = self.inner.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(RestoredSweep { tasks, dir, kept }) = sweep {
+            tasks.sweep_keeping(&dir, kept);
+        }
+    }
+
+    pub(crate) fn at_quit(&self, store: &Store, written: Option<&crate::restore::RestoreManifest>) {
+        let sweep = self.inner.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(RestoredSweep { tasks, dir, .. }) = sweep {
+            let mut kept = Kept::of(store, &dir);
+            if let Some(written) = written {
+                kept.keep_layout(written);
+            }
+            tasks.sweep_keeping(&dir, kept);
+        }
+    }
+}
+
 impl RestoredTasks {
     /// What `manifest`, a layout this launch took, names: the session IDs of its leaves, the
     /// results its task rows name, and the results each row says its tab named under other IDs
@@ -845,7 +888,7 @@ impl RestoredTasks {
         }
     }
 
-    /// [`Self::sweep`] at a quit that came before the restore finished, which wrote layout
+    /// [`Self::sweep`] at a quit that came before the restore's sweep finished, which wrote layout
     /// `written`: the tabs the restore had placed are in `written` under their new session IDs,
     /// so nothing names the IDs this layout gave them again, and no later launch would clear
     /// what is left under those. What `written` names stays as well as what `store` keeps: the
@@ -947,10 +990,14 @@ fn remove_in(
 /// with a process that left no layout to restore stays, which leaks one file and deletes no
 /// answer.
 fn owner_lives(pinned: &crate::pinned_dir::PinnedDir, name: &std::ffi::OsStr) -> bool {
-    let Some(owner) = name.to_str().and_then(snapshot_sid) else {
+    let Some(owner) = name
+        .to_str()
+        .and_then(snapshot_sid)
+        .and_then(SessionId::parse)
+    else {
         return false;
     };
-    let task = task_file_name(&SessionId::new(owner));
+    let task = task_file_name(&owner);
     pinned
         .holds_regular_file(std::ffi::OsStr::new(&task))
         .unwrap_or(true)
@@ -1411,8 +1458,8 @@ fn run_worker_launch(work: &Launch) {
     };
     // A worker runs with its parent's permissions, held to its CLI's
     // floor (`aterm_agent::harness::worker::WorkerCli::unnamed_posture`; Claude Code's auto, by
-    // `aterm_agent::harness::worker::starter`), the disk-free worker included. A credit claim
-    // worker (`work.chrome`) names its own mode and tools ([`worker_fresh`]).
+    // `aterm_agent::harness::worker::starter`). A credit claim worker (`work.chrome`) names its
+    // own mode and tools ([`worker_fresh`]).
     let config = crate::app_config::config_path();
     let mut fresh = worker_fresh(model, here, work.chrome, work.approve);
     fresh.config = config.as_deref();

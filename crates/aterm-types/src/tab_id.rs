@@ -33,10 +33,11 @@ pub const LEGACY_LEN: usize = 22;
 
 const MASK: u64 = (1 << BITS) - 1;
 
-/// The draws [`TabId::mint`] makes before it gives up on finding an ID nobody knows. Each draw
-/// clashes with odds of (known IDs) / 2^50, so a mint that needs more than one already means the
-/// known set is wrong; the bound only keeps a `taken` that answers yes to everything from
-/// spinning forever.
+/// The draws [`TabId::mint`] makes before it gives up on finding an ID nobody knows. A `taken`
+/// that refuses only known IDs clashes with odds of (known IDs) / 2^50 a draw, and one that also
+/// refuses an ID sharing a known one's shown form (aterm's minter) with (known IDs) / 2^20, so 64
+/// draws all clash only when the known set is wrong; the bound keeps a `taken` that answers yes
+/// to everything from spinning forever.
 pub const MINT_DRAWS: u32 = 64;
 
 /// A tab's ID, held as its 11 ASCII bytes. Hash,
@@ -152,6 +153,69 @@ pub const fn is_legacy(s: &str) -> bool {
         i += 1;
     }
     true
+}
+
+/// Whether `s` could begin a tab ID, so a reader may resolve it ([`by_prefix`]): at least the
+/// shown form's [`SHORT_LEN`] characters, `t` and 4 to 10 of [`ALPHABET`] (a whole ID is a prefix
+/// of itself). Shorter would let a word typed once name whichever tab begins it later, and every
+/// form a tab is shown in is at least this long.
+#[must_use]
+pub const fn is_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < SHORT_LEN || b.len() > LEN || b[0] != b't' {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() {
+        if digit(b[i]).is_none() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The one of `ids` that `prefix` begins, as a person types a tab ID: any prefix that names one
+/// tab. `Err` holds every ID it begins otherwise: none, or the two or more a reader names when it
+/// refuses the prefix as ambiguous. A word that is not a prefix ([`is_prefix`]) begins none.
+///
+/// # Errors
+///
+/// Every ID `prefix` begins, unless that is exactly one.
+pub fn by_prefix<T: AsRef<str>>(
+    prefix: &str,
+    ids: impl IntoIterator<Item = T>,
+) -> Result<T, Vec<T>> {
+    if !is_prefix(prefix) {
+        return Err(Vec::new());
+    }
+    let mut found: Vec<T> = ids
+        .into_iter()
+        .filter(|id| is_tab_id(id.as_ref()) && id.as_ref().starts_with(prefix))
+        .collect();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        _ => Err(found),
+    }
+}
+
+impl TabId {
+    /// The ID as it is shown beside `others`: its first [`SHORT_LEN`] characters, longer only as
+    /// far as it takes to tell it apart from each other ID that shares them.
+    #[must_use]
+    pub fn shown<'a>(&self, others: impl IntoIterator<Item = &'a Self>) -> &str {
+        let mine = self.as_str().as_bytes();
+        let len = others
+            .into_iter()
+            .filter(|other| *other != self)
+            .map(|other| {
+                let theirs = other.as_str().as_bytes();
+                mine.iter().zip(theirs).take_while(|(a, b)| a == b).count() + 1
+            })
+            .fold(SHORT_LEN, usize::max)
+            .min(LEN);
+        self.as_str().get(..len).unwrap_or_default()
+    }
 }
 
 /// `s` as it is shown: a tab ID's short form ([`TabId::short`]), and any other word (`ctl`,

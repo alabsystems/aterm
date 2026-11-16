@@ -696,6 +696,7 @@ mod ai_screen;
 mod command_ran;
 #[cfg(unix)]
 mod descriptor_limit;
+mod effect_lane_tally;
 mod exceptions_host;
 #[cfg(unix)]
 mod exec_edges;
@@ -1110,6 +1111,7 @@ use app_config::{
     Config, config_path, resolve_force_scale, resolve_tab_strip_rows, resolve_want_gpu,
 };
 use cli::{Cli, parse_cli};
+use effect_lane_tally::LaneTerm;
 use input::{InputEvent, InputOutcome, Source};
 use platform::AppRt;
 use spawn::{SessionFactory, spawn_session};
@@ -2967,7 +2969,14 @@ struct RepaintKey {
     link_caption: Option<link_target::LinkHover>,
     claude_footer_fp: u64,
     rewind_fp: u64,
+    /// What the dock puts on glass ([`DockShape`]): a dock re-raster is a new card, so a frame
+    /// whose terminal is unchanged still presents it.
+    dock: Option<DockShape>,
 }
+
+/// The dock as a present lays it on glass: its card's serial, its origin and its size in device
+/// px. A frame's unchanged-frame proof and the CPU surface's retained copy both compare it.
+pub(crate) type DockShape = (u64, (i64, i64), (u32, u32));
 
 /// Structural repaint key for a non-empty IME preedit composition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3149,6 +3158,8 @@ impl OutageWait {
 
 #[derive(Debug)]
 enum Wake {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    NavigatorTitleReady(String),
     /// Acknowledgement of this FIFO position, independent of callback payloads.
     #[cfg(target_os = "macos")]
     DispatchFence(std::sync::mpsc::Sender<()>),
@@ -3287,6 +3298,10 @@ enum Wake {
         op: aterm_types::WindowOperation,
     },
     Image(Box<control::ImageReq>),
+    NativeImage {
+        view: tab_model::ViewId,
+        request: Box<control::ImageReq>,
+    },
     Video {
         dur_ms: u64,
         full_res: bool,
@@ -3859,9 +3874,10 @@ enum Wake {
     #[cfg(unix)]
     #[cfg_attr(test, expect(dead_code, reason = "a unit test starts no reader"))]
     FleetTraffic,
-    /// This Mac's stored fleet access changed (`aterm_agent::fleet_access::CHANGED`, which
-    /// `aterm fleet access` and another window's lock post): the App reads the file again
-    /// ([`App::reread_fleet_access`]). The notification carries no level.
+    /// This Mac's fleet access stored under the state home this window reads changed
+    /// (`aterm_agent::fleet_access::changed`, which `aterm fleet access` and another window's
+    /// lock post for that home): the App reads the file again ([`App::reread_fleet_access`]).
+    /// The notification carries no level.
     #[cfg(target_os = "macos")]
     FleetAccessChanged,
     SiblingScan(Vec<sibling_scan::SiblingInstance>),
@@ -6915,6 +6931,11 @@ struct LeafRenderCache {
     /// Every pending change is host-owned pointer feedback over unchanged presented geometry.
     /// Generic invalidation revokes this independently of whether the compile stamp changes.
     native_pointer_style_only: bool,
+    /// The model moved under nodes the retained compile lists and paints none of (a row a list
+    /// holds off its screen, `App::note_native_nodes_behind`): its pixels and its hit geometry
+    /// still answer for the view, so no frame is owed, and a reader of its nodes compiles the page
+    /// as it stands. The next raster of the leaf compiles it so, and clears this.
+    native_nodes_behind: bool,
     /// The terminal id, engine fill and display offset of the fill this leaf's last frame
     /// showed, which the hover memo keys on (`HoverMemo::frame_of`). The swap of `input` and
     /// `staged_input` after the frame leaves it alone.
@@ -6930,6 +6951,7 @@ impl Default for LeafRenderCache {
             native_damage: None,
             native_paint_serial: 0,
             native_pointer_style_only: false,
+            native_nodes_behind: false,
             hover_key: (0, 0, 0),
         }
     }
@@ -7304,8 +7326,8 @@ struct WindowState {
     head_pts: f64,
     last_windowed_band_pts: f64,
     deck_form: crate::stats_plan::DeckForm,
-    /// Whether this window carries the System Resources band (the stats deck and the Network
-    /// State band under it): what `[sys] stats_bars = "deck"` gives a window
+    /// Whether this window carries the System Resources band (the stats deck's rows and the Disk
+    /// Custody and Network State bands under them): what `[sys] stats_bars = "deck"` gives a window
     /// ([`stats_deck::StatsBars::in_window`]). Set in the first window a process creates, clear
     /// in every later one, and flipped by a person (`App::toggle_window_band`).
     carries_band: bool,
@@ -7362,6 +7384,7 @@ struct WindowState {
     reported_buttons: u8,
     button_owners: [Option<app_mouse::ButtonOwner>; 5],
     page_buttons: u8,
+    native_button_owners: [Option<tab_model::ViewId>; 5],
     consumed_press_keys: std::collections::HashSet<aterm_window::keyboard::PhysicalKey>,
     overlay_consumed_keys: std::collections::HashSet<aterm_types::keyboard::Key>,
     focused: bool,
@@ -7437,9 +7460,19 @@ struct WindowState {
     next_rain_tick: Option<Instant>,
     next_trail_tick: Option<Instant>,
     last_trail_fire: Option<Instant>,
+    /// The planner's term that armed `next_trail_tick`; `None` while no slot is armed.
+    trail_tick_term: Option<effect_lane_tally::LaneTerm>,
+    /// The effect-lane slots this window has had served, by the term that armed each.
+    lane_tally: effect_lane_tally::LaneTally,
     effect_lane_parked: bool,
     fifo_backlog: FifoBacklog,
     deco_anim_until: Option<Instant>,
+    /// Whether `deco_anim_until` was last set by the load-shed fade alone
+    /// ([`Self::note_shed_fade_animating`]): no other site asked for a hold that long.
+    deco_hold_by_fade: bool,
+    /// The frame at which the resident pet last saw a completion or a landing
+    /// ([`Self::note_pet_events`]); `None` before the first.
+    pet_event_at: Option<Instant>,
     next_autoscroll: Option<Instant>,
     scroll_glide: Option<ScrollGlideState>,
     overscroll: Option<scroll_motion::OverscrollSpring>,
@@ -7453,9 +7486,17 @@ struct WindowState {
     pending_resize: Option<PhysicalSize<u32>>,
     next_resize_settle: Option<Instant>,
     last_resized_event_at: Option<Instant>,
-    /// The least inner size this window's platform window was last told
-    /// ([`App::push_least_window_size`]).
+    /// The least inner size this window was last offered ([`App::push_least_window_size`]): what
+    /// its platform window was told, and, for a headless window, the record alone.
     least_held: Option<PhysicalSize<u32>>,
+    /// Every minimum this window was told, in order: a test reads an offer a later one
+    /// overwrote in `least_held` (a push before a re-grid, then the hold after it).
+    #[cfg(test)]
+    offers_for_test: Vec<PhysicalSize<u32>>,
+    /// `least_held` is an inside offer capped to the client the window held
+    /// ([`App::push_least_window_size_inside`]): every later offer keeps the cap until an actual
+    /// resize fits the nominal least, so no unrelated offer grows the client through its minimum.
+    least_inside: bool,
     #[cfg(any(target_os = "linux", test))]
     initial_frame_settle: Option<InitialFrameSettle>,
     panes_stale: bool,
@@ -7472,8 +7513,16 @@ struct WindowState {
     /// size ([`App::held_inner_px`]). `None` for a platform window, and for a headless one no
     /// size was given yet (its grid's frame stands for it).
     headless_px: Option<app_config::HeadlessSize>,
-    /// Whole cells beside the frame; kept at zero until the dock commits them.
-    side_inset_cells: u16,
+    /// Window chrome beside the frame. Its record (`Dock::pref`) is captured and restored with
+    /// the window's layout row, and its view is made again at the window's birth
+    /// (`App::seat_birth_dock`).
+    dock: app_window::Dock,
+    dock_card: Option<SettingsCard>,
+    /// The dock the CPU surface's retained pixels hold ([`DockShape`]), as the last present that
+    /// copied the whole window composited it. A present whose dock differs copies the whole
+    /// window again; one whose dock is the same copies its damaged rows, which never reach the
+    /// dock's column left of the frame.
+    cpu_presented_dock: Option<DockShape>,
     carried_inner_px: Option<PhysicalSize<u32>>,
     #[cfg(any(windows, target_os = "linux"))]
     restore_placement: Option<app_window::RestorePlacement>,
@@ -8130,6 +8179,41 @@ impl WindowState {
         )
     }
 
+    /// Whether a person is here: someone touched the window within its attention and it does
+    /// not rest ([`window_rest::Rest::attended`], [`window_rest::Rest::resting`]). The touch
+    /// that ends a lapse sets it as its event arrives (`App::note_rest_event`), so the event's
+    /// own turn reads it.
+    pub(crate) const fn person_here(&self) -> bool {
+        self.rest.attended() && !self.rest.resting()
+    }
+
+    /// Whether the effect lane may plan the resident pet's coarse offer: while a person is here
+    /// ([`Self::person_here`]), while its brain moves (`PetBrain::needs_frames`, which the load
+    /// shed leaves as it is, unlike the companion's), for less than
+    /// [`crate::app_render::CURSOR_FX_TYPED_WAKE`] after a completion or a landing it saw
+    /// ([`Self::note_pet_events`]), and while a celebration plays (`KittySing::external_live`).
+    /// Otherwise its idle steps wait for a person.
+    pub(crate) fn pet_offer_admitted(&self, now: Instant) -> bool {
+        self.person_here()
+            || self.fx.companion().brain().needs_frames()
+            || self.pet_event_at.is_some_and(|at| {
+                now.saturating_duration_since(at) < crate::app_render::CURSOR_FX_TYPED_WAKE
+            })
+            || self.fx.companions().kitty_sing.external_live()
+    }
+
+    /// Stamps the pet event at `at` when `tick` carries a completion or a landing the pet saw;
+    /// a tick with neither leaves the stamp as it was.
+    pub(crate) const fn note_pet_events(
+        &mut self,
+        tick: &aterm_effects::companion::PetTick,
+        at: Instant,
+    ) {
+        if tick.completion.is_some() || tick.landed_seen.is_some() {
+            self.pet_event_at = Some(at);
+        }
+    }
+
     /// The cursor-effect typed wake.
     pub(crate) fn cursor_fx_typed_wake(&self, now: Instant) -> bool {
         self.last_key_at.is_some_and(|at| {
@@ -8221,10 +8305,24 @@ impl WindowState {
             .saturating_mul(DECO_ANIM_LEVEL_FRAMES)
     }
 
+    /// A decoration moves at `now`: the hold lasts at least [`Self::deco_anim_hold`] past it,
+    /// and never shortens. A hold this reaches the end of is this site's, not the fade's
+    /// ([`Self::note_shed_fade_animating`]).
     fn note_deco_animating(&mut self, now: Instant) {
+        let until = saturating_instant_add(now, self.deco_anim_hold());
+        if self.deco_anim_until.is_none_or(|held| held <= until) {
+            self.deco_anim_until = Some(until);
+            self.deco_hold_by_fade = false;
+        }
+    }
+
+    /// The load-shed fade moves at `now`: the hold as [`Self::note_deco_animating`] extends it,
+    /// marked the fade's where only the fade asks for it to last that long.
+    fn note_shed_fade_animating(&mut self, now: Instant) {
         let until = saturating_instant_add(now, self.deco_anim_hold());
         if self.deco_anim_until.is_none_or(|held| held < until) {
             self.deco_anim_until = Some(until);
+            self.deco_hold_by_fade = true;
         }
     }
 
@@ -8284,9 +8382,10 @@ impl WindowState {
         let pet_deadline = (has_glass
             && pet_motion
             && self.front_draws_cursor_companions()
-            && (self.focused || self.cursor_fx_typed_wake(now) || recording_watcher))
-            .then(|| self.fx.companion_mut().next_change_deadline(now))
-            .flatten();
+            && (self.focused || self.cursor_fx_typed_wake(now) || recording_watcher)
+            && self.pet_offer_admitted(now))
+        .then(|| self.fx.companion_mut().next_change_deadline(now))
+        .flatten();
         let celebration_deadline = (has_glass
             && celebration_allowed
             && self.front_terminal().is_some()
@@ -8335,34 +8434,51 @@ impl WindowState {
                  body settle"
             );
             let others_need_cadence = cursor_dependents || deco_wake;
-            let glow_deadline = [
-                self.fx
-                    .cursor_mut()
-                    .glow
-                    .next_change_deadline(now, aurora_interval),
-                pet_deadline,
-                celebration_deadline,
-                body_deadline,
+            // The soonest coarse deadline and its term; a tie goes to the earlier term here.
+            let coarse = [
+                (
+                    LaneTerm::Glow,
+                    self.fx
+                        .cursor_mut()
+                        .glow
+                        .next_change_deadline(now, aurora_interval),
+                ),
+                (LaneTerm::Pet, pet_deadline),
+                (LaneTerm::Celebration, celebration_deadline),
+                (LaneTerm::Body, body_deadline),
             ]
             .into_iter()
-            .flatten()
-            .min();
+            .filter_map(|(term, deadline)| deadline.map(|at| (at, term)))
+            .min_by_key(|(at, _)| *at);
             let needs_frame_cadence =
                 others_need_cadence || self.fx.cursor_mut().glow.needs_frame_cadence();
-            (aurora_interval, glow_deadline, needs_frame_cadence)
+            let cadence_term = if deco_wake && self.deco_hold_by_fade {
+                LaneTerm::Fade
+            } else if deco_wake {
+                LaneTerm::Deco
+            } else if cursor_dependents {
+                LaneTerm::CursorFx
+            } else {
+                LaneTerm::Glow
+            };
+            (aurora_interval, coarse, needs_frame_cadence, cadence_term)
         })
-        .filter(|(_, glow_deadline, needs_frame_cadence)| {
-            *needs_frame_cadence || glow_deadline.is_some()
-        });
-        if let Some((aurora_interval, glow_deadline, needs_frame_cadence)) = frame_lane {
+        .filter(|(_, coarse, needs_frame_cadence, _)| *needs_frame_cadence || coarse.is_some());
+        if let Some((aurora_interval, coarse, needs_frame_cadence, cadence_term)) = frame_lane {
             let last_fire = self.last_trail_fire.take();
             let fresh = crate::app_render::phase_locked_effect_deadline(
                 now,
                 aurora_interval,
                 last_fire,
-                glow_deadline,
+                coarse.map(|(at, _)| at),
                 needs_frame_cadence,
             );
+            // `phase_locked_effect_deadline` returns the coarse deadline exactly when no frame
+            // cadence is needed.
+            let fresh_term = match coarse {
+                Some((_, term)) if !needs_frame_cadence => term,
+                _ => cadence_term,
+            };
             let fresh = effect_slot_after_fifo_drain(
                 fresh,
                 self.fifo_drained_at(EFFECT_FIFO_BACKLOG_MAX),
@@ -8371,9 +8487,13 @@ impl WindowState {
                     effect_present_interval_with(self.frame_interval, EFFECT_PRESENT_PANEL_PERIODS),
                 ),
             );
+            // A held slot no later than the fresh one keeps itself and the term that armed it.
             let d = match self.next_trail_tick {
                 Some(held) if held <= fresh => held,
-                _ => fresh,
+                _ => {
+                    self.trail_tick_term = Some(fresh_term);
+                    fresh
+                }
             };
             self.next_trail_tick = Some(d);
             Some(d)
@@ -8389,15 +8509,17 @@ impl WindowState {
             // redraw paints settled pixels; without one, no wake train is created.
             Some(d)
         } else if has_glass
-            && let Some(d) = match (
+            && let Some((d, term)) = match (
                 self.output_streak_next_change_deadline(now, output_streak_idle_secs),
                 self.static_cursor_cat_deadline(now, cursor_cat_motion, recording_watcher),
             ) {
-                (Some(streak), Some(cat)) => Some(streak.min(cat)),
-                (streak, cat) => streak.or(cat),
+                (Some(streak), Some(cat)) if cat < streak => Some((cat, LaneTerm::StaticCat)),
+                (Some(streak), _) => Some((streak, LaneTerm::Streak)),
+                (None, cat) => cat.map(|cat| (cat, LaneTerm::StaticCat)),
             }
         {
             self.next_trail_tick = Some(d);
+            self.trail_tick_term = Some(term);
             Some(d)
         } else {
             self.park_terminal_effect_scheduler();
@@ -8405,15 +8527,21 @@ impl WindowState {
         }
     }
 
+    /// Serves the armed slot when it is due at `now`, booking one fire under the term that
+    /// armed it ([`effect_lane_tally`]); true when it was served, and the caller asks a frame.
     fn service_due_terminal_effect_tick(&mut self, now: Instant) -> bool {
         if self.gpu_acquire_pending() {
             return false;
         }
-        crate::app_render::take_due_trail_tick(
+        let served = crate::app_render::take_due_trail_tick(
             &mut self.next_trail_tick,
             &mut self.last_trail_fire,
             now,
-        )
+        );
+        if served && let Some(term) = self.trail_tick_term.take() {
+            self.lane_tally.book(term);
+        }
+        served
     }
 
     fn static_cursor_cat_deadline(
@@ -8431,9 +8559,11 @@ impl WindowState {
 
     const fn park_terminal_effect_scheduler(&mut self) {
         self.next_trail_tick = None;
+        self.trail_tick_term = None;
         self.last_trail_fire = None;
         self.effect_lane_parked = false;
         self.deco_anim_until = None;
+        self.deco_hold_by_fade = false;
     }
 
     fn drain_serious_effects(&mut self) {
@@ -8701,6 +8831,7 @@ impl WindowState {
             reported_buttons: 0,
             button_owners: [None; 5],
             page_buttons: 0,
+            native_button_owners: [None; 5],
             consumed_press_keys: std::collections::HashSet::new(),
             overlay_consumed_keys: std::collections::HashSet::new(),
             focused: true,
@@ -8762,9 +8893,13 @@ impl WindowState {
             next_rain_tick: None,
             next_trail_tick: None,
             last_trail_fire: None,
+            trail_tick_term: None,
+            lane_tally: effect_lane_tally::LaneTally::default(),
             effect_lane_parked: false,
             fifo_backlog: FifoBacklog::default(),
             deco_anim_until: None,
+            deco_hold_by_fade: false,
+            pet_event_at: None,
             next_autoscroll: None,
             scroll_glide: None,
             overscroll: None,
@@ -8778,6 +8913,9 @@ impl WindowState {
             next_resize_settle: None,
             last_resized_event_at: None,
             least_held: None,
+            #[cfg(test)]
+            offers_for_test: Vec::new(),
+            least_inside: false,
             #[cfg(any(target_os = "linux", test))]
             initial_frame_settle: None,
             panes_stale: false,
@@ -8786,7 +8924,9 @@ impl WindowState {
             last_visible_views: Vec::new(),
             win_px: None,
             headless_px: None,
-            side_inset_cells: 0,
+            dock: app_window::Dock::default(),
+            dock_card: None,
+            cpu_presented_dock: None,
             carried_inner_px: None,
             #[cfg(any(windows, target_os = "linux"))]
             restore_placement: None,
@@ -10033,6 +10173,7 @@ struct PendingUpdateHandoff {
     teardown: DeferredHandoffTeardown,
     commit_drain_started: Option<std::time::Instant>,
     commit_flush: Option<bool>,
+    table_flush: Option<(std::time::Instant, std::sync::mpsc::Receiver<bool>)>,
     held_commit: Option<app_update_handoff::HeldCommit>,
     park_at: std::time::Instant,
     proof_ready_at: Option<std::time::Instant>,
@@ -10658,6 +10799,7 @@ struct App {
     next_window_id: u64,
     pending_restore: Option<restore::RestoreManifest>,
     restore_drain: Option<Box<app_restore::RestoreDrain>>,
+    restored_tasks_sweep: Option<crate::task_launch::PendingRestoredSweep>,
     restore_leaf_staging: Option<app_restore::RestoreLeafStaging>,
     /// The park's queued restore pass waiting for the first window to reach the glass.
     restore_glass: RestoreGlassWait,
@@ -15205,7 +15347,14 @@ impl App {
                     false
                 });
             }
+            for view in ws.native_button_owners.into_iter().flatten() {
+                native_runtime.change_view_state(view, |state| {
+                    state.common_mut().retire_input();
+                    false
+                });
+            }
             ws.page_buttons = 0;
+            ws.native_button_owners = [None; 5];
             ws.fx.front_replaced(crate::metrics::host_now());
             ws.fx
                 .companions_mut()
@@ -15835,6 +15984,7 @@ impl App {
             next_window_id: 1,
             pending_restore: None,
             restore_drain: None,
+            restored_tasks_sweep: None,
             restore_leaf_staging: None,
             restore_glass: RestoreGlassWait::default(),
             lane_hold_clocks: native_update_lane_hold::LaneHoldClocks::default(),
@@ -16542,9 +16692,9 @@ impl App {
             visible = true;
             if output {
                 ws.pending_deco_birth = Some(now);
-                // Every window that shows the output wakes; only a focused one asks a reading
-                // ([`Self::stir_rest`]).
-                ask_reading |= ws.rest.stir(now) && ws.focused;
+                // Every window that shows the output wakes; only a focused one a person attends
+                // asks a reading ([`Self::stir_rest`]).
+                ask_reading |= ws.rest.stir(now) && ws.focused && ws.rest.attended();
             }
             let Some(w) = ws.os_window.as_ref() else {
                 continue;
@@ -16582,7 +16732,9 @@ impl App {
     /// ([`window_rest::Rest::settle_attended`], [`window_rest::ATTENTION`]). The same two
     /// windows are always attended, and so is every window under `motion = "full"`, a person's
     /// own word that motion plays. A window whose attention lapsed here is asked for one frame,
-    /// which draws its deck still; no deadline is armed for the lapse, as none is for the rest.
+    /// which draws its deck still; no deadline is armed for the lapse, as none is for the rest:
+    /// the reading the focused cadence armed before the lapse is the last on that cadence, and
+    /// the next is due on the resting one ([`Self::vitals_audience`]).
     pub(crate) fn settle_rest(&mut self, now: Instant) {
         let after = self
             .config
@@ -16645,8 +16797,10 @@ impl App {
 
     /// A person touched window `wid` at `now`: it is attended, and its attention starts over.
     /// Where its attention had lapsed and it is focused, or `focusing` focuses it, a reading is
-    /// asked at once, as a wake asks one ([`Self::stir_rest`]): the deck moves again from that
-    /// reading, not in the touch's own frame.
+    /// asked at once, as a wake asks one ([`Self::stir_rest`]): the readings were on the resting
+    /// cadence while it was unattended ([`Self::vitals_audience`]) and are on the focused one
+    /// from that reading on, and the deck moves again from that reading, not in the touch's own
+    /// frame.
     pub(crate) fn touch_rest(&mut self, wid: WindowId, now: Instant, focusing: bool) {
         if self
             .windows
@@ -16658,11 +16812,16 @@ impl App {
     }
 
     /// Window `wid` stirred at `now`: its quiet starts over, and a window that was resting wakes.
-    /// A woken window that is focused, or that `focusing` focuses, asks a reading at once, so its
-    /// deck is live again from the next reading rather than from the background cadence's next.
-    /// An unfocused window's wake asks none: the readings' audience counts a window's focus
-    /// ([`Self::vitals_audience`]), so that wake changes no cadence, and a reading's frame would
-    /// take the GPU's block back for nothing.
+    /// A woken window that is focused, or that `focusing` focuses, and that a person attends
+    /// asks a reading at once, so its deck is live again from the next reading rather than from
+    /// the background cadence's next. An unfocused window's wake asks none: the readings'
+    /// audience counts a window's focus ([`Self::vitals_audience`]), so that wake changes no
+    /// cadence, and a reading's frame would take the GPU's block back for nothing. Nor does the
+    /// wake of a window whose attention has lapsed (a key aterm posted, the `Resized` of its own
+    /// resize; its tab's output keeps the same rule in `admit_content_redraws`): the
+    /// audience counts the attention too, so its cadence stays the resting one and its deck
+    /// holds still on every reading; the touch that attends it again asks that reading
+    /// ([`Self::touch_rest`]).
     ///
     /// A wake of a window that was focused before the event marks its next present a rest wake
     /// ([`crate::metrics::WindowPresentState::note_rest_wake`]), so the key that woke a resting
@@ -16680,7 +16839,7 @@ impl App {
         if ws.focused {
             ws.present_metrics.note_rest_wake();
         }
-        if focusing || ws.focused {
+        if (focusing || ws.focused) && ws.rest.attended() {
             drop(route_guard_ws);
             self.vitals_ask_now(now);
         }
@@ -18024,6 +18183,13 @@ impl App {
     /// never start again. A pass that runs without glass is said once.
     fn restore_pass_due_at_park(&mut self, on_glass: bool, now: Instant) -> bool {
         let queued = self.restore_pass_queued();
+        if !queued {
+            self.store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .table()
+                .sessions_settled();
+        }
         let due = restore_pass_due(
             RestorePassSite::Park,
             self.restore_pass_handoff_lane(),
@@ -20338,6 +20504,7 @@ impl ApplicationHandler<Wake> for App {
                 .get(&target_id)
                 .and_then(|ws| ws.os_window.as_ref())
         {
+            let (x, y) = self.restored_origin(target_id, w, x, y);
             w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
         }
         if carried_position.is_none()
@@ -20357,6 +20524,7 @@ impl ApplicationHandler<Wake> for App {
                 && let Some((x, y)) = outer
                 && crate::app_window::restored_position_on_screen(w, x, y)
             {
+                let (x, y) = self.restored_origin(target_id, w, x, y);
                 w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
             }
             if maximized == Some(true) {
@@ -20758,6 +20926,12 @@ impl App {
                 };
                 let _ = reply.send(line);
             }
+            Wake::NativeImage { view, request } => match self.locate_native_view(view) {
+                Ok((window, _)) => self.render_native_view_image(window, view, *request),
+                Err(error) => {
+                    let _ = request.reply.send(Err(error));
+                }
+            },
             Wake::Image(req) => {
                 let _phase = crate::watchdog::phase(crate::watchdog::Phase::ImageCapture);
                 self.render_image(*req);
@@ -22106,6 +22280,8 @@ impl App {
                 session,
                 activation,
             } => self.notice_clicked(session, activation),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Wake::NavigatorTitleReady(title) => self.navigator_title_ready(title),
             Wake::SiblingScan(rows) => {
                 if self.siblings != rows {
                     self.siblings = rows;
@@ -28200,7 +28376,12 @@ pub fn main_entry_with_network(
     if !headless && aterm_update::enabled() {
         aterm_update::set_required_team_id(crate::app_config::update_required_team_id(&config));
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        crate::network_moved::observe_for_updater();
+        {
+            crate::network_moved::observe_for_updater();
+            // The window's own sleeps and wall-clock steps end the check's wait; its watch starts
+            // off this thread.
+            let _ = aterm_update::hear_wakes();
+        }
         let health_proxy = event_loop.create_proxy();
         let staged_proxy = event_loop.create_proxy();
         let checked_proxy = event_loop.create_proxy();
@@ -28710,6 +28891,14 @@ pub fn main_entry_with_network(
             .map(|[width, height]| PhysicalSize::new(width, height))
             .or(cold_first_frame),
     );
+    // The first window's dock record and birth: its manifest row's, which a handoff carries
+    // in its layout as a quit does (`WindowCarry` holds no dock).
+    (ws0.dock.pref, ws0.dock.birth) = restore::bootstrap_dock(
+        restore_manifest.as_ref(),
+        seamless_window
+            .as_ref()
+            .and_then(|w| w.outer_x.zip(w.outer_y)),
+    );
     let mut pool = SessionPool::default();
     pool.insert(session0);
 
@@ -29153,6 +29342,7 @@ pub fn main_entry_with_network(
         next_window_id: 1,
         pending_restore: restore_manifest,
         restore_drain: None,
+        restored_tasks_sweep: None,
         restore_leaf_staging: None,
         restore_glass: RestoreGlassWait::default(),
         lane_hold_clocks: native_update_lane_hold::LaneHoldClocks::default(),
@@ -30044,6 +30234,10 @@ mod recursion_provision_tests;
 #[cfg(test)]
 #[path = "lib_effect_cadence_tests.rs"]
 mod effect_cadence_tests;
+
+#[cfg(test)]
+#[path = "lib_effect_lane_attended_tests.rs"]
+mod effect_lane_attended_tests;
 
 #[cfg(test)]
 #[path = "lib_fifo_backlog_tests.rs"]

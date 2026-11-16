@@ -172,7 +172,7 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
     let task = "-x\n'q' \"q\" $(rm -rf /) `id`\n\u{1b}[31m"
         .as_bytes()
         .to_vec();
-    let from = SessionId::new("s-ab12");
+    let from = tab_sid("tqn5r6eab12");
     let root = std::env::temp_dir();
     let root = root.ancestors().last().expect("a root").to_string_lossy();
     let order = TaskOrder::of_frame(
@@ -428,10 +428,10 @@ fn the_task_file_is_private_and_never_overwritten() {
         .tempdir()
         .expect("scratch dir");
     let dir = scratch.path().join("tasks");
-    let sid = SessionId::new("s-0123abcd");
+    let sid = tab_sid("tqn5r6e0148");
     let seed = TaskSeed::new(b"the task\n".to_vec());
     let path = seed.write_in(&dir, &sid).expect("written");
-    assert_eq!(path, dir.join("s-0123abcd-1.txt"));
+    assert_eq!(path, dir.join("tqn5r6e0148-1.txt"));
     assert_eq!(std::fs::read(&path).unwrap(), b"the task\n");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!((mode(&dir), mode(&path)), (0o700, 0o600));
@@ -450,7 +450,7 @@ fn the_task_file_is_private_and_never_overwritten() {
     let cancelled = TaskSeed::new(b"never started".to_vec());
     let late = cancelled.clone();
     cancelled.discard();
-    let sid = SessionId::new("s-0001");
+    let sid = tab_sid("tqn5r6e0001");
     assert_eq!(
         late.write_in(&dir, &sid).unwrap_err().kind(),
         std::io::ErrorKind::Interrupted
@@ -459,7 +459,7 @@ fn the_task_file_is_private_and_never_overwritten() {
 
     let racing = TaskSeed::new(b"cancelled during write".to_vec());
     let cancel = racing.clone();
-    let sid = SessionId::new("s-0002");
+    let sid = tab_sid("tqn5r6e0002");
     let path = dir.join(task_file_name(&sid));
     let outcome = racing.write_in_using(&dir, &sid, |pinned, name, text| {
         let file = pinned.write_new_private(name, text)?;
@@ -472,7 +472,7 @@ fn the_task_file_is_private_and_never_overwritten() {
     assert!(racing.write_in(&dir, &sid).is_err(), "discard stays sticky");
 
     let running = TaskSeed::new(b"still needed".to_vec());
-    let path = running.write_in(&dir, &SessionId::new("s-0003")).unwrap();
+    let path = running.write_in(&dir, &tab_sid("tqn5r6e0003")).unwrap();
     drop(running);
     assert_eq!(
         std::fs::read(&path).unwrap(),
@@ -588,7 +588,7 @@ fn an_older_builds_trust_sidecar_goes_with_its_worker() {
         .tempdir()
         .expect("scratch dir");
     let dir = scratch.path().join("tasks");
-    let (gone, kept) = (SessionId::new("s-0d"), SessionId::new("s-0e"));
+    let (gone, kept) = (tab_sid("tqn5r6e0d0d"), tab_sid("tqn5r6e0e0e"));
     let task = TaskSeed::new(b"task".to_vec())
         .write_in(&dir, &gone)
         .expect("written");
@@ -601,7 +601,7 @@ fn an_older_builds_trust_sidecar_goes_with_its_worker() {
     );
     assert_eq!(
         path,
-        dir.join("s-0d-1.trust.json"),
+        dir.join("tqn5r6e0d0d-1.trust.json"),
         "the name it was written under"
     );
     for sidecar in [&path, &other] {
@@ -670,6 +670,11 @@ fn a_stalled_worker_says_whether_its_line_was_typed() {
     assert!(words.ends_with(" s before"), "{words}");
 }
 
+/// The session whose tab ID is `id`.
+fn tab_sid(id: &str) -> SessionId {
+    SessionId::parse(id).expect("a tab id")
+}
+
 /// Write an empty file `name` in `dir`.
 #[cfg(unix)]
 fn touch(dir: &Path, name: &str) -> PathBuf {
@@ -690,30 +695,31 @@ fn a_closed_workers_task_files_are_removed_and_no_other() {
         .tempdir()
         .expect("scratch dir");
     let dir = scratch.path().join("tasks");
-    let (gone, kept) = (SessionId::new("s-0a"), SessionId::new("s-0b"));
+    let (gone, kept) = (tab_sid("tqn5r6e0a0a"), tab_sid("tqn5r6e0b0b"));
     let path = TaskSeed::new(b"one".to_vec())
         .write_in(&dir, &gone)
         .expect("written");
     let other = TaskSeed::new(b"two".to_vec())
         .write_in(&dir, &kept)
         .expect("written");
+    let (g, k) = (gone.as_str(), kept.as_str());
     let results: Vec<PathBuf> = [
-        "s-0a-2.result.md",
-        "s-0a-2.result.src",
-        "s-0a-17.result.md",
-        "s-0a-17.result.src",
+        format!("{g}-2.result.md"),
+        format!("{g}-2.result.src"),
+        format!("{g}-17.result.md"),
+        format!("{g}-17.result.src"),
     ]
     .iter()
     .map(|n| touch(&dir, n))
     .collect();
     let others: Vec<PathBuf> = [
-        "s-0b-2.result.md",
-        "s-0b-2.result.src",
-        "s-0ab-2.result.md",
-        "s-0a-x.result.md",
-        "s-0a-.result.md",
-        "s-0a-2.result.txt",
-        "s-0a-2.md",
+        format!("{k}-2.result.md"),
+        format!("{k}-2.result.src"),
+        format!("{g}b-2.result.md"),
+        format!("{g}-x.result.md"),
+        format!("{g}-.result.md"),
+        format!("{g}-2.result.txt"),
+        format!("{g}-2.md"),
     ]
     .iter()
     .map(|n| touch(&dir, n))
@@ -763,7 +769,7 @@ fn a_quit_removes_its_workers_task_files_and_no_other() {
     };
     let tasked = write(&worker.sid);
     let untasked = write(&shell.sid);
-    let elsewhere = write(&SessionId::new("s-0c"));
+    let elsewhere = write(&tab_sid("tqn5r6e0c0c"));
     let result = touch(&dir, &format!("{}-2.result.md", worker.sid.as_str()));
     let untasked_result = touch(&dir, &format!("{}-2.result.md", shell.sid.as_str()));
     retire_task_files_in(
@@ -3610,7 +3616,7 @@ fn a_done_task_result_reads_back_after_a_quit_and_a_restore() {
 /// reopens the task leaves the record naming none, and the harness's exit mark, made from a
 /// reading of the record before that turn, names the file again; removed at the reopening mark
 /// (as it was before 2026-11-12), that exit left a record naming a file that was gone. CONTROL: a
-/// close that keeps results (a retired row answers for them) keeps it, and the row's end takes
+/// close that keeps results (a row answers for them) keeps it, and the row's end takes
 /// it.
 #[test]
 fn a_result_a_tab_came_back_with_goes_with_its_tab() {

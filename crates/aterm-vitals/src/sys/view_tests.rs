@@ -310,39 +310,22 @@ fn scheduling_values_errors_and_active_executable_survive_rendering() {
 }
 
 #[test]
-fn idle_performance_wait_is_shown_even_for_unbackgrounded_workers() {
-    use crate::scheduling::Scheduling;
+fn reported_cpu_counter_difference_never_qualifies_physical_wait_with_idle_cores() {
     let mut s = snapshot();
     let w = world();
     s.global.wait = Some(4.0);
     for core in &mut s.cpu.as_mut().unwrap().cores {
         core.load.raw = 0.0;
     }
-    s.procs[0].scheduling = Some(Scheduling {
-        nice: Ok(0),
-        application: true,
-        background_internal: false,
-        background_external: false,
-        suppressed: false,
-        role: Ok(0),
-        qos_cpu_ns: Some(Ok([0; 7])),
-    });
     let c = ctx(&w, Some(&s), true, true);
-    for view in [View::Cores, View::Procs, View::Why] {
+    for view in [View::Cores, View::Procs] {
         let json = render_json(&query(view, true), &c);
-        let finding = json
-            .get("scheduling_context")
-            .unwrap()
-            .get("finding")
-            .unwrap();
         assert_eq!(
-            finding.get("observation"),
-            Some(&Jv::s("runnable-wait-with-idle-performance"))
+            json.get("scheduling_context").unwrap().get("finding"),
+            Some(&Jv::why("unavailable:execution_window_unknown"))
         );
-        assert_eq!(finding.get("cause"), Some(&Jv::s("unproven")));
-        assert_ne!(json.get("calm"), Some(&Jv::Bool(true)));
         assert!(
-            all_text(&render_text(&query(view, false), &c))
+            !all_text(&render_text(&query(view, false), &c))
                 .contains("runnable-wait-with-idle-performance")
         );
         assert!(contract_violations(&json).is_empty());
@@ -361,6 +344,7 @@ fn cpu_accounting_scope_identity_and_unknowns_survive_both_reports() {
         sampled_at_ns: Some(17),
         start: Some(23),
         exec_version: Some(42),
+        published: crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS,
     };
     s.procs
         .iter_mut()
@@ -793,26 +777,40 @@ fn memory_off_macos_says_its_remainder_unread_classes_and_commit() {
 }
 
 #[test]
-fn the_split_adds_up_to_the_machines_busy_figure() {
+fn reported_cpu_accounts_keep_unknown_owners_without_machine_closure() {
     let s = snapshot();
     let w = world();
     let c = ctx(&w, Some(&s), true, true);
     let j = render_json(&query(View::Overview, true), &c);
-    let split = j.get("split_mc").expect("a split");
-    let mut sum = 0i64;
-    for k in SPLIT_PARTS {
-        if let Some(v) = split.get(k).and_then(part_value) {
-            sum += v;
-        }
-    }
+    let reported = j
+        .get("reported_cpu_mc")
+        .expect("published counter accounts");
     let busy = match j.get("global").and_then(|g| g.get("cpu_mc")) {
         Some(Jv::Int(n)) => *n,
         other => panic!("{other:?}"),
     };
-    assert_eq!(sum, busy, "{}", split.to_text());
     assert_eq!(busy, 2400);
-    assert_eq!(split.get("tab").and_then(part_value), Some(1200));
-    assert_eq!(split.get("others").and_then(part_value), Some(300));
+    assert_eq!(reported.get("tab"), Some(&Jv::Int(1200)));
+    assert_eq!(reported.get("aterm"), Some(&Jv::Int(1450)));
+    assert_eq!(reported.get("others"), Some(&Jv::Int(300)));
+    assert_eq!(
+        reported.get("cpu_basis"),
+        Some(&Jv::s("published_counters"))
+    );
+    assert_eq!(
+        reported.get("cpu_execution_window"),
+        Some(&Jv::why("unavailable:execution_window_unknown"))
+    );
+    assert!(reported.get("unaccounted").is_none());
+    assert!(j.get("split_mc").is_none());
+    let counters: i64 = ["aterm", "others", "services"]
+        .into_iter()
+        .map(|key| reported.get(key).and_then(part_value).unwrap())
+        .sum();
+    assert_ne!(
+        counters, busy,
+        "independent published counters need no machine closure"
+    );
 
     for self_uid in [None, Some(501)] {
         let input = |at, busy: &[u64], k| {
@@ -832,7 +830,7 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
                 &query(View::Overview, true),
                 &ctx(&w, Some(&warming), true, true)
             )
-            .get("split_mc"),
+            .get("reported_cpu_mc"),
             Some(&Jv::why("warming"))
         );
         let unknown = model.absorb(&input(11, &[20, 30, 100, 90], 1));
@@ -844,6 +842,7 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
         assert_eq!(row(900).scope, RowScope::Unknown);
         assert_eq!(row(900).cores, Some(0.3));
         assert_eq!(row(900).footprint, Some(900 << 20));
+        assert!((unknown.split.unwrap().unknown_owner_reported - 0.3).abs() < 1e-6);
         assert_eq!(row(100).scope, RowScope::SelfProc);
         assert_eq!(row(150).scope, RowScope::Helper);
         assert_eq!(row(201).scope, RowScope::Tab(7));
@@ -854,16 +853,23 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
         let c = ctx(&w, Some(&unknown), true, true);
         for view in [View::Overview, View::Global] {
             let j = render_json(&query(view, true), &c);
-            let split = j.get("split_mc").unwrap();
-            assert_eq!(split.get("tab").and_then(part_value), Some(1200));
-            assert!(split.get("unaccounted").and_then(part_value).unwrap() >= 300);
+            let reported = j.get("reported_cpu_mc").unwrap();
+            assert_eq!(reported.get("tab"), Some(&Jv::Int(1200)));
+            assert_eq!(reported.get("process_unknown_owner"), Some(&Jv::Int(300)));
+            assert!(reported.get("unaccounted").is_none());
+            assert_eq!(
+                reported.get("cpu_execution_window"),
+                Some(&Jv::why("unavailable:execution_window_unknown"))
+            );
             assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
             let text = render_text(&query(view, false), &c);
-            assert!(
-                text.lines.iter().any(|l| {
-                    matches!(l.key.as_str(), "rest" | "split") && l.text.contains('≥')
-                })
-            );
+            assert!(text.lines.iter().any(|l| {
+                l.key == "reported_cpu"
+                    && l.text
+                        .contains("execution_window=unavailable:execution_window_unknown")
+                    && !l.text.contains('≥')
+                    && !l.text.contains('≤')
+            }));
         }
         let global = render_json(&query(View::Global, true), &c);
         assert_eq!(global.get("aterm_mc").and_then(part_value), Some(1450));
@@ -2768,26 +2774,124 @@ fn sys_jobs_scope_global_is_every_row_and_finding() {
 }
 
 #[test]
-fn an_idle_measured_tab_waited_for_no_core() {
-    let idle = Fig {
+fn reported_cpu_counter_differences_never_become_wait_fractions() {
+    for (cpu, difference) in [
+        (0.0, Some(0.0)),
+        (1.0, Some(1.0)),
+        (1.0, Some(-1.5)),
+        (1.0, None),
+    ] {
+        let fig = Fig {
+            present: true,
+            cores: cpu,
+            wait: difference,
+            ..Fig::default()
+        };
+        let json = fig_json(&fig);
+        assert_eq!(
+            json.get("starved_pm"),
+            Some(&Jv::why("unavailable:execution_window_unknown"))
+        );
+        assert_eq!(
+            json.get("wait_basis"),
+            Some(&Jv::s("runnable_minus_cpu_counter_growth"))
+        );
+        if difference == Some(-1.5) {
+            assert_eq!(json.get("wait_mc"), Some(&Jv::Int(-1500)));
+        }
+    }
+}
+
+#[test]
+fn reported_cpu_growth_is_not_clipped_to_the_old_u32_rate_ceiling() {
+    let fig = Fig {
         present: true,
-        wait: Some(0.0),
+        cores: 5_000_000.0,
         ..Fig::default()
     };
-    assert_eq!(idle.starved(), Some(0.0));
-    let busy = Fig {
-        present: true,
-        cores: 1.0,
-        wait: Some(1.0),
-        ..Fig::default()
-    };
-    assert_eq!(busy.starved(), Some(0.5));
-    let unread = Fig {
-        present: true,
-        cores: 1.0,
-        ..Fig::default()
-    };
-    assert_eq!(unread.starved(), None);
+    assert_eq!(fig_json(&fig).get("cpu_mc"), Some(&Jv::Int(5_000_000_000)));
+}
+
+#[test]
+fn reported_cpu_timing_uses_its_process_read_span_and_endpoint() {
+    let mut scene = crate::explain::fixtures::claude_reaped_1032();
+    scene.unanswered = 0;
+    let mut vitals = Vitals::new();
+    vitals.absorb(&scene.reading(0, true));
+    vitals.absorb(&scene.reading(4000, false));
+    vitals.absorb(&scene.reading(5000, true));
+    let current_reading = scene.reading(6000, false);
+    let expected_at = current_reading.at_ns;
+    let mut snap = vitals.absorb(&current_reading);
+    let cpu = snap.scoped_cpu.as_ref().unwrap();
+    assert_eq!(
+        (cpu.read_at_ns, cpu.window_ns),
+        (expected_at, 1_000_000_000)
+    );
+    assert_eq!(
+        snap.why.as_ref().unwrap().at_ns,
+        scene.reading(5000, true).at_ns
+    );
+    assert_eq!(
+        cpu_timing(&snap),
+        Some((expected_at, 1_000_000_000, "process_and_reap"))
+    );
+    snap.at_ns += 2_000_000_000;
+    snap.at_unix_ms += 2000;
+    assert_eq!(
+        cpu_timing(&snap),
+        Some((expected_at, 1_000_000_000, "process_and_reap"))
+    );
+}
+
+#[test]
+fn reported_cpu_process_json_uses_the_rows_chosen_read_span() {
+    for process_marks in [false, true] {
+        let mut before = sample(10, &[0; 4], 0);
+        let mut after = sample(11, &[1; 4], 1);
+        for (reading, mark) in [(&mut before, 10_500_000_000), (&mut after, 11_750_000_000)] {
+            reading
+                .procs
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p.pid == 201)
+                .unwrap()
+                .at_ns = process_marks.then_some(mark);
+        }
+        let mut vitals = Vitals::new();
+        vitals.absorb(&before);
+        let snapshot = vitals.absorb(&after);
+        let w = world();
+        let c = ctx(&w, Some(&snapshot), true, true);
+        let row = snapshot.procs.iter().find(|row| row.pid == 201).unwrap();
+        let json = proc_json(&c, &snapshot, row);
+        assert_eq!(snapshot.procs_window_ns, Some(1_000_000_000));
+        assert_eq!(
+            json.get("cpu_mc"),
+            Some(&Jv::Int(if process_marks { 720 } else { 900 }))
+        );
+        assert_eq!(
+            json.get("cpu_read_span_ns"),
+            Some(&Jv::u(if process_marks {
+                1_250_000_000
+            } else {
+                1_000_000_000
+            }))
+        );
+        assert_eq!(
+            json.get("cpu_execution_window"),
+            Some(&Jv::why("unavailable:execution_window_unknown"))
+        );
+        let mut unavailable = row.clone();
+        unavailable.cores = None;
+        unavailable.cpu_read_span_ns = None;
+        assert_eq!(
+            proc_json(&c, &snapshot, &unavailable).get("cpu_read_span_ns"),
+            Some(&Jv::why("warming")),
+            "a row without a valid rate cannot borrow the sweep's span"
+        );
+    }
 }
 
 #[test]
@@ -3787,7 +3891,7 @@ fn sys_json_carries_each_stalled_lane_and_marks_its_figures() {
     }
     let overview = render_json(&query(View::Overview, true), &c);
     assert_eq!(
-        overview.get("aterm").and_then(|a| a.get("cpu_mc")),
+        overview.get("aterm"),
         Some(&Jv::stalled("procs")),
         "{}",
         overview.to_text()
@@ -3798,6 +3902,8 @@ fn sys_json_carries_each_stalled_lane_and_marks_its_figures() {
         "{}",
         overview.to_text()
     );
+    assert_eq!(overview.get("reported_cpu_mc"), Some(&Jv::stalled("procs")));
+    assert!(overview.get("split_mc").is_none());
     let procs = render_json(&query(View::Procs, true), &c);
     assert_eq!(procs.get("procs"), Some(&Jv::stalled("procs")));
     let memory = render_json(&query(View::Mem, true), &c);
@@ -3929,7 +4035,7 @@ fn a_stall_leaves_no_figure_it_feeds_warming_or_unsampled() {
     let mut cpu = query(View::Why, false);
     cpu.subject = Some(crate::explain::WhySubject::Cpu);
     let why = all_text(&render_text(&cpu, &c));
-    assert!(why.contains("split unavailable(stalled)"), "{why}");
+    assert!(why.contains("reported_cpu unavailable(stalled)"), "{why}");
     assert!(why.contains("role=unavailable(stalled)"), "{why}");
     assert!(!why.contains("warming"), "{why}");
     cpu.json = true;

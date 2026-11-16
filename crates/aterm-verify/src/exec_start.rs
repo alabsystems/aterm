@@ -14,8 +14,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aterm_process_facts::program_check::Daemon;
 use aterm_sysprobe::jobs::{self as probe, AtStart, StartFacts};
-use aterm_uds::program_check::Daemon;
 
 use super::Host;
 

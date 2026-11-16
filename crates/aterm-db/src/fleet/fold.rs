@@ -21,8 +21,9 @@
 //!   unproven answer listed is no evidence. What the registry states (`status`, a stated
 //!   `plan`, `expected`) is a person's word and no observation is written over it: an observed
 //!   fact stands in its own column beside it, with when it was read and the Mac that read it,
-//!   and where the two differ both are shown (`plan_mismatch`). `observed` is what Macs saw
-//!   of the account ([`ObservedState`]), derived here beside the `status` it never rewrites;
+//!   and where the two differ both are shown (`plan_mismatch`; a stated plan that adds a tier
+//!   to the observed one does not differ from it, `plans_differ`). `observed` is what Macs
+//!   saw of the account ([`ObservedState`]), derived here beside the `status` it never rewrites;
 //!   `last_seen` and `seen_on` are the sightings of its login (`crate::alab::sighted`). Each
 //!   fact's provenance has one shape, `<fact>_at` and `<fact>_by`: a time never after the read
 //!   of the input that carried it, and the Mac by its label, else its machine key, else the
@@ -508,6 +509,21 @@ fn sighted_facts(
         }
         next.at(newest_ms.saturating_add(REACH_KEEP_MS).saturating_add(1));
     }
+}
+
+/// Whether a stated plan's key and an observed one name different plans. A Mac's reading may
+/// carry the plan's word alone (`max` of Max 5x and of Max 20x) or the word and its tier
+/// (`max-20x`), so the observed key is `<provider>-<word>[-<tier>]`. A stated key that is the
+/// observed one, or the observed one with a tier after it (`anthropic-max-20x` beside an
+/// observed `anthropic-max`), names the plan the Mac saw. A stated key that only begins with
+/// the observed word is another plan (`openai-prolite` beside an observed `openai-pro`), two
+/// tiers differ (`anthropic-max-5x` beside an observed `anthropic-max-20x`), and a stated key
+/// with no tier beside an observed one with a tier differs too: the registry states less than
+/// the Mac saw, and the row to name is the tier's.
+fn plans_differ(stated: &str, observed: &str) -> bool {
+    !stated
+        .strip_prefix(observed)
+        .is_some_and(|tier| tier.is_empty() || (tier.len() > 1 && tier.starts_with('-')))
 }
 
 /// The newest read that could have named `sighted`: any read for this Mac, whose windows every
@@ -1060,6 +1076,12 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             (None, Some(observed)) => (Some(observed.v.clone()), Some(PlanSource::Observed)),
             (None, None) => (None, None),
         };
+        // A mismatch is between two plans: with either missing there is none to say.
+        let plan_mismatch = account
+            .plan
+            .as_deref()
+            .zip(plan_observed.as_ref())
+            .map(|(set, observed)| plans_differ(set, &observed.v));
         accounts.push(AccountRow {
             account: account.pk.clone(),
             provider: account.provider.clone(),
@@ -1073,6 +1095,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             plan,
             plan_source,
             plan_observed,
+            plan_mismatch,
             w5h,
             w7d,
             walled,

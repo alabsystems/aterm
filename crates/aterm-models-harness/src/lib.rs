@@ -21,7 +21,9 @@ mod models_lab_preference_identity;
 pub use models_lab_preference_identity::lab_preference_identity_model;
 mod models_lab_source_availability;
 pub use models_lab_source_availability::lab_source_availability_model;
+mod models_account_login_adoption;
 mod models_account_source_capture;
+pub use models_account_login_adoption::account_login_adoption_model;
 pub use models_account_source_capture::account_source_capture_model;
 mod models_account_provider_capture;
 pub use models_account_provider_capture::account_provider_capture_model;
@@ -299,8 +301,6 @@ mod models_cold_resume_environment;
 mod models_custody;
 mod models_disk;
 mod models_disk_discovery_cycle;
-mod models_disk_projected;
-mod models_disk_worker;
 mod models_fleet_machine_assignment;
 mod models_harness;
 mod models_harness_account_key;
@@ -459,11 +459,9 @@ pub use models_cold_resume_environment::cold_resume_environment_model;
 pub use models_custody::line_custody_model;
 pub use models_disk::{
     disk_await_liveness, disk_await_model, disk_budget_pass_model, disk_emergency_unmet_model,
-    disk_free_ask_model, disk_reclaim_pass_model,
+    disk_reclaim_pass_model,
 };
 pub use models_disk_discovery_cycle::disk_discovery_cycle_model;
-pub use models_disk_projected::disk_projected_hold_model;
-pub use models_disk_worker::disk_free_worker_model;
 pub use models_fleet_machine_assignment::fleet_machine_assignment_model;
 pub use models_harness::*;
 pub use models_harness_account_key::harness_account_key_model;

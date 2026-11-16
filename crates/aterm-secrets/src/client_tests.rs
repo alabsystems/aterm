@@ -17,10 +17,12 @@ fn offline_materialization_keeps_convergence_due_for_the_returning_source() {
         let applied = SyncOutcome::Applied {
             seq: 4,
             report: Report::default(),
+            moved: true,
         };
         assert!(converge_after_pass(
             &mut due,
             &applied,
+            false,
             2,
             [None; 3],
             Last::Ended,
@@ -30,6 +32,7 @@ fn offline_materialization_keeps_convergence_due_for_the_returning_source() {
         assert!(!converge_after_pass(
             &mut due,
             &unchanged,
+            false,
             3,
             [None; 3],
             Last::Ended,
@@ -38,6 +41,7 @@ fn offline_materialization_keeps_convergence_due_for_the_returning_source() {
         assert!(converge_after_pass(
             &mut due,
             &unchanged,
+            false,
             4,
             [None; 3],
             Last::Ended,
@@ -46,6 +50,7 @@ fn offline_materialization_keeps_convergence_due_for_the_returning_source() {
         assert!(!converge_after_pass(
             &mut due,
             &unchanged,
+            false,
             5,
             [None; 3],
             Last::Ended,
@@ -4713,4 +4718,349 @@ fn a_sync_writes_nothing_under_the_home_and_every_entry_reads_in_place() {
     )
     .expect("a write");
     assert_ne!(home_tree(&reader.home, &reader.dir), before, "CONTROL");
+}
+
+/// A swarm roster whose one row names `recipient` under `label`.
+fn roster_naming(recipient: &str, label: &str) -> Vec<u8> {
+    crate::swarm_roster::SwarmRoster {
+        members: vec![crate::swarm_roster::SwarmMember {
+            label: label.to_owned(),
+            vault_name: "mb".to_owned(),
+            recipient: recipient.to_owned(),
+            node_id: None,
+            node_key: None,
+            aliases: Vec::new(),
+            hint: None,
+            hw_hint: None,
+            admitted_ms: 1,
+            claimed_label: None,
+            claimed_at_ms: None,
+        }],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    }
+    .to_toml()
+    .into_bytes()
+}
+
+/// The pass a moved version owes outlives the apply that found it. `moved` is an edge against
+/// `state.toml`, which that same apply rewrites, and most appliers start no runner (`aterm
+/// secrets sync`, the sync that ends a publish, a reader): the next apply by the subscriber then
+/// reads no difference. The debt is kept in `state.toml` until a starter takes it, once, and a
+/// pass that ended `Unchanged` with the debt taken starts a runner as an applied version does. A
+/// version that moved nothing leaves none, and the mark is no part of the state's standing.
+/// NEGATIVE CONTROL: an apply that does not record the debt (`converge_inputs::owe` a no-op)
+/// fails the first `take_owed`, and the later quiet version shows what was lost: `moved: false`
+/// with nothing owed (run 2026-11-14). A `converge_after_pass` that ignores `owed` fails the
+/// runner assertion.
+#[test]
+fn a_pass_owed_by_an_apply_that_starts_no_runner_is_kept_for_the_next_starter() {
+    use crate::converge::{Causes, Due, Last};
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let socket = bound();
+    let server = serve(&root.path().join("store"), &socket);
+    let url = format!("http://{}/v1/team", server.addr);
+    let admin = Paths::for_home(&root.path().join("ma"));
+    let created = create(&admin, &url, None, Some("ma")).expect("create");
+    let member = Paths::for_home(&root.path().join("mb"));
+    join_pinned(&member, &format!("{url}#{}", created.signer), "mb");
+    let key = status(&member)
+        .expect("status")
+        .machine
+        .expect("a key")
+        .0
+        .to_bech32();
+    let publish = |change: &dyn Fn(&mut Document)| {
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        change(&mut doc);
+        admin_publish(&admin, &opened, &doc).expect("publish");
+    };
+    // What `aterm secrets sync` does with the outcome: reads its `moved` and starts nothing.
+    let synced = || match sync(&member, None).expect("sync") {
+        SyncOutcome::Applied { moved, .. } => Some(moved),
+        SyncOutcome::Unchanged { .. } => None,
+        other => panic!("a member applies or holds its version, got {other:?}"),
+    };
+    let marked = || {
+        std::fs::read_to_string(member.state_file())
+            .expect("state")
+            .contains("converge_owed = true")
+    };
+
+    publish(&|doc| doc.add_machine("mb", &key).expect("add"));
+    assert_eq!(synced(), Some(true), "let in");
+    assert!(marked(), "the pass is owed in the state");
+    let standing = state_standing(&member).expect("standing");
+    assert!(converge_inputs::take_owed(&member), "a starter takes it");
+    assert!(!marked());
+    assert!(!converge_inputs::take_owed(&member), "once");
+    assert_eq!(
+        state_standing(&member).expect("standing"),
+        standing,
+        "whose turn a pass is moves no reader of the state"
+    );
+
+    publish(&|doc| {
+        doc.add_machine("mc", &transport::test_recipient(3))
+            .expect("add");
+    });
+    assert_eq!(synced(), Some(false), "another Mac let in");
+    assert!(!converge_inputs::take_owed(&member), "which owes nothing");
+
+    // The edge another applier consumed: an entry this Mac reads, applied by a sync that starts
+    // no runner, then the subscriber's own rounds, which read nothing new and then a quiet
+    // version.
+    publish(&|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .expect("set");
+    });
+    assert_eq!(synced(), Some(true), "an entry read by name");
+    assert_eq!(
+        synced(),
+        None,
+        "the subscriber's next round holds the version"
+    );
+    publish(&|doc| {
+        doc.add_machine("md", &transport::test_recipient(4))
+            .expect("add");
+    });
+    assert_eq!(synced(), Some(false), "and the next version moved nothing");
+    let owed = converge_inputs::take_owed(&member);
+    assert!(owed, "the entry's pass is still owed");
+
+    let mut due = Due::default();
+    assert!(due.at_start(0, [None; 3], Last::None));
+    let unchanged = SyncOutcome::Unchanged { seq: 5 };
+    assert!(
+        !converge_after_pass(
+            &mut due,
+            &unchanged,
+            false,
+            1,
+            [None; 3],
+            Last::Ended,
+            SourceSaid::AtOnce
+        ),
+        "a round that held its version and found nothing owed starts none"
+    );
+    assert!(
+        converge_after_pass(
+            &mut due,
+            &unchanged,
+            owed,
+            2,
+            [None; 3],
+            Last::Ended,
+            SourceSaid::AtOnce
+        ),
+        "the debt taken starts a runner though this round applied nothing"
+    );
+    assert_eq!(due.note().causes, Causes::APPLIED);
+    server.stop();
+}
+
+/// On an admin's Mac the steward's steps read the admin text whole, and every publish of a
+/// vault that holds a `code-only` line rewrites `[join]`'s note with its own version
+/// (`note_code_only`). A publish that changed nothing else owes that Mac no pass: the notes are
+/// no input of it. One that changed a `[machines]` row still does.
+/// NEGATIVE CONTROL: a digest of the admin text as written (`steward_text` returning `None`)
+/// leaves the pass owed after each quiet publish (run 2026-11-14).
+#[test]
+fn a_publish_that_only_renews_the_code_only_note_owes_an_admin_no_pass() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let socket = bound();
+    let server = serve(&root.path().join("store"), &socket);
+    let url = format!("http://{}/v1/team", server.addr);
+    let admin = Paths::for_home(&root.path().join("ma"));
+    create(&admin, &url, None, Some("ma")).expect("create");
+    let publish = |change: &dyn Fn(&mut Document)| {
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        change(&mut doc);
+        admin_publish(&admin, &opened, &doc).expect("publish");
+    };
+    // The publish's own sync applies the version here and starts no runner: what it owes is
+    // what a starter would take.
+    let owed = || {
+        while let SyncOutcome::Applied { .. } = sync(&admin, None).expect("sync") {}
+        converge_inputs::take_owed(&admin)
+    };
+    let noted = || {
+        admin_open(&admin)
+            .expect("open")
+            .doc
+            .code_only_noted()
+            .expect("the run note")
+    };
+    let waiting = transport::test_recipient(9);
+    publish(&|doc| doc.add_code_only(&waiting).expect("a code-only line"));
+    assert!(owed(), "the line itself is the steward's news");
+    let first = noted();
+
+    for round in 0..2 {
+        publish(&|_| {});
+        let now = noted();
+        assert!(
+            now.1 > first.1,
+            "round {round}: the note was rewritten: {now:?}"
+        );
+        assert!(!owed(), "round {round}: a note alone owes no pass");
+    }
+
+    publish(&|doc| {
+        doc.add_machine("mc", &transport::test_recipient(3))
+            .expect("add");
+    });
+    assert!(owed(), "a `[machines]` row is read by the steward's steps");
+    server.stop();
+}
+
+/// [`SyncOutcome::Applied`]'s `moved` on the real sync path, for a member of a served vault: the
+/// version that lets this Mac in moved it, a version that changes an entry it reads by name
+/// moved it, and a version that only lets another Mac in (what every join in a fleet publishes)
+/// is applied and moved nothing, so it owes no converge pass. The entries the pass reads under
+/// no name move it too: the fleet code a removal rotates, and the swarm roster row that gives
+/// this Mac its label. A state that recorded no digest of the pass's other inputs (an older
+/// aterm's) owes one pass at its next apply, and none at the one after.
+/// NEGATIVE CONTROLS: an apply that says `moved: true` for every version fails each "another
+/// Mac" sync. A report whose `changed` compared only the entries held by name (`[held]`, without
+/// the selection's meaning) says the fleet code and the roster moved nothing. An apply that
+/// never said its recorded digest differed is the apply under [`converge_inputs::blind`], run
+/// here for the first version after the older state: it owes no pass, and the same apply
+/// without it does.
+#[test]
+fn an_applied_version_moved_this_mac_only_where_it_changed_what_its_pass_reads() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let socket = bound();
+    let server = serve(&root.path().join("store"), &socket);
+    let url = format!("http://{}/v1/team", server.addr);
+    let admin = Paths::for_home(&root.path().join("ma"));
+    let created = create(&admin, &url, None, Some("ma")).expect("create");
+    let member = Paths::for_home(&root.path().join("mb"));
+    join_pinned(&member, &format!("{url}#{}", created.signer), "mb");
+    let key = status(&member)
+        .expect("status")
+        .machine
+        .expect("a key")
+        .0
+        .to_bech32();
+    let publish = |change: &dyn Fn(&mut Document)| {
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        change(&mut doc);
+        admin_publish(&admin, &opened, &doc).expect("publish");
+    };
+    let mut seq = 1;
+    let mut applied = |what: &str| {
+        seq += 1;
+        match sync(&member, None).expect("sync") {
+            SyncOutcome::Applied {
+                seq: at,
+                report,
+                moved,
+            } => {
+                assert_eq!(at, seq, "{what}: the version just published");
+                (report.changed, moved)
+            }
+            other => panic!("{what}: seq {seq} is applied, got {other:?}"),
+        }
+    };
+    let mut others = 2_u8;
+    let mut another_mac = |applied: &mut dyn FnMut(&str) -> (bool, bool), after: &str| {
+        others += 1;
+        let (name, recipient) = (format!("mc{others}"), transport::test_recipient(others));
+        publish(&|doc| doc.add_machine(&name, &recipient).expect("add"));
+        assert_eq!(
+            applied(after),
+            (false, false),
+            "another Mac let in after {after} moved nothing here"
+        );
+    };
+
+    publish(&|doc| doc.add_machine("mb", &key).expect("add"));
+    assert!(
+        applied("let in").1,
+        "the first apply of a Mac not in before"
+    );
+
+    publish(&|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .expect("set");
+    });
+    assert_eq!(applied("an entry read by name"), (true, true));
+    another_mac(&mut applied, "an entry");
+
+    // The fleet code, as a removal rotates it: no entry this Mac reads by name changed.
+    let code = |value: &'static [u8]| {
+        publish(&|doc| {
+            doc.set_entry(&Audience::Everyone, crate::entry_class::FLEET_CODE, value)
+                .expect("set");
+        });
+    };
+    code(b"inert-code-1");
+    assert!(applied("the fleet code published").1);
+    code(b"inert-code-2");
+    assert!(applied("the fleet code rotated").1);
+    assert!(
+        !load_state(&member)
+            .expect("state")
+            .held
+            .expect("recorded")
+            .contains_key(crate::entry_class::FLEET_CODE),
+        "the code is read under no name"
+    );
+    another_mac(&mut applied, "the fleet code");
+
+    // This Mac's label, which only the swarm roster's row gives it.
+    let label = |label: &str| {
+        let roster = roster_naming(&key, label);
+        publish(&|doc| {
+            doc.set_entry(
+                &Audience::Everyone,
+                crate::swarm_roster::ROSTER_ENTRY,
+                &roster,
+            )
+            .expect("set");
+        });
+    };
+    label("m7");
+    assert!(applied("the roster published").1);
+    label("m8");
+    assert!(applied("this Mac's roster label changed").1);
+    another_mac(&mut applied, "the roster");
+
+    // A state an older aterm wrote records no digest: the next version applied owes one pass,
+    // and the one after it none.
+    let forget = || {
+        let state = std::fs::read_to_string(member.state_file()).expect("state");
+        assert!(state.contains("converge_inputs = "), "{state}");
+        let without: String = state
+            .lines()
+            .filter(|line| !line.starts_with("converge_inputs = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fsx::write_atomic(&member.state_file(), without.as_bytes(), 0o600).expect("an older state");
+    };
+    let quiet = |name: &str, n: u8| {
+        publish(&|doc| {
+            doc.add_machine(name, &transport::test_recipient(n))
+                .expect("add");
+        });
+    };
+    forget();
+    quiet("md", 200);
+    assert_eq!(
+        converge_inputs::blind(|| applied("CONTROL: an older state, its digest never compared")),
+        (false, false)
+    );
+    forget();
+    quiet("me", 201);
+    assert_eq!(
+        applied("an older aterm's state"),
+        (false, true),
+        "no digest recorded differs from every digest"
+    );
+    another_mac(&mut applied, "an older aterm's state");
+    server.stop();
 }

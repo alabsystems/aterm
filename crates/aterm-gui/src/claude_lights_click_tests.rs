@@ -223,12 +223,13 @@ pub(super) fn project_permission_click(
     if let Some(talk) = crate::harness_host::published_snapshot(tab).and_then(|s| s.session) {
         observed.insert("conv", conv(&talk));
     }
-    let open = app
-        .store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_sid(&aterm_session::SessionId::new(tab))
-        .is_some();
+    let open = aterm_session::SessionId::parse(tab).is_some_and(|id| {
+        app.store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_sid(&id)
+            .is_some()
+    });
     observed.insert("tab", i64::from(open));
     let now = Instant::now();
     let said = app.windows.get(&wid).is_some_and(|ws| {

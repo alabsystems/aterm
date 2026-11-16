@@ -503,7 +503,7 @@ fn attempt(paths: &Paths, config: &Path, target: &Target, id: &str, env: &Env<'_
                 Some(&target.name),
                 &materialize::Pass {
                     now_ms: env.now_ms,
-                    ..materialize::Pass::now(false)
+                    ..materialize::Pass::now()
                 },
             );
             Said::Published { id, op }

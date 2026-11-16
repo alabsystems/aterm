@@ -274,8 +274,8 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         key: Some(aterm_net::fleet::NodeKey::from_bytes([0xcd; 32])),
         peer: Some(peer),
         sids: vec![
-            SessionId::new("s-4c56f539e92639ba37ae"),
-            SessionId::new("tqn5r6e0148"),
+            SessionId::parse("s-4c56f539e92639ba37ae").expect("a legacy tab id"),
+            SessionId::parse("tqn5r6e0148").expect("a tab id"),
         ],
         requester: Requester::default(),
     };

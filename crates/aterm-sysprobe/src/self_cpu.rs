@@ -321,16 +321,15 @@ mod resources {
                     });
                 }
             }
-            if self.count != 0 {
-                if let Err(code) = self
+            if self.count != 0
+                && let Err(code) = self
                     .release
                     .array(self.address as usize, self.count * size_of::<u32>())
-                {
-                    first.get_or_insert(ReadError::Native {
-                        operation: Operation::ReleaseList,
-                        code,
-                    });
-                }
+            {
+                first.get_or_insert(ReadError::Native {
+                    operation: Operation::ReleaseList,
+                    code,
+                });
             }
             first.map_or(Ok(()), Err)
         }

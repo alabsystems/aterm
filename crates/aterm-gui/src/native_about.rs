@@ -580,6 +580,12 @@ fn collect_spans(node: &UiNode, top: f32, spans: &mut Vec<Span>) {
     }
 }
 
+/// How tall each line of a [`wrapped`] text in `role` and `style` stands.
+pub(crate) fn wrapped_line_height(role: SemanticRole, style: StyleRef) -> f32 {
+    let (px, _) = crate::native_ui::text_paint_metrics(role, style);
+    (px * 1.6).ceil()
+}
+
 pub(crate) fn wrapped(
     key: &str,
     text: &str,
@@ -588,7 +594,7 @@ pub(crate) fn wrapped(
     style: StyleRef,
 ) -> UiNode {
     let (px, face) = crate::native_ui::text_paint_metrics(role, style);
-    let line_height = (px * 1.6).ceil();
+    let line_height = wrapped_line_height(role, style);
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {

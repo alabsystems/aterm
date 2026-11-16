@@ -72,11 +72,12 @@ impl Rig {
 }
 
 /// Past its attention the deck draws still: one frame is asked at the lapse, the live edge and
-/// the deck clock arm nothing, only the grey's moment stays scheduled, and the readings keep
-/// the focused cadence. Each reading that lands after it asks one frame, which draws the deck
-/// still on that reading, and no turn asks another. Output in between changes none of it.
+/// the deck clock arm nothing, only the grey's moment stays scheduled, and the readings are on
+/// the resting cadence (`vitals_host_attended_tests` counts them). Each reading that lands
+/// after it asks one frame, which draws the deck still on that reading, and no turn asks
+/// another. Output in between changes none of it.
 #[test]
-fn an_unattended_windows_deck_is_still_and_its_readings_keep_their_clock() {
+fn an_unattended_windows_deck_is_still_and_draws_each_reading_once() {
     let mut rig = Rig::new();
     let t0 = rig.t0;
     assert!(rig.moves());
@@ -110,10 +111,10 @@ fn an_unattended_windows_deck_is_still_and_its_readings_keep_their_clock() {
     assert_eq!(still.live(t0, OPEN), DeckLive::STILL);
     assert_eq!(
         still.stale_after,
-        FOCUSED_PERIOD * STALE_PERIODS,
-        "the readings' cadence is the focused one still"
+        BACKGROUND_PERIOD * STALE_PERIODS,
+        "the readings' cadence is the resting one"
     );
-    assert_eq!(rig.app.vitals_audience(), Audience::Shown);
+    assert_eq!(rig.app.vitals_audience(), Audience::Background);
     assert_eq!(
         rig.app.stats_live_deadline(t0),
         Some(t0 + still.stale_after),
@@ -123,7 +124,7 @@ fn an_unattended_windows_deck_is_still_and_its_readings_keep_their_clock() {
     for k in 1..=8_u32 {
         // The probe thread hands the reading over, and its `Wake::Vitals` turn settles the
         // rest and serves the readings, as every turn does.
-        let at = lapse + FOCUSED_PERIOD * k;
+        let at = lapse + BACKGROUND_PERIOD * k;
         rig.app.vitals.land_for_test(u64::from(k), at);
         rig.app.settle_rest(at);
         rig.app.service_vitals(at);
@@ -145,7 +146,7 @@ fn an_unattended_windows_deck_is_still_and_its_readings_keep_their_clock() {
             "reading {k}: no motion deadline"
         );
         // A turn between two readings: nothing landed, so nothing is drawn.
-        let between = at + FOCUSED_PERIOD / 4;
+        let between = at + BACKGROUND_PERIOD / 4;
         rig.app.settle_rest(between);
         rig.app.service_vitals(between);
         assert_eq!(
@@ -448,4 +449,66 @@ fn a_headless_instance_and_full_motion_are_always_attended() {
     rig.app.settle_rest(long);
     assert!(!rig.app.windows[&rig.wid].rest.attended(), "the default");
     assert_eq!(rig.frames_asked(), frames + 1);
+}
+
+/// A touch gives a lapsed window's settled pet its offer back in the touch's own turn: the plan
+/// right after a person's key returns the step the lapse withheld, and the touch asks no frame.
+/// A key aterm posted for a control client attends nothing, and the pet stays still.
+///
+/// NEGATIVE CONTROL: the admission read a snapshot `settle_rest` took (a `WindowState` bit set
+/// to `ws.person_here()` in `settle_rest`, read by `pet_offer_admitted` in place of
+/// `self.person_here()`): "a person's key gives the pet its step in the key's own turn" failed
+/// (left None, right Some(Instant { .. })).
+#[test]
+fn a_touch_restores_the_pet_offer_in_its_own_turn() {
+    let mut app = crate::App::headless_for_test();
+    let wid = crate::WindowId(0);
+    app.headless = false;
+    let start = Instant::now() + ATTENTION;
+    let mut ws = app.windows.get_mut(&wid).expect("the headless window");
+    let now = crate::effect_lane_attended_tests::settled_pet(&mut ws, start);
+    let offer = ws
+        .fx
+        .companion()
+        .next_change_deadline(now)
+        .expect("fixture: the settled resident owes a step");
+    drop(ws);
+    let plan = |app: &mut crate::App| {
+        app.windows
+            .get_mut(&wid)
+            .expect("the window")
+            .plan_terminal_effect_lane_with_recording(now, false, true, true, false, 10.0, true)
+    };
+    app.settle_rest(now);
+    assert!(
+        !app.windows[&wid].rest.attended(),
+        "fixture: the attention lapsed"
+    );
+    assert_eq!(
+        plan(&mut app),
+        None,
+        "a lapsed window's settled pet is still"
+    );
+
+    app.input_origin = InputOrigin::Posted;
+    app.note_rest_event(wid, &crate::window_rest::tests::key(), now);
+    app.input_origin = InputOrigin::Person;
+    assert_eq!(
+        plan(&mut app),
+        None,
+        "a key aterm posted gives the pet nothing"
+    );
+
+    let asks = crate::frame_asks_for_test(&app);
+    app.note_rest_event(wid, &crate::window_rest::tests::key(), now);
+    assert_eq!(
+        crate::frame_asks_for_test(&app),
+        asks,
+        "the touch asks no frame"
+    );
+    assert_eq!(
+        plan(&mut app),
+        Some(offer),
+        "a person's key gives the pet its step in the key's own turn"
+    );
 }

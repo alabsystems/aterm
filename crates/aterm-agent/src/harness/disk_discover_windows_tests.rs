@@ -38,7 +38,7 @@ fn found_keys(roots: &Roots) -> Vec<String> {
     let mut keys: Vec<String> = found
         .found
         .iter()
-        .map(|f| aterm_sysprobe::paths::windows_key(&f.path).expect("a keyed path"))
+        .map(|f| aterm_path::windows_key(&f.path).expect("a keyed path"))
         .collect();
     keys.sort();
     keys
@@ -46,8 +46,7 @@ fn found_keys(roots: &Roots) -> Vec<String> {
 
 /// `path`'s key, for comparing with [`found_keys`].
 fn key(path: &Path) -> String {
-    aterm_sysprobe::paths::windows_key(&std::fs::canonicalize(path).expect("canonical"))
-        .expect("a keyed path")
+    aterm_path::windows_key(&std::fs::canonicalize(path).expect("canonical")).expect("a keyed path")
 }
 
 /// Convert `top` and every entry under it into cloud placeholders of `root`.
@@ -182,7 +181,7 @@ fn a_checkout_in_a_cloud_sync_root_is_never_offered() {
     let keys: Vec<String> = found
         .found
         .iter()
-        .map(|f| aterm_sysprobe::paths::windows_key(&f.path).expect("keyed"))
+        .map(|f| aterm_path::windows_key(&f.path).expect("keyed"))
         .collect();
     assert_eq!(keys, [key(&home.join("plain").join("target"))], "{found:?}");
     assert!(
@@ -248,7 +247,7 @@ fn the_walk_lists_with_cloud_placeholders_exposed_while_it_lives() {
 /// Nothing inside a cloud sync root is read from any search root or via a junction.
 #[test]
 fn nothing_in_a_cloud_sync_root_is_read_into_from_any_root() {
-    use aterm_sysprobe::paths::is_under;
+    use aterm_path::is_under;
     let tmp = Tmp::new("discover-win-sync-reads");
     let synced = mkdirs(&tmp.path().join("Synced"));
     let proj = synced.join("proj");
@@ -298,7 +297,7 @@ fn nothing_in_a_cloud_sync_root_is_read_into_from_any_root() {
     let keys: Vec<String> = found
         .found
         .iter()
-        .map(|f| aterm_sysprobe::paths::windows_key(&f.path).expect("keyed"))
+        .map(|f| aterm_path::windows_key(&f.path).expect("keyed"))
         .collect();
     assert_eq!(
         keys,
@@ -318,7 +317,7 @@ fn nothing_in_a_cloud_sync_root_is_read_into_from_any_root() {
     let resolved = |p: &Path| {
         std::fs::canonicalize(p)
             .ok()
-            .and_then(|c| aterm_sysprobe::paths::windows_key(&c))
+            .and_then(|c| aterm_path::windows_key(&c))
     };
     for read in [
         proj.join("target"),
@@ -395,7 +394,7 @@ fn every_spelling_of_one_build_directory_is_one_row() {
     let keys: Vec<String> = found
         .found
         .iter()
-        .map(|f| aterm_sysprobe::paths::windows_key(&f.path).expect("keyed"))
+        .map(|f| aterm_path::windows_key(&f.path).expect("keyed"))
         .collect();
     assert_eq!(
         keys,
@@ -804,7 +803,7 @@ fn a_cloud_sync_root_the_home_search_meets_is_said_once_each() {
     let keys: Vec<String> = found
         .found
         .iter()
-        .map(|f| aterm_sysprobe::paths::windows_key(&f.path).expect("keyed"))
+        .map(|f| aterm_path::windows_key(&f.path).expect("keyed"))
         .collect();
     assert_eq!(keys, [key(&home.join("plain").join("target"))], "{found:?}");
     let said: Vec<Option<String>> = found
@@ -812,7 +811,7 @@ fn a_cloud_sync_root_the_home_search_meets_is_said_once_each() {
         .iter()
         .filter_map(|n| n.strip_prefix("cargo-targets: "))
         .filter_map(|n| n.strip_suffix(&format!(" {}", super::super::target::IN_SYNC_ROOT)))
-        .map(|p| aterm_sysprobe::paths::windows_key(Path::new(p)))
+        .map(|p| aterm_path::windows_key(Path::new(p)))
         .collect();
     assert_eq!(
         said,

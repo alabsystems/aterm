@@ -49,8 +49,8 @@ impl Frontier {
         }
     }
 
-    /// A digest of the whole frontier: equal fingerprints mean nothing arrived, so a pass
-    /// projects nothing again.
+    /// A digest of the whole frontier: equal fingerprints mean nothing arrived. The
+    /// materializer's key holds it among the rest of what a projection reads.
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
         let mut sha = Sha256::new();

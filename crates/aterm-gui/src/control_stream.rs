@@ -10,21 +10,30 @@
 //! answers `OK stream v=1 epoch=<instance> acked=<seq> in=<seq>` and reads one JSON record per
 //! line with the wire library's own codec ([`alab_wire::record`]), the one parser both sides run.
 //!
-//! Every harness record is acknowledged. What is not applied says why (`dropped`): a line over
-//! the bound, a record over the stream's budget, one the claim's grant does not cover, one
-//! applied before. A sequence gap, a line that is no record (it has no number to acknowledge), or
-//! the claim leaving the connection closes the stream; the harness reopens and resends from
-//! `acked`, which the session keeps beside the claim ([`crate::session_timeline::StreamState`]).
+//! Every harness line is acknowledged. What is not applied says why (`dropped`): a line over
+//! the bound, a line this codec does not read (each is record `acked+1`, so a resend never brings
+//! it back), a record over the stream's budget, one the claim's grant does not cover, one
+//! applied before. A sequence gap or the claim leaving the connection closes the stream; the
+//! harness reopens and resends from `acked`, which the session keeps beside the claim
+//! ([`crate::session_timeline::StreamState`]).
+//!
+//! Applied so far: `beat`, which counts as liveness, and `state`, which moves the session's
+//! current-state record ([`crate::session_timeline::AgentPublication`]) and is written as
+//! `mark agent word= rev= hseq= holder=` by the stream's one write arm
+//! ([`crate::session_log::SessionLog::stream_mark`]). From the first `state` applied, the
+//! screen reader no longer decides the agent word or the composer of that tab, until the claim
+//! ends; it goes on feeding every kind the stream has not applied.
 //!
 //! A record is data: nothing in one is typed, run or opened. This module is Unix only, as the
 //! claim's proof is; the state it keeps names no wire type.
 
 use std::io::{Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alab_wire::Scope as WireScope;
 use alab_wire::record::{
-    Body, Dropped, LINE_MAX, RATE_BURST, RATE_PER_S, Record, STREAM_VERSION, Side,
+    Body, Composer, Dropped, LINE_MAX, LineError, RATE_BURST, RATE_PER_S, Record, STREAM_VERSION,
+    Side, State,
 };
 use aterm_agent::harness::contract::UNIVERSAL;
 use aterm_slog::Bucket;
@@ -34,7 +43,7 @@ use super::control_lanes::Outbox;
 use super::{Request, Scope, Selector, ServeDisposition, Sid, Store};
 use crate::SessionCtx;
 use crate::harness_claim::{Proven, Scoped};
-use crate::session_timeline::{SessionMeta, StreamState};
+use crate::session_timeline::{SessionMeta, StreamFed, StreamState, StreamedState};
 
 /// The verb's one spelling: verb first, as `subscribe @<sid> events` is, so `@<sid> stream v=1`
 /// is answered this too.
@@ -45,7 +54,8 @@ const NO_CLAIM: &str =
 const NOT_OWNER: &str = "ERR denied: stream is owner-only\n";
 const NO_SESSION: &str = "ERR no such session\n";
 
-/// How often the reader looks at the claim while its peer sends nothing.
+/// How often the reader looks at the claim while its peer completes no line: one that sends
+/// nothing, and one that sends bytes with no newline.
 const TICK: Duration = Duration::from_millis(250);
 /// How long the peer has to take an acknowledgement before the stream ends: a hang detector.
 const ACK_WRITE: Duration = Duration::from_secs(60);
@@ -131,7 +141,7 @@ enum Line {
     Whole(Vec<u8>),
     /// A line longer than [`LINE_MAX`], discarded up to its newline and never parsed.
     Over,
-    /// Nothing arrived for [`TICK`].
+    /// No line was completed for [`TICK`], whether or not bytes arrived.
     Tick,
     /// The peer closed, or the socket failed.
     Ended,
@@ -145,17 +155,29 @@ struct Lines {
     scanned: usize,
     /// The line being gathered passed the bound: its bytes are discarded up to its newline.
     over: bool,
+    /// When [`Line::Tick`] was last due from: the reader's start, then each tick.
+    looked: Instant,
 }
 
 impl Lines {
-    const fn new(buffered: Vec<u8>) -> Self {
+    fn new(buffered: Vec<u8>) -> Self {
         Self {
             buffer: buffered,
             scanned: 0,
             over: false,
+            looked: Instant::now(),
         }
     }
 
+    /// The tick is due: the next one counts from now.
+    fn tick(&mut self) -> Line {
+        self.looked = Instant::now();
+        Line::Tick
+    }
+
+    /// The next line, or [`Line::Tick`] once [`TICK`] has passed since the last one. The tick is
+    /// a deadline over the whole wait, not over one read: each read is given only what is left
+    /// of it, so bytes that keep arriving with no newline do not put it off.
     fn next(&mut self, stream: &CtlStream) -> Line {
         loop {
             if let Some(at) = self.buffer[self.scanned..]
@@ -176,6 +198,13 @@ impl Lines {
                 self.buffer.clear();
             }
             self.scanned = self.buffer.len();
+            let left = TICK.saturating_sub(self.looked.elapsed());
+            if left.is_zero() {
+                return self.tick();
+            }
+            // macOS refuses a socket option once the peer has closed (`EINVAL`), with bytes
+            // still to read: the bound set before stands, and the read says how the stream ends.
+            let _ = stream.set_read_timeout(Some(left));
             let mut chunk = [0u8; CHUNK];
             let mut reader = stream;
             match reader.read(&mut chunk) {
@@ -188,10 +217,31 @@ impl Lines {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Line::Tick;
+                    return self.tick();
                 }
                 Err(_) => return Line::Ended,
             }
+        }
+    }
+}
+
+/// What one line was, read before any lock is taken.
+enum Sent {
+    /// A line over the bound, discarded unparsed.
+    Over,
+    /// A line within the bound that the codec does not read.
+    Unread(LineError),
+    /// A record.
+    Record(Record),
+}
+
+impl Sent {
+    /// Read `line` with the wire library's codec; `None` is a line over the bound.
+    fn read(line: Option<&[u8]>) -> Self {
+        match line.map(Record::read) {
+            None => Self::Over,
+            Some(Ok(decoded)) => Self::Record(decoded.record),
+            Some(Err(error)) => Self::Unread(error),
         }
     }
 }
@@ -203,6 +253,40 @@ enum Step {
     Ack { seq: u64, dropped: Option<Dropped> },
     /// Close the stream, and log why.
     Close(String),
+}
+
+/// A `state` record [`judge`] took, for [`step`] to apply to the session's current-state
+/// record.
+#[derive(Debug, PartialEq, Eq)]
+struct StateRecord {
+    seq: u64,
+    state: State,
+    composer: Option<Composer>,
+    /// The record as the codec writes it: the line kept as text.
+    line: String,
+}
+
+/// The record's state under the name the every-platform record keeps it by.
+fn streamed(state: State) -> StreamedState {
+    match state {
+        State::Starting => StreamedState::Starting,
+        State::Idle => StreamedState::Idle,
+        State::Working => StreamedState::Working,
+        State::Asking => StreamedState::Asking,
+        State::Walled => StreamedState::Walled,
+        State::Ended => StreamedState::Ended,
+    }
+}
+
+/// What the record says the input box holds. A `state` with no `composer` says nothing of it,
+/// and the stream is the composer's one source once it feeds the state: it reads `-`.
+fn composer(composer: Option<Composer>) -> aterm_messages::presence::ComposerState {
+    use aterm_messages::presence::ComposerState;
+    match composer {
+        Some(Composer::Empty) => ComposerState::Empty,
+        Some(Composer::Draft) => ComposerState::Draft,
+        None => ComposerState::Unknown,
+    }
 }
 
 /// The scope aterm's act table names for `rule`, as the wire library spells it.
@@ -221,51 +305,79 @@ fn granted(scoped: &Scoped) -> Vec<WireScope> {
 }
 
 /// JUDGE ONE LINE against the stream's state, the claim's grant and the stream's budget at
-/// `now` (the awake clock), and move the state.
+/// `now` (the awake clock), and move the state. It is given the line already read, so nothing
+/// is parsed under the lock its caller holds.
 ///
-/// In order: a line over the bound (`None`) is record `acked+1` and is dropped unparsed, because
-/// sequence numbers have no gaps. A line that is no record has no number: nothing can be
-/// acknowledged for it, so it closes the stream as a gap does. A `seq` above `acked+1` is a gap
+/// In order: a line over the bound is record `acked+1` and is dropped unparsed, because
+/// sequence numbers have no gaps. A line the codec does not read is record `acked+1` too,
+/// dropped `refused:usage`: the harness keeps every record above `acked` and sends it again, so
+/// a line that took no number would come back on every reopen and nothing behind it would ever
+/// arrive. A `seq` above `acked+1` is a gap
 /// and closes the stream. A `beat` counts as liveness as it arrives. A `seq` at or below `acked`
 /// was applied before. A record with less than one token in the budget is dropped; only a record
 /// that has one spends it, so the tokens that came back while records were dropped stay. A
-/// record aterm sends, or one the grant does not cover, is dropped. `beat` is applied; `title`,
+/// record aterm sends, or one the grant does not cover, is dropped. `beat` is applied; so is
+/// `state`, which needs the scope `state` and is handed back for [`step`] to apply; `title`,
 /// an unknown kind and every kind this aterm does not apply yet are acknowledged and counted,
 /// and are not added to the applied kinds.
 fn judge(
     state: &mut StreamState,
-    line: Option<&[u8]>,
+    sent: Sent,
     granted: &[WireScope],
     bucket: &mut Bucket,
     now: u64,
-) -> Step {
+) -> (Step, Option<StateRecord>) {
     let next = state.acked.saturating_add(1);
-    let Some(line) = line else {
-        state.acked = next;
-        state.dropped += 1;
-        return Step::Ack {
-            seq: next,
-            dropped: Some(Dropped::Bound),
-        };
-    };
-    let Record { seq, body, .. } = match Record::read(line) {
-        Ok(decoded) => decoded.record,
-        Err(error) => {
-            return Step::Close(format!("no record ({error}) acked={}", state.acked));
+    let record = match sent {
+        Sent::Record(record) => record,
+        unnumbered => {
+            state.acked = next;
+            state.dropped += 1;
+            let why = match unnumbered {
+                Sent::Over => Dropped::Bound,
+                _ => Dropped::Refused("usage".to_string()),
+            };
+            return (
+                Step::Ack {
+                    seq: next,
+                    dropped: Some(why),
+                },
+                None,
+            );
         }
     };
+    judge_record(state, record, granted, bucket, now)
+}
+
+/// [`judge`] for a line that read as a record.
+fn judge_record(
+    state: &mut StreamState,
+    record: Record,
+    granted: &[WireScope],
+    bucket: &mut Bucket,
+    now: u64,
+) -> (Step, Option<StateRecord>) {
+    let next = state.acked.saturating_add(1);
+    let seq = record.seq;
     if seq > next {
-        return Step::Close(format!("seq={seq} gap acked={}", state.acked));
+        return (
+            Step::Close(format!("seq={seq} gap acked={}", state.acked)),
+            None,
+        );
     }
+    let body = &record.body;
     if matches!(body, Body::Beat) {
         state.last_beat_ms = Some(now);
     }
     let drop = |state: &mut StreamState, why: Dropped| {
         state.dropped += 1;
-        Step::Ack {
-            seq,
-            dropped: Some(why),
-        }
+        (
+            Step::Ack {
+                seq,
+                dropped: Some(why),
+            },
+            None,
+        )
     };
     if seq <= state.acked {
         return drop(state, Dropped::Applied);
@@ -284,39 +396,85 @@ fn judge(
     if !body.admitted(granted, act_scope) {
         return drop(state, Dropped::Scope);
     }
+    let mut applied = None;
     match body {
         Body::Beat => {
             state.applied.insert(alab_wire::Kind::Beat.word());
         }
+        Body::State {
+            state: said,
+            composer,
+        } => match record.line() {
+            Ok(line) => {
+                state.applied.insert(alab_wire::Kind::State.word());
+                applied = Some(StateRecord {
+                    seq,
+                    state: *said,
+                    composer: *composer,
+                    line,
+                });
+            }
+            // A record the codec read and cannot write back is kept as no line: not applied.
+            Err(_) => state.unapplied += 1,
+        },
         Body::Title { .. } => state.titles += 1,
         Body::Unknown { .. } => state.unknown += 1,
         _ => state.unapplied += 1,
     }
-    Step::Ack { seq, dropped: None }
+    (Step::Ack { seq, dropped: None }, applied)
 }
 
-/// Judge `line` for the stream of `proven` on connection `conn`, under the session's metadata
+/// Judge `sent` for the stream of `proven` on connection `conn`, under the session's metadata
 /// lock: the claim is read again for every line, so a record is held to the grant that stands
-/// when it arrives, and a claim that left this connection ends the stream.
+/// when it arrives, and a claim that left this connection ends the stream. A `state` record
+/// that was taken is applied in the same hold (meta, then the timeline), so no reader sees the
+/// kind applied and the record not yet moved.
 fn step(
     ctx: &SessionCtx,
     conn: u64,
     proven: &Proven,
-    line: Option<&[u8]>,
+    sent: Sent,
     bucket: &mut Bucket,
     now: u64,
 ) -> Step {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(granted) = claim_on(&meta, conn, crate::metrics::now_us())
-        .filter(|scoped| scoped.proven == *proven)
-        .map(granted)
+    let now_us = crate::metrics::now_us();
+    let Some((granted, holder, agent)) = meta
+        .live_claim(now_us)
+        .filter(|claim| claim.conn == Some(conn))
+        .and_then(|claim| {
+            let scoped = claim_on(&meta, conn, now_us).filter(|s| s.proven == *proven)?;
+            Some((
+                granted(scoped),
+                claim.holder.clone(),
+                scoped.claim.row.program,
+            ))
+        })
     else {
         return Step::Close("the claim left this connection".to_string());
     };
-    match meta.stream.as_mut().filter(|state| state.proven == *proven) {
-        Some(state) => judge(state, line, &granted, bucket, now),
-        None => Step::Close("the stream's state went to another claimant".to_string()),
+    let Some(state) = meta.stream.as_mut().filter(|state| state.proven == *proven) else {
+        return Step::Close("the stream's state went to another claimant".to_string());
+    };
+    let (step, applied) = judge(state, sent, &granted, bucket, now);
+    if let Some(record) = applied {
+        let fed = StreamFed {
+            state: streamed(record.state),
+            composer: composer(record.composer),
+            epoch: state.epoch.clone(),
+            hseq: record.seq,
+            holder,
+            by: crate::session_log::sid_actor(ctx.self_id.as_str())
+                .unwrap_or(aterm_slog::Actor::Nobody),
+            agent,
+            line: record.line,
+        };
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publish_stream_state(fed);
     }
+    step
 }
 
 /// Whether the claim the stream opened under still stands on connection `conn`.
@@ -386,7 +544,8 @@ pub(super) fn serve(
         aterm_log::info!("stream @{sid} closed before it opened: the claim left this connection");
         return;
     };
-    // The request lanes' 250 ms read poll gives way to this reader's own tick.
+    // The request lanes' read poll gives way to this reader's own tick: no read waits longer
+    // than this, and [`Lines::next`] gives each one only what is left of the tick.
     if stream.set_read_timeout(Some(TICK)).is_err()
         || stream.set_write_timeout(Some(ACK_WRITE)).is_err()
     {
@@ -399,6 +558,8 @@ pub(super) fn serve(
     let refill_ms = 1000 / u64::from(RATE_PER_S.max(1));
     let mut bucket = Bucket::new(RATE_BURST, refill_ms, now_ms());
     let mut lines = Lines::new(buffered);
+    // The first line of this connection the codec did not read is logged; the rest are counted.
+    let mut unread_logged = false;
     let why = loop {
         let line = match lines.next(stream) {
             Line::Whole(line) => Some(line),
@@ -407,7 +568,14 @@ pub(super) fn serve(
             Line::Tick => break "the claim left this connection".to_string(),
             Line::Ended => break "the peer closed".to_string(),
         };
-        match step(ctx, conn, &proven, line.as_deref(), &mut bucket, now_ms()) {
+        // Read outside the session's lock: a line is up to 256 KiB of JSON.
+        let sent = Sent::read(line.as_deref());
+        if let Sent::Unread(error) = &sent
+            && !std::mem::replace(&mut unread_logged, true)
+        {
+            aterm_log::info!("stream @{sid} dropped a line that is no record ({error})");
+        }
+        match step(ctx, conn, &proven, sent, &mut bucket, now_ms()) {
             Step::Ack { seq, dropped } => {
                 let written = ack_line(seq, dropped).map(|line| write_line(stream, &line));
                 if !matches!(written, Some(Ok(()))) {

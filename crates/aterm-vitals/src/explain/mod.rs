@@ -9,6 +9,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::model::{Membership, Sample, Snapshot};
+use crate::published_cpu::CpuAccounting;
 
 pub mod account;
 pub mod detect;
@@ -25,7 +26,7 @@ pub use account::{
 pub use detect::{
     ACTIVITIES, Activity, ActivityId, Candidate, CauseId, Context, Evidence, Term, WakeFact, detect,
 };
-pub use episodes::{ClauseHold, DeckCause, Episodes, OpenCause, deck_cause};
+pub use episodes::{DeckCause, OpenCause, deck_cause};
 pub use reap::{ReapLedger, ReapTotals, Scope};
 pub use split::{CoalBase, SplitIn, WINDOW_MAX_NS, split};
 
@@ -378,13 +379,13 @@ pub struct CoalRow {
     /// `false` for one the base should have held and did not, or whose counter went back: its
     /// figures over the window read 0, and the residual holds its work.
     pub measured: bool,
-    /// Independently attributed app members' own CPU moved out of an outside coalition,
-    /// millicores. Different kernel read cuts can put this past [`Self::cpu_mc`].
+    /// Published app-member own-counter growth under an outside coalition, millicores.
+    /// This independent account can exceed [`Self::cpu_mc`]; it is not its temporal subset.
     pub delegated_mc: i64,
     /// Whole-coalition ownership is mixed or incomplete; its raw total has no single owner.
     pub ownership_mixed: bool,
-    /// Independently measured foreign members' own CPU when ownership is mixed.
-    pub outside_floor_mc: i64,
+    /// Published foreign-member own-counter growth when ownership is mixed.
+    pub outside_reported_mc: i64,
     /// Of [`Self::cpu_mc`], what ran at maintenance or background QoS (deferred work), millicores.
     pub deferred_mc: i64,
     /// Its seven QoS buckets' growth over the window, millicores: what [`Self::deferred_mc`] is a
@@ -536,17 +537,20 @@ pub fn deferred_pm(deferred: i64, qos: i64) -> Option<u16> {
     })
 }
 
-/// The busy CPU over one matched window, millicores: every figure is over the same window, and
-/// `global = aterm + delegated + others + services + unaccounted` exactly.
+/// Independent CPU counter accounts divided by a common frontend read separation.
+///
+/// Process, coalition and machine counters need not publish the same execution epochs. Their
+/// arithmetic differences are diagnostics, not actual-window ownership partitions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoalSplit {
+    /// Temporal meaning of these reported CPU rates, independent of coverage.
+    pub cpu_accounting: CpuAccounting,
     /// How it was made.
     pub via: Via,
-    /// Whether every coalition was read and every process swept at both ends of the window, so
-    /// every row is measured and every scope's CPU charge is unambiguous (`exact`), or not
-    /// (`heuristic`, as every process-only account is).
-    pub exact: bool,
-    /// App and outside scopes are lower bounds because a coalition has mixed or unread owners.
+    /// Whether all coalition/process observations and charge reconciliation have coverage.
+    /// This does not establish when the reported CPU executed.
+    pub coverage_complete: bool,
+    /// App and outside ownership observations have mixed or unread members.
     pub ownership_incomplete: bool,
     /// Whether the kernel's list of coalitions stopped short at either end of the window
     /// (`cannot what=coalition_list why=truncated`).
@@ -565,61 +569,47 @@ pub struct CoalSplit {
     /// Every other measured coalition, less the delegated work. By subtraction, only observed
     /// other-user processes' own CPU; unknown services remain in [`Self::unaccounted_mc`].
     pub services_mc: i64,
-    /// What no part holds, signed and never clamped.
+    /// Machine tick rate minus independent reported accounts, signed and never clamped.
+    /// This diagnostic does not measure unowned actual-window CPU.
     pub unaccounted_mc: i64,
     /// Each tab's work over the window, by its key ([`crate::model::TabRoot::tab`]; a tab split into panes is
     /// one), in the host's order: where the reap credit's ledger read both ends of the window
     /// ([`reap`]), its members' own CPU and their reaped children's (finished work included),
     /// else its processes alive at both ends of it; delegated members' live work included.
     pub tabs: Vec<(u64, i64)>,
-    /// Independently observed own CPU for each tab, without any reaped-child charge.
-    pub tab_floors: Vec<(u64, i64)>,
-    /// Tabs whose reaped-counter charge may exceed actual CPU in this window.
+    /// Each tab's published own-counter growth, without inherited child charges.
+    pub tab_reported: Vec<(u64, i64)>,
+    /// Tabs whose reconciled charge may repeat inherited accounting.
     pub ambiguous_tabs: Vec<u64>,
     /// The same over the window for aterm's processes in no tab (itself, its helpers, what
     /// closed tabs left, and a delegated job's members whose tab closed), so of
     /// [`Self::aterm_mc`] plus [`Self::delegated_mc`], not of aterm's coalitions alone.
     pub own_mc: i64,
-    /// Independently observed own CPU outside tabs, millicores.
-    pub own_floor_mc: i64,
-    /// Whether the charge outside tabs may exceed actual CPU.
+    /// Published own-counter growth outside tabs, millicores.
+    pub own_reported_mc: i64,
+    /// Whether inherited charge outside tabs may repeat accounting.
     pub own_ambiguous: bool,
-    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every supported actual-CPU figure
-    /// ([`Self::own_actual`] and [`Self::tab_actual_of`]), never below 0: work in no
-    /// figure, so in no tab's: with the reap credit, a process that left for
-    /// launchd before a sweep read it, a member's tail before launchd reaped
-    /// it, the counters' skew; without it, every process not alive at both
-    /// ends of the window. Taken from the parts' nanoseconds and rounded
-    /// once, so the parts' own rounding never reads as a millicore of it; 0
-    /// where aterm's coalitions held only the figures' work
-    /// ([`Self::skew_mc`]).
+    /// Positive difference between coalition/delegated reported growth and the process
+    /// own-counter account, rounded once from nanoseconds. This is not unowned execution:
+    /// publication delay, missing reads and lifetime ownership can all contribute.
     pub unattributed_mc: i64,
-    /// What aterm's coalitions' counters ran past their members' figures
-    /// over a window in which none of them made or reaped a member (the
-    /// kernel's task counters at both ends) and the sweep found every live
-    /// member (as many as the counters hold) in a figure that read it at
-    /// both ends of the window: no process came or went, so none of it is
-    /// finished work, only the skew between a coalition's counter and its
-    /// members' times, which the headless run read at 2.70–3.78 ms, each
-    /// giving back what the counter fell behind in the windows before (RD
-    /// §3.5, §7.3). Rounded once from ns, as [`Self::unattributed_mc`]
-    /// (which reads 0 then); 0 in any other window and without coalition counters.
+    /// Positive cross-counter difference when the coalition task census is unchanged and
+    /// every live member was observed at both reads. These conditions classify observation
+    /// coverage only; they do not bound deferred accounting or prove an execution-window tail.
     pub skew_mc: i64,
-    /// The tabs, by key, whose figure the reap credit's ledger knows is short of their work over
-    /// the window, so only a lower bound however little is [`Self::unattributed_mc`] ([`reap`]'s
-    /// missed steps): a member's tail where launchd reaped it, work taken out against members
-    /// gone with their parent that the reaper's reaped time fell short of, a member of aterm's
-    /// back from a delegated job, a process first read since the last reading. None by
-    /// subtraction, which reads no finished work.
+    /// Tabs whose reconciled charge knowingly missed observations ([`reap`]). This coverage
+    /// signal is independent of the publication epochs behind every counter read.
     pub short_tabs: Vec<u64>,
     /// Every listed coalition that answered, busiest first (none in a process-only account), rounded as a
     /// set to their measured total. A mixed row retains its raw coalition total, while only
-    /// independently attributed owner floors enter the scope totals.
+    /// independently attributed member observations enter mixed-owner summaries.
     pub rows: Vec<CoalRow>,
 }
 
-/// The split's five parts with one tab's work taken out of aterm's, millicores: they add up to
-/// [`CoalSplit::global_mc`] exactly.
+/// Diagnostic arithmetic across independent reported accounts, in millicores.
+///
+/// The signed difference makes the arithmetic sum to [`CoalSplit::global_mc`]; it does not
+/// establish actual-window ownership, a machine partition or an upper bound on other work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Parts {
     /// The tab's work ([`CoalSplit::tabs`]).
@@ -645,40 +635,21 @@ impl CoalSplit {
             .sum()
     }
 
-    /// The supported actual-CPU figure: exact charge where unambiguous, otherwise only the
-    /// independently measured own-CPU floor. Charges remain available separately.
+    /// Published own-counter growth of these tabs, independent of inherited charges.
+    /// Missing ownership or reads do not change its temporal basis or select another account.
     #[must_use]
-    pub fn tab_actual_of(&self, panes: &[u64]) -> i64 {
-        self.tabs
+    pub fn tab_reported_of(&self, panes: &[u64]) -> i64 {
+        self.tab_reported
             .iter()
-            .filter(|(k, _)| panes.contains(k))
-            .map(|(k, charge)| {
-                let floor = self
-                    .tab_floors
-                    .iter()
-                    .find(|(key, _)| key == k)
-                    .map_or(0, |(_, mc)| *mc);
-                if self.ownership_incomplete
-                    || self.unaccounted_mc > 0
-                    || self.ambiguous_tabs.contains(k)
-                    || floor > *charge
-                {
-                    floor
-                } else {
-                    *charge
-                }
-            })
+            .filter(|(key, _)| panes.contains(key))
+            .map(|(_, mc)| *mc)
             .sum()
     }
 
-    /// Actual CPU outside tabs, or its independent floor when the charge is ambiguous.
+    /// Published own-counter growth outside tabs, independent of inherited charges.
     #[must_use]
-    pub fn own_actual(&self) -> i64 {
-        if self.ownership_incomplete || self.own_ambiguous || self.own_floor_mc > self.own_mc {
-            self.own_floor_mc
-        } else {
-            self.own_mc
-        }
+    pub fn own_reported(&self) -> i64 {
+        self.own_reported_mc
     }
 
     /// The parts with tab `tab`'s work (the caller's) out of aterm's: none for no tab or one the
@@ -694,20 +665,21 @@ impl CoalSplit {
         self.parts_of_coverage(panes, false)
     }
 
-    /// Owner parts with source coverage that may be incomplete independently of coalition reads.
+    /// Diagnostic differences with independent source-coverage flags. No result is an
+    /// actual-window partition, even with complete coverage.
     #[must_use]
     pub fn parts_of_coverage(&self, panes: &[u64], source_incomplete: bool) -> Parts {
-        let tab = self.tab_actual_of(panes);
+        let tab = self.tab_charge_of(panes);
         if self.ownership_incomplete || source_incomplete {
             let tab = self
-                .tab_floors
+                .tab_reported
                 .iter()
                 .filter(|(key, _)| panes.contains(key))
                 .map(|(_, cpu)| *cpu)
                 .sum();
-            let aterm_rest = self.own_floor_mc
+            let aterm_rest = self.own_reported_mc
                 + self
-                    .tab_floors
+                    .tab_reported
                     .iter()
                     .filter(|(key, _)| !panes.contains(key))
                     .map(|(_, cpu)| *cpu)
@@ -738,7 +710,7 @@ pub struct WhyFacts {
     pub at_ns: u64,
     /// Its wall clock, unix ms.
     pub at_unix_ms: i64,
-    /// The window every figure is over, ns.
+    /// Separation between frontend observations, ns; not CPU accounting epochs.
     pub window_ns: u64,
     /// Whether the lane read.
     pub lane: CoalLane,
@@ -759,7 +731,7 @@ pub struct WhyFacts {
     pub userspace_ms: Option<i64>,
     /// This aterm's user, where read.
     pub self_uid: Option<u32>,
-    /// The causes that hold over the window, ranked ([`detect()`]).
+    /// Independently supported machine contexts, ranked ([`detect()`]).
     pub causes: Vec<Candidate>,
     /// The episodes open after this tick, ranked the same way: covering causes only, since a
     /// context keeps no episode.
@@ -786,13 +758,6 @@ pub enum Fault {
     /// inside the window ran (`unattributed_mc`) leaves it for services, the
     /// reaper's (SA's `DropReapedChildTime`).
     DropReapedChildTime,
-    /// A named activity's members are matched by signing id alone, under any voucher.
-    MatchBySigningIdOnly,
-    /// The Deck's clause shows and goes with its candidate, with no hold.
-    NoHold,
-    /// `unexplained` reads only the three parts, so the split's unaccounted residual goes uncovered
-    /// however large.
-    IgnoreUnaccounted,
     /// Unattributed work up to a fixed [`Fault::TOLERANCE_MC`] is taken
     /// for the counters' skew whatever was read: the fudge the task
     /// counters' rule ([`CoalSplit::skew_mc`]) replaces, which calls a small
@@ -823,7 +788,7 @@ impl Fault {
                     .iter()
                     .map(|t| (t.key, millicores(t.scope.cores.raw)))
                     .collect();
-                split.tab_floors.clone_from(&split.tabs);
+                split.tab_reported.clone_from(&split.tabs);
             }
             Self::ChargeSharedLauncher => {
                 for r in &split.rows {
@@ -844,7 +809,6 @@ impl Fault {
                     split.unattributed_mc = 0;
                 }
             }
-            Self::MatchBySigningIdOnly | Self::NoHold | Self::IgnoreUnaccounted => {}
         }
         facts
     }
@@ -993,8 +957,6 @@ pub(crate) struct WhyState {
     /// swept, or while it leads a listed coalition on a truncated sweep.
     identities: IdMap<(u32, i64), LeadIdentity>,
     facts: Option<Arc<WhyFacts>>,
-    episodes: Episodes,
-    clause: ClauseHold,
     /// The tabs' and aterm's CPU, live and reaped, read at each whole reading ([`reap`]).
     reap: ReapLedger,
     /// The last whole reading used by the resource rows' scope histories.
@@ -1008,50 +970,57 @@ pub(crate) struct WhyState {
     pub(crate) fault: Option<Fault>,
 }
 
-/// One whole sweep's common-window CPU account, separate from process-live rates.
+/// Published process and coalition CPU accounts over one frontend read separation.
+///
+/// These channels remain independent: neither their maximum nor complete ownership establishes
+/// an actual-window total. Inherited child charges are retained as a separate diagnostic.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopeCpu {
-    /// Duration between the two whole readings, nanoseconds.
+    /// Monotonic stamp of the later frontend observation, not an accounting epoch.
+    pub read_at_ns: u64,
+    /// Duration between the two whole frontend readings, not accounting epochs, nanoseconds.
     pub window_ns: u64,
-    /// App CPU supported by the matched coalition account, including proved mixed-owner floors.
-    pub app_measured: Option<f64>,
-    /// Whether the measured app total is only a lower bound of app ownership/coverage.
-    pub app_incomplete: bool,
-    /// Non-tab reconciled counter charge, in cores.
+    /// Temporal meaning of every CPU rate in this account, independent of coverage.
+    pub cpu_accounting: CpuAccounting,
+    /// Independently reported app coalition/member-account growth, in cores, where available.
+    pub coalition_reported: Option<f64>,
+    /// Whether the coalition ownership/read coverage is incomplete.
+    pub coalition_incomplete: bool,
+    /// Non-tab reconciled inherited counter charge, in cores.
     pub own_charge: f64,
-    /// Non-tab CPU proved by each observed process's own counter, in cores.
-    pub own_floor: f64,
-    /// Whether the non-tab reaped remainder cannot be equated with actual CPU.
+    /// Non-tab published own-counter growth, in cores.
+    pub own_reported: f64,
+    /// Whether inherited charge outside tabs may repeat accounting.
     pub own_ambiguous: bool,
-    /// Whether any contribution was unread or missed in this interval.
+    /// Whether any process contribution was unread or missed between the readings.
     pub missed: bool,
     /// Logical tabs, one row per tab key.
     pub tabs: Vec<ScopeCpuTab>,
-    /// Independently confirmed CPU for each currently open pane. A logical tab can hold
-    /// additional work from a pane that has closed.
+    /// Published own-counter growth for each currently open pane. A logical tab can retain
+    /// additional observations from a pane that has closed.
     pub panes: Vec<ScopeCpuPane>,
 }
 
-/// A pane's independently observed own-counter CPU over the common window.
+/// A pane's published own-counter growth divided by the frontend read separation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopeCpuPane {
     /// Pane/session key.
     pub key: u64,
-    /// Confirmed CPU in cores.
-    pub floor: f64,
+    /// Reported own-counter growth rate, in cores; not an execution-window floor.
+    pub reported: f64,
 }
 
-/// A logical tab's contribution to the common-window CPU account.
+/// A logical tab's independent reported and inherited-charge channels.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScopeCpuTab {
     /// Logical tab key.
     pub key: u64,
     /// Stable identity assigned by the reap ledger while the logical tab stays open.
     pub id: u64,
-    /// Reconciled counter charge, in cores.
+    /// Reconciled inherited counter charge, in cores.
     pub charge: f64,
-    /// Proved own-counter CPU, in cores.
-    pub floor: f64,
+    /// Published own-counter growth, in cores; not an execution-window floor.
+    pub reported: f64,
     /// Whether inherited reaped-counter charge can include repeated accounting.
     pub ambiguous: bool,
     /// Whether the interval missed or could not read some tab work.
@@ -1059,22 +1028,13 @@ pub struct ScopeCpuTab {
 }
 
 impl ScopeCpu {
-    /// Actual non-tab CPU supported by this account; a lower bound when ambiguous.
+    /// Published own-counter growth of the process account, counting every scope once.
+    /// Coalition growth and inherited child charges remain independent of this sum.
     #[must_use]
-    pub fn own_actual(&self) -> f64 {
-        if self.own_ambiguous {
-            self.own_floor
-        } else {
-            self.own_charge.max(self.own_floor)
-        }
+    pub fn process_reported(&self) -> f64 {
+        self.own_reported + self.tabs.iter().map(|tab| tab.reported).sum::<f64>()
     }
-    /// Actual app CPU supported by this account, including every logical tab once.
-    #[must_use]
-    pub fn all_actual(&self) -> f64 {
-        let assigned = self.own_actual() + self.tabs.iter().map(ScopeCpuTab::actual).sum::<f64>();
-        self.app_measured.map_or(assigned, |app| app.max(assigned))
-    }
-    /// App kernel counter charge, which is separate from proved actual CPU.
+    /// App inherited counter charge, separate from published process growth.
     #[must_use]
     pub fn all_charge(&self) -> f64 {
         self.own_charge + self.tabs.iter().map(|t| t.charge).sum::<f64>()
@@ -1100,13 +1060,12 @@ impl PreparedWhy {
         let Some(facts) = self
             .facts
             .as_ref()
-            .filter(|f| f.lane.on() && f.window_ns == cpu.window_ns)
+            .filter(|f| f.lane.on() && f.at_ns == cpu.read_at_ns && f.window_ns == cpu.window_ns)
         else {
             return;
         };
-        cpu.app_measured =
-            Some((facts.split.aterm_mc + facts.split.delegated_mc).max(0) as f64 / 1000.0);
-        cpu.app_incomplete = facts.split.ownership_incomplete
+        cpu.coalition_reported = Some(facts.split.aterm_mc.max(0) as f64 / 1000.0);
+        cpu.coalition_incomplete = facts.split.ownership_incomplete
             || facts.split.list_truncated
             || facts.split.rows.len() < facts.split.listed as usize
             || facts
@@ -1119,20 +1078,6 @@ impl PreparedWhy {
             || s.native_source_lost
             || s.ownership_incomplete
             || !s.unproved_tabs.is_empty();
-        let assigned = cpu.own_actual() + cpu.tabs.iter().map(ScopeCpuTab::actual).sum::<f64>();
-        cpu.app_incomplete |= cpu.app_measured.is_some_and(|app| app < assigned);
-    }
-}
-
-impl ScopeCpuTab {
-    /// Actual CPU supported by this account; a lower bound when ambiguous.
-    #[must_use]
-    pub fn actual(&self) -> f64 {
-        if self.ambiguous {
-            self.floor
-        } else {
-            self.charge.max(self.floor)
-        }
     }
 }
 
@@ -1215,13 +1160,13 @@ impl WhyState {
             .iter()
             .map(|tab| {
                 let (cpu, missed) = now.since(&base, tab.key);
-                let (floor, ambiguous) = now.floor_since(&base, tab.key);
+                let (floor, ambiguous) = now.reported_since(&base, tab.key);
                 let extra = extra_tabs.get(&tab.key).copied().unwrap_or(0);
                 ScopeCpuTab {
                     key: tab.key,
                     id: tab.id,
                     charge: cpu.saturating_add(extra) as f64 / window as f64,
-                    floor: floor.saturating_add(extra) as f64 / window as f64,
+                    reported: floor.saturating_add(extra) as f64 / window as f64,
                     ambiguous: ambiguous || floor > cpu,
                     missed: missed || extra_missing.contains(&Some(tab.key)),
                 }
@@ -1232,8 +1177,8 @@ impl WhyState {
             .iter()
             .map(|pane| ScopeCpuPane {
                 key: pane.key,
-                floor: now
-                    .pane_floor_since(&base, pane.key)
+                reported: now
+                    .pane_reported_since(&base, pane.key)
                     .saturating_add(extra_panes.get(&pane.key).copied().unwrap_or(0))
                     as f64
                     / window as f64,
@@ -1242,15 +1187,17 @@ impl WhyState {
         let raw_tabs = now.tabs.iter().fold(0_u64, |sum, t| {
             sum.saturating_add(now.since(&base, t.key).0)
         });
-        let (own_floor, own_ambiguous) = now.own_floor_since(&base);
+        let (own_reported, own_ambiguous) = now.own_reported_since(&base);
         let own_charge = now.all.saturating_sub(base.all).saturating_sub(raw_tabs);
         Some(ScopeCpu {
+            read_at_ns: s.at_ns,
             window_ns: window,
-            app_measured: None,
-            app_incomplete: true,
+            cpu_accounting: CpuAccounting::PUBLISHED_COUNTERS,
+            coalition_reported: None,
+            coalition_incomplete: true,
             own_charge: own_charge.saturating_add(extra_own) as f64 / window as f64,
-            own_floor: own_floor.saturating_add(extra_own) as f64 / window as f64,
-            own_ambiguous: own_ambiguous || own_floor > own_charge,
+            own_reported: own_reported.saturating_add(extra_own) as f64 / window as f64,
+            own_ambiguous: own_ambiguous || own_reported > own_charge,
             missed: now.missed > base.step
                 || !extra_missing.is_empty()
                 || s.ownership_incomplete
@@ -1277,10 +1224,6 @@ impl WhyState {
     ) -> PreparedWhy {
         self.misread = self.misread || (s.coal_lane.on() && misread(s));
         let lane = self.lane(s);
-        if !lane.on() {
-            self.episodes = Episodes::default();
-            self.clause = ClauseHold::default();
-        }
         if !self.reap.stepped_at(s.at_ns) {
             self.step_reap(s, attribution);
         }
@@ -1315,8 +1258,6 @@ impl WhyState {
                 self.facts = Some(Arc::new(self.explain(facts, s, snap)));
             }
             None if s.coal_lane.on() && !self.misread && s.coalitions.is_some() => {
-                self.episodes = Episodes::default();
-                self.clause = ClauseHold::default();
                 if let Some(f) = self
                     .facts
                     .as_mut()
@@ -1360,25 +1301,12 @@ impl WhyState {
         );
     }
 
-    /// `facts` with the causes that hold over their window, the episodes
-    /// open after it and the Deck's clause.
-    fn explain(&mut self, mut facts: WhyFacts, s: &Sample, snap: &Snapshot) -> WhyFacts {
-        #[cfg(any(test, debug_assertions))]
-        let (vouched, residual) = (
-            self.fault != Some(Fault::MatchBySigningIdOnly),
-            self.fault != Some(Fault::IgnoreUnaccounted),
-        );
-        #[cfg(any(test, debug_assertions))]
-        {
-            self.clause.no_hold = self.fault == Some(Fault::NoHold);
-        }
-        #[cfg(not(any(test, debug_assertions)))]
-        let (vouched, residual) = (true, true);
-        facts.causes = detect::detect_as(&facts, snap, vouched, residual);
-        facts.open = self
-            .episodes
-            .step(s.mono_ms, s.at_unix_ms, &facts.causes, s.procs_truncated);
-        facts.clause = self.clause.step(s.mono_ms, &facts.open, &facts.split);
+    /// Add independently supported machine contexts. Published CPU growth cannot retain
+    /// an actual-window CPU episode or Deck clause.
+    fn explain(&mut self, mut facts: WhyFacts, _s: &Sample, snap: &Snapshot) -> WhyFacts {
+        facts.causes = detect::detect(&facts, snap);
+        facts.open.clear();
+        facts.clause = None;
         facts
     }
 
@@ -1508,19 +1436,19 @@ fn by_subtraction(s: &Sample, snap: &Snapshot, lane: CoalLane) -> Option<WhyFact
     let built = snap.split?;
     let mut split = CoalSplit::by_subtraction(&built, &snap.tabs, &s.tabs);
     if let Some(cpu) = &snap.scoped_cpu {
-        split.aterm_mc = (cpu.all_actual() * 1000.0).floor() as i64;
+        split.aterm_mc = (cpu.process_reported() * 1000.0).floor() as i64;
         split.own_mc = (cpu.own_charge * 1000.0).round() as i64;
-        split.own_floor_mc = (cpu.own_floor * 1000.0).floor() as i64;
+        split.own_reported_mc = (cpu.own_reported * 1000.0).floor() as i64;
         split.own_ambiguous = cpu.own_ambiguous;
         split.tabs = cpu
             .tabs
             .iter()
             .map(|t| (t.key, (t.charge * 1000.0).round() as i64))
             .collect();
-        split.tab_floors = cpu
+        split.tab_reported = cpu
             .tabs
             .iter()
-            .map(|t| (t.key, (t.floor * 1000.0).floor() as i64))
+            .map(|t| (t.key, (t.reported * 1000.0).floor() as i64))
             .collect();
         split.ambiguous_tabs = cpu
             .tabs
@@ -1535,8 +1463,8 @@ fn by_subtraction(s: &Sample, snap: &Snapshot, lane: CoalLane) -> Option<WhyFact
             .map(|t| t.key)
             .collect();
     }
-    // Unknown services and app work stay in the residual. Only independently observed
-    // other-user process CPU belongs to the services floor.
+    // This signed cross-counter difference is diagnostic. Unknown ownership and deferred
+    // accounting cannot be recovered by subtracting process reports from machine ticks.
     split.unaccounted_mc = split.global_mc - split.aterm_mc - split.others_mc - split.services_mc;
     Some(WhyFacts {
         at_ns: snap.at_ns,

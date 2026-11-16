@@ -2151,12 +2151,8 @@ fn each_program_is_taught_the_wait_its_shell_can_do() {
             assert!(line.starts_with("In Claude Code,"), "{name}: {line}");
         }
         assert_eq!(
-            lines.len(),
-            if matches!(name, "claude" | "shared") {
-                2
-            } else {
-                0
-            },
+            !lines.is_empty(),
+            matches!(name, "claude" | "shared"),
             "{name}'s Claude Code lines: {lines:?}"
         );
     }

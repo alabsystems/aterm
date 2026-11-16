@@ -458,7 +458,10 @@ fn seeds_fit_their_schemas_and_share_the_provider_words() {
         assert!(crate::typed::pk_grammar(plan.pk));
     }
     let rows = seeds::rows_for(&Cells::new()).unwrap();
-    assert_eq!(rows.len(), 6 + 7 + 13);
+    assert_eq!(
+        rows.len(),
+        seeds::PROVIDERS.len() + seeds::CLIS.len() + seeds::PLANS.len()
+    );
     for change in rows.iter().flatten() {
         assert_eq!(change.value.as_ref().unwrap()["a"], Value::Bool(true));
     }
@@ -491,7 +494,7 @@ fn owner_value(pk: &str, col: &str, x: Value) -> Change {
 /// the owner set it), and a second Mac's run after repair all write no record.
 /// NEGATIVE CONTROL: with `seeds::held` always false (every seeded cell written whatever the
 /// scan found), the run after the owner's edit rebuilds the first pass's records and finds them
-/// as retries: `` left: Seeded { records: 0, retried: 2 } ``.
+/// as retries: `` left: Seeded { records: 0, retried: 3 } ``.
 #[test]
 fn seeds_go_only_into_cells_a_complete_scan_found_absent() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -528,6 +531,42 @@ fn seeds_go_only_into_cells_a_complete_scan_found_absent() {
     let second = Registry::at(lab.paths[1].clone());
     assert_eq!(second.seed().unwrap(), Seeded::default());
     assert_eq!(second.view().unwrap().project(&PROVIDER).rows.len(), 6);
+}
+
+/// A provider the owner retired is named by no seed the pass writes: a seeded CLI or plan whose
+/// `provider` is that provider is written without it, since a live row naming a retired one
+/// would have the rules every write passes refuse the pass (`typed::check::names_not_live`), and
+/// every later seed pass. The pass passes those rules, and once the provider is live again the
+/// next pass fills the cells it left out.
+/// NEGATIVE CONTROL: with `names_ended_provider` always false, the Kimi Code CLI's seed names the
+/// retired provider and the rules refuse it: `` assertion `left == right` failed: the seeds pass
+/// the rules every write passes left: Some(Refused { collection: "cli", pk: "kimi", column:
+/// "provider", rule: "names provider row kimi, which is not live; point it at a live row, leave
+/// it empty, or make that row live first" }) right: None ``.
+#[test]
+fn a_seed_names_no_provider_the_owner_retired() {
+    let retired = apply(&[vec![owner_value("kimi", "row", json!("retired"))]]);
+    let rows = seeds::rows_for(&retired).unwrap();
+    let names_kimi = |rows: &[Vec<Change>]| {
+        rows.iter().flatten().any(|change| {
+            change.key.ends_with(".provider")
+                && change.value.as_ref().unwrap()["x"] == json!(keys::KIMI)
+        })
+    };
+    let mut view = crate::typed::View::empty_for_test();
+    view.cells = retired.clone();
+    assert_eq!(
+        crate::typed::check::refused(&registry::REGISTRY, &rows, &view, seeds::compiled),
+        None,
+        "the seeds pass the rules every write passes"
+    );
+    assert!(!names_kimi(&rows), "{rows:?}");
+    let live = apply(&[
+        vec![owner_value("kimi", "row", json!("retired"))],
+        rows.concat(),
+        vec![owner_value("kimi", "row", json!("live"))],
+    ]);
+    assert!(names_kimi(&seeds::rows_for(&live).unwrap()));
 }
 
 /// This Mac's Commons machine uuid.

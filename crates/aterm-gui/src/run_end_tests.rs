@@ -20,7 +20,9 @@ fn the_runs_end_runs_once() {
     assert!(app.run_end.is_none());
 
     let ran = Rc::new(Cell::new(0));
-    let mut end = RunEnd::new(aterm_session::SessionId::new("s-root"));
+    let mut end = RunEnd::new(aterm_session::SessionId::from_tab(
+        aterm_types::tab_id::TabId::from_bits(0x2e_0001),
+    ));
     end.counted = Some(Rc::clone(&ran));
     app.run_end = Some(end);
     app.end_run();

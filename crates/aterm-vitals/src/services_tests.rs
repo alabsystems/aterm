@@ -259,6 +259,44 @@ fn pressure_is_the_kernels_level_or_swap_moving() {
     );
 }
 
+/// Swap is measured over a minute or more whatever rang the watch early: 4 MiB paged in the
+/// 3 s between a wake's reading and a clock step's is no pressure, 64 MiB over a minute is, and
+/// a reading seconds after a span tells that span's verdict until the next span ends.
+#[test]
+fn swap_is_measured_over_a_minute_however_soon_a_reading_comes() {
+    const MIB: u64 = 1024;
+    let swapped = |kib: u64| Reading {
+        pressure_warn: Some(false),
+        swapped_kib: Some(kib),
+        ..reading(vec![fseventsd(40 * GIB)])
+    };
+    let mut judge = Judge::new();
+    let mut pressed =
+        |at_ms: u64, kib: u64| judge.absorb(at_ms, Some(&swapped(kib))).unwrap().pressed;
+    let base = 50_000 * MIB;
+    assert!(!pressed(0, base), "the first reading measures nothing");
+    assert!(
+        !pressed(3_000, base + 4 * MIB),
+        "4 MiB within 3 s of the reading before: too short a span to measure"
+    );
+    assert!(
+        pressed(60_000, base + 64 * MIB),
+        "64 MiB over the minute since the first reading"
+    );
+    assert!(
+        pressed(63_000, base + 64 * MIB),
+        "a reading 3 s on tells the minute's verdict, not its own quiet seconds"
+    );
+    assert!(
+        !pressed(120_000, base + 64 * MIB + 1),
+        "the next minute, quiet, measured from the reading that ended the last span"
+    );
+    assert!(
+        !pressed(123_000, base + 68 * MIB),
+        "and a burst 3 s on keeps that quiet verdict"
+    );
+}
+
 /// The restart names only the service it was measured on: a look-alike at another path or
 /// uid gets none, as does one that shares its coalition; one whose image this reading did not
 /// read keeps the restart its process was matched to.
@@ -386,79 +424,4 @@ fn a_direct_read_names_the_services_past_the_bar() {
         .map(|o| (o.lead.exe.as_deref(), o.size, o.restart.is_some()))
         .collect();
     assert_eq!(named, [(Some("fseventsd"), Size::Huge, true)]);
-}
-
-#[test]
-fn system_accounts_are_below_500_and_nobody() {
-    assert!(system_uid(0) && system_uid(88) && system_uid(499) && system_uid(NOBODY_UID));
-    assert!(!system_uid(500) && !system_uid(501));
-    assert!(kernel_member(0) && kernel_member(1) && !kernel_member(2));
-}
-
-fn member(pid: u32, uid: u32, name: &str, start_s: u64, coalition: u64) -> Member {
-    Member {
-        pid,
-        uid,
-        name: name.into(),
-        start_s,
-        start_us: 0,
-        coalition,
-    }
-}
-
-/// The fold keeps the coalitions of system accounts alone, led by the earliest-born member,
-/// leaves out the kernel's coalition, names a coalition whose footprint does not read by its
-/// lead, and reads an image only from the followed footprint.
-#[test]
-fn the_fold_keeps_coalitions_of_system_accounts_alone() {
-    let members = [
-        member(537, 0, "fseventsd", 100, 7),
-        member(88, 0, "mds", 90, 9),
-        member(89, 0, "mds_stores", 80, 9),
-        member(700, 501, "keyboxd", 50, 11),
-        member(701, 0, "helper", 40, 11),
-        member(702, 0, "unread", 40, 12),
-        member(160, 88, "WindowServer", 60, 13),
-        member(0, 0, "kernel_task", 0, 1),
-        member(1, 0, "launchd", 1, 1),
-    ];
-    let mut paths = Vec::new();
-    let reading = fold(
-        &members,
-        M3,
-        |id| match id {
-            1 => Some(140 * GIB),
-            7 => Some(40 * GIB),
-            9 => Some(GIB),
-            11 => Some(50 * GIB),
-            13 => Some(900 << 20),
-            _ => None,
-        },
-        |pid| {
-            paths.push(pid);
-            Some(format!("/path/of/{pid}"))
-        },
-    );
-    let leads: Vec<(u64, u32, &str, u32)> = reading
-        .services
-        .iter()
-        .map(|s| (s.coalition, s.pid, s.name.as_str(), s.live))
-        .collect();
-    assert_eq!(
-        leads,
-        [
-            (7, 537, "fseventsd", 1),
-            (9, 89, "mds_stores", 2),
-            (13, 160, "WindowServer", 1)
-        ]
-    );
-    assert_eq!(paths, [537], "only the service followed");
-    assert_eq!(reading.total, M3);
-    assert_eq!(reading.services[0].path.as_deref(), Some("/path/of/537"));
-    let unread: Vec<(u64, u32)> = reading
-        .unread
-        .iter()
-        .map(|m| (m.coalition, m.pid))
-        .collect();
-    assert_eq!(unread, [(12, 702)]);
 }

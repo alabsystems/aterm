@@ -609,6 +609,134 @@ fn a_login_of_a_retired_account_marks_it_and_never_revives_it() {
     assert!(again.changes.is_empty(), "{:?}", again.changes);
 }
 
+/// A login whose one address row the owner retired, with no account yet: the account is born
+/// without a `login`, since a live account naming a retired address would have the rules every
+/// write passes refuse the pass (`typed::check::names_not_live`), and every later pass that
+/// planned it again. The plan passes those rules; the address stays retired and unwritten; and
+/// the next pass finds the account by its key and writes no second birth over it.
+/// NEGATIVE CONTROL: with `matched`'s retired-holder arm removed, the birth names the retired
+/// address and the rules refuse it: `` assertion `left == right` failed: the birth passes the
+/// rules every write passes left: Some(Refused { collection: "account", pk: "ac-…", column:
+/// "login", rule: "names address row ad-…, which is not live; point it at a live row, leave it
+/// empty, or make that row live first" }) right: None ``.
+#[test]
+fn a_login_whose_only_address_row_is_retired_is_born_without_it() {
+    let address = addr_pk(BRONTO);
+    let pk = account_pk(BRONTO);
+    let held = cells(vec![
+        put(&ADDRESS, &address, "addr", json!(BRONTO)),
+        put(&ADDRESS, &address, LIFECYCLE, json!("retired")),
+    ]);
+    let first = run(
+        ME,
+        &[sighting(BRONTO, "running", 1, NOW)],
+        &held,
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!((first.born, first.marked), (1, 1));
+    assert_eq!(of(&first, ADDRESS.name), 0, "{:?}", first.changes);
+    let mut view = crate::typed::View::empty_for_test();
+    view.cells = held.clone();
+    assert_eq!(
+        crate::typed::check::refused(
+            crate::att::REGISTRY.table,
+            &[first.changes.clone()],
+            &view,
+            crate::alab::seeds::compiled,
+        ),
+        None,
+        "the birth passes the rules every write passes"
+    );
+    let after = cells(
+        [
+            vec![
+                put(&ADDRESS, &address, "addr", json!(BRONTO)),
+                put(&ADDRESS, &address, LIFECYCLE, json!("retired")),
+            ],
+            first.changes.clone(),
+        ]
+        .concat(),
+    );
+    let accounts = cell::project(&ACCOUNT, &after);
+    assert!(accounts.rows[&pk].live());
+    assert_eq!(accounts.rows[&pk].get("login"), None);
+    assert!(!cell::project(&ADDRESS, &after).rows[&address].live());
+    let again = run(
+        ME,
+        &[sighting(BRONTO, "running", 1, NOW + DAY)],
+        &after,
+        &obs_after(OwnedRead::default(), &first.changes),
+        NOW + DAY,
+    );
+    assert_eq!(again.born, 0);
+    assert_eq!(of(&again, ACCOUNT.name), 0, "{:?}", again.changes);
+}
+
+/// The account a pass gave birth to without a login, its address then retired, is still the
+/// sighting's row by its key once the owner makes the address live again: no live row at the realm
+/// says the address (the account has no login), but a pass writes no second birth over the row,
+/// whose automatic `status=active` and default label would replace the owner's `paused` and
+/// `mine`. The pass marks the account and births nothing, and the owner's cells stand.
+/// NEGATIVE CONTROL: with `matched` finding a row at the birth's key only where it is not live
+/// (`accounts.rows.get(&pk).is_some_and(|row| !row.live())`, as it did), the live address takes
+/// the plain holder arm and the birth is written again: `` assertion `left == right` failed: a
+/// second birth over the existing account: ["ac-….provider", "ac-….realm", "ac-….login",
+/// "ac-….status", "ac-….services.claude-code", "ac-….row", "ac-….label"] left: 1 right: 0 ``.
+#[test]
+fn an_account_born_without_its_retired_login_is_not_born_again_once_the_address_is_live() {
+    let address = addr_pk(BRONTO);
+    let pk = account_pk(BRONTO);
+    let mut book = Book::new();
+    let retired = book.write(
+        1,
+        &[],
+        vec![
+            put(&ADDRESS, &address, "addr", json!(BRONTO)),
+            put(&ADDRESS, &address, LIFECYCLE, json!("retired")),
+        ],
+    );
+    let first = run(
+        ME,
+        &[sighting(BRONTO, "running", 1, NOW)],
+        &book.cells(),
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!(first.born, 1);
+    let born = book.write(2, &[retired], first.changes.clone());
+    book.write(
+        3,
+        &[retired, born],
+        vec![
+            put(&ACCOUNT, &pk, "status", json!("paused")),
+            put(&ACCOUNT, &pk, "label", json!("mine")),
+            put(&ADDRESS, &address, LIFECYCLE, json!("live")),
+        ],
+    );
+    let again = run(
+        ME,
+        &[sighting(BRONTO, "running", 1, NOW + DAY)],
+        &book.cells(),
+        &obs_after(OwnedRead::default(), &first.changes),
+        NOW + DAY,
+    );
+    let keys: Vec<&str> = again.changes.iter().map(|c| c.key.as_str()).collect();
+    assert_eq!(
+        again.born, 0,
+        "a second birth over the existing account: {keys:?}"
+    );
+    assert_eq!(of(&again, ACCOUNT.name), 0, "{keys:?}");
+    assert_eq!(of(&again, ADDRESS.name), 0, "{keys:?}");
+    // The pass's rewrite of this Mac's row, if any, lands after the owner's word and leaves it.
+    let seen = book.all();
+    book.write(2, &seen, again.changes);
+    let row = &cell::project(&ACCOUNT, &book.cells()).rows[&pk];
+    assert!(row.live());
+    assert_eq!(row.get("status"), Some(&json!("paused")));
+    assert_eq!(row.get("label"), Some(&json!("mine")));
+}
+
 /// Every row a plan writes to `account-obs` carries this Mac's uuid as its suffix, the one key
 /// shape `SelfSuffix` admits from this signer.
 /// NEGATIVE CONTROL: with the key made `<uuid>.<account>`, `` assertion failed: key.ends_with(ME)

@@ -2371,7 +2371,7 @@ fn no_check_starts_in_a_held_slot() {
 
 fn finished(dir: &Path, log_text: &str, code: i32, over: bool) -> Finished {
     let log = dir.join("alpha@1.0.0.log");
-    fs::write(&log, log_text).unwrap();
+    trust_facts::testing::write_log(&log, log_text);
     let mut j = job("alpha");
     j.log = log;
     j.target = dir.join("j0");
@@ -2388,6 +2388,7 @@ fn finished(dir: &Path, log_text: &str, code: i32, over: bool) -> Finished {
         interrupted: false,
         load: Some(30.0),
         trustd_lost: false,
+        log_read: LogRead::Unread,
     }
 }
 
@@ -2432,8 +2433,9 @@ fn a_check_cut_short_keeps_what_it_measured() {
     let mut quiet = finished(d.path(), DONE, 0, false);
     quiet.ended.maxrss = 0;
     assert_eq!(cut(&quiet), Some(None));
-    fs::remove_file(&done.job.log).unwrap();
-    fs::create_dir(&done.job.log).unwrap();
+    let stored = trust_facts::stored_log(&done.job.log);
+    fs::remove_file(&stored).unwrap();
+    fs::create_dir(&stored).unwrap();
     assert!(
         cost_of(&done, &driver).is_err(),
         "a log read error is never a completed cost"
@@ -2497,8 +2499,9 @@ fn a_diagnostic_read_failure_still_attempts_the_other_receipts() {
     let d = tmp("trust-lane-log-read-error");
     let mut f = finished(d.path(), DONE, 0, true);
     f.trustd_lost = true;
-    fs::remove_file(&f.job.log).unwrap();
-    fs::create_dir(&f.job.log).unwrap();
+    let stored = trust_facts::stored_log(&f.job.log);
+    fs::remove_file(&stored).unwrap();
+    fs::create_dir(&stored).unwrap();
     let error = record(&f, Duration::from_secs(60), 14, &mut || {
         "ours\tthis build's".into()
     })
@@ -2793,6 +2796,7 @@ fn a_running_checks_times_are_its_own_tree_s_in_the_live_table() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     check.read_times(true);
     assert_eq!(check.times.threads(), None, "no table read, no times");
@@ -2845,6 +2849,7 @@ fn a_checks_peak_counts_its_trees_largest_footprint() {
                 times: TreeTimes::default(),
                 read_at: None,
                 sweep: || None,
+                log: None,
             };
             if read {
                 check.times.take(
@@ -3037,7 +3042,7 @@ impl Checks for Quick<'_> {
                 .open(&dep)?
                 .set_modified(t)?;
         }
-        fs::write(&job.log, self.log)?;
+        trust_facts::testing::write_log(&job.log, self.log);
         if self.stop_at.is_some() {
             return Ok(Box::new(Hung));
         }
@@ -3762,7 +3767,7 @@ fn a_log_read_error_after_completed_checks_prevents_conclusion() {
             let log = repo
                 .parent()
                 .unwrap()
-                .join("target-trust.noindex/logs/alpha@1.0.0.log");
+                .join("target-trust.noindex/logs/alpha@1.0.0.log.zst");
             fs::remove_file(&log).unwrap();
             fs::create_dir(&log).unwrap();
         });
@@ -4390,8 +4395,9 @@ fn a_floor_this_host_cannot_reproduce_narrows_the_run() {
             "{outcome:?}: {said}"
         );
         assert_eq!(outcome.exit(), 4);
+        let log = root_of(&s).join("logs/alpha@1.0.0.log");
         assert!(
-            !root_of(&s).join("logs/alpha@1.0.0.log").exists(),
+            !log.exists() && !trust_facts::stored_log(&log).exists(),
             "a refused library is never run: {said}"
         );
         if stop {
@@ -7373,6 +7379,7 @@ fn a_check_a_signal_ended_ends_what_it_left_and_holds_its_slot() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     let ended = loop {
@@ -7763,6 +7770,7 @@ fn what_a_check_left_in_its_session_is_ended_when_its_root_exits() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     let ended = loop {
@@ -8171,6 +8179,7 @@ fn a_record_whose_stamp_cannot_be_written_holds_its_slot() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     real.end();
     let kept = record.exists();
@@ -9301,6 +9310,7 @@ fn ending_a_check_ends_its_whole_tree() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     let read = |file: &Path| {
         fs::read_to_string(file)
@@ -9388,6 +9398,7 @@ fn ending_a_check_ends_its_whole_tree() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     let ended = loop {
@@ -9437,6 +9448,7 @@ fn a_check_that_failed_holds_its_slot() {
         times: TreeTimes::default(),
         read_at: None,
         sweep: || None,
+        log: None,
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     let ended = loop {
@@ -9775,4 +9787,747 @@ fn the_keeper_ends_while_a_trustd_keeps_it_waiting() {
         .expect("the keeper never ended after closing its connection");
     ending.join().unwrap();
     drop(peer);
+}
+
+/// `n` lines of a check's output the judge reads nothing in, each naming `tag` and its number.
+fn noise(tag: &str, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("   Compiling {tag}-dep{i} v0.{i}.0 (/ws/vendor/{tag}-dep{i})\n"))
+        .collect()
+}
+
+/// What the zstd frame `zst` holds, as text.
+fn unzstd(zst: &[u8]) -> String {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    aterm_zstd::Decoder::new(zst).read_to_end(&mut out).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// What the zstd frame `zst` holds as far as it reaches, as text, and whether it ended.
+fn unzstd_so_far(zst: &[u8]) -> (String, bool) {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    let ended = aterm_zstd::Decoder::new(zst).read_to_end(&mut out).is_ok();
+    (String::from_utf8_lossy(&out).into_owned(), ended)
+}
+
+/// A line of a check's output for each string the judge reads ([`trust_facts::JUDGED`], in
+/// its order), naming no other, then a line of each path refusal the judge reads, which names
+/// none of them; each with the line it is read beside where its fact needs one (a launch
+/// refusal for its cause, a summary for its coverage).
+fn judged_lines() -> [(&'static str, &'static str); trust_facts::JUDGED.len() + 3] {
+    const REFUSED: &str =
+        "error: could not establish the selected same-sysroot trustd memory authority";
+    const SUMMARY: &str = "Summary: 5 proved, 0 failed (20 total); reproducible";
+    [
+        ("error: verification did not run (targo-trust)", ""),
+        ("warning: transport:missing-json for alpha::f", ""),
+        (
+            "targo trust: COULD NOT RUN: resource admission refused the solver",
+            "",
+        ),
+        (REFUSED, ""),
+        ("trustd: crash epoch is not CLEAN", REFUSED),
+        ("trustd: another trustd owns /tmp/t.sock", REFUSED),
+        (
+            "trustd did not establish exact-identity readiness in 10s",
+            REFUSED,
+        ),
+        (SUMMARY, ""),
+        (
+            "Coverage: 3/3 eligible function bodies verified (complete)",
+            SUMMARY,
+        ),
+        ("Stop causes: rss-backstop=2", ""),
+        (
+            "  [UNKNOWN] [transport:missing-crate-summary] compiler emitted function rows without an end-of-compile target inventory (targo-trust)",
+            "",
+        ),
+        (
+            "  process didn't exit successfully: `/x/bin/trustc --crate-name alpha` (signal: 9, SIGKILL: kill)",
+            "",
+        ),
+        (
+            "  [UNKNOWN] [unknown] unsupported MIR `MemoryAdmission`: memory admission failed before solver dispatch: could not connect to selected endpoint",
+            "",
+        ),
+        (
+            "  [UNKNOWN] [unknown] malformed: type lowering exceeded the per-function verification budget",
+            "",
+        ),
+        ("error: proof validation cancelled by the caller", ""),
+        ("noise timed_out=3 and timed_out=4", ""),
+        (
+            "note: trust: memory census: 397 bodies verified and compacted, 2 compacted slots recomputed, 3 bodies skipped at the memory ceiling; resident 1.2 GiB, peak 3.5 GiB, ceiling 3.0 GiB",
+            "",
+        ),
+        ("rustc -Ztrust-verify-memory-ceiling-bytes=3221225472", ""),
+        (
+            "error: verified runtime-library directory path component `/tmp` is group- or world-writable (uid=0, mode=0o1777); any local principal could substitute the executed object between authorization and execution",
+            "",
+        ),
+        (
+            "  verified tool launcher path component `/opt/trust` is owned by uid=501, which is neither root nor the invoking identity (uid=1000); an execution object a foreign principal owns can be replaced between authorization and execution",
+            "",
+        ),
+        (
+            "targo trust: error: could not establish the private per-user trustd runtime directory: trustd runtime root must be an euid-owned 0700 directory: /tmp/trustd-runtime-locks-1000",
+            "",
+        ),
+    ]
+}
+
+/// What [`trust_facts::Measured::of_log`] reads in `text`, at exit code 0.
+fn measured(text: &str) -> trust_facts::Measured {
+    trust_facts::Measured::of_log(text.as_bytes(), "0").unwrap()
+}
+
+/// DC-08: past its cap a stored log keeps every line of output the judge reads, each whole,
+/// leaves out the rest but the output's last bytes, and ends saying how much it left out: for
+/// each string the judge reads ([`trust_facts::JUDGED`]) and each path refusal it reads, a
+/// line naming it past the cap is kept, and `of_log` of the capped log equals `of_log` of the
+/// whole output. A line that only passes the path refusals' quick gate (a rustc note that
+/// something "must be used") gives no fact and is left out. A line longer than the judge reads
+/// ([`trust_facts::LINE_MAX`]), which it skips, is left out whole past the cap, and cut where
+/// the cap came within it, still longer than the judge reads; a refusal in a line left out is
+/// still read, over all the output; a write refused stores nothing more, and the output is
+/// still read to its end. NEGATIVE CONTROL: each line gives a fact the output without it does
+/// not, and the same output stored past a cap that drops every line, judged or not, leaves it
+/// out and measures otherwise; a line kept whole past the cap that the judge reads nothing in
+/// would be in the stored log.
+#[test]
+fn a_log_past_its_cap_keeps_every_line_the_judge_reads() {
+    let store = |output: &str, tail: u64, judged: &dyn Fn(&[u8]) -> bool| {
+        let mut zst = Vec::new();
+        let stored = store_log_with(output.as_bytes(), &mut zst, 1, tail, judged);
+        (stored, unzstd(&zst))
+    };
+    let last: u64 = 1024;
+    let (head, tail) = (noise("head", 4000), noise("tail", 100));
+    for (i, (line, beside)) in judged_lines().into_iter().enumerate() {
+        let named: Vec<&str> = trust_facts::JUDGED
+            .into_iter()
+            .filter(|n| line.contains(n))
+            .collect();
+        match trust_facts::JUDGED.get(i) {
+            Some(needle) => assert_eq!(named, [*needle], "{line}"),
+            None => assert!(named.is_empty() && trust_facts::judged(line), "{line}"),
+        }
+        let beside = if beside.is_empty() {
+            String::new()
+        } else {
+            format!("{beside}\n")
+        };
+        let output = format!("{beside}{head}{line}\n{tail}");
+        let whole = measured(&output);
+        assert_ne!(
+            whole,
+            measured(&format!("{beside}{head}{tail}")),
+            "{line} gives no fact"
+        );
+        let (stored, kept) = store(&output, last, &trust_facts::judged_line);
+        assert!(kept.contains(&format!("\n{line}\n")), "{line}: left out");
+        assert!(!kept.contains("tail-dep50 "), "the noise past the cap");
+        assert!(kept.contains("tail-dep99 "), "the output's last bytes");
+        assert_eq!(measured(&kept), whole, "{line}");
+        let note = left_out_note(stored.left_out, stored.lines_left_out, 1, last);
+        assert!(!trust_facts::judged(&note), "{note}");
+        let body = kept
+            .strip_suffix(&note)
+            .expect("the stored log ends with its note");
+        assert_eq!(
+            u64::try_from(body.len()).unwrap() + stored.left_out,
+            u64::try_from(output.len()).unwrap(),
+            "{line}: the note says what was left out"
+        );
+        assert!(stored.lines_left_out > 100, "{line}: {stored:?}");
+        let (_, none) = store(&output, 0, &|_| false);
+        assert!(!none.contains(line), "{line} stayed with nothing judged");
+        assert_ne!(measured(&none), whole, "{line}");
+    }
+
+    // A line that names only the path refusals' quick gate gives no fact, so it goes.
+    let gate = "warning: unused `Result` that must be used, and a mode that is writable";
+    assert!(!trust_facts::judged(gate));
+    let output = format!("{head}{gate}\n{tail}");
+    let (_, kept) = store(&output, last, &trust_facts::judged_line);
+    assert!(!kept.contains(gate), "a line no fact comes from stayed");
+    assert_eq!(measured(&kept), measured(&output));
+
+    // A line longer than the judge reads names nothing it reads: past the cap it goes whole,
+    // and the stored log measures as the output does.
+    let piece = usize::try_from(trust_facts::LINE_MAX).unwrap();
+    let long = format!(
+        "{head}{}Stop causes: rss-backstop=2\n{}Stop causes: rss-backstop=1\n{tail}",
+        "x".repeat(piece),
+        DONE,
+    );
+    let (stored, kept) = store(&long, 0, &trust_facts::judged_line);
+    assert!(!kept.contains("xxxx"));
+    assert!(!kept.contains("rss-backstop=2"));
+    assert!(kept.contains("\nStop causes: rss-backstop=1\n"));
+    assert_eq!(measured(&kept), measured(&long));
+    assert_eq!(measured(&kept).rss, 1);
+    let body = kept.len() - left_out_note(stored.left_out, stored.lines_left_out, 1, 0).len();
+    assert_eq!(body as u64 + stored.left_out, long.len() as u64);
+
+    // One the cap comes within is cut there and ended with its newline: still longer than the
+    // judge reads, so the judge reads in it what it read in the whole line, nothing.
+    let first = format!(
+        "{}Summary: 1 proved, 9 failed (10 total)\n{}",
+        "y".repeat(3 * piece),
+        DONE,
+    );
+    let (stored, kept) = store(&first, 0, &trust_facts::judged_line);
+    let cut_at = kept.find('\n').unwrap();
+    assert!(
+        cut_at > piece,
+        "{cut_at}: what is kept of it is longer than read"
+    );
+    assert!(cut_at < 3 * piece, "{cut_at}: it was cut");
+    assert!(!kept.contains("9 failed"));
+    assert_eq!(stored.lines_left_out, 1, "{stored:?}");
+    assert_eq!(measured(&kept), measured(&first));
+    assert!(measured(&kept).summary.contains("5 proved"));
+    let body = kept.len() - left_out_note(stored.left_out, stored.lines_left_out, 1, 0).len();
+    assert_eq!(body as u64 + stored.left_out, first.len() as u64);
+
+    // A refusal in a line left out is read all the same, as `record` reads all the output.
+    let refused = trust_facts::TRUSTD_REFUSED;
+    let split = format!("{head}{}{refused}\n{tail}", "x".repeat(piece - 10));
+    let (stored, kept) = store(&split, 0, &trust_facts::judged_line);
+    assert!(!kept.contains(refused));
+    assert!(stored.refused, "a refusal in a line left out is read");
+    assert_eq!(
+        log_refused(split.as_bytes()).unwrap(),
+        stored.refused,
+        "as record reads a whole log"
+    );
+    let (stored, _) = store(&format!("{head}{tail}"), 0, &trust_facts::judged_line);
+    assert!(!stored.refused);
+
+    struct Full(usize);
+    impl Write for Full {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::other("the disk is full"));
+            }
+            let n = buf.len().min(self.0);
+            self.0 -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = format!("{head}{refused}\n{tail}");
+    let mut from = output.as_bytes();
+    let stored = store_log_with(&mut from, Full(10), 1, last, &trust_facts::judged_line);
+    assert!(from.is_empty(), "the output was read to its end");
+    assert_eq!((stored.left_out, stored.refused), (0, true), "{stored:?}");
+}
+
+/// Output read from `text`, whose read fails once it is all read.
+struct FailingOutput<'a>(&'a [u8]);
+
+impl std::io::Read for FailingOutput<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.0.is_empty() {
+            return Err(std::io::Error::other("injected output read failure"));
+        }
+        self.0.read(buf)
+    }
+}
+
+impl CheckOutput for FailingOutput<'_> {
+    fn more_before(&mut self, _: Instant) -> bool {
+        true
+    }
+}
+
+/// DC-08: a read of a check's output that failed before its end leaves the stored log
+/// unended, so no reader takes what it holds for the whole output: it decodes as far as the
+/// read reached and then fails, the writer says the read failed ([`LogRead::Incomplete`]), and
+/// `record` returns that error after writing the other receipts. NEGATIVE CONTROL: the same
+/// output whose read ends cleanly is stored whole and read ([`LogRead::Read`]); a writer that
+/// ended the frame at a failed read would make the first stored log decode whole, its summary
+/// missing nothing a reader could tell.
+#[test]
+fn a_failed_read_of_a_checks_output_leaves_its_stored_log_unended() {
+    let output = format!("{}{DONE}", noise("read", 400));
+    let head = &output.as_bytes()[..output.len() / 2];
+    let mut zst = Vec::new();
+    let stored = store_log(FailingOutput(head), &mut zst, LOG_STORED, LOG_TAIL);
+    assert!(stored.read_failed, "{stored:?}");
+    assert!(matches!(stored.log_read(), LogRead::Incomplete(_)));
+    let (text, ended) = unzstd_so_far(&zst);
+    assert!(!ended, "a stored log whose read failed decodes as whole");
+    assert!(output.starts_with(&text), "{text}");
+    let d = tmp("trust-lane-log-read-failed");
+    let mut f = finished(d.path(), &output, 0, false);
+    f.log_read = stored.log_read();
+    let error = record(&f, Duration::from_secs(60), 1, &mut || "ours\tthis".into()).unwrap_err();
+    assert!(
+        error.to_string().contains("failed before its end"),
+        "{error}"
+    );
+    assert!(d.path().join("alpha@1.0.0.log.rc").is_file());
+
+    let mut whole = Vec::new();
+    let stored = store_log(output.as_bytes(), &mut whole, LOG_STORED, LOG_TAIL);
+    assert_eq!(stored.log_read(), LogRead::Read { refused: false });
+    assert_eq!(unzstd_so_far(&whole), (output, true));
+}
+
+/// DC-08: a check that writes complete lines and then part of a line it has not ended, and
+/// goes quiet, has those complete lines in its stored log within [`LOG_FLUSH`], for `ship trust
+/// log` to read while it runs; the stored log ends whole once its output does. NEGATIVE
+/// CONTROL: a writer that flushed only between lines would hold them in its encoder until the
+/// line ends, here never while the test waits: its one-minute hang detector fails.
+#[test]
+fn a_line_a_check_has_not_ended_holds_back_no_line_before_it() {
+    let d = tmp("trust-lane-log-partial");
+    let path = d.path().join("partial@1.0.0.log.zst");
+    let file = crate::durable::create_fresh(&path).unwrap();
+    let (from, mut to) = aterm_uds::pipe().unwrap();
+    let mut log = LogWriter::start(from, file, LOG_STORED, LOG_TAIL).unwrap();
+    to.write_all(b"first line\nsecond line\nthird, not ended")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (text, _) = unzstd_so_far(&fs::read(&path).unwrap());
+        if text.contains("second line\n") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lines before the one not ended were never flushed: {text:?}"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+    to.write_all(b", now ended\n").unwrap();
+    drop(to);
+    log.finish();
+    assert_eq!(log.log_read(), LogRead::Read { refused: false });
+    assert_eq!(
+        unzstd(&fs::read(&path).unwrap()),
+        "first line\nsecond line\nthird, not ended, now ended\n"
+    );
+}
+
+/// A driver whose `targo trust check <file> --allow-l0-gaps` prints `<file>` and exits 0.
+fn printing_driver(d: &Path) -> Driver {
+    script_driver(d, "shift 2\nexec /bin/cat \"$1\"")
+}
+
+/// Runs `j` to its end on `real`, under a one-minute hang detector.
+fn run_to_end(real: &mut RealChecks<'_>, j: &mut Job) -> (Box<dyn Check>, Ended) {
+    let mut check = real.start(j).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ended = loop {
+        if let Some(ended) = check.poll().unwrap() {
+            break ended;
+        }
+        assert!(Instant::now() < deadline, "the check never ended");
+        aterm_uds::deadline::poll_yield();
+    };
+    (check, ended)
+}
+
+/// DC-08: a check's output is stored zstd-compressed, as `<name@version>.log.zst` (one a run
+/// before left there is replaced), and judged as its plain text: what `Plan::measure` reads in
+/// the stored logs of a check that passed (alpha), one targo would not start (beta) and one
+/// whose output names every other string and path refusal the judge reads (gamma), stored
+/// whole and past a cap that left their other lines out but the last, is what it reads in
+/// their whole output stored beside the same marks; `record` writes the `.trustd` mark from
+/// what the writer read, `cost_of` reads a stored log's summary, and `trust log` prints a
+/// stored log decompressed, naming the versions where a library's name has logs at more than
+/// one, prints a stored log whose frame has not ended as far as it is, saying so, says a
+/// missing logs folder has no log (1) and one it cannot read is an error (2). NEGATIVE
+/// CONTROL: with the stored logs gone, `Plan::measure` has no log to read and says so, so a
+/// reader that found no stored log would be told apart.
+#[test]
+fn a_checks_log_is_stored_compressed_and_judged_as_its_plain_text() {
+    let d = tmp("trust-lane-stored-log");
+    let lines = judged_lines();
+    let gamma_lines: String = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(3..=8).contains(i))
+        .map(|(_, (line, _))| format!("{line}\n"))
+        .collect();
+    let outputs = [
+        (
+            "alpha",
+            format!("{}{DONE}{}", noise("alpha", 4000), noise("a", 50)),
+        ),
+        (
+            "beta",
+            format!(
+                "{}{}\n{}\n{}",
+                noise("beta", 4000),
+                lines[3].0,
+                lines[4].0,
+                noise("b", 50)
+            ),
+        ),
+        (
+            "gamma",
+            format!("{}{gamma_lines}{}", noise("gamma", 4000), noise("g", 50)),
+        ),
+    ];
+    let driver = printing_driver(d.path());
+    let root = d.path().join("root");
+    owner_dirs(&root).unwrap();
+    let (sock, keeper) = quiet_keeper(d.path());
+    let mut real = real_checks(
+        d.path(),
+        &root,
+        &driver,
+        &keeper,
+        &sock,
+        aterm_uds::process::process_serial,
+    );
+    real.log_tail = 1024;
+    let plan = |logdir: &Path| {
+        let mut p = Plan::parse(&format!(
+            "{}\nlogdir {}\ncrate alpha\talpha@1.0.0\tgate\ncrate beta\tbeta@1.0.0\tgate\ncrate gamma\tgamma@1.0.0\tgate\n",
+            trust_facts::PLAN_MAGIC,
+            logdir.display()
+        ))
+        .unwrap();
+        p.measure().map(|()| p.facts.crates)
+    };
+    let mut probe = || "ours\tthis build's".to_string();
+    let mut slot = 0;
+    for cap in [LOG_STORED, 1] {
+        let logs = d.path().join(format!("cap-{cap}/logs"));
+        let whole = d.path().join(format!("cap-{cap}/whole"));
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&whole).unwrap();
+        real.log_cap = cap;
+        for (name, output) in &outputs {
+            let printed = d.path().join(format!("{name}.out"));
+            fs::write(&printed, output).unwrap();
+            let mut j = job(name);
+            j.slot = slot;
+            slot += 1;
+            j.argv = vec![printed.display().to_string()];
+            j.log = logs.join(format!("{name}@1.0.0.log"));
+            trust_facts::testing::write_log(
+                &j.log,
+                "Summary: 9 proved, 0 failed (9 total); a run before\n",
+            );
+            let (check, ended) = run_to_end(&mut real, &mut j);
+            assert_eq!(ended.code, 0, "{name}");
+            let read = LogRead::Read {
+                refused: *name == "beta",
+            };
+            assert_eq!(check.log_read(), read, "{name}");
+            let f = Finished {
+                job: j,
+                ended,
+                wall: Duration::from_secs(1),
+                over_budget: false,
+                interrupted: false,
+                load: None,
+                trustd_lost: false,
+                log_read: check.log_read(),
+            };
+            record(&f, Duration::from_secs(60), 1, &mut probe).unwrap();
+            let zst = fs::read(trust_facts::stored_log(&f.job.log)).unwrap();
+            assert_eq!(zst[..4], aterm_zstd::frame::MAGIC.to_le_bytes(), "{name}");
+            let text = unzstd(&zst);
+            if cap == LOG_STORED {
+                assert_eq!(&text, output, "{name}: stored whole");
+            } else {
+                assert!(
+                    text.len() < output.len() && text.contains("were left out"),
+                    "{name}: {} of {} bytes kept",
+                    text.len(),
+                    output.len()
+                );
+                let end = output.lines().last().unwrap();
+                assert!(
+                    text.contains(&format!("\n{end}\n\naterm trust lane: ")),
+                    "{name}: its last line"
+                );
+            }
+            assert_eq!(
+                measured(&text),
+                measured(output),
+                "{name}: of_log of the stored log is of_log of the whole output"
+            );
+            let cut = cost_of(&f, &driver).unwrap().map(|c| c.cut);
+            let want = (*name != "alpha").then_some(Cut::Failed);
+            assert_eq!(cut, Some(want), "{name}");
+            assert_eq!(
+                f.job.log.with_extension("log.trustd").exists(),
+                *name == "beta",
+                "{name}: the .trustd mark"
+            );
+            trust_facts::testing::write_log(&whole.join(format!("{name}@1.0.0.log")), output);
+            for ext in ["rc", "pace", "trustd"] {
+                let mark = PathBuf::from(format!("{}.{ext}", f.job.log.display()));
+                if mark.exists() {
+                    fs::copy(&mark, whole.join(format!("{name}@1.0.0.log.{ext}"))).unwrap();
+                }
+            }
+        }
+        let stored = plan(&logs).unwrap();
+        assert_eq!(stored, plan(&whole).unwrap(), "cap {cap}");
+        let print = |dir: &Path, lib: &str| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = trust_facts::print_log(dir, lib, &mut out, &mut err);
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        for (name, output) in &outputs {
+            let zst = fs::read(logs.join(format!("{name}@1.0.0.log.zst"))).unwrap();
+            let want = (0, unzstd(&zst), String::new());
+            assert_eq!(print(&logs, name), want, "{name}");
+            let want = (0, output.clone(), String::new());
+            assert_eq!(print(&whole, &format!("{name}@1.0.0")), want, "{name}");
+        }
+        assert_eq!(print(&logs, "delta").0, 1);
+        assert_eq!(print(&d.path().join("no-such-logs"), "alpha").0, 1);
+        trust_facts::testing::write_log(&whole.join("alpha@2.0.0.log"), "");
+        let (code, _, err) = print(&whole, "alpha");
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("alpha@1.0.0, alpha@2.0.0"), "{err}");
+        assert_eq!(print(&whole, "alpha@2.0.0").0, 0);
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&whole, fs::Permissions::from_mode(0o000)).unwrap();
+            let (code, _, err) = print(&whole, "alpha");
+            fs::set_permissions(&whole, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                code, 2,
+                "an unreadable logs folder is no missing log: {err}"
+            );
+        }
+        let zst = fs::read(logs.join("alpha@1.0.0.log.zst")).unwrap();
+        let unended = logs.join("omega@1.0.0.log.zst");
+        fs::write(&unended, &zst[..zst.len() - 4]).unwrap();
+        let (code, out, err) = print(&logs, "omega");
+        assert_eq!(code, 0, "{err}");
+        assert!(unzstd(&zst).starts_with(&out), "{out}");
+        assert!(err.contains("before its end"), "{err}");
+        fs::remove_file(&unended).unwrap();
+        for (name, _) in &outputs {
+            fs::remove_file(logs.join(format!("{name}@1.0.0.log.zst"))).unwrap();
+        }
+        let unread = plan(&logs).unwrap_err();
+        assert_eq!(unread.kind(), std::io::ErrorKind::NotFound, "cap {cap}");
+    }
+}
+
+/// DC-08: what a check prints past its cap costs the run's log folder nothing: a check whose
+/// output is far past the cap, none of it read by the judge, ends, its writer having read it
+/// all, and its stored log is the only log in the folder, past the cap and within the slack
+/// the lane states ([`LOG_SLACK`]; with the lane's own cap, [`LOG_BOUND`], a run's folder
+/// [`logs_bound`] of its checks), ending with the output's last line and what it left out.
+/// NEGATIVE CONTROL: the same output stored with no cap is larger than that bound.
+#[test]
+fn a_runs_log_folder_stays_under_its_stated_bound() {
+    let d = tmp("trust-lane-log-bound");
+    let cap: u64 = 256 << 10;
+    assert_eq!(logs_bound(3), 3 * (LOG_STORED + LOG_SLACK));
+    // Lines of a xorshift's state in hex, which compress about two to one.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut flood = String::new();
+    while flood.len() < 5 << 20 {
+        for _ in 0..4 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            flood.push_str(&format!("{x:016x}"));
+        }
+        flood.push('\n');
+    }
+    let printed = d.path().join("flood.out");
+    fs::write(&printed, &flood).unwrap();
+    let logs = d.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    let driver = printing_driver(d.path());
+    let root = d.path().join("root");
+    owner_dirs(&root).unwrap();
+    let (sock, keeper) = quiet_keeper(d.path());
+    let mut real = real_checks(
+        d.path(),
+        &root,
+        &driver,
+        &keeper,
+        &sock,
+        aterm_uds::process::process_serial,
+    );
+    real.log_cap = cap;
+    let mut j = job("alpha");
+    j.argv = vec![printed.display().to_string()];
+    j.log = logs.join("alpha@1.0.0.log");
+    let (check, ended) = run_to_end(&mut real, &mut j);
+    assert_eq!(
+        (ended.code, check.log_read()),
+        (0, LogRead::Read { refused: false })
+    );
+    let names: Vec<String> = fs::read_dir(&logs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["alpha@1.0.0.log.zst"]);
+    let zst = fs::read(logs.join("alpha@1.0.0.log.zst")).unwrap();
+    let size = u64::try_from(zst.len()).unwrap();
+    assert!(
+        (cap..=cap + LOG_SLACK).contains(&size),
+        "{size} bytes stored under a cap of {cap}"
+    );
+    let text = unzstd(&zst);
+    let note = text.rsplit_once("\n\n").map(|(_, note)| note).unwrap();
+    let left = |word: &str| {
+        let (n, _) = note.split_once(word).unwrap();
+        n.rsplit(' ').next().unwrap().parse::<u64>().unwrap()
+    };
+    let body = text.len() - note.len() - 1;
+    assert_eq!(
+        u64::try_from(body).unwrap() + left(" bytes of this check's output"),
+        u64::try_from(flood.len()).unwrap(),
+        "{note}"
+    );
+    let end = flood.lines().last().unwrap();
+    assert!(text[..body].ends_with(&format!("\n{end}\n")), "{note}");
+    let mut all = Vec::new();
+    store_log(flood.as_bytes(), &mut all, u64::MAX, LOG_TAIL);
+    assert!(
+        u64::try_from(all.len()).unwrap() > cap + LOG_SLACK,
+        "{} bytes stored with no cap",
+        all.len()
+    );
+}
+
+/// DC-08: a check that left a process holding its output open (here, a writer the test keeps)
+/// ends its stored log all the same: the writer waits [`LOG_DRAIN`] for the output's end, then
+/// stores what the pipe held, says in the stored log that it stopped reading output still held
+/// open ([`stopped_note`]), and ends it, whole; and it still reads what that process writes
+/// after, so the process never waits on a full pipe. NEGATIVE CONTROL: output whose writers all
+/// closed it ends with no such note; a writer that did not stop at the drain never says what it
+/// stored; and one that stopped reading the pipe once it stored the log leaves the holder's
+/// write of more than a pipe holds waiting past its one-minute hang detector.
+#[test]
+fn a_log_whose_pipe_a_leftover_holds_ends_after_its_drain() {
+    let d = tmp("trust-lane-log-held");
+    let path = d.path().join("held@1.0.0.log.zst");
+    let file = crate::durable::create_fresh(&path).unwrap();
+    let (from, mut to) = aterm_uds::pipe().unwrap();
+    let mut holder = aterm_uds::kept_out(|| to.try_clone()).unwrap();
+    let mut log = LogWriter::start(from, file, LOG_STORED, LOG_TAIL).unwrap();
+    let said = noise("held", 100);
+    to.write_all(said.as_bytes()).unwrap();
+    drop(to);
+    let waited = Instant::now();
+    log.finish();
+    assert!(
+        waited.elapsed() >= LOG_DRAIN,
+        "it waited for the output's end"
+    );
+    let stored = log.stored.expect("the writer said what it stored");
+    assert!(stored.stopped, "{stored:?}");
+    assert_eq!(log.log_read(), LogRead::Read { refused: false });
+    let text = unzstd(&fs::read(&path).unwrap());
+    assert_eq!(text, format!("{said}{}", stopped_note()));
+    assert!(!trust_facts::judged(&stopped_note()));
+    let (wrote_tx, wrote) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = wrote_tx.send(holder.write_all(&vec![b'x'; 1 << 20]).is_ok());
+    });
+    assert_eq!(
+        wrote.recv_timeout(Duration::from_secs(60)),
+        Ok(true),
+        "what the holder writes after is read"
+    );
+
+    let closed = d.path().join("closed@1.0.0.log.zst");
+    let file = crate::durable::create_fresh(&closed).unwrap();
+    let (from, mut to) = aterm_uds::pipe().unwrap();
+    let mut log = LogWriter::start(from, file, LOG_STORED, LOG_TAIL).unwrap();
+    to.write_all(said.as_bytes()).unwrap();
+    drop(to);
+    log.finish();
+    assert!(!log.stored.unwrap().stopped);
+    assert_eq!(unzstd(&fs::read(&closed).unwrap()), said);
+}
+
+/// DC-08: a run removes, before it checks a library, the stored log a run before it left of
+/// that library, as it removes the plain one, so the judge reads the check this run made; and
+/// the logs, sidecars and report of that library's other versions (a version bump's), so the
+/// folder holds one version of each library a run checks. NEGATIVE CONTROL: the stale stored
+/// log, below the floor, would fail the run; and the logs of a library the run does not check
+/// stay, so the sweep is of the run's libraries' other versions, not of the folder.
+#[test]
+fn a_run_removes_the_stored_log_a_run_before_it_left() {
+    let mut s = site(Scope::WholeTree);
+    let logs = root_of(&s).join("logs");
+    owner_dirs(&logs).unwrap();
+    let stale = logs.join("alpha@1.0.0.log.zst");
+    let options = aterm_zstd::encode::Options::new();
+    let zst = aterm_zstd::compress(b"Summary: 0 proved, 20 failed (20 total)\n", &options);
+    fs::write(&stale, &zst).unwrap();
+    let plain = logs.join("alpha@1.0.0.log");
+    fs::write(&plain, "Summary: 0 proved, 20 failed (20 total)\n").unwrap();
+    let earlier: Vec<PathBuf> = ["log", "log.zst", "log.rc", "log.oblig.tsv"]
+        .iter()
+        .map(|ext| logs.join(format!("alpha@0.9.0.{ext}")))
+        .collect();
+    for path in &earlier {
+        fs::write(path, &zst).unwrap();
+    }
+    let report = logs.join("alpha@0.9.0.log.report");
+    fs::create_dir_all(report.join("x")).unwrap();
+    let other = logs.join("zeta@0.1.0.log.zst");
+    fs::write(&other, &zst).unwrap();
+    let (outcome, said, filed) = run_site(&mut s);
+    let now = fs::read(&stale).map(|z| unzstd(&z)).unwrap_or_default();
+    assert!(
+        !now.contains("20 failed"),
+        "the stale stored log stayed: {said}"
+    );
+    assert!(!plain.exists(), "{said}");
+    for path in &earlier {
+        assert!(!path.exists(), "{}: {said}", path.display());
+    }
+    assert!(!report.exists(), "{said}");
+    assert!(
+        other.exists(),
+        "a library the run does not check keeps its logs"
+    );
+    assert_eq!((outcome, filed.len()), (Outcome::Pass, 1), "{said}");
+}
+
+/// DC-08: `trust log` reads the `logs` folder of the target root a run with the same
+/// `--target-root` uses: one named absolute, or relative to the checkout, and refuses one
+/// `targo trust` would refuse. NEGATIVE CONTROL: a root under a folder anyone may write is
+/// refused, so a reader that took any root named would be told apart.
+#[test]
+fn the_log_verb_reads_the_runs_own_log_folder() {
+    let base = aterm_tempfile::Builder::new()
+        .prefix("trust-lane-log-dir")
+        .tempdir_in(slots_base())
+        .unwrap();
+    let root = base.path().join("target-trust.noindex");
+    owner_dirs(&root).unwrap();
+    let logs = Ok(root.join("logs"));
+    assert_eq!(log_dir(base.path(), Some(root.as_path())), logs);
+    let named = Path::new("target-trust.noindex");
+    assert_eq!(log_dir(base.path(), Some(named)), logs);
+    let open = base.path().join("open");
+    fs::create_dir(&open).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let refused = log_dir(base.path(), Some(open.join("root").as_path()));
+    assert!(refused.is_err(), "{refused:?}");
 }

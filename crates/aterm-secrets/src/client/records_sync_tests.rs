@@ -317,11 +317,300 @@ fn member_of(root: &Path, host: &RecordsHost) -> Paths {
 
 /// [`member_of`], pinning the vault key `key`.
 fn member_pinned(root: &Path, host: &RecordsHost, key: &[u8; 32]) -> Paths {
+    member_at(root, &host.url("team"), key)
+}
+
+/// A Mac configured, with no envelope, to read the vault at `url`, pinning the vault key `key`.
+fn member_at(root: &Path, url: &str, key: &[u8; 32]) -> Paths {
     let member = Paths::for_home(&root.join("m2"));
     let pin = crate::b64::encode_padded(key);
-    configure_log_member(&member, &format!("{}#{pin}", host.url("team")), "m2")
-        .expect("configured");
+    configure_log_member(&member, &format!("{url}#{pin}"), "m2").expect("configured");
     member
+}
+
+/// How [`paged_host`] answers a records GET.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Paging {
+    /// What the server holds past the ids the GET names, one reply of at most the cap at a time
+    /// ([`crate::membership_log::Store::missing_within`]), saying more follow where they do.
+    Honest,
+    /// The first reply's worth of the server's log from its genesis, whatever the GET names, each
+    /// time saying more follow: a host that never stops saying so.
+    Repeats,
+    /// No record, with `200`, saying more follow.
+    EmptyMore,
+}
+
+/// A records host that answers each GET as `paging` says, saying more follow where it does
+/// ([`transport::RECORDS_MORE_HEADER`]), and keeps each GET's answer: the ids it sent, none for
+/// one it refused. It states this build's uncrossed bound where `states`, and none otherwise,
+/// answers a POST `400`, answers every GET past the first `gets` `503`, and runs until a
+/// connection finds `stop` set.
+fn paged_host(
+    server: crate::membership_log::Store,
+    cap: usize,
+    stop: Arc<AtomicBool>,
+) -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Vec<Vec<RecordId>>>>,
+    std::thread::JoinHandle<()>,
+) {
+    paging_host(server, cap, Paging::Honest, true, usize::MAX, stop)
+}
+
+/// [`paged_host`], answering as `paging` says, stating a bound only where `states`, and the
+/// first `gets` GETs alone.
+fn paging_host(
+    server: crate::membership_log::Store,
+    cap: usize,
+    paging: Paging,
+    states: bool,
+    gets: usize,
+    stop: Arc<AtomicBool>,
+) -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Vec<Vec<RecordId>>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let answers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = Arc::clone(&answers);
+    let worker = std::thread::spawn(move || {
+        loop {
+            let accepted = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            );
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let Ok((mut stream, _)) = accepted else {
+                continue;
+            };
+            let Some((line, _)) = read_request(&mut stream) else {
+                continue;
+            };
+            let asked = line.starts_with("GET ") && line.contains("/records");
+            let answered = kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            let reply = if asked && answered < gets {
+                let missing = match paging {
+                    Paging::Honest => server.missing_within(&have_named(&line), cap),
+                    Paging::Repeats => crate::membership_log::store::Missing {
+                        records: server.missing_within(&[], cap).records,
+                        more: true,
+                    },
+                    Paging::EmptyMore => crate::membership_log::store::Missing {
+                        records: Vec::new(),
+                        more: true,
+                    },
+                };
+                kept.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(missing.records.iter().map(|r| *r.id()).collect());
+                let body = encode_records(&missing.records);
+                let mut more = if states {
+                    format!(
+                        "{}: {}\r\n",
+                        transport::RECORDS_BOUND_HEADER,
+                        crate::crossing::RecordsBound::uncrossed().value()
+                    )
+                } else {
+                    String::new()
+                };
+                if missing.more {
+                    more.push_str(&format!("{}: 1\r\n", transport::RECORDS_MORE_HEADER));
+                }
+                let status = if body.is_empty() && !missing.more {
+                    "204 No Content"
+                } else {
+                    "200 OK"
+                };
+                let mut reply = format!(
+                    "HTTP/1.1 {status}\r\n{more}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                reply.extend_from_slice(&body);
+                reply
+            } else if asked {
+                kept.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Vec::new());
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            } else {
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            };
+            let _ = stream.write_all(&reply);
+        }
+    });
+    (addr, answers, worker)
+}
+
+/// A pull of more than one reply arrives in causally closed prefixes, each under the reply cap,
+/// and the records pass asks again past each until it holds the server's whole log
+/// (`docs/DESIGN-vault-log-2026-11-14.md` step 3).
+///
+/// NEGATIVE CONTROL (in the test): one pass alone ([`records_pass`]) takes the first prefix only
+/// and is not fresh.
+#[test]
+fn vault_fence_a_pull_larger_than_one_reply_arrives_in_closed_prefixes() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (writer, incarnation, founder, entrant) = entrant(1, "m1");
+    let genesis = Record::found(&[7; 32], vec![entrant], 1_000).expect("genesis");
+    let mut log = Log::new(genesis.clone()).expect("log");
+    let mut held = vec![genesis.clone()];
+    for n in 0..40 {
+        held.push(named(&mut log, &writer, incarnation, &founder, n));
+    }
+    let server = crate::membership_log::Store::decode("team", &encode_records(&held))
+        .expect("the server's store");
+    let cap = 6 * held[1].wire_len();
+    let digest = server.records_digest();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (addr, answers, worker) = paged_host(server, cap, Arc::clone(&stop));
+    let key = envelope::signer_public(&[7; 32]).expect("the fixture genesis signer");
+    let found = |_: &Config| Vec::new();
+    let found = PeerDiscovery::supplied(&found);
+
+    let control = member_at(
+        &root.path().join("control"),
+        &format!("http://{addr}/v1/team"),
+        &key,
+    );
+    save_records(&control, &encode_records(&held[..1])).expect("the genesis");
+    let one = records_pass(&control, None, &[], Some(&found), None, None).expect("one pass");
+    assert!(one.more && !one.fresh(), "control: {one:?}");
+    assert!(one.added > 0 && one.added < 40, "control: {one:?}");
+
+    let member = member_at(root.path(), &format!("http://{addr}/v1/team"), &key);
+    save_records(&member, &encode_records(&held[..1])).expect("the genesis");
+    let pass = sync_records_until(&member, None, &[], Some(&found), None, None).expect("a pass");
+    stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr);
+    worker.join().expect("the host ends");
+    assert_eq!(pass.added, 40, "{pass:?}");
+    assert!(!pass.more && pass.fresh(), "{pass:?}");
+    assert_eq!(
+        load_records(&member).expect("the store").records_digest(),
+        digest
+    );
+
+    let by_id: BTreeMap<RecordId, &Record> = held.iter().map(|r| (*r.id(), r)).collect();
+    let answers = answers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut known = BTreeSet::from([*genesis.id()]);
+    // The member's answers follow the control's first one.
+    let theirs = &answers[1..];
+    assert!(theirs.len() > 2, "several replies: {}", theirs.len());
+    for answer in theirs.iter().filter(|answer| !answer.is_empty()) {
+        let bytes: usize = answer.iter().map(|id| by_id[id].wire_len()).sum();
+        assert!(bytes <= cap, "{bytes} > {cap}");
+        for id in answer {
+            assert!(
+                by_id[id]
+                    .parents()
+                    .iter()
+                    .all(|parent| known.contains(parent)),
+                "a record before its parent"
+            );
+            known.insert(*id);
+        }
+    }
+    assert_eq!(known.len(), held.len());
+}
+
+/// The server's log of [`vault_fence_a_pull_larger_than_one_reply_arrives_in_closed_prefixes`]:
+/// a genesis and 40 names, with the vault key that signed the genesis.
+fn forty_names() -> (Vec<Record>, [u8; 32]) {
+    let (writer, incarnation, founder, entrant) = entrant(1, "m1");
+    let genesis = Record::found(&[7; 32], vec![entrant], 1_000).expect("genesis");
+    let mut log = Log::new(genesis.clone()).expect("log");
+    let mut held = vec![genesis];
+    for n in 0..40 {
+        held.push(named(&mut log, &writer, incarnation, &founder, n));
+    }
+    let key = envelope::signer_public(&[7; 32]).expect("the fixture genesis signer");
+    (held, key)
+}
+
+/// A host that says more follow on every answer, but sends the same records each time, keeps
+/// the records pass asking only while a pass of its own grows the store: the second pass takes
+/// nothing, and the asking ends there, not where the host stops answering. Any LAN host can say
+/// more follow, and a member's sync passes no deadline.
+///
+/// NEGATIVE CONTROL: with the loop asking again while the passes' running total of records taken
+/// is above zero (`pass.added > 0`, as first built), the member asked all 8 GETs the host answers
+/// and then a 9th it refused (`left: 9, right: 2`); with no answer limit it never ended.
+#[test]
+fn vault_fence_a_host_that_always_says_more_ends_the_asking() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (held, key) = forty_names();
+    let server = crate::membership_log::Store::decode("team", &encode_records(&held))
+        .expect("the server's store");
+    let cap = 6 * held[1].wire_len();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (addr, answers, worker) =
+        paging_host(server, cap, Paging::Repeats, true, 8, Arc::clone(&stop));
+    let found = |_: &Config| Vec::new();
+    let found = PeerDiscovery::supplied(&found);
+    let member = member_at(root.path(), &format!("http://{addr}/v1/team"), &key);
+    save_records(&member, &encode_records(&held[..1])).expect("the genesis");
+    let pass = sync_records_until(&member, None, &[], Some(&found), None, None).expect("a pass");
+    stop.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr);
+    worker.join().expect("the host ends");
+    let asked = answers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    assert_eq!(asked, 2, "{pass:?}");
+    assert!(pass.added > 0 && pass.more && !pass.fresh(), "{pass:?}");
+}
+
+/// Only a cut reply says more follow: one that carries no record, or comes from a host that
+/// states no records bound (a LAN host's, one before the fence), is no reason to ask again, and
+/// leaves the pass fresh where nothing else made it stale.
+///
+/// NEGATIVE CONTROL: with `more` read from the header alone, the empty case failed
+/// (`empty: RecordsPass { added: 0, .., more: true }`); with it read from the header and a
+/// record but not the bound, the unstated case failed
+/// (`unstated: RecordsPass { added: 3, .., unstated: true, more: true }`).
+#[test]
+fn vault_fence_only_a_stated_reply_with_records_says_more() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (held, key) = forty_names();
+    let found = |_: &Config| Vec::new();
+    let found = PeerDiscovery::supplied(&found);
+    for (case, paging, states) in [
+        ("empty", Paging::EmptyMore, true),
+        ("unstated", Paging::Repeats, false),
+    ] {
+        let server = crate::membership_log::Store::decode("team", &encode_records(&held))
+            .expect("the server's store");
+        let cap = 6 * held[1].wire_len();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (addr, _, worker) = paging_host(server, cap, paging, states, 1, Arc::clone(&stop));
+        let member = member_at(
+            &root.path().join(case),
+            &format!("http://{addr}/v1/team"),
+            &key,
+        );
+        save_records(&member, &encode_records(&held[..1])).expect("the genesis");
+        let pass = records_pass(&member, None, &[], Some(&found), None, None).expect("a pass");
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(addr);
+        worker.join().expect("the host ends");
+        assert!(!pass.more, "{case}: {pass:?}");
+    }
 }
 
 #[test]
@@ -1514,6 +1803,7 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
             added: 0,
             untaken: true,
             unstated: false,
+            more: false,
         },
         "the next pass names what it could not take, and the server sends nothing"
     );

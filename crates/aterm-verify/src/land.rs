@@ -223,6 +223,10 @@ pub const RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// establishes a deadline for the complete operation's cleanup. Killing the owner before it
 /// records its outcome would leave its durable intent open.
 const WRITE: Duration = agh::git::GRANT_MAX;
+/// How long a push waits on another writer's open atomic intent: agh's full grace period
+/// (`agh::Journal::closable`, `GRANT_MAX` from retirement or the first free observation)
+/// and half a minute for the reads. A writer still running may outlast this wait.
+const INTENT_WAIT: Duration = Duration::from_secs(agh::git::GRANT_MAX.as_secs() + 30);
 const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
 /// Where a passed judgment is kept until its landing is on main ([`Git::keep`]): a ref of this
 /// worktree alone, which no fetch or push moves.
@@ -629,7 +633,7 @@ pub fn land(root: &Path, own: &Own<'_>, seams: &mut Seams<'_>) -> i32 {
 
 /// How a landing that ran as `ran` ends, whatever ended it: an error is said (as the interrupt
 /// it came after, where the landing took one it has not said) and could not run; then the run's
-/// end record and its append ([`records::finish`]), the closing verdict of `tally`
+/// end record and its delivery ([`records::finish`]), the closing verdict of `tally`
 /// ([`say_verdict`]) and the exit. A landing that panicked records its end as [`PANICKED`] and
 /// then goes on panicking, so it dies as without the record, and says no verdict.
 fn concluded(
@@ -653,11 +657,22 @@ fn concluded(
             exit::COULD_NOT_RUN
         }
         Err(panic) => {
-            records::finish(git, &mut seams.records, &mut *seams.say, PANICKED);
+            records::finish(
+                git,
+                &mut seams.records,
+                &mut *seams.say,
+                PANICKED,
+                records::Delivery::Publish,
+            );
             std::panic::resume_unwind(panic);
         }
     };
-    records::finish(git, &mut seams.records, &mut *seams.say, code);
+    let delivery = if code == exit::CONFLICT {
+        records::Delivery::DeferIfKept
+    } else {
+        records::Delivery::Publish
+    };
+    records::finish(git, &mut seams.records, &mut *seams.say, code, delivery);
     say_verdict(git, seams, code, tally);
     code
 }
@@ -1505,8 +1520,9 @@ impl<'a> Wire<'a> {
         let unknown = |why: String| {
             *self.unsettled.borrow_mut() = Some(format!(
                 "the write of {landing} to {MAIN} ended with an unknown outcome; where agh \
-                 journaled it, its intent stays open (`agh intent list --open`) until it is \
-                 settled, or retracted once the write is known not to have landed"
+                 journaled it, its intent stops atomic writes from this Mac for agh's window \
+                 (`agh intent show`), after which the next push closes it; a later push of \
+                 this landing is refused where main holds it already, and read as landed"
             ));
             why
         };
@@ -1542,12 +1558,12 @@ impl<'a> Wire<'a> {
                 (self.say)(&format!(
                     "verify land: waiting up to {}s for agh atomic intent {} to close; this push \
                      sent nothing",
-                    WRITE.as_secs(),
+                    INTENT_WAIT.as_secs(),
                     intent.as_str()
                 ));
-                // Bound this wait without inferring whether the other owner is still alive
-                // or whether its write was applied from the age of its intent alone.
-                let until = Instant::now() + WRITE;
+                // agh judges when the intent stops pushes (`agh::Journal::closable`); the wait
+                // ends there and the push is made again, whose begin closes it.
+                let until = Instant::now() + INTENT_WAIT;
                 self.wait_for_intent(intent, until)
             },
             // The refused attempt sent nothing. Where main is unchanged the same expected-ref
@@ -1569,15 +1585,15 @@ impl<'a> Wire<'a> {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 *self.unsettled.borrow_mut() = Some(format!(
-                    "agh intent {} stayed open for this wait's {}s budget: its outcome \
-                     remains unresolved; retract it only once its write is known not \
-                     to have landed (`agh intent list --open`)",
+                    "agh intent {} stayed open for this wait's {}s budget, its writer or \
+                     late-arrival grace still stopping it (`agh intent show`); the next run \
+                     waits on it again",
                     intent.as_str(),
-                    WRITE.as_secs()
+                    INTENT_WAIT.as_secs()
                 ));
                 return Err(format!(
                     "another writer's atomic intent stayed open for {}s",
-                    WRITE.as_secs()
+                    INTENT_WAIT.as_secs()
                 ));
             }
             Ok(left)
@@ -3270,31 +3286,45 @@ impl Git<'_> {
 
     /// Main's tip read through `run`, then cached without overwriting another writer's
     /// observation made during that read. An absent tracking ref is created conditionally.
+    ///
+    /// The cache is shared by every worktree of the repository, so a landing in another
+    /// worktree (or Git's local transport) may record its own observation while this read
+    /// runs. The conditional update then fails with the ref moved off what this read saw
+    /// before it, that observation is kept, and this read's tip still stands: it was read
+    /// from the remote, and the tracking ref is only a cache of such reads.
+    ///
+    /// # Errors
+    /// The tracking ref cannot be read, the remote read fails, or the update fails with the
+    /// ref still where this read saw it.
     fn fetch_through(&self, run: &crate::remote::Runner<'_>) -> Result<String, String> {
         let reference = format!("refs/remotes/{REMOTE}/{MAIN}");
-        let before = self.complete(&["rev-parse", "--quiet", "--verify", &reference], LOCAL)?;
-        let expected = if before.status.success() {
-            String::from_utf8(before.stdout)
-                .map_err(|_| "main's tracking ref is not UTF-8")?
-                .trim()
-                .to_owned()
-        } else if before.status.code() == Some(1) && before.stdout.is_empty() {
-            String::new()
-        } else {
-            return Err(format!(
-                "cannot read main's tracking ref: {}",
-                String::from_utf8_lossy(&before.stderr).trim()
-            ));
-        };
+        let expected = self.tracking(&reference)?;
         let remote = crate::remote::Remote::open(self.root, REMOTE, run)?;
         let tip = remote.refresh_main()?;
-        if let Err(why) = self.local(&["update-ref", "--no-deref", &reference, &tip, &expected]) {
-            // Git's local transport may have recorded this same observation itself.
-            if self.local(&["rev-parse", "--verify", &reference])? != tip {
-                return Err(why);
-            }
+        if let Err(why) = self.local(&["update-ref", "--no-deref", &reference, &tip, &expected])
+            && self.tracking(&reference)? == expected
+        {
+            return Err(why);
         }
         Ok(tip)
+    }
+
+    /// The object main's tracking ref names, or an empty string where the ref is absent.
+    fn tracking(&self, reference: &str) -> Result<String, String> {
+        let read = self.complete(&["rev-parse", "--quiet", "--verify", reference], LOCAL)?;
+        if read.status.success() {
+            Ok(String::from_utf8(read.stdout)
+                .map_err(|_| "main's tracking ref is not UTF-8")?
+                .trim()
+                .to_owned())
+        } else if read.status.code() == Some(1) && read.stdout.is_empty() {
+            Ok(String::new())
+        } else {
+            Err(format!(
+                "cannot read main's tracking ref: {}",
+                String::from_utf8_lossy(&read.stderr).trim()
+            ))
+        }
     }
 
     /// Record a known successful landing where the tracking ref still names its expected
@@ -4212,7 +4242,10 @@ pub fn usage() -> String {
          whose step outlasts the interrupt's grace, has none), each kept at least fourteen days. Each record is kept in this clone as it is made; one append\n\
          at the run's end, after its last use of {MAIN}, carries them with any an earlier run\n\
          left, and a failed append is said and made by the next run, changing no exit and no\n\
-         count. `verify land records` lists a tree's verdicts; `verify land --census` reads the\n\
+         count. `verify land records --flush` retries one snapshot of pending records without\n\
+         starting a landing or creating records; unreadable records and incomplete cleanup\n\
+         give it a nonzero exit. `verify land records` lists a tree's verdicts;\n\
+         `verify land --census` reads the\n\
          run records. Nothing reads them to decide a landing: what lands, and the exit, are the\n\
          same with them as without them.\n\n\
          GitHub reads and writes use agh (expected refs, durable write intents; one write, with\n\
@@ -4605,7 +4638,13 @@ fn refused(
     if let Some(carried) = carried {
         let mut records = records(git.root);
         records.adopt(carried);
-        records::finish(git, &mut records, say, exit::COULD_NOT_RUN);
+        records::finish(
+            git,
+            &mut records,
+            say,
+            exit::COULD_NOT_RUN,
+            records::Delivery::Publish,
+        );
     }
     exit::COULD_NOT_RUN
 }

@@ -48,7 +48,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Engine, PathBuf, PathBuf, PathBuf) {
     }
     let named: BTreeSet<PathBuf> = [&root, &cache, &other].into_iter().cloned().collect();
     let mut life = PaneLife::default();
-    life.membership.observe(&named, 1, now);
+    life.membership.observe(&named, 1, now, PANE_STALE_AFTER);
     for path in &named {
         life.claims.insert(
             path.clone(),

@@ -268,9 +268,8 @@ pub const LEAVE_DEVELOPER_MODE: &str = "--leave-developer-mode";
 /// The tab's last line once the tools read in place and no root step beside them reads owed, each
 /// read back after the root half ran; the window then closes the tab unless it is its window's
 /// last (`aterm-gui`'s `App::developer_tools_install_ended`).
-pub const TAB_INSTALLED: &str = "Successfully completed: Apple's Command Line Tools and the \
-                                 administrator's part of setup are in place. This tab closes by \
-                                 itself.";
+pub const TAB_INSTALLED: &str = "Apple's Command Line Tools and the administrator's part of setup \
+                                 are in place. You can close this tab.";
 
 /// Clear the admitted tab's screen and scrollback after its go line was received.
 pub(crate) const TAB_CLEAR: &str = "\x1b[H\x1b[2J\x1b[3J";
@@ -424,6 +423,8 @@ pub struct CommandLineTools {
     /// The window that opened the Mac Setup tab read developer mode off as the person's own
     /// choice ([`Self::leaving_developer_mode`]).
     developer_mode_theirs: bool,
+    /// An explicit Finish setup press may extend existing administrator setup.
+    explicit_tab: bool,
     /// The root work the last probe admitted ([`Self::read`]), which an apply re-reads within
     /// ([`Self::plan_after`]).
     root_plan: Mutex<RootPlan>,
@@ -472,6 +473,7 @@ impl CommandLineTools {
             owed: Box::new(|_| Vec::new()),
             asked: std::sync::atomic::AtomicBool::new(false),
             developer_mode_theirs: false,
+            explicit_tab: false,
             root_plan: Mutex::new(RootPlan::WithTools),
         }
     }
@@ -537,6 +539,15 @@ impl CommandLineTools {
     pub fn in_tab(self, tab: Tab) -> Self {
         Self {
             tab: Some(tab),
+            ..self
+        }
+    }
+
+    /// Record that a person explicitly opened the Mac Setup tab.
+    #[must_use]
+    pub fn with_explicit_tab(self, explicit_tab: bool) -> Self {
+        Self {
+            explicit_tab,
             ..self
         }
     }
@@ -642,7 +653,7 @@ impl CommandLineTools {
     }
 
     fn is_explicit(&self) -> bool {
-        self.unbidden.as_ref().is_some_and(|record| record.explicit)
+        self.explicit_tab || self.unbidden.as_ref().is_some_and(|record| record.explicit)
     }
 
     /// What the elevation still owes this Mac beside the tools ([`Self::with_owed`]), less
@@ -651,6 +662,9 @@ impl CommandLineTools {
     /// retain the original metadata inventory and durable episode policy.
     fn owed_now(&self, sys: &dyn System) -> Vec<crate::root_steps::Owed> {
         let mut owed = (self.owed)(sys);
+        if !self.is_explicit() && !crate::init_spotlight::automatic_scope_owed(sys) {
+            owed.retain(|step| *step != crate::root_steps::Owed::Spotlight);
+        }
         if self.leaves_developer_mode(sys) {
             owed.retain(|step| *step != crate::root_steps::Owed::Debugger);
         }

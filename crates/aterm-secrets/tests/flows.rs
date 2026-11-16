@@ -195,7 +195,7 @@ fn set(admin_paths: &Paths, audience: &Audience, name: &str, value: &str) -> u64
 
 fn applied(outcome: SyncOutcome) -> (u64, aterm_secrets::client::Report) {
     match outcome {
-        SyncOutcome::Applied { seq, report } => (seq, report),
+        SyncOutcome::Applied { seq, report, .. } => (seq, report),
         other => panic!("expected a new version, got {other:?}"),
     }
 }

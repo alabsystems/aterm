@@ -19,6 +19,10 @@ pub struct Policy {
     pub flags: &'static [&'static str],
     /// Tokens that already decide the posture: a launch holding one and no `--yolo` runs as typed.
     pub markers: &'static [&'static str],
+    /// First words the flags go behind.
+    pub after: &'static [&'static str],
+    /// First words that leave a launch without `--yolo` as typed.
+    pub skip: &'static [&'static str],
 }
 
 impl Policy {
@@ -26,6 +30,8 @@ impl Policy {
     pub const NONE: Self = Self {
         flags: &[],
         markers: &[],
+        after: &[],
+        skip: &[],
     };
 }
 
@@ -35,6 +41,8 @@ pub fn policy_of(program: &str) -> Policy {
     crate::vendor_direct::spec(program).map_or(Policy::NONE, |row| Policy {
         flags: row.yolo_flags,
         markers: row.yolo_markers,
+        after: row.yolo_after,
+        skip: row.yolo_skip,
     })
 }
 
@@ -128,6 +136,10 @@ pub(crate) fn word_options(program: &str) -> WordOptions {
                 "--no-daemon",
             ],
         },
+        "muse" => WordOptions {
+            values: &["--model"],
+            ..WordOptions::default()
+        },
         "claude" => WordOptions {
             switches: &["-p", "--print"],
             ..WordOptions::default()
@@ -208,10 +220,12 @@ fn config_decides_posture(program: &str, head: &[String]) -> bool {
 }
 
 /// Decide `program args…`, reading the words ahead of a literal `--`. A program with no policy
-/// runs as typed. A typed `--yolo` becomes the policy's flags in place, each once
-/// ([`Launch::Flag`]). Else an option the word scan does not know, a marker, a Codex permission
-/// config assignment or a self-update verb as the first word runs as typed; else the flags go
-/// in front ([`Launch::Default`]).
+/// runs as typed, and so does an option the word scan does not know (with a typed `--yolo` too,
+/// when the policy has `after` words, since where the flags go is then unknown). Else a typed
+/// `--yolo` becomes the policy's flags in place, each once, or right behind an `after` first word
+/// ([`Launch::Flag`]); else a marker, a Codex permission config assignment, or a `skip` word or
+/// self-update verb as the first word runs as typed; else the flags go in front, or behind an
+/// `after` first word ([`Launch::Default`]).
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
     let policy = policy_of(program);
@@ -220,27 +234,43 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     }
     let head_len = args.iter().take_while(|a| a.as_str() != "--").count();
     let head = &args[..head_len];
-    if head.iter().any(|a| a == WORD) {
+    let explicit = head.iter().any(|a| a == WORD);
+    let word = match first_word(program, &policy, head) {
+        Ok(word) => word,
+        Err(Unread) if !explicit || !policy.after.is_empty() => return Launch::AsTyped,
+        Err(Unread) => None,
+    };
+    let after = word.is_some_and(|i| policy.after.contains(&head[i].as_str()));
+    if explicit {
         let mut present: Vec<&str> = head.iter().map(String::as_str).collect();
-        let mut out: Vec<String> = Vec::with_capacity(args.len() + policy.flags.len());
-        for arg in head {
-            if arg != WORD {
-                out.push(arg.clone());
-                continue;
-            }
+        let fresh = |out: &mut Vec<String>, present: &mut Vec<&str>| {
             for flag in policy.flags {
                 if !present.contains(flag) {
                     present.push(flag);
                     out.push((*flag).to_string());
                 }
             }
+        };
+        let mut out: Vec<String> = Vec::with_capacity(args.len() + policy.flags.len());
+        let mut pending = false;
+        for (i, arg) in head.iter().enumerate() {
+            if arg == WORD {
+                if after && word.is_some_and(|w| i < w) {
+                    pending = true;
+                } else {
+                    fresh(&mut out, &mut present);
+                }
+            } else {
+                out.push(arg.clone());
+                if pending && word == Some(i) {
+                    pending = false;
+                    fresh(&mut out, &mut present);
+                }
+            }
         }
         out.extend(args[head_len..].iter().cloned());
         return Launch::Flag(out);
     }
-    let Ok(word) = first_word(program, &policy, head) else {
-        return Launch::AsTyped;
-    };
     if head
         .iter()
         .any(|a| policy.markers.iter().any(|m| marker_matches(m, a)))
@@ -248,11 +278,22 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     {
         return Launch::AsTyped;
     }
-    // The self-update verbs skip, on every lane: an update shape is decided by that intercept
-    // first (`claude update --help` forwards to the vendor), and the default must not land on
-    // the forward.
-    if word.is_some_and(|i| crate::selfupdate::verbs_of(program).contains(&head[i].as_str())) {
-        return Launch::AsTyped;
+    if let Some(i) = word {
+        // The self-update verbs skip too, on every lane: an update shape is
+        // decided by that intercept first (`claude update --help` forwards to
+        // the vendor), and the default must not land on the forward.
+        if policy.skip.contains(&head[i].as_str())
+            || crate::selfupdate::verbs_of(program).contains(&head[i].as_str())
+        {
+            return Launch::AsTyped;
+        }
+        if after {
+            let mut out: Vec<String> = Vec::with_capacity(args.len() + policy.flags.len());
+            out.extend(head[..=i].iter().cloned());
+            out.extend(policy.flags.iter().map(|f| (*f).to_string()));
+            out.extend(args[i + 1..].iter().cloned());
+            return Launch::Default(out);
+        }
     }
     let mut out: Vec<String> = policy.flags.iter().map(|f| (*f).to_string()).collect();
     out.extend(args.iter().cloned());

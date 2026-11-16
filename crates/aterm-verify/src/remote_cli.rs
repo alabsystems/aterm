@@ -116,8 +116,9 @@ pub unsafe fn entry(args: &[OsString]) -> Option<ExitCode> {
     Some(agh::cli::main_entry(args.to_vec()))
 }
 
-/// Arm before entering Agh and join the watcher on every return or unwind. A broken watcher
-/// requests stop; it never leaves a native mutation running without its cancellation owner.
+/// Start the process's hang-up bell, arm before entering Agh and join the watcher on every return
+/// or unwind. A broken watcher requests stop; it never leaves a native mutation running without
+/// its cancellation owner.
 #[cfg(unix)]
 pub(super) fn cancellation<T>(
     stream: aterm_uds::CtlStream,
@@ -134,6 +135,9 @@ fn cancellation_with<T>(
 ) -> Result<T, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
+    // An arm never starts its bell ([`aterm_uds::hangup::Bell::arm`]); this thread holds no lock,
+    // so the start's wait for any spawn in flight is made here, once per bell.
+    bell.start();
     let (ring, heard) = mpsc::sync_channel(1);
     let armed = bell
         .arm(&stream, ring.clone())

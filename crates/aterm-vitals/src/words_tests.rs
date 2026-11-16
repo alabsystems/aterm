@@ -894,7 +894,10 @@ fn scope_cells_name_their_unit() {
     };
     assert_eq!(
         each(Resource::Cpu, fig(6.8), fig(0.04), &MAC),
-        (words(&["6.8 cores"]), words(&["0.0 cores"]))
+        (
+            words(&["6.8 reported cores"]),
+            words(&["0.0 reported cores"])
+        )
     );
     assert_eq!(
         each(Resource::Memory, fig(5.0 * GIB), fig(0.18 * GIB), &MAC),
@@ -971,38 +974,46 @@ fn scope_cells_name_their_unit() {
 }
 
 #[test]
-fn incomplete_scope_figures_keep_the_lower_bound_in_every_form() {
-    for (resource, value) in [(Resource::Cpu, 1.2), (Resource::Memory, 2.0 * GIB)] {
-        let mut figure = fig(value);
-        figure.unread = 1;
-        let bounded = scope_cell(resource, &figure, false);
-        assert!(
-            bounded.forms.iter().all(|form| form.starts_with('≥')),
-            "{bounded:?}"
-        );
-        figure.unread = 0;
-        assert!(
-            scope_cell(resource, &figure, false)
-                .forms
-                .iter()
-                .all(|form| !form.starts_with('≥'))
-        );
-    }
+fn incomplete_memory_scope_figures_keep_the_lower_bound_in_every_form() {
+    let mut figure = fig(2.0 * GIB);
+    figure.unread = 1;
+    let bounded = scope_cell(Resource::Memory, &figure, false);
+    assert!(
+        bounded.forms.iter().all(|form| form.starts_with('≥')),
+        "{bounded:?}"
+    );
+    figure.unread = 0;
+    assert!(
+        scope_cell(Resource::Memory, &figure, false)
+            .forms
+            .iter()
+            .all(|form| !form.starts_with('≥'))
+    );
 }
 
 #[test]
-fn a_confirmed_cpu_floor_never_rounds_its_lower_bound_up() {
+fn reported_cpu_growth_and_inherited_charge_are_said_separately() {
     let mut figure = fig(1.19);
-    figure.unread = 1;
-    assert_eq!(
-        scope_cell(Resource::Cpu, &figure, false).forms,
-        strings(&["≥1.1 cores"])
-    );
+    for unread in [0, 1] {
+        figure.unread = unread;
+        assert_eq!(
+            scope_cell(Resource::Cpu, &figure, false).forms,
+            strings(&["1.2 reported cores"]),
+            "ownership coverage never makes reported growth a physical CPU floor"
+        );
+    }
     figure.cpu_charge = Some(3.5);
     assert_eq!(
         cpu_charge_words(&figure).as_deref(),
         Some("counter charge 3.50 cores")
     );
+    assert_eq!(
+        scope_cell(Resource::Cpu, &figure, false).forms,
+        strings(&["1.2 reported cores"]),
+        "inherited charge does not replace independently reported growth"
+    );
+    figure.cpu_charge = Some(1.19);
+    assert_eq!(cpu_charge_words(&figure), None);
 }
 
 #[test]
@@ -1419,63 +1430,26 @@ fn details_lead_with_kept_state_clauses() {
         born_ms: None,
         unborn: 9,
     });
-    let busiest = (
-        1,
-        false,
-        None,
-        Words,
-        f(&[
-            "busiest rustc \u{d7}9 in Tab 3, 5.9 cores",
-            "rustc \u{d7}9 in Tab 3",
-        ]),
-    );
-    assert_eq!(
-        shape(&details(Resource::Cpu, &s, &MAC)),
-        vec![
-            (
-                0,
-                false,
-                None,
-                Words,
-                f(&["8 waiting for a core (load 25.7)", "load 25.7 on 18 cores"])
-            ),
-            busiest.clone(),
-        ]
-    );
-    assert_eq!(
-        shape(&details(Resource::Cpu, &s, &LINUX)),
-        vec![
-            (
-                0,
-                false,
-                None,
-                Words,
-                f(&["load 25.7 on 18 cores", "load 25.7"])
-            ),
-            busiest.clone()
-        ]
-    );
-    s.why = spotlight(Some(Context::Startup));
-    assert_eq!(
-        shape(&details(Resource::Cpu, &s, &MAC)),
-        vec![
-            (
-                0,
-                false,
-                None,
-                Words,
-                f(&["8 waiting for a core (load 25.7)", "load 25.7 on 18 cores"])
-            ),
-            (
-                1,
-                false,
-                Some(Mark::Cause),
-                Words,
-                f(&["Spotlight, after start-up", "Spotlight"])
-            ),
-            busiest
-        ]
-    );
+    for loc in [&MAC, &LINUX] {
+        s.why = None;
+        let baseline = details(Resource::Cpu, &s, loc);
+        assert_eq!(baseline.len(), 2);
+        assert!(baseline[0].forms.iter().any(|form| form.contains("25.7")));
+        assert!(baseline[1].forms.iter().any(|form| {
+            form.contains("reported CPU") && form.contains("rustc") && form.contains("5.9")
+        }));
+        assert!(
+            baseline
+                .iter()
+                .all(|clause| clause.mark != Some(Mark::Cause))
+        );
+        s.why = spotlight(Some(Context::Startup));
+        assert_eq!(
+            shape(&details(Resource::Cpu, &s, loc)),
+            shape(&baseline),
+            "a retained CPU cause cannot qualify native counter publication"
+        );
+    }
 
     let mut s = snap();
     let mut net = row(2.1e6, 22.9e6);
@@ -1609,7 +1583,7 @@ fn details_lead_with_kept_state_clauses() {
 }
 
 #[test]
-fn cpu_details_name_the_cause_after_load_and_before_busiest() {
+fn reported_cpu_details_retain_numeric_context_without_promoting_kept_causes() {
     let mut s = snap();
     set(&mut s, Resource::Cpu, row(3.3, 18.0));
     s.facts.load1 = Some(5.6);
@@ -1627,45 +1601,50 @@ fn cpu_details_name_the_cause_after_load_and_before_busiest() {
             .map(|c| (c.forms, c.mark, c.spoken))
             .collect()
     };
-    let load = (
-        strings(&["load 5.6 on 18 cores", "load 5.6"]),
-        None,
-        "Load 5.6 on 18 cores.".to_owned(),
+    let baseline = read(&s);
+    assert_eq!(baseline.len(), 2);
+    assert!(
+        baseline[0]
+            .0
+            .iter()
+            .any(|form| form.contains("5.6") && form.contains("18"))
     );
-    let busiest = (
-        strings(&["busiest siriactionsd, 0.7 cores", "siriactionsd"]),
-        None,
-        "Busiest siriactionsd, 0.7 cores.".to_owned(),
+    assert!(baseline[1].0.iter().any(|form| {
+        form.contains("reported CPU") && form.contains("siriactionsd") && form.contains("0.7")
+    }));
+    assert!(baseline[1].2.contains("reported CPU"));
+    assert!(
+        baseline
+            .iter()
+            .all(|(_, mark, _)| *mark != Some(Mark::Cause))
     );
-    assert_eq!(read(&s), [load.clone(), busiest.clone()]);
-    for (context, long) in [
-        (Some(Context::Startup), "Spotlight, after start-up"),
-        (Some(Context::Wake), "Spotlight, since wake"),
-        (Some(Context::Throttled), "Spotlight"),
-        (None, "Spotlight"),
+    for context in [
+        Some(Context::Startup),
+        Some(Context::Wake),
+        Some(Context::Throttled),
+        None,
     ] {
         s.why = spotlight(context);
-        let cause = (
-            strings(&[long, "Spotlight"]),
-            Some(Mark::Cause),
-            format!("Why: {long}."),
-        );
+        assert_eq!(read(&s), baseline, "{context:?}");
         assert_eq!(
-            read(&s),
-            [load.clone(), cause, busiest.clone()],
-            "{context:?}"
+            state(Resource::Cpu, &s, &MAC),
+            None,
+            "a retained cause is no state"
         );
-        assert_eq!(state(Resource::Cpu, &s, &MAC), None, "a cause is no state");
     }
 
     s.why = spotlight(Some(Context::Startup));
-    s.at_ns = 15_000_000_000;
-    assert_eq!(read(&s).len(), 3, "15 s old");
-    s.at_ns += 1_000_000;
-    assert_eq!(read(&s), [load.clone(), busiest.clone()], "older");
+    for at_ns in [0, 15_000_000_000, 15_001_000_000] {
+        s.at_ns = at_ns;
+        assert_eq!(
+            read(&s),
+            baseline,
+            "retention age cannot establish an execution window"
+        );
+    }
     s.at_ns = 0;
     s.why = Some(Arc::new(WhyFacts::default()));
-    assert_eq!(read(&s), [load, busiest], "no clause held");
+    assert_eq!(read(&s), baseline, "no clause held");
 }
 
 /// Tab 2 split in panes 2 and 3 speaks as one tab: named once, its figure both panes'.
@@ -1679,13 +1658,13 @@ fn a_split_tab_speaks_for_all_its_panes() {
     set(&mut s, Resource::Cpu, cpu);
     let said = |panes: &[u64]| row_sentence(Resource::Cpu, &s, panes, &MAC);
     assert!(
-        said(&[2, 3]).contains(". aterm 6.8 cores, Tab 2 2.5 cores. "),
+        said(&[2, 3]).contains(". aterm 6.8 reported cores, Tab 2 2.5 reported cores. "),
         "{}",
         said(&[2, 3])
     );
     assert_eq!(said(&[3, 2]), said(&[2, 3]));
     assert!(
-        said(&[2]).contains(". aterm 6.8 cores, Tab 2 0.1 cores. "),
+        said(&[2]).contains(". aterm 6.8 reported cores, Tab 2 0.1 reported cores. "),
         "one pane, as before: {}",
         said(&[2])
     );
@@ -1699,13 +1678,11 @@ fn row_sentences() {
     cpu.tabs = vec![(2, fig(0.1))];
     set(&mut s, Resource::Cpu, cpu);
     s.facts.load1 = Some(25.7);
-    assert_eq!(
-        row_sentence(Resource::Cpu, &s, &[2], &MAC),
-        "CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1 cores. \
-         Steady near 98 percent. Over capacity 8 of the last 10 minutes. 8 waiting for a \
-         core, load 25.7 on 18 cores."
-    );
-    s.why = spotlight(Some(Context::Startup));
+    let said = row_sentence(Resource::Cpu, &s, &[2], &MAC);
+    assert!(said.contains("17.7 of 18 cores"));
+    assert!(said.contains("aterm 6.8 reported cores, Tab 2 0.1 reported cores"));
+    assert!(said.contains("25.7"));
+    assert!(said.contains(CPU_CHARGE_NOTE));
     s.facts.busiest = Some(Busiest {
         name: "rustc".into(),
         cores: 5.9,
@@ -1714,13 +1691,12 @@ fn row_sentences() {
         born_ms: None,
         unborn: 9,
     });
-    assert!(
-        row_sentence(Resource::Cpu, &s, &[2], &MAC).ends_with(
-            "8 waiting for a core, load 25.7 on 18 cores. Why: Spotlight, after start-up. \
-             Busiest rustc, 9 processes in Tab 3, 5.9 cores."
-        ),
-        "the meter says the cause where no Details column shows"
-    );
+    let baseline = row_sentence(Resource::Cpu, &s, &[2], &MAC);
+    assert!(baseline.contains("Largest reported CPU:") && baseline.contains("rustc"));
+    assert!(baseline.contains("5.9 cores"));
+    s.why = spotlight(Some(Context::Startup));
+    assert_eq!(row_sentence(Resource::Cpu, &s, &[2], &MAC), baseline);
+    assert!(!baseline.contains("Why:") && !baseline.contains("Spotlight"));
 
     assert_eq!(
         row_sentence(Resource::Disk, &disk_trouble(), &[2], &MAC),
@@ -2068,8 +2044,7 @@ fn the_disk_says_aterms_writes_from_a_megabyte_a_second() {
     assert!(writes(&s, &[2]).is_empty(), "under a megabyte a second");
 }
 
-/// The glance says a clause only while it is unusual: Spotlight's cause always, the threads
-/// waiting once one waits, the busiest program from a core, the other direction from 0.1 MB/s,
+/// The glance keeps independent load and reported program context, the other direction from 0.1 MB/s,
 /// "yours" from 80% of the user's limit.
 #[test]
 fn the_glance_says_a_clause_only_while_it_is_unusual() {
@@ -2090,15 +2065,18 @@ fn the_glance_says_a_clause_only_while_it_is_unusual() {
         born_ms: None,
         unborn: 1,
     });
-    assert_eq!(forms(Resource::Cpu, &s), Vec::<Vec<String>>::new(), "calm");
+    assert_eq!(
+        forms(Resource::Cpu, &s),
+        Vec::<Vec<String>>::new(),
+        "the reported program is below the glance threshold"
+    );
     assert_eq!(
         details(Resource::Cpu, &s, &MAC).len(),
         2,
-        "CONTROL: load and busiest"
+        "CONTROL: load and reported program remain in Details"
     );
 
     s.facts.load1 = Some(25.7);
-    s.why = spotlight(Some(Context::Startup));
     s.facts.busiest = Some(Busiest {
         name: "rustc".into(),
         cores: 5.9,
@@ -2107,13 +2085,19 @@ fn the_glance_says_a_clause_only_while_it_is_unusual() {
         born_ms: None,
         unborn: 9,
     });
+    let baseline = forms(Resource::Cpu, &s);
+    assert_eq!(baseline.len(), 2);
+    assert!(baseline[1].iter().all(|form| form.contains("rustc")));
+    assert!(
+        glance_details(Resource::Cpu, &s, &[], &MAC)
+            .iter()
+            .all(|clause| clause.mark != Some(Mark::Cause))
+    );
+    s.why = spotlight(Some(Context::Startup));
     assert_eq!(
         forms(Resource::Cpu, &s),
-        [
-            strings(&["8 waiting for a core"]),
-            strings(&["Spotlight, after start-up", "Spotlight"]),
-            strings(&["rustc \u{d7}9 in Tab 3", "rustc \u{d7}9"]),
-        ]
+        baseline,
+        "retained activity cannot promote reported growth into a cause"
     );
     assert_eq!(
         glance_details(Resource::Cpu, &s, &[], &LINUX)[0].forms,

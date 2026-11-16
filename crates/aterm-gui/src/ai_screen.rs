@@ -1167,8 +1167,8 @@ impl App {
     pub(crate) fn type_into_new_session(&mut self, sid: &str, line: &str) {
         let found = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-            store
-                .by_sid(&aterm_session::SessionId::new(sid))
+            aterm_session::SessionId::parse(sid)
+                .and_then(|id| store.by_sid(&id))
                 .map(|handle| (handle.term.clone(), handle.ctx.clone()))
         };
         if let Some((term, ctx)) = found {

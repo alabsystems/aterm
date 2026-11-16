@@ -10085,6 +10085,7 @@ impl App {
                 }
             }
             MenuAction::Workers => self.open_workers_from_menu(),
+            MenuAction::ToggleNavigator => self.toggle_navigator_dock(),
             MenuAction::Navigator => {
                 if let Err(error) = self.open_navigator(false) {
                     self.pending_action_refusal = Some(error);

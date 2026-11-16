@@ -1280,7 +1280,7 @@ impl App {
             return format!("tab {position}");
         }
         match sid {
-            Some(sid) => aterm_messages::presence::short_sid(sid.as_str()),
+            Some(sid) => crate::presence::short_sid(sid.as_str()),
             None => format!("tab {session}"),
         }
     }

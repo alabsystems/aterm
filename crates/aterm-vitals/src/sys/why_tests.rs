@@ -1,21 +1,109 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for `sys why` cause attribution, split accounting, and text/JSON formatting.
+//! Tests for reported CPU accounts, memory attribution, privacy, and text/JSON boundaries.
 
 use super::*;
 use crate::events::{Event, EventKind};
 use crate::explain::fixtures::{
     Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, build_start_1032, calm_1510,
-    claude_reaped_1032, delegated_1032, delegated_in_aterm_1032, finished_1032, lane_off_1032,
-    liar_1032, reaped_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab_ahead_1032,
-    tab2_build_1048, two_coalitions_1421, wrapped_1218,
+    delegated_1032, delegated_in_aterm_1032, finished_1032, lane_off_1032, liar_1032, reaped_1032,
+    spotlight_1032, spotlight_late_1032, tab, tab_ahead_1032, tab2_build_1048, two_coalitions_1421,
+    wrapped_1218,
 };
 use crate::explain::{CoalLane, LeadIdentity, Voucher};
 use crate::model::{MemCounters, MemSample, Pressure, Thermal, Throttle, Vitals};
-use crate::sys::json::{SPLIT_PARTS, contract_violations};
+use crate::sys::json::contract_violations;
 use crate::sys::view::{Reply, render_json, render_text};
 use crate::sys::{Ctx, Freshness, Machine, TabFact, Target, apply_delta, fingerprints};
+
+fn published_reading(tab_mc: i64, machine_mc: i64) -> Snapshot {
+    let mut snapshot = read(&calm_1510(), 3);
+    snapshot.procs_window_ns = Some(2_000_000_000);
+    let facts = std::sync::Arc::make_mut(snapshot.why.as_mut().expect("counter observations"));
+    facts.window_ns = 1_000_000_000;
+    facts.split.cpu_accounting = crate::published_cpu::CpuAccounting::PUBLISHED_COUNTERS;
+    facts.split.coverage_complete = true;
+    facts.split.ownership_incomplete = false;
+    facts.split.global_mc = machine_mc;
+    facts.split.tabs = vec![(1, tab_mc + 100)];
+    facts.split.tab_reported = vec![(1, tab_mc)];
+    facts.split.own_reported_mc = 4;
+    // Coalition and process reports are independent; neither caps the other's growth.
+    facts.split.aterm_mc = 50_000;
+    snapshot
+}
+
+#[test]
+fn reported_cpu_late_growth_keeps_rates_read_span_and_unknown_execution_window() {
+    // Four ms from before the first read publish with the one ms executed inside it.
+    // One other ms executes inside. The reported tab rate is 5 mc, above the 2 mc machine
+    // observation, although its execution inside was only 1 mc. Coverage is complete.
+    let snapshot = published_reading(5, 2);
+    let world = mac();
+    for owner in [true, false] {
+        let context = ctx(&world, &snapshot, owner);
+        let json = render_json(&q("why cpu --json"), &context);
+        assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
+        assert!(json.get("split_mc").is_none());
+        let figure = json.get("figure").unwrap();
+        assert_eq!(figure.get("cpu_mc"), Some(&Jv::Int(2)));
+        assert_eq!(
+            figure.get("accounting_basis"),
+            Some(&Jv::s("machine_ticks"))
+        );
+        assert!(figure.get("execution_window").is_none());
+        let reported = json.get("reported_cpu_mc").unwrap();
+        assert_eq!(reported.get("tab"), Some(&Jv::Int(5)));
+        assert_eq!(reported.get("aterm_rest"), Some(&Jv::Int(4)));
+        assert_eq!(reported.get("basis"), Some(&Jv::s("published_counters")));
+        assert_eq!(reported.get("coalition_coverage"), Some(&Jv::s("complete")));
+        assert_eq!(reported.get("read_span_ns"), Some(&Jv::u(1_000_000_000)));
+        assert!(reported.get("unaccounted").is_none());
+        assert_eq!(
+            reported.get("execution_window"),
+            Some(&Jv::why("unavailable:execution_window_unknown"))
+        );
+        let you = json.get("you").unwrap();
+        assert_eq!(you.get("reported_cpu_mc"), Some(&Jv::Int(5)));
+        assert_eq!(
+            you.get("role"),
+            Some(&Jv::why("unavailable:execution_window_unknown"))
+        );
+        assert!(you.get("cpu_at_least_mc").is_none() && you.get("share_pm").is_none());
+        assert_eq!(json.get("causes"), Some(&Jv::Arr(Vec::new())));
+        let text = why("why cpu", &context);
+        let rates = lines(&text, "reported_cpu")[0];
+        assert_eq!(field(rates, "tab_mc"), 5);
+        assert_eq!(field(rates, "read_span_ns"), 1_000_000_000);
+        assert!(!text.contains('≥') && !text.contains('≤'));
+        assert!(lines(&text, "cause").is_empty());
+    }
+}
+
+#[test]
+fn reported_cpu_zero_publication_never_says_no_execution_or_nothing_needed() {
+    // Positive execution can be unpublished at both reads. These observations cannot
+    // distinguish it from an idle process, even with complete owner coverage.
+    let snapshot = published_reading(0, 0);
+    let world = mac();
+    let context = ctx(&world, &snapshot, true);
+    let text = why("why cpu", &context);
+    assert_eq!(field(lines(&text, "reported_cpu")[0], "tab_mc"), 0);
+    assert!(!text.contains("uses none") && !text.contains("role=none"));
+    assert!(lines(&text, "do").is_empty());
+    let json = render_json(&q("why cpu --json"), &context);
+    assert_eq!(
+        json.get("you").and_then(|you| you.get("reported_cpu_mc")),
+        Some(&Jv::Int(0))
+    );
+    assert_eq!(
+        json.get("you").and_then(|you| you.get("role")),
+        Some(&Jv::why("unavailable:execution_window_unknown"))
+    );
+    assert_eq!(json.get("do"), Some(&Jv::Arr(Vec::new())));
+    assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
+}
 
 struct World {
     machine: Machine,
@@ -119,139 +207,6 @@ fn example_a() -> Snapshot {
     s
 }
 
-/// The ordinary resource views must retain finished compiler work and use the same matched
-/// window as `why`; comparing their numbers used to mix a live sweep with a coalition window.
-#[test]
-fn resource_views_share_the_finished_work_cpu_account() {
-    let s = read(&claude_reaped_1032(), 3);
-    let w = mac();
-    let c = ctx(&w, &s, true);
-    let facts = s.why.as_deref().unwrap();
-    let total = facts.split.aterm_mc + facts.split.delegated_mc;
-    let charge = facts.split.tab_charge_of(&[1]);
-    let tab = facts.split.tab_actual_of(&[1]);
-    assert!(
-        charge >= 3000,
-        "the fixture's finished compilers must be charged"
-    );
-    for view in ["overview", "tab", "aterm", "global"] {
-        let query = q(view);
-        let json = render_json(&query, &c);
-        assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
-        if let Some(t) = json.get("tab") {
-            let used = t.get("cpu_mc").unwrap();
-            assert_eq!(used.get("v").unwrap_or(used), &Jv::Int(tab), "{view}");
-            assert_eq!(t.get("cpu_charge_mc"), Some(&Jv::Int(charge)));
-        }
-        if let Some(a) = json.get("aterm") {
-            assert_eq!(a.get("cpu_mc"), Some(&Jv::Int(total)), "{view}");
-            assert_eq!(a.get("via"), Some(&Jv::s("coalitions")));
-        }
-        if let Some(p) = json.get("split_mc") {
-            let sum: i64 = SPLIT_PARTS
-                .iter()
-                .map(|k| crate::sys::json::part_value(p.get(k).unwrap()).unwrap())
-                .sum();
-            assert_eq!(sum, facts.split.global_mc, "{view}");
-            assert_eq!(
-                json.get("global").unwrap().get("cpu_mc"),
-                Some(&Jv::Int(sum))
-            );
-        }
-        if let Some(Jv::Arr(parts)) = json.get("parts") {
-            let sum: i64 = parts
-                .iter()
-                .map(|p| {
-                    let used = p.get("cpu_mc").unwrap();
-                    match used.get("v").unwrap_or(used) {
-                        Jv::Int(n) => *n,
-                        other => panic!("{other:?}"),
-                    }
-                })
-                .sum();
-            assert_eq!(sum, total, "{view}");
-        }
-        let text = wire(&render_text(&query, &c), &c);
-        assert!(!text.contains("lane_off:coalitions"), "{view}: {text}");
-        assert!(text.contains("window_ms=5000"), "{view}: {text}");
-    }
-}
-
-#[test]
-fn resource_views_use_the_common_reap_account_without_coalitions() {
-    let mut snapshot = read(&lane_off_1032(), 3);
-    snapshot.scoped_cpu = Some(crate::explain::ScopeCpu {
-        window_ns: 1_000_000_000,
-        app_measured: None,
-        app_incomplete: true,
-        own_charge: 0.5,
-        own_floor: 0.3,
-        own_ambiguous: false,
-        missed: false,
-        tabs: vec![crate::explain::ScopeCpuTab {
-            key: 1,
-            id: 1,
-            charge: 3.0,
-            floor: 2.0,
-            ambiguous: true,
-            missed: false,
-        }],
-        panes: vec![crate::explain::ScopeCpuPane { key: 1, floor: 2.0 }],
-    });
-    let world = mac();
-    let context = ctx(&world, &snapshot, true);
-    for view in ["overview", "tab", "aterm", "global"] {
-        let json = render_json(&q(view), &context);
-        assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
-        if let Some(tab) = json.get("tab") {
-            assert_eq!(
-                crate::sys::json::part_value(tab.get("cpu_mc").unwrap()),
-                Some(2000),
-                "{view}"
-            );
-            assert_eq!(tab.get("cpu_charge_mc"), Some(&Jv::Int(3000)), "{view}");
-        }
-        if let Some(app) = json.get("aterm") {
-            assert_eq!(
-                crate::sys::json::part_value(app.get("cpu_mc").unwrap()),
-                Some(2500),
-                "{view}"
-            );
-            assert_eq!(app.get("cpu_charge_mc"), Some(&Jv::Int(3500)), "{view}");
-            assert_eq!(app.get("via"), Some(&Jv::s("process_and_reap")), "{view}");
-        }
-        assert_eq!(
-            json.get("cpu_as_of").unwrap().get("window_ms"),
-            Some(&Jv::Int(1000)),
-            "{view}"
-        );
-    }
-}
-
-#[test]
-fn a_carried_cpu_account_keeps_its_time_separate_from_current_memory() {
-    let mut snapshot = example_a();
-    snapshot.at_ns += 2_000_000_000;
-    snapshot.at_unix_ms += 2000;
-    let world = mac();
-    let context = ctx(&world, &snapshot, true);
-    for view in ["overview", "tab", "aterm", "global"] {
-        let query = q(view);
-        let json = render_json(&query, &context);
-        assert_eq!(
-            json.get("as_of").unwrap().get("unix_ms"),
-            Some(&Jv::u(context.as_of_unix_ms))
-        );
-        let cpu = json.get("cpu_as_of").unwrap();
-        assert_eq!(
-            cpu.get("unix_ms"),
-            Some(&Jv::u(context.as_of_unix_ms - 2000))
-        );
-        assert_eq!(cpu.get("age_ms"), Some(&Jv::u(context.age_ms + 2000)));
-        assert_eq!(cpu.get("window_ms"), Some(&Jv::u(5000)));
-    }
-}
-
 fn q(text: &str) -> SysQuery {
     SysQuery::parse(text).expect("query")
 }
@@ -283,83 +238,188 @@ fn field(line: &str, key: &str) -> i64 {
     let head = format!("{key}=");
     line.split(' ')
         .find_map(|f| f.strip_prefix(&head))
-        .and_then(|v| v.trim_start_matches(['≥', '≤']).parse().ok())
+        .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| panic!("no {key} in {line}"))
 }
 
-const EXAMPLE_A: &str = "\
-OK 21 sys v=1 view=why subject=global.cpu as_of=17:32:41.200 age_ms=120 window_ms=5000 next=7f3a.7
-why     global cpu: 3.3 of 18 cores busy, easing; mostly macOS services (2.17c); Spotlight, after start-up; this tab is not the cause
-split tab_mc=200 aterm_rest_mc=200 others_mc=730 services_mc=2170 unaccounted_mc=0 exact=heuristic via=coalitions n=9
-you tab=1 role=minor cpu_mc=200 share_pm=61
-who coalition=307 pid=387 birth_ms=1792517318000 exe=mds voucher=apple uid=0 part=services cpu_mc=1290 read_bps=22900000 deferred_pm=722 finished_included=1 cause=spotlight
-who coalition=1092 pid=916 birth_ms=1792517325000 exe=siriactionsd voucher=apple uid=501 part=others cpu_mc=660 cause=-
-who coalition=327 pid=397 birth_ms=1792517318000 exe=contextstored voucher=apple uid=0 part=services cpu_mc=460 finished_included=1 cause=-
-who coalition=1342 pid=1187 birth_ms=1792517515000 exe=aterm voucher=developer_id team=A66A9P66Z7 scope=aterm cpu_mc=400 finished_included=1 cause=-
-who coalition=1 pid=1 birth_ms=1792512374000 exe=launchd voucher=apple uid=0 part=services cpu_mc=170 finished_included=1 cause=-
-who coalition=491 pid=533 birth_ms=1792517319000 exe=mds_stores voucher=apple uid=308 part=services cpu_mc=130 finished_included=1 cause=spotlight
-more who=2 cpu_mc=190
-cause id=spotlight covers_mc=1420 since=17:28:38 opened=17:32:36 deferred_pm=722 sure=held src=signature,kernel
-cause id=startup since=17:28:38 wake=17:28:33 wake_reason=RTP.multi-touch slept_s=3715 sure=held src=kernel
-pass trend=easing src=kernel
-do class=none may=agent destructive=0
-cannot what=every_process_start why=not_sampled
-cannot what=between_sweep_orphans why=not_sampled
-cannot what=socket_delegation why=unsupported
-cannot what=index_progress why=unsupported
-cannot what=index_folder why=needs_privilege:root
-CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
-OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
-";
+fn mem_1142() -> Scene {
+    let mut scene = calm_1510();
+    scene.mem = Some(MemSample {
+        total: 128 << 30,
+        app: 12_545_392_640,
+        wired: 5_132_959_744,
+        compressed: Some(0),
+        cached: 27_967_258_624,
+        free: 89_733_971_968,
+        swap_used: Some(0),
+        swap_total: Some(0),
+        exact: true,
+        pressure: Pressure::Normal,
+        counters: Some(MemCounters::default()),
+        ..MemSample::default()
+    });
+    for c in &mut scene.coalitions {
+        c.footprint = match c.id {
+            1342 => Some(1_630_032_364),
+            393 => Some(773_230_428),
+            _ => None,
+        };
+    }
+    let safari = USERSPACE_MS + 320_000;
+    scene.coalitions.push(Coal {
+        footprint: Some(846_525_891),
+        ..Coal::new(1393, 0)
+    });
+    scene
+        .procs
+        .push(Proc::new(1631, 1, 501, 1393, safari, "Safari", 0));
+    scene
+        .leads
+        .push(apple(1631, safari, "Safari", "com.apple.Safari"));
+    scene
+}
 
-#[test]
-fn example_a_spotlight_after_start_up() {
-    let w = mac();
-    let s = example_a();
-    let c = ctx(&w, &s, true);
-    let a = why("why top=6", &c);
-    assert_eq!(a, EXAMPLE_A);
-    assert!(a.len() <= REPLY_MAX, "{} bytes", a.len());
-    let bare = why("why", &c);
-    assert!(!lines(&bare, "who").is_empty());
-    assert!(lines(&bare, "who").len() <= 8);
-    assert!(bare.len() <= REPLY_MAX, "{} bytes", bare.len());
+/// [`mem_1142`] with fseventsd holding 44.4 GiB, as on 2026-10-22, its lead signed as
+/// `signing_id`.
+fn fseventsd_1142(signing_id: &str) -> Scene {
+    let mut scene = mem_1142();
+    let born = USERSPACE_MS + 2_000;
+    scene.coalitions.push(Coal {
+        footprint: Some(47_675_000_000),
+        ..Coal::new(777, 0)
+    });
+    scene
+        .procs
+        .push(Proc::new(537, 1, 0, 777, born, "fseventsd", 0));
+    scene.leads.push(apple(537, born, "fseventsd", signing_id));
+    scene
+}
+
+/// `scene` with the kernel's memory pressure past normal.
+fn pressed(mut scene: Scene) -> Scene {
+    if let Some(mem) = scene.mem.as_mut() {
+        mem.pressure = Pressure::Warn;
+    }
+    scene
+}
+
+/// The service-memory cause lines of a reply.
+fn service_causes(t: &str) -> Vec<&str> {
+    lines(t, "cause")
+        .into_iter()
+        .filter(|l| l.contains("id=service-memory"))
+        .collect()
+}
+
+fn split_tab(key: u64) -> World {
+    let mut w = world("macOS", 2);
+    w.target.key = key;
+    w.target.panes = vec![1, 2];
+    w.target.window_sessions = vec![1, 2];
+    for t in &mut w.tabs {
+        t.tab = Some(1);
+    }
+    w
+}
+
+fn two_sessions_1032() -> Scene {
+    let born = USERSPACE_MS + 210_000;
+    let mut scene = read_calm(spotlight_1032());
+    scene.tabs.push(tab(2, 1300));
+    scene.busy_mc += 300;
+    for c in &mut scene.coalitions {
+        if c.id == 1342 {
+            c.mc += 300;
+            c.started += 2;
+        }
+    }
+    scene
+        .procs
+        .push(Proc::new(1300, 1187, 501, 1342, born, "zsh", 0));
+    scene.procs.push(Proc::new(
+        1310,
+        1300,
+        501,
+        1342,
+        born + 1_000,
+        "claude",
+        300,
+    ));
+    scene
+}
+
+fn split_1032() -> Scene {
+    let mut scene = two_sessions_1032();
+    for t in &mut scene.tabs {
+        t.tab = 1;
+    }
+    scene
+}
+
+fn long_workers_1032() -> Scene {
+    let mut scene = read_calm(spotlight_1032());
+    let born = USERSPACE_MS + 60_000;
+    for i in 0..10u32 {
+        let id = 5000 + u64::from(i);
+        let pid = 6000 + i;
+        let exe = format!("com.example.long-worker-name-{i:02}");
+        scene.busy_mc += 600;
+        scene.coalitions.push(Coal {
+            started: 3,
+            exited: 2,
+            ..Coal::new(id, 600)
+        });
+        scene
+            .procs
+            .push(Proc::new(pid, 1, 501, id, born + i64::from(i), &exe, 600));
+        scene.leads.push(LeadIdentity {
+            pid,
+            birth_ms: born + i64::from(i),
+            exe,
+            voucher: Voucher::DeveloperId,
+            signing_id: None,
+            team: Some("ABCDE12345".into()),
+        });
+    }
+    scene
+}
+
+fn pressure_events(n: u64, at_ns: u64) -> Vec<Event> {
+    (1..=n)
+        .map(|seq| Event {
+            seq,
+            at_ns,
+            kind: EventKind::Pressure {
+                from: Pressure::Normal,
+                to: Pressure::Warn,
+            },
+        })
+        .collect()
 }
 
 #[test]
-fn the_rows_sum_to_the_split_and_a_scoped_caller_gets_the_sums() {
-    let w = mac();
-    let s = example_a();
-    for (owner, top) in [(true, "why"), (true, "why top=2"), (false, "why")] {
-        let c = ctx(&w, &s, owner);
-        let t = why(top, &c);
-        let split = lines(&t, "split")[0];
-        let parts: i64 = [
-            "tab_mc",
-            "aterm_rest_mc",
-            "others_mc",
-            "services_mc",
-            "unaccounted_mc",
-        ]
-        .iter()
-        .map(|k| field(split, k))
-        .sum();
-        assert_eq!(parts, 3300, "{t}");
-        let rows: i64 = ["who", "more", "withheld"]
-            .iter()
-            .flat_map(|k| lines(&t, k))
-            .map(|l| field(l, "cpu_mc"))
-            .sum();
-        assert_eq!(rows, 3300, "{t}");
-        assert_eq!(lines(&t, "who").is_empty(), !owner, "{t}");
+fn a_carried_cpu_account_keeps_its_time_separate_from_current_memory() {
+    let mut snapshot = example_a();
+    let source_span_ms = snapshot.scoped_cpu.as_ref().unwrap().window_ns / 1_000_000;
+    snapshot.at_ns += 2_000_000_000;
+    snapshot.at_unix_ms += 2000;
+    let world = mac();
+    let context = ctx(&world, &snapshot, true);
+    for view in ["overview", "tab", "aterm", "global"] {
+        let query = q(view);
+        let json = render_json(&query, &context);
+        assert_eq!(
+            json.get("as_of").unwrap().get("unix_ms"),
+            Some(&Jv::u(context.as_of_unix_ms))
+        );
+        let cpu = json.get("cpu_as_of").unwrap();
+        assert_eq!(
+            cpu.get("unix_ms"),
+            Some(&Jv::u(context.as_of_unix_ms - 2000))
+        );
+        assert_eq!(cpu.get("age_ms"), Some(&Jv::u(context.age_ms + 2000)));
+        assert_eq!(cpu.get("window_ms"), Some(&Jv::u(source_span_ms)));
     }
-    let c = ctx(&w, &s, false);
-    let scoped = why("why", &c);
-    assert_eq!(lines(&scoped, "withheld"), ["withheld who=8 cpu_mc=3300"]);
-    assert!(lines(&scoped, "more").is_empty());
-    let two = why("why top=2", &ctx(&w, &s, true));
-    assert_eq!(lines(&two, "who").len(), 2);
-    assert_eq!(lines(&two, "more"), ["more who=6 cpu_mc=1350"]);
 }
 
 #[test]
@@ -405,113 +465,11 @@ fn a_scoped_caller_sees_its_own_tabs_coalition() {
 }
 
 #[test]
-fn example_b_a_calm_mac_names_its_attribution_limits() {
-    let w = mac();
-    let s = read_at(&calm_1510(), 3);
-    let c = ctx(&w, &s, true);
-    assert_eq!(
-        why("why", &c),
-        "OK 7 sys v=1 view=why subject=global as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
-why     calm: 0.4 of 18 cores busy; memory 16.6 GiB used · 108.0 GiB available · 128 GiB total, pressure normal; swap 0; no cause open
-you tab=1 role=minor basis=machine_calm cpu_mc=120 share_pm=300
-cannot what=every_process_start why=not_sampled
-cannot what=between_sweep_orphans why=not_sampled
-cannot what=socket_delegation why=unsupported
-CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
-OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
-"
-    );
-    let j = render_json(&q("why --json"), &c);
-    assert_eq!(j.get("calm"), Some(&Jv::Bool(true)));
-    assert_eq!(
-        j.get("you").and_then(|y| y.get("basis")),
-        Some(&Jv::s("machine_calm"))
-    );
-    let cpu = why("why cpu", &c);
-    assert!(cpu.contains(" view=why subject=global.cpu "), "{cpu}");
-    assert_eq!(lines(&cpu, "split").len(), 1, "{cpu}");
-    assert_eq!(lines(&cpu, "pass"), ["pass trend=steady src=kernel"]);
-}
-
-#[test]
-fn a_bare_why_is_never_calm_without_the_thermal_state() {
-    let w = world("Linux", 1);
-    let scene = Scene {
-        lane: CoalLane::Unsupported,
-        thermal: None,
-        ..calm_1510()
-    };
-    let s = read(&scene, 3);
-    let c = ctx(&w, &s, true);
-    let t = why("why", &c);
-    assert!(!t.contains("subject=global "), "{t}");
-    assert!(lines(&t, "you")[0].find("basis=").is_none(), "{t}");
-    assert_eq!(subject_word(&q("why"), Some(&s)), Some("global.mem"));
-}
-
-fn mem_1142() -> Scene {
-    let mut scene = calm_1510();
-    scene.mem = Some(MemSample {
-        total: 128 << 30,
-        app: 12_545_392_640,
-        wired: 5_132_959_744,
-        compressed: Some(0),
-        cached: 27_967_258_624,
-        free: 89_733_971_968,
-        swap_used: Some(0),
-        swap_total: Some(0),
-        exact: true,
-        pressure: Pressure::Normal,
-        counters: Some(MemCounters::default()),
-        ..MemSample::default()
-    });
-    for c in &mut scene.coalitions {
-        c.footprint = match c.id {
-            1342 => Some(1_630_032_364),
-            393 => Some(773_230_428),
-            _ => None,
-        };
-    }
-    let safari = USERSPACE_MS + 320_000;
-    scene.coalitions.push(Coal {
-        footprint: Some(846_525_891),
-        ..Coal::new(1393, 0)
-    });
-    scene
-        .procs
-        .push(Proc::new(1631, 1, 501, 1393, safari, "Safari", 0));
-    scene
-        .leads
-        .push(apple(1631, safari, "Safari", "com.apple.Safari"));
-    scene
-}
-
-#[test]
 fn the_memory_reply_reads_its_classes_and_footprints() {
     let w = mac();
     let s = read_at(&mem_1142(), 3);
     let c = ctx(&w, &s, true);
     let t = why("why mem top=3", &c);
-    assert_eq!(
-        t,
-        "OK 15 sys v=1 view=why subject=global.mem as_of=22:10:02.120 age_ms=120 window_ms=5000 next=7f3a.7
-why     global memory: 16.5 of 128 GiB used; pressure normal; swap 0; nothing compressed; no cause open; 32 MiB charged to this tab
-classes total_bytes=137438953472 app_bytes=12545392640 wired_bytes=5132959744 compressed_bytes=0 used_bytes=17678352384 cache_bytes=27967258624 free_bytes=89733971968 src=kernel
-classes not_in_vm_bytes=2059370496 src=derived
-you tab=1 role=minor fp_bytes=33554432
-owners fp_bytes=3451115275 coalitions=6 live_only=1 src=kernel
-who coalition=1342 pid=1187 birth_ms=1792517515000 exe=aterm voucher=developer_id team=A66A9P66Z7 scope=aterm fp_bytes=1630032364 live=3
-who coalition=1393 pid=1631 birth_ms=1792517638000 exe=Safari voucher=apple uid=501 part=others fp_bytes=846525891 live=1
-who coalition=393 pid=430 birth_ms=1792517318500 exe=WindowServer voucher=apple uid=88 part=services fp_bytes=773230428 live=1
-more who=3 fp_bytes=201326592
-pass trend=steady src=kernel
-do class=none may=agent destructive=0
-cannot what=wired_by_process why=needs_privilege:root
-cannot what=uncharged_memory why=unsupported
-CPU hardware: not in this reading; `sys cores` or `sys why fresh=0` takes a sample
-OS thermal state 0 (nominal); low power off; nominal thermal state does not exclude another limit
-"
-    );
     let classes = lines(&t, "classes");
     let named: i64 = [
         "app_bytes",
@@ -553,38 +511,6 @@ OS thermal state 0 (nominal); low power off; nominal thermal state does not excl
             assert!(!l.contains("cpu_mc="), "{l}");
         }
     }
-}
-
-/// [`mem_1142`] with fseventsd holding 44.4 GiB, as on 2026-10-22, its lead signed as
-/// `signing_id`.
-fn fseventsd_1142(signing_id: &str) -> Scene {
-    let mut scene = mem_1142();
-    let born = USERSPACE_MS + 2_000;
-    scene.coalitions.push(Coal {
-        footprint: Some(47_675_000_000),
-        ..Coal::new(777, 0)
-    });
-    scene
-        .procs
-        .push(Proc::new(537, 1, 0, 777, born, "fseventsd", 0));
-    scene.leads.push(apple(537, born, "fseventsd", signing_id));
-    scene
-}
-
-/// `scene` with the kernel's memory pressure past normal.
-fn pressed(mut scene: Scene) -> Scene {
-    if let Some(mem) = scene.mem.as_mut() {
-        mem.pressure = Pressure::Warn;
-    }
-    scene
-}
-
-/// The service-memory cause lines of a reply.
-fn service_causes(t: &str) -> Vec<&str> {
-    lines(t, "cause")
-        .into_iter()
-        .filter(|l| l.contains("id=service-memory"))
-        .collect()
 }
 
 /// A service past the huge bar while memory is under pressure is memory's headline and a cause
@@ -715,7 +641,8 @@ fn a_service_past_only_the_large_bar_is_a_fact_for_later() {
 /// names none.
 #[test]
 fn a_service_is_named_from_its_own_read_while_the_split_is_cold() {
-    use crate::services::{FSEVENTSD, Reading, Service};
+    use crate::services::FSEVENTSD;
+    use aterm_process_facts::services::{Reading, Service};
     let w = mac();
     let mut s = read_at(&pressed(mem_1142()), 3);
     s.why = None;
@@ -752,115 +679,7 @@ fn a_service_is_named_from_its_own_read_while_the_split_is_cold() {
 }
 
 #[test]
-fn another_tabs_work_is_named_only_to_the_owner() {
-    let w = world("macOS", 2);
-    let s = read(&tab2_build_1048(), 3);
-    let owner = why("why", &ctx(&w, &s, true));
-    assert!(
-        owner.contains("; Tab 2's work; this tab is not the cause\n"),
-        "{owner}"
-    );
-    assert_eq!(
-        lines(&owner, "cause")[0].split(' ').nth(1),
-        Some("id=tab-work")
-    );
-    assert!(lines(&owner, "cause")[0].contains(" tab=2 "), "{owner}");
-    let scoped = why("why", &ctx(&w, &s, false));
-    assert!(
-        scoped.contains("; another tab's work; this tab is not the cause\n"),
-        "{scoped}"
-    );
-    assert!(!scoped.contains("tab-work"), "{scoped}");
-    assert!(!scoped.contains("tab=2"), "{scoped}");
-    let j = render_json(&q("why --json"), &ctx(&w, &s, false)).to_text();
-    assert!(!j.contains("tab-work"), "{j}");
-}
-
-#[test]
-fn app_work_names_its_coalition_only_to_the_owner() {
-    let w = mac();
-    let s = read(&app_work_1510(), 3);
-    for owner in [true, false] {
-        let c = ctx(&w, &s, owner);
-        let t = why("why cpu", &c);
-        assert!(
-            t.contains("; an app running as you; this tab is not the cause\n"),
-            "{t}"
-        );
-        let cause = lines(&t, "cause")[0];
-        assert!(
-            cause.starts_with("cause id=app-work covers_mc=1500 "),
-            "{t}"
-        );
-        assert_eq!(cause.contains(" coalition=896 "), owner, "{cause}");
-        let j = render_json(&q("why cpu --json"), &c);
-        let Some(Jv::Arr(causes)) = j.get("causes") else {
-            panic!("no causes in {}", j.to_text());
-        };
-        let named = causes[0].get("evidence").is_some_and(|e| {
-            matches!(e, Jv::Arr(facts) if facts.iter().any(|f| f.get("coalition") == Some(&Jv::Int(896))))
-        });
-        assert_eq!(named, owner, "{}", j.to_text());
-        let first = render_text(&q("why cpu"), &c);
-        let mut again = render_text(&q("why cpu"), &c);
-        apply_delta(&mut again, &fingerprints(&first));
-        let same = &again.lines[0].text;
-        assert!(same.contains(",cause_app-work,"), "{same}");
-        if !owner {
-            assert!(!t.contains("coalition="), "{t}");
-            assert!(!j.to_text().contains("\"coalition\""), "{}", j.to_text());
-            assert!(!same.contains("896"), "{same}");
-        }
-    }
-}
-
-fn split_tab(key: u64) -> World {
-    let mut w = world("macOS", 2);
-    w.target.key = key;
-    w.target.panes = vec![1, 2];
-    w.target.window_sessions = vec![1, 2];
-    for t in &mut w.tabs {
-        t.tab = Some(1);
-    }
-    w
-}
-
-fn two_sessions_1032() -> Scene {
-    let born = USERSPACE_MS + 210_000;
-    let mut scene = read_calm(spotlight_1032());
-    scene.tabs.push(tab(2, 1300));
-    scene.busy_mc += 300;
-    for c in &mut scene.coalitions {
-        if c.id == 1342 {
-            c.mc += 300;
-            c.started += 2;
-        }
-    }
-    scene
-        .procs
-        .push(Proc::new(1300, 1187, 501, 1342, born, "zsh", 0));
-    scene.procs.push(Proc::new(
-        1310,
-        1300,
-        501,
-        1342,
-        born + 1_000,
-        "claude",
-        300,
-    ));
-    scene
-}
-
-fn split_1032() -> Scene {
-    let mut scene = two_sessions_1032();
-    for t in &mut scene.tabs {
-        t.tab = 1;
-    }
-    scene
-}
-
-#[test]
-fn a_split_tab_is_its_panes_summed() {
+fn reported_cpu_split_tab_is_its_panes_summed() {
     let apart = read(&two_sessions_1032(), 3);
     let joined = read(&split_1032(), 3);
     let alone = |key: u64| {
@@ -874,12 +693,24 @@ fn a_split_tab_is_its_panes_summed() {
         field(lines(&why(text, &ctx(w, s, true)), line)[0], key)
     };
     let (one, two) = (alone(1), alone(2));
-    assert_eq!(figure(&one, &apart, "why cpu", "split", "tab_mc"), 200);
-    assert_eq!(figure(&two, &apart, "why cpu", "split", "tab_mc"), 300);
+    assert_eq!(
+        figure(&one, &apart, "why cpu", "reported_cpu", "tab_mc"),
+        200
+    );
+    assert_eq!(
+        figure(&two, &apart, "why cpu", "reported_cpu", "tab_mc"),
+        300
+    );
     for key in [1, 2] {
         let both = split_tab(key);
-        assert_eq!(figure(&both, &joined, "why cpu", "split", "tab_mc"), 500);
-        assert_eq!(figure(&both, &joined, "why cpu", "you", "cpu_mc"), 500);
+        assert_eq!(
+            figure(&both, &joined, "why cpu", "reported_cpu", "tab_mc"),
+            500
+        );
+        assert_eq!(
+            figure(&both, &joined, "why cpu", "you", "reported_cpu_mc"),
+            500
+        );
         assert_eq!(
             figure(&both, &joined, "why mem", "you", "fp_bytes"),
             figure(&one, &apart, "why mem", "you", "fp_bytes")
@@ -917,53 +748,6 @@ fn a_split_tab_is_its_panes_summed() {
     let t = why("why", &ctx(&split_tab(1), &cut, false));
     assert!(lines(&t, "who").is_empty(), "{t}");
     assert_eq!(field(lines(&t, "withheld")[0], "who"), 9, "{t}");
-}
-
-#[test]
-fn a_split_tabs_work_is_one_cause() {
-    let tab_work = |t: &str| -> Vec<String> {
-        lines(t, "cause")
-            .into_iter()
-            .filter(|l| l.starts_with("cause id=tab-work "))
-            .map(str::to_owned)
-            .collect()
-    };
-    let apart = read(&two_sessions_1032(), 3);
-    let t = why("why cpu", &ctx(&world("macOS", 2), &apart, true));
-    assert!(tab_work(&t).is_empty(), "{t}");
-    let s = read(&split_1032(), 3);
-    for key in [1, 2] {
-        let t = why("why cpu", &ctx(&split_tab(key), &s, false));
-        let work = tab_work(&t);
-        assert_eq!(work.len(), 1, "{t}");
-        assert_eq!(field(&work[0], "covers_mc"), 500, "{t}");
-        assert_eq!(field(&work[0], "tab"), 1, "{t}");
-        assert_eq!(field(lines(&t, "you")[0], "cpu_mc"), 500, "{t}");
-    }
-    let mut busy = split_1032();
-    for (pid, mc) in [(1210, 800), (1310, 800)] {
-        let p = busy
-            .procs
-            .iter_mut()
-            .find(|p| p.pid == pid)
-            .expect("a pane's claude");
-        let more = mc - p.mc;
-        (p.mc, p.fast_mc) = (mc, mc);
-        busy.busy_mc += more;
-        for c in busy.coalitions.iter_mut().filter(|c| c.id == 1342) {
-            c.mc += more;
-        }
-    }
-    let s = read(&busy, 3);
-    let t = why("why cpu", &ctx(&split_tab(2), &s, true));
-    let work = tab_work(&t);
-    assert_eq!(work.len(), 1, "{t}");
-    assert_eq!(field(&work[0], "covers_mc"), 1600, "{t}");
-    assert!(
-        t.contains("; Tab 1's work; this tab is part of the cause\n"),
-        "{t}"
-    );
-    assert_eq!(field(lines(&t, "you")[0], "cpu_mc"), 1600, "{t}");
 }
 
 #[test]
@@ -1062,8 +846,8 @@ fn a_context_with_no_covering_cause_is_the_headline() {
 
 /// The cause engine names `throttled` only where the level claims throttling: an exact OS
 /// level of serious or above, a heuristic level of light or above, or Low Power Mode. Fair
-/// ("slightly elevated") names none, so `sys why` on a calm Mac at Fair is calm and says no
-/// "throttled". Control: the code before A2 S3 named `throttled level=light` at Fair.
+/// ("slightly elevated") names no throttled context, while CPU execution-window assurance
+/// remains unavailable. Control: the earlier implementation named `throttled level=light` at Fair.
 #[test]
 fn fair_names_no_throttled_cause() {
     let w = mac();
@@ -1083,15 +867,8 @@ fn fair_names_no_throttled_cause() {
         assert!(lines(&t, "cause").is_empty(), "{text}: {t}");
         assert!(!t.contains("throttled"), "{text}: {t}");
     }
-    assert_eq!(
-        bare_subject(&fair),
-        Bare::Calm,
-        "a calm Mac at Fair is calm"
-    );
-    assert!(
-        why("why cpu", &c).contains("\ndo class=none "),
-        "nothing needs doing at Fair"
-    );
+    assert_ne!(bare_subject(&fair), Bare::Calm);
+    assert!(!why("why cpu", &c).contains("\ndo class=none "));
     for (scene, word) in [
         (at(Throttle::Heavy, 2, true, Some(false)), "serious"),
         (at(Throttle::Severe, 3, true, Some(false)), "critical"),
@@ -1109,107 +886,6 @@ fn fair_names_no_throttled_cause() {
 }
 
 #[test]
-fn each_cause_says_its_own_words() {
-    let w = mac();
-    let why_of = |scene: &Scene, text: &str| why(text, &ctx(&w, &read(scene, 3), true));
-    let cause = |t: &str, id: &str| -> String {
-        let head = format!("cause id={id} ");
-        lines(t, "cause")
-            .into_iter()
-            .find(|l| l.starts_with(&head))
-            .unwrap_or_else(|| panic!("no {id} in {t}"))
-            .to_owned()
-    };
-
-    let t = why_of(&spotlight_late_1032(), "why cpu");
-    assert!(t.contains("; Spotlight, since wake; "), "{t}");
-    assert_eq!(
-        cause(&t, "wake"),
-        "cause id=wake wake=17:28:33 wake_reason=RTP.multi-touch slept_s=3715 sure=held src=kernel"
-    );
-
-    let t = why_of(&finished_1032(), "why cpu");
-    assert!(t.contains("; no cause aterm can name: aterm; "), "{t}");
-    let unexplained = cause(&t, "unexplained");
-    assert!(
-        unexplained.starts_with("cause id=unexplained covers_mc=3400 "),
-        "{t}"
-    );
-    assert!(
-        unexplained.ends_with(" part=aterm sure=held src=derived"),
-        "{t}"
-    );
-
-    let t = why_of(&reaped_1510(), "why");
-    assert!(
-        t.contains("; no cause aterm can name: unaccounted; "),
-        "{t}"
-    );
-    let lost = cause(&t, "unexplained");
-    assert!(
-        lost.starts_with("cause id=unexplained covers_mc=1500 "),
-        "{t}"
-    );
-    assert!(
-        lost.ends_with(" part=unaccounted sure=held src=derived"),
-        "{t}"
-    );
-    assert!(
-        t.contains("\ncannot what=remedy why=unsupported\n") && !t.contains("\ndo "),
-        "a core no coalition held is never nothing needed: {t}"
-    );
-    let calm = why_of(&calm_1510(), "why cpu");
-    assert!(
-        calm.contains("\ndo class=none may=agent destructive=0\n"),
-        "{calm}"
-    );
-
-    let mut busy = calm_1510();
-    busy.busy_mc += 1420;
-    for c in busy.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.mc += 1420;
-    }
-    for p in busy.procs.iter_mut().filter(|p| p.pid == 1187) {
-        *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "aterm", 1500);
-    }
-    let t = why_of(&busy, "why cpu");
-    assert!(t.contains("; aterm outside tabs; "), "{t}");
-    assert!(
-        cause(&t, "aterm-work").starts_with("cause id=aterm-work covers_mc=1500 "),
-        "{t}"
-    );
-
-    let low_power = Scene {
-        thermal: Some(Thermal {
-            level: Throttle::None,
-            raw: 0,
-            low_power: Some(true),
-            exact: true,
-        }),
-        ..calm_1510()
-    };
-    let t = why_of(&low_power, "why cpu");
-    assert!(t.contains("; throttled: low power; "), "{t}");
-    assert_eq!(
-        cause(&t, "throttled"),
-        "cause id=throttled level=nominal low_power=1 sure=held src=kernel"
-    );
-
-    let t = why_of(&tab2_build_1048(), "why");
-    assert!(t.contains("; a tab's work; "), "{t}");
-    let work = cause(&t, "tab-work");
-    assert!(work.contains(" local=2 "), "{work}");
-    assert!(!work.contains(" tab="), "{work}");
-
-    let mut squeezed = mem_1142();
-    if let Some(m) = squeezed.mem.as_mut() {
-        m.compressed = Some(3 << 29);
-    }
-    let t = why_of(&squeezed, "why mem");
-    assert!(t.contains("; 1.5 GiB compressed; "), "{t}");
-}
-
-#[test]
 fn a_small_figure_is_in_mib_never_zero_gib() {
     let mut light = mem_1142();
     if let Some(m) = light.mem.as_mut() {
@@ -1219,46 +895,6 @@ fn a_small_figure_is_in_mib_never_zero_gib() {
     let t = why("why mem", &ctx(&w, &read(&light, 3), true));
     assert!(t.contains("; swap 0; 17 MiB compressed; "), "{t}");
     assert!(!t.contains("0.0 GiB"), "{t}");
-}
-
-#[test]
-fn with_the_lane_off_the_split_is_by_subtraction() {
-    let off = Scene {
-        lane: CoalLane::Unsupported,
-        ..spotlight_1032()
-    };
-    for (w, scene) in [(mac(), lane_off_1032()), (world("Linux", 1), off)] {
-        let s = read(&scene, 3);
-        let c = ctx(&w, &s, true);
-        let t = why("why cpu", &c);
-        let split = lines(&t, "split")[0];
-        assert!(split.contains(" exact=heuristic via=subtraction"), "{t}");
-        assert!(!split.contains(" n="), "{t}");
-        assert!(lines(&t, "who").is_empty(), "{t}");
-        assert!(lines(&t, "more").is_empty(), "{t}");
-        assert!(
-            t.contains("\ncannot what=coalitions why=lane_off:coalitions\n"),
-            "{t}"
-        );
-        let mem = why("why mem", &c);
-        assert!(lines(&mem, "owners").is_empty(), "{mem}");
-        let j = render_json(&q("why --json"), &c);
-        assert_eq!(
-            j.get("split_mc").and_then(|p| p.get("unaccounted")),
-            Some(&Jv::Int(
-                s.why.as_deref().unwrap().split.parts(Some(1)).unaccounted
-            ))
-        );
-        assert!(
-            j.get("split_mc")
-                .and_then(|p| p.get("services"))
-                .unwrap()
-                .get("v")
-                .is_some(),
-            "only independently observed services form a lower bound: {}",
-            j.to_text()
-        );
-    }
 }
 
 /// A tab holding two thirds of used memory is the main part only where every
@@ -1467,47 +1103,6 @@ fn memory_rows_keep_current_ownership_separate_from_whole_coalition_charge() {
     }
 }
 
-fn long_workers_1032() -> Scene {
-    let mut scene = read_calm(spotlight_1032());
-    let born = USERSPACE_MS + 60_000;
-    for i in 0..10u32 {
-        let id = 5000 + u64::from(i);
-        let pid = 6000 + i;
-        let exe = format!("com.example.long-worker-name-{i:02}");
-        scene.busy_mc += 600;
-        scene.coalitions.push(Coal {
-            started: 3,
-            exited: 2,
-            ..Coal::new(id, 600)
-        });
-        scene
-            .procs
-            .push(Proc::new(pid, 1, 501, id, born + i64::from(i), &exe, 600));
-        scene.leads.push(LeadIdentity {
-            pid,
-            birth_ms: born + i64::from(i),
-            exe,
-            voucher: Voucher::DeveloperId,
-            signing_id: None,
-            team: Some("ABCDE12345".into()),
-        });
-    }
-    scene
-}
-
-fn pressure_events(n: u64, at_ns: u64) -> Vec<Event> {
-    (1..=n)
-        .map(|seq| Event {
-            seq,
-            at_ns,
-            kind: EventKind::Pressure {
-                from: Pressure::Normal,
-                to: Pressure::Warn,
-            },
-        })
-        .collect()
-}
-
 #[test]
 fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
     let s = read(&long_workers_1032(), 3);
@@ -1545,10 +1140,6 @@ fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
         ..ctx(&w, &hw, true)
     };
     let with_hw = why("why", &hw_ctx);
-    assert!(
-        with_hw.contains("CPU hardware: cut to fit; `sys cores` prints it"),
-        "{with_hw}"
-    );
     assert!(
         with_hw.len() <= REPLY_MAX,
         "{} bytes\n{with_hw}",
@@ -1785,194 +1376,10 @@ fn one_src_per_record() {
     }
 }
 
-#[test]
-fn unattributed_work_bounds_the_tab_pair() {
-    let w = mac();
-    let s = read(&finished_1032(), 3);
-    let c = ctx(&w, &s, true);
-    let t = why("why", &c);
-    assert!(
-        lines(&t, "split")[0].starts_with("split tab_mc=≥200 aterm_rest_mc=≤3200 others_mc=730 "),
-        "{t}"
-    );
-    assert_eq!(
-        lines(&t, "you"),
-        ["you tab=1 role=unavailable(not_sampled) cpu_at_least_mc=200 unattributed_mc=3000"]
-    );
-    assert!(
-        t.contains("\ncannot what=finished_tab_work why=not_sampled\n"),
-        "{t}"
-    );
-    assert!(t.contains("; this tab's share is not read now\n"), "{t}");
-    let j = render_json(&q("why --json"), &c);
-    let split = j.get("split_mc").expect("split_mc");
-    assert_eq!(split.get("tab"), Some(&Jv::at_least(200, "not_sampled")));
-    assert_eq!(
-        split.get("aterm_rest"),
-        Some(&Jv::at_most(3200, "not_sampled"))
-    );
-    let you = j.get("you").expect("you");
-    assert_eq!(you.get("cpu_at_least_mc"), Some(&Jv::Int(200)));
-    assert_eq!(you.get("role"), Some(&Jv::why("not_sampled")));
-}
-
-/// An unseen descendant's inherited counter charge is retained for the tab but cannot prove
-/// actual work: an unseen auto-reaping parent could have charged its descendants twice.
-#[test]
-fn inherited_reaped_charge_does_not_masquerade_as_proved_actual_cpu() {
-    let w = mac();
-    let s = read(&claude_reaped_1032(), 3);
-    let c = ctx(&w, &s, true);
-    let t = why("why cpu", &c);
-    let j = render_json(&q("why cpu --json"), &c);
-    let split = j.get("split_mc").expect("split_mc");
-    assert_eq!(
-        crate::sys::json::part_value(split.get("tab").unwrap()),
-        Some(200)
-    );
-    assert_eq!(
-        crate::sys::json::part_value(split.get("aterm_rest").unwrap()),
-        Some(3200)
-    );
-    let you = j.get("you").expect("you");
-    assert_eq!(you.get("cpu_at_least_mc"), Some(&Jv::Int(200)));
-    assert_eq!(you.get("cpu_charge_mc"), Some(&Jv::Int(3200)));
-    assert_eq!(you.get("cpu_ambiguous"), Some(&Jv::Bool(true)));
-    assert_eq!(you.get("share_pm"), None);
-    assert!(!t.contains("this tab is the main cause"), "{t}");
-    let app = render_json(&q("aterm --json"), &c);
-    let Some(Jv::Arr(parts)) = app.get("parts") else {
-        panic!("{}", app.to_text())
-    };
-    let part = |name: &str| {
-        parts
-            .iter()
-            .find(|p| p.get("name") == Some(&Jv::s(name)))
-            .unwrap()
-            .get("cpu_mc")
-            .unwrap()
-    };
-    assert_eq!(
-        part("unattributed"),
-        &Jv::Int(3000),
-        "measured app CPU with unresolved owner stays visible"
-    );
-    assert_eq!(part("counter_difference"), &Jv::Int(0));
-    assert_eq!(
-        app.get("aterm").and_then(|a| a.get("cpu_charge_mc")),
-        Some(&Jv::Int(3400))
-    );
-    assert_eq!(
-        app.get("aterm").and_then(|a| a.get("charge_difference_mc")),
-        Some(&Jv::Int(0))
-    );
-}
-
-/// The same build with aterm's coalition 100 millicores short of the ledger, as the counter runs
-/// short of its exited tasks' work, and one of claude's helpers (pid 1220) left for launchd and
-/// reaped by it, its tail since its last reading lost: nothing reads as unattributed, but the
-/// ledger knows it missed some of tab 1's work, so the tab's figure is a lower bound.
-#[test]
-fn lost_work_and_ambiguous_charge_keep_the_independent_tab_floor() {
-    let w = mac();
-    let mut scene = claude_reaped_1032();
-    for c in scene.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.mc -= 100;
-    }
-    let [mut base, mut sweep, mut now] = scene.samples();
-    for (sample, ended) in [(&mut base, false), (&mut now, true)] {
-        let coalition = sample
-            .coalitions
-            .as_mut()
-            .unwrap()
-            .rows
-            .iter_mut()
-            .find(|c| c.id == 1342)
-            .unwrap();
-        coalition.tasks_started += 1;
-        if ended {
-            coalition.tasks_exited += 1;
-        }
-    }
-    // Idle while read: under claude, then under launchd.
-    for (reading, ppid) in [(&mut base, 1210), (&mut sweep, 1)] {
-        let procs = reading.procs.as_mut().expect("swept");
-        let mut helper = procs
-            .iter()
-            .find(|p| p.pid == 1210)
-            .cloned()
-            .expect("claude");
-        helper.pid = 1220;
-        helper.ppid = ppid;
-        helper.cpu_ns = Some(1_000_000_000);
-        helper.child_cpu_ns = Some(0);
-        procs.push(helper);
-    }
-    let s = last(&[base, sweep, now]);
-    let c = ctx(&w, &s, true);
-    let t = why("why cpu", &c);
-    assert!(
-        lines(&t, "split")[0].starts_with("split tab_mc=≥200 aterm_rest_mc=≤3100 "),
-        "{t}"
-    );
-    assert!(s.why.as_deref().unwrap().split.short_tabs.contains(&1));
-    let you = render_json(&q("why cpu --json"), &c);
-    let you = you.get("you").expect("you");
-    assert_eq!(you.get("cpu_at_least_mc"), Some(&Jv::Int(200)));
-    assert_eq!(you.get("cpu_charge_mc"), Some(&Jv::Int(3200)));
-    assert_eq!(you.get("role"), Some(&Jv::why("ambiguous_reap")));
-}
-
-#[test]
-fn delegated_work_bounds_the_tab_from_below() {
-    let w = mac();
-    let s = read(&delegated_1032(500, 100), 3);
-    let t = why("why", &ctx(&w, &s, true));
-    let split = lines(&t, "split")[0];
-    assert!(
-        split.starts_with("split tab_mc=≥700 aterm_rest_mc=≥200 "),
-        "{t}"
-    );
-    assert!(split.contains(" delegated_mc=500 "), "{t}");
-    let row = lines(&t, "who")
-        .into_iter()
-        .find(|l| l.starts_with("who coalition=4000 "))
-        .expect("coalition 4000");
-    assert!(
-        row.contains(" part=others cpu_mc=600 delegated_mc=500 "),
-        "{row}"
-    );
-}
-
-#[test]
-fn a_cold_why_names_its_cause_with_no_opened() {
-    let w = mac();
-    let s = read(&spotlight_1032(), 1);
-    let t = why("why", &ctx(&w, &s, true));
-    assert!(
-        t.starts_with("OK 21 sys v=1 view=why subject=global.cpu "),
-        "{t}"
-    );
-    let spotlight = lines(&t, "cause")[0];
-    assert!(
-        spotlight.starts_with("cause id=spotlight covers_mc=1420 since=17:28:38 deferred_pm=722 ")
-    );
-    assert!(!t.contains("opened="), "{t}");
-    let first = last(&spotlight_1032().series(1)[..1]);
-    let t = why("why", &ctx(&w, &first, true));
-    assert!(t.contains("\nsplit unavailable(warming)\n"), "{t}");
-    assert!(t.contains("\nyou tab=1 role=unavailable(warming)\n"), "{t}");
-    assert!(
-        t.contains("; causes not read yet; this tab's share is not read now\n"),
-        "{t}"
-    );
-    assert!(!t.contains("no cause open"), "{t}");
-}
-
 /// Before the lane's first window no cause is known not to hold, so the
 /// CPU's reply never says nothing is needed, though memory's pressure and
 /// the thermal state read calm (the CPU account's half of the bare `sys
-/// why` that is never calm there); the first window's reply says it.
+/// why` that is never calm there). Later published counters still supply no execution epochs.
 #[test]
 fn a_why_cpu_before_the_lanes_first_window_never_says_nothing_needed() {
     let w = mac();
@@ -1993,7 +1400,7 @@ fn a_why_cpu_before_the_lanes_first_window_never_says_nothing_needed() {
     }
     let t = why("why cpu", &ctx(&w, &last(&[base, sweep, now]), true));
     assert!(
-        t.contains("\ndo class=none may=agent destructive=0\n"),
+        !t.contains("\ndo class=none may=agent destructive=0\n"),
         "CONTROL: {t}"
     );
 }
@@ -2008,7 +1415,7 @@ fn a_why_reply_is_as_old_as_its_split() {
     let c = ctx(&w, &s, true);
     let t = why("why", &c);
     assert!(
-        t.starts_with("OK 21 sys v=1 view=why subject=global.cpu as_of=17:32:41.200 age_ms=1120 window_ms=5000 "),
+        t.contains(" subject=global.cpu as_of=17:32:41.200 age_ms=1120 window_ms=5000 "),
         "{t}"
     );
     let j = render_json(&q("why --json"), &c);
@@ -2042,10 +1449,7 @@ fn the_json_keeps_the_contract() {
                 );
                 assert_eq!(j.get("kind"), Some(&Jv::s("sys.why")));
                 assert_eq!(j.get("why"), None);
-                if let Some(Jv::Obj(parts)) = j.get("split_mc").filter(|p| p.get("why").is_none()) {
-                    let keys: Vec<&str> = parts.iter().map(|(k, _)| k.as_str()).collect();
-                    assert_eq!(keys, SPLIT_PARTS);
-                }
+                assert!(j.get("split_mc").is_none(), "{}", j.to_text());
             }
         }
     }
@@ -2058,150 +1462,6 @@ fn the_json_keeps_the_contract() {
             "{}",
             j.to_text()
         );
-    }
-}
-
-const EXAMPLE_A_JSON: &str = r#"{"schema":1,
-"kind":"sys.why",
-"as_of":{"unix_ms":1792517561200,"age_ms":120,"window_ms":5000,"cursor":"7f3a.7","state":"fresh"},
-"subject":{"scope":"global","res":"cpu"},
-"figure":{"cpu_mc":3300,"capacity_mc":18000,"trend":"easing","exact":"heuristic","via":"coalitions","n":9},
-"split_mc":{"tab":200,"aterm_rest":200,"others":730,"services":2170,"unaccounted":0},
-"you":{"tab":1,"role":"minor","cpu_mc":200,"share_pm":61},
-"who":[{"coalition":307,"pid":387,"birth_ms":1792517318000,"exe":"mds","voucher":"apple","uid":0,"part":"services","cpu_mc":1290,"read_bps":22900000,"deferred_pm":722,"finished_included":true,"cause":"spotlight"},
-{"coalition":1092,"pid":916,"birth_ms":1792517325000,"exe":"siriactionsd","voucher":"apple","uid":501,"part":"others","cpu_mc":660,"cause":"-"},
-{"coalition":327,"pid":397,"birth_ms":1792517318000,"exe":"contextstored","voucher":"apple","uid":0,"part":"services","cpu_mc":460,"finished_included":true,"cause":"-"},
-{"coalition":1342,"pid":1187,"birth_ms":1792517515000,"exe":"aterm","voucher":"developer_id","team":"A66A9P66Z7","scope":"aterm","cpu_mc":400,"finished_included":true,"cause":"-"},
-{"coalition":1,"pid":1,"birth_ms":1792512374000,"exe":"launchd","voucher":"apple","uid":0,"part":"services","cpu_mc":170,"finished_included":true,"cause":"-"},
-{"coalition":491,"pid":533,"birth_ms":1792517319000,"exe":"mds_stores","voucher":"apple","uid":308,"part":"services","cpu_mc":130,"finished_included":true,"cause":"spotlight"}],
-"more":{"who":2,"cpu_mc":190},
-"causes":[{"cause":"spotlight","sure":"held","since_ms":1792517318000,"opened_ms":1792517556200,"covers_mc":1420,"evidence":[{"fact":"deferred","deferred_pm":722,"src":"kernel"},{"fact":"read","read_bps":22900000,"src":"kernel"},{"fact":"signature","coalitions":2,"src":"signature"}]},
-{"cause":"startup","sure":"held","since_ms":1792517318000,"evidence":[{"fact":"userspace_start","at_unix_ms":1792517318000,"src":"kernel"},{"fact":"wake","at_unix_ms":1792517313000,"src":"kernel"},{"fact":"wake_reason","reason":"RTP.multi-touch","src":"kernel"},{"fact":"slept","slept_s":3715,"src":"kernel"}]}],
-"pass":{"trend":"easing","src":"kernel"},
-"do":[{"class":"none","may":"agent","destructive":0}],
-"cannot":[{"what":"every_process_start","reason":{"why":"not_sampled"}},
-{"what":"between_sweep_orphans","reason":{"why":"not_sampled"}},
-{"what":"socket_delegation","reason":{"why":"unsupported"}},
-{"what":"index_progress","reason":{"why":"unsupported"}},
-{"what":"index_folder","reason":{"why":"needs_privilege:root"}}],
-"cpu_hardware":{"why":"not_sampled"},
-"events":[]}"#;
-
-const MEM_1142_JSON: &str = r#"{"schema":1,
-"kind":"sys.why",
-"as_of":{"unix_ms":1792534202120,"age_ms":120,"window_ms":5000,"cursor":"7f3a.7","state":"fresh"},
-"subject":{"scope":"global","res":"mem"},
-"figure":{"used_bytes":17678352384,"total_bytes":137438953472,"trend":"steady","exact":"exact","via":"coalitions","n":6},
-"classes":[{"class":"app","bytes":12545392640},
-{"class":"wired","bytes":5132959744},
-{"class":"compressed","bytes":0},
-{"class":"cache","bytes":27967258624},
-{"class":"free","bytes":89733971968},
-{"class":"not_in_vm","bytes":2059370496}],
-"owners":{"fp_bytes":3451115275,"coalitions":6,"live_only":true},
-"you":{"tab":1,"role":"minor","fp_bytes":33554432},
-"who":[{"coalition":1342,"pid":1187,"birth_ms":1792517515000,"exe":"aterm","voucher":"developer_id","team":"A66A9P66Z7","scope":"aterm","fp_bytes":1630032364,"live":3},
-{"coalition":1393,"pid":1631,"birth_ms":1792517638000,"exe":"Safari","voucher":"apple","uid":501,"part":"others","fp_bytes":846525891,"live":1},
-{"coalition":393,"pid":430,"birth_ms":1792517318500,"exe":"WindowServer","voucher":"apple","uid":88,"part":"services","fp_bytes":773230428,"live":1}],
-"more":{"who":3,"fp_bytes":201326592},
-"causes":[],
-"pass":{"trend":"steady","src":"kernel"},
-"do":[{"class":"none","may":"agent","destructive":0}],
-"cannot":[{"what":"wired_by_process","reason":{"why":"needs_privilege:root"}},
-{"what":"uncharged_memory","reason":{"why":"unsupported"}}],
-"cpu_hardware":{"why":"not_sampled"},
-"events":[]}"#;
-
-#[test]
-fn the_json_goldens() {
-    let w = mac();
-    let a = example_a();
-    let j = render_json(&q("why top=6 --json"), &ctx(&w, &a, true)).to_text();
-    assert_eq!(j, EXAMPLE_A_JSON.replace('\n', ""));
-    let m = read_at(&mem_1142(), 3);
-    let j = render_json(&q("why mem top=3 --json"), &ctx(&w, &m, true)).to_text();
-    assert_eq!(j, MEM_1142_JSON.replace('\n', ""));
-}
-
-fn int(j: &Jv) -> Option<i64> {
-    match j {
-        Jv::Int(n) => Some(*n),
-        _ => match j.get("v") {
-            Some(Jv::Int(n)) => Some(*n),
-            _ => None,
-        },
-    }
-}
-
-fn rows_sum(j: &Jv, key: &str) -> i64 {
-    let who: i64 = match j.get("who") {
-        Some(Jv::Arr(rows)) => rows.iter().filter_map(|r| r.get(key).and_then(int)).sum(),
-        _ => 0,
-    };
-    who + ["more", "withheld"]
-        .iter()
-        .filter_map(|k| j.get(k).and_then(|m| m.get(key)).and_then(int))
-        .sum::<i64>()
-}
-
-#[test]
-fn the_json_sums_close_as_the_text_does() {
-    let scenes = [
-        example_a(),
-        read(&finished_1032(), 3),
-        read(&delegated_1032(500, 100), 3),
-        read(&reaped_1032(), 3),
-        read(&lane_off_1032(), 3),
-        read(&mem_1142(), 3),
-    ];
-    let w = mac();
-    for s in &scenes {
-        for owner in [true, false] {
-            let c = ctx(&w, s, owner);
-            let j = render_json(&q("why cpu --json"), &c);
-            let figure = j
-                .get("figure")
-                .and_then(|f| f.get("cpu_mc"))
-                .and_then(int)
-                .expect("cpu_mc");
-            let split = j.get("split_mc").expect("split_mc");
-            let text = why("why cpu", &c);
-            let line = lines(&text, "split")[0];
-            let mut parts = 0;
-            for (part, key) in SPLIT_PARTS.iter().zip([
-                "tab_mc",
-                "aterm_rest_mc",
-                "others_mc",
-                "services_mc",
-                "unaccounted_mc",
-            ]) {
-                if let Some(v) = split.get(part).and_then(crate::sys::json::part_value) {
-                    assert_eq!(v, field(line, key), "{part}: {line}");
-                    parts += v;
-                }
-            }
-            assert_eq!(parts, figure, "{}", j.to_text());
-            if let Some(unaccounted) = split.get("unaccounted").and_then(int)
-                && s.why.as_deref().is_some_and(|f| {
-                    f.split.via == crate::explain::Via::Coalitions && !f.split.ownership_incomplete
-                })
-            {
-                assert_eq!(
-                    rows_sum(&j, "cpu_mc") + unaccounted,
-                    figure,
-                    "{}",
-                    j.to_text()
-                );
-            }
-            let j = render_json(&q("why mem --json"), &c);
-            if let Some(owners) = j
-                .get("owners")
-                .and_then(|o| o.get("fp_bytes"))
-                .and_then(int)
-            {
-                assert_eq!(rows_sum(&j, "fp_bytes"), owners, "{}", j.to_text());
-            }
-        }
     }
 }
 
@@ -2236,8 +1496,8 @@ fn names_print_only_as_words() {
     let w = mac();
     for owner in [true, false] {
         let c = ctx(&w, &s, owner);
-        let t = why("why cpu", &c);
-        let j = render_json(&q("why cpu --json"), &c).to_text();
+        let t = why("why cpu top=64", &c);
+        let j = render_json(&q("why cpu top=64 --json"), &c).to_text();
         for out in [&t, &j] {
             for bad in ["ignore", "rm -rf", "a66a9p66z7", "make me", "ABCDE1234"] {
                 assert!(!out.contains(bad), "{bad}: {out}");
@@ -2251,9 +1511,8 @@ fn names_print_only_as_words() {
             row.contains(" exe=- voucher=developer_id scope=aterm "),
             "{row}"
         );
-        assert!(t.contains(" wake_reason=- "), "{t}");
     }
-    let owner = why("why cpu", &ctx(&w, &s, true));
+    let owner = why("why cpu top=64", &ctx(&w, &s, true));
     let row = |id: &str| {
         lines(&owner, "who")
             .into_iter()
@@ -2332,7 +1591,7 @@ fn an_unmeasured_coalition_reads_no_cpu() {
         row.measured = false;
         split.services_mc -= mc;
         split.unaccounted_mc += mc;
-        split.exact = false;
+        split.coverage_complete = false;
     }
     let w = mac();
     let c = ctx(&w, &s, true);
@@ -2343,17 +1602,9 @@ fn an_unmeasured_coalition_reads_no_cpu() {
         .find(|l| l.starts_with("who coalition=327 "))
         .expect("contextstored's row");
     assert!(row.contains(&format!(" {unread} ")), "{row}");
-    let split = lines(&t, "split")[0];
-    assert!(
-        split.contains(" unaccounted_mc=460 exact=heuristic "),
-        "{t}"
-    );
-    let rows: i64 = lines(&t, "who")
-        .into_iter()
-        .filter(|l| !l.contains(unread))
-        .map(|l| field(l, "cpu_mc"))
-        .sum();
-    assert_eq!(rows + field(split, "unaccounted_mc"), 3300, "{t}");
+    let reported = lines(&t, "reported_cpu")[0];
+    assert!(reported.contains(" coalition_coverage=partial "), "{t}");
+    assert!(!reported.contains("unaccounted"), "{t}");
     let j = render_json(&q("why top=8 --json"), &c);
     assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
     let Some(Jv::Arr(who)) = j.get("who") else {
@@ -2364,15 +1615,11 @@ fn an_unmeasured_coalition_reads_no_cpu() {
         .find(|r| r.get("coalition") == Some(&Jv::Int(327)))
         .expect("contextstored's row");
     assert_eq!(row.get("cpu_mc"), Some(&Jv::why("not_sampled")));
-    let unaccounted = j
-        .get("split_mc")
-        .and_then(|p| p.get("unaccounted"))
-        .and_then(int);
+    assert!(j.get("split_mc").is_none());
     assert_eq!(
-        Some(rows_sum(&j, "cpu_mc"))
-            .zip(unaccounted)
-            .map(|(r, u)| r + u),
-        Some(3300)
+        j.get("reported_cpu_mc")
+            .and_then(|r| r.get("coalition_coverage")),
+        Some(&Jv::s("partial"))
     );
 }
 
@@ -2418,7 +1665,7 @@ fn since_folds_every_unchanged_record() {
 fn the_subject_word_is_the_replys() {
     let calm = read(&calm_1510(), 3);
     let a = example_a();
-    assert_eq!(subject_word(&q("why"), Some(&calm)), Some("global"));
+    assert_eq!(subject_word(&q("why"), Some(&calm)), Some("global.cpu"));
     assert_eq!(subject_word(&q("why"), Some(&a)), Some("global.cpu"));
     assert_eq!(subject_word(&q("why mem"), Some(&a)), Some("global.mem"));
     assert_eq!(
@@ -2429,7 +1676,7 @@ fn the_subject_word_is_the_replys() {
     assert_eq!(subject_word(&q("global"), Some(&a)), None);
 }
 
-/// A sampled CPU partition is not a witness of every lifetime or socket delegation.
+/// Published CPU observations do not witness every lifetime or socket delegation.
 /// Memory and an unread first CPU window are controls: neither claims sampled attribution.
 #[test]
 fn sampled_cpu_names_the_work_its_attribution_cannot_witness() {

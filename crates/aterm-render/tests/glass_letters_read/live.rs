@@ -564,93 +564,27 @@ fn a_coloured_line_keeps_every_letter_at_its_bar_and_one_run_under_it() {
 /// held it ([`with_share_over_aa`]), one reads under AA on each page; and with each solid level
 /// held to its dimmest level's bar ([`with_least_level_bar`]), one the judges read at AA reads
 /// under it on Default Light (on GitHub Light, at that bar, none on this line falls under it: the
-/// least reads 4.508). The last two words are magentas of the coloured line and the flood: W1's
-/// #b43fb4 and #b441b4 on Default Light, #bb43bb and the flood's #c1479f on GitHub Light. The
-/// first is the face's [`uncored_word`] in #b43fb4: a glyph whose core holds its word from every
-/// glass holds it under the last control too. A letter the judges read at 4.495 to 4.5 is held by
-/// aterm-effects' `a_letter_the_judges_read_at_aa_keeps_aa` and
+/// least reads 4.508). That last control was measured at 24 px on macOS's SF Mono; on a face whose
+/// 24 px line it does not bite, it is taken at the first larger size of [`APP_INK_SIZES`] where it
+/// does, and the law is held there too: Windows' Iosevka Term NL lays the line at 24 px in
+/// 12 x 30 px cells, where the least reads 4.560 of 984, at 26 px 4.517 of 3,440, and bites at
+/// 28 px, its uncored word `sss`, 724 of 1,584 under AA, the least 4.345 (Windows x64,
+/// 2026-11-15). The last two words are magentas of the coloured line and the flood: W1's #b43fb4
+/// and #b441b4 on Default Light, #bb43bb and the flood's #c1479f on GitHub Light. The first is the
+/// face's [`uncored_word`] in #b43fb4 at the line's size: a glyph whose core holds its word from
+/// every glass holds it under the last control too. A letter the judges read at 4.495 to 4.5 is
+/// held by aterm-effects' `a_letter_the_judges_read_at_aa_keeps_aa` and
 /// `a_letter_on_a_dim_page_keeps_a_level_in_hand`.
 #[test]
 fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
-    let text = format!(
-        "gypsy pygmy jiggy foggy poppy guppy {} wigwag",
-        uncored_word(PAGE, "180;63;180")
-    );
-    // Each page's inks, its letters' readings at this size straddling 4.5 to 4.6 (a step of a
-    // level moves a glyph's worst solid pixel by a few hundredths), and two magentas.
-    const PAGES: [(u32, u32, [&str; 8]); 2] = [
-        (
-            PAGE.0,
-            PAGE.1,
-            [
-                "38;2;172;60;114",
-                "38;2;40;113;113",
-                "38;2;173;61;115",
-                "38;2;180;63;119",
-                "38;2;41;118;118",
-                "38;2;181;63;120",
-                "38;2;180;63;180",
-                "38;2;180;65;180",
-            ],
-        ),
-        (
-            0x001F_2328,
-            0x00FF_FFFF,
-            [
-                "38;2;180;63;119",
-                "38;2;41;118;118",
-                "38;2;181;63;120",
-                "38;2;188;66;124",
-                "38;2;43;123;123",
-                "38;2;190;66;126",
-                "38;2;187;67;187",
-                "38;2;193;71;159",
-            ],
-        ),
-    ];
-    let word = |at: usize| text[..at].matches(' ').count();
-    for (fg, bg, inks) in PAGES {
-        let ink = move |at: usize| Some(inks[word(at) % inks.len()].to_owned());
-        let read = || {
-            live_line_reading(
-                24.0,
-                1.0,
-                fg,
-                bg,
-                LiveLine {
-                    text: &text,
-                    ink: &ink,
-                    yields: true,
-                },
-            )
-        };
-        let law = read();
-        assert!(law.glass_frames > 0, "#{bg:06x}: the line draws its glass");
-        assert!(
-            law.at_aa > 0,
-            "#{bg:06x}: premise, no letter on a glass frame reads between AA and the floor"
-        );
-        assert_eq!(
-            law.under_aa, 0,
-            "#{bg:06x}: of {} letters at AA, {} read under it, the least {:.3}",
-            law.at_aa, law.under_aa, law.least_at_aa
-        );
-        assert!(
-            law.rail_run * 2 >= text.len(),
-            "#{bg:06x}: the rail's run is {} columns of {}",
-            law.rail_run,
-            text.len()
-        );
-        assert!(
-            law.judged_at_aa > 0,
-            "#{bg:06x}: premise, the judges read no letter on a glass frame between AA and the \
-             floor"
-        );
-        assert_eq!(
-            law.judged_under_aa, 0,
-            "#{bg:06x}: of {} letters the judges read at AA, {} read under it, the least {:.3}",
-            law.judged_at_aa, law.judged_under_aa, law.judged_least_at_aa
-        );
+    let line = |px: f32| {
+        uncored_word(px, PAGE, "180;63;180")
+            .map(|word| format!("gypsy pygmy jiggy foggy poppy guppy {word} wigwag"))
+    };
+    let text = line(24.0).expect("a word no core holds");
+    for (fg, bg, inks) in APP_INK_PAGES {
+        let read = || app_ink_line(24.0, &text, (fg, bg), &inks);
+        keeps_aa_under_the_glass(&read(), &text, bg);
         let share = with_share_over_aa(read);
         assert!(
             share.under_aa > 0,
@@ -659,32 +593,140 @@ fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
             share.least_at_aa,
             share.at_aa
         );
-        let least = with_least_level_bar(read);
-        assert!(
-            bg != PAGE.1 || least.judged_under_aa > 0,
+    }
+    let (fg, bg, inks) = APP_INK_PAGES[0];
+    let mut tried = Vec::new();
+    let bites = APP_INK_SIZES.into_iter().find_map(|px| {
+        // A size where every word's core holds it is no place for the control.
+        let Some(text) = (if px == 24.0 {
+            Some(text.clone())
+        } else {
+            line(px)
+        }) else {
+            tried.push(format!("{px} px: no word no core holds"));
+            return None;
+        };
+        let least = with_least_level_bar(|| app_ink_line(px, &text, (fg, bg), &inks));
+        tried.push(format!(
+            "{px} px: least {:.3} of {}",
+            least.judged_least_at_aa, least.judged_at_aa
+        ));
+        (least.judged_under_aa > 0).then_some((px, text))
+    });
+    let Some((px, text)) = bites else {
+        panic!(
             "control, #{bg:06x}: at its dimmest level's bar no letter the judges read at AA reads \
-             under it (least {:.3} of {})",
-            least.judged_least_at_aa,
-            least.judged_at_aa
-        );
+             under it ({})",
+            tried.join("; ")
+        )
+    };
+    if px != 24.0 {
+        keeps_aa_under_the_glass(&app_ink_line(px, &text, (fg, bg), &inks), &text, bg);
     }
 }
 
-/// The first of `wow` and `xxx` in `ink` (`r;g;b`) on the page `(fg, bg)` at 24 px no glyph of
-/// which holds the word from every glass by its core alone: a core whose letter bar lies over its
-/// own reading keeps its word whole whatever its solid levels' bars (aterm-effects' `uncored_word`,
-/// the yield's own test of the same law, says why). #b43fb4's on Default Light is `wow` under
-/// macOS's SF Mono, where the control was measured on it, and `xxx` under Linux's bundled JetBrains
-/// Mono, whose `o` core (coverage 253) reads 4.4976 there (Linux arm64, 2026-11-07).
-fn uncored_word((fg, bg): (u32, u32), ink: &str) -> &'static str {
-    let mut renderer = Renderer::from_system(24.0, Theme::default()).expect("the window face");
+/// The sizes [`an_app_ink_at_aa_keeps_aa_under_the_glass`]'s dimmest-level control is taken at,
+/// px: the first where it bites.
+const APP_INK_SIZES: [f32; 5] = [24.0, 26.0, 28.0, 30.0, 32.0];
+
+/// [`an_app_ink_at_aa_keeps_aa_under_the_glass`]'s pages and each one's inks, its letters' readings
+/// at 24 px straddling 4.5 to 4.6 (a step of a level moves a glyph's worst solid pixel by a few
+/// hundredths), and two magentas.
+const APP_INK_PAGES: [(u32, u32, [&str; 8]); 2] = [
+    (
+        PAGE.0,
+        PAGE.1,
+        [
+            "38;2;172;60;114",
+            "38;2;40;113;113",
+            "38;2;173;61;115",
+            "38;2;180;63;119",
+            "38;2;41;118;118",
+            "38;2;181;63;120",
+            "38;2;180;63;180",
+            "38;2;180;65;180",
+        ],
+    ),
+    (
+        0x001F_2328,
+        0x00FF_FFFF,
+        [
+            "38;2;180;63;119",
+            "38;2;41;118;118",
+            "38;2;181;63;120",
+            "38;2;188;66;124",
+            "38;2;43;123;123",
+            "38;2;190;66;126",
+            "38;2;187;67;187",
+            "38;2;193;71;159",
+        ],
+    ),
+];
+
+/// The live reading of `text` at `px` on the page `(fg, bg)`, each word in the next of `inks`.
+fn app_ink_line(px: f32, text: &str, (fg, bg): (u32, u32), inks: &[&str; 8]) -> LiveReading {
+    let word = |at: usize| text[..at].matches(' ').count();
+    let ink = |at: usize| Some(inks[word(at) % inks.len()].to_owned());
+    live_line_reading(
+        px,
+        1.0,
+        fg,
+        bg,
+        LiveLine {
+            text,
+            ink: &ink,
+            yields: true,
+        },
+    )
+}
+
+/// [`an_app_ink_at_aa_keeps_aa_under_the_glass`]'s law on one reading of `text` on the page `bg`.
+fn keeps_aa_under_the_glass(law: &LiveReading, text: &str, bg: u32) {
+    assert!(law.glass_frames > 0, "#{bg:06x}: the line draws its glass");
+    assert!(
+        law.at_aa > 0,
+        "#{bg:06x}: premise, no letter on a glass frame reads between AA and the floor"
+    );
+    assert_eq!(
+        law.under_aa, 0,
+        "#{bg:06x}: of {} letters at AA, {} read under it, the least {:.3}",
+        law.at_aa, law.under_aa, law.least_at_aa
+    );
+    assert!(
+        law.rail_run * 2 >= text.len(),
+        "#{bg:06x}: the rail's run is {} columns of {}",
+        law.rail_run,
+        text.len()
+    );
+    assert!(
+        law.judged_at_aa > 0,
+        "#{bg:06x}: premise, the judges read no letter on a glass frame between AA and the floor"
+    );
+    assert_eq!(
+        law.judged_under_aa, 0,
+        "#{bg:06x}: of {} letters the judges read at AA, {} read under it, the least {:.3}",
+        law.judged_at_aa, law.judged_under_aa, law.judged_least_at_aa
+    );
+}
+
+/// The first of `wow`, `xxx` and each lowercase letter three times over in `ink` (`r;g;b`) on the
+/// page `(fg, bg)` at `px` no glyph of which holds the word from every glass by its core alone, if
+/// any: a
+/// core whose letter bar lies over its own reading keeps its word whole whatever its solid levels'
+/// bars (aterm-effects' `uncored_word`, the yield's own test of the same law, says why, and takes
+/// the same words). #b43fb4's on Default Light at 24 px is `wow` under macOS's SF Mono, where the
+/// control was measured on it, and `xxx` under Linux's bundled JetBrains Mono, whose `o` core
+/// (coverage 253) reads 4.4976 there (Linux arm64, 2026-11-07).
+fn uncored_word(px: f32, (fg, bg): (u32, u32), ink: &str) -> Option<String> {
+    let mut renderer = Renderer::from_system(px, Theme::default()).expect("the window face");
     let (cw, ch) = renderer.cell_size();
     let rgb_ink = ink
         .split(';')
         .map(|c| c.parse::<u32>().expect("a channel"))
         .fold(0, |rgb, c| rgb << 8 | c);
-    ["wow", "xxx"]
+    ["wow".to_owned(), "xxx".to_owned()]
         .into_iter()
+        .chain(('a'..='z').map(|c| c.to_string().repeat(3)))
         .find(|word| {
             let mut term = Terminal::new(1, 8);
             term.set_default_foreground(rgb(fg));
@@ -712,5 +754,4 @@ fn uncored_word((fg, bg): (u32, u32), ink: &str) -> &'static str {
                 letter_bar(read, false) <= read
             })
         })
-        .expect("a word no core holds")
 }

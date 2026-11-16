@@ -261,9 +261,8 @@ impl Subscription {
     }
 
     /// A ring of this subscription's own wake for a waker that is no watcher list (the hang-up
-    /// bell, [`aterm_uds::hangup::Bell`]): its `try_send` ends the [`Self::wait`] it finds parked,
-    /// or the next one, and a wake already pending in the single slot stands for it.
-    #[cfg(unix)]
+    /// bell, `aterm_uds::hangup::Bell` on Unix): its `try_send` ends the [`Self::wait`] it finds
+    /// parked, or the next one, and a wake already pending in the single slot stands for it.
     #[must_use]
     pub(crate) fn bell(&self) -> SyncSender<()> {
         self.notify.clone()

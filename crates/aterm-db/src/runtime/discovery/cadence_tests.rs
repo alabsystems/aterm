@@ -198,6 +198,7 @@ fn walk(state: &State, start: Instant) -> (Hints, Vec<(SocketAddr, Actor)>) {
             Subject::Table(MOVED),
             Hot {
                 since: start,
+                held: None,
                 cold: usize::try_from(state["cold"]).expect("a count"),
                 tried: seats[..tried].iter().map(|(_, actor)| *actor).collect(),
             },
@@ -304,7 +305,7 @@ pub(crate) fn dial_cadence_transition(state: &State, action: &str) -> State {
         }
         "Move" => {
             let (mut hints, _) = walk(state, now - Duration::from_secs(1));
-            hints.moved(Subject::Table(MOVED), [], now);
+            hints.moved(Subject::Table(MOVED), None, [], now);
             read_walk(&mut next, &hints);
             next.insert("walked", 0);
         }

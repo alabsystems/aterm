@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The completion prerequisite of the disk-worker model, including its negative controls.
+//! The discovery cycle's completion law, including its negative controls.
 
 use aterm_models_harness::disk_discovery_cycle_model;
 use aterm_spec::interp;

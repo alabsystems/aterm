@@ -798,12 +798,77 @@ pub enum OneCompiler {
     LinkedResigned,
 }
 
+const TRUST_ALIAS_PAIRS: [(&str, &str); 3] = [
+    ("trustc", "rustc"),
+    ("targo", "cargo"),
+    ("trustdoc", "rustdoc"),
+];
+
+fn require_alias_pair(root: &Path, canonical: &str, alias: &str) -> Result<()> {
+    for name in [canonical, alias] {
+        let path = root.join("bin").join(name);
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| Error::io(format!("stat bin/{name}"), &e))?;
+        if !meta.file_type().is_file() || !atpkg::toolchain::is_executable_file(&path) {
+            return Err(Error::refused(format!(
+                "same-surface alias gate FAIL — bin/{name} must be a regular executable file"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Give each required full-Trust compatibility pair one private staged inode.
+///
+/// The original compiler normalization also applies to Cargo and documentation:
+/// independently copied twins otherwise acquire different signatures when the
+/// strip or relocation pass signs them by file name. Only already equivalent
+/// programs are linked; this never supplies a missing member or changes the seal.
+///
+/// # Errors
+/// A missing/nonregular member, different programs, or a failed comparison/link.
+pub fn trust_aliases(tools: &dyn Tools, root: &Path) -> Result<Vec<OneCompiler>> {
+    for (canonical, alias) in TRUST_ALIAS_PAIRS {
+        require_alias_pair(root, canonical, alias)?;
+    }
+    TRUST_ALIAS_PAIRS
+        .into_iter()
+        .map(|(canonical, alias)| one_alias_pair(tools, root, canonical, alias))
+        .collect()
+}
+
+/// Check every required full-Trust alias against the final package bytes.
+///
+/// # Errors
+/// A missing/nonregular member or any byte difference, including signatures.
+pub fn trust_alias_gate(root: &Path) -> Result<Vec<OneCompiler>> {
+    TRUST_ALIAS_PAIRS
+        .into_iter()
+        .map(|(canonical, alias)| {
+            require_alias_pair(root, canonical, alias)?;
+            alias_pair_gate(root, canonical, alias)
+        })
+        .collect()
+}
+
 /// Deduplicate `bin/rustc` and `bin/trustc` into one inode before signing.
 ///
 /// # Errors
 /// A refusal for two different programs.
 pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
-    let (r, t) = (root.join("bin/rustc"), root.join("bin/trustc"));
+    one_alias_pair(tools, root, "trustc", "rustc")
+}
+
+fn one_alias_pair(
+    tools: &dyn Tools,
+    root: &Path,
+    canonical: &str,
+    alias: &str,
+) -> Result<OneCompiler> {
+    let (r, t) = (
+        root.join("bin").join(alias),
+        root.join("bin").join(canonical),
+    );
     let (Ok(rm), Ok(tm)) = (std::fs::symlink_metadata(&r), std::fs::symlink_metadata(&t)) else {
         return Ok(OneCompiler::NotApplicable);
     };
@@ -815,9 +880,9 @@ pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
     }
     let (rb, tb) = (
         crate::identity::read_regular_bytes(&r, 512 * 1024 * 1024)
-            .map_err(|e| Error::io("read bin/rustc", &e))?,
+            .map_err(|e| Error::io(format!("read bin/{alias}"), &e))?,
         crate::identity::read_regular_bytes(&t, 512 * 1024 * 1024)
-            .map_err(|e| Error::io("read bin/trustc", &e))?,
+            .map_err(|e| Error::io(format!("read bin/{canonical}"), &e))?,
     );
     let how = if rb == tb {
         OneCompiler::LinkedCopy
@@ -825,14 +890,14 @@ pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
         OneCompiler::LinkedResigned
     } else {
         return Err(Error::refused(format!(
-            "bin/rustc and bin/trustc are different programs ({}, and still different with \
-             both code signatures removed); a Trust bundle's rustc must BE its trustc — fix \
+            "bin/{alias} and bin/{canonical} are different programs ({}, and still different with \
+             both code signatures removed); a Trust bundle's {alias} must BE its {canonical} — fix \
              the staged sysroot",
             first_difference(&rb, &tb)
         )));
     };
-    std::fs::remove_file(&r).map_err(|e| Error::io("rm bin/rustc", &e))?;
-    std::fs::hard_link(&t, &r).map_err(|e| Error::io("link bin/rustc", &e))?;
+    std::fs::remove_file(&r).map_err(|e| Error::io(format!("rm bin/{alias}"), &e))?;
+    std::fs::hard_link(&t, &r).map_err(|e| Error::io(format!("link bin/{alias}"), &e))?;
     Ok(how)
 }
 
@@ -841,31 +906,38 @@ pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
 /// # Errors
 /// A refusal for a link or two different files.
 pub fn compiler_gate(root: &Path) -> Result<OneCompiler> {
-    let (r, t) = (root.join("bin/rustc"), root.join("bin/trustc"));
+    alias_pair_gate(root, "trustc", "rustc")
+}
+
+fn alias_pair_gate(root: &Path, canonical: &str, alias: &str) -> Result<OneCompiler> {
+    let (r, t) = (
+        root.join("bin").join(alias),
+        root.join("bin").join(canonical),
+    );
     let (Ok(rm), Ok(tm)) = (std::fs::symlink_metadata(&r), std::fs::symlink_metadata(&t)) else {
         return Ok(OneCompiler::NotApplicable);
     };
     if !rm.file_type().is_file() || !tm.file_type().is_file() {
-        return Err(Error::refused(
-            "one-compiler gate FAIL — bin/rustc and bin/trustc must both be regular files \
+        return Err(Error::refused(format!(
+            "one-compiler gate FAIL — bin/{alias} and bin/{canonical} must both be regular files \
              (tippy refuses a link)",
-        ));
+        )));
     }
     if same_meta_inode(&rm, &tm) {
         return Ok(OneCompiler::AlreadyLinked);
     }
     let (rb, tb) = (
         crate::identity::read_regular_bytes(&r, 512 * 1024 * 1024)
-            .map_err(|e| Error::io("read bin/rustc", &e))?,
+            .map_err(|e| Error::io(format!("read bin/{alias}"), &e))?,
         crate::identity::read_regular_bytes(&t, 512 * 1024 * 1024)
-            .map_err(|e| Error::io("read bin/trustc", &e))?,
+            .map_err(|e| Error::io(format!("read bin/{canonical}"), &e))?,
     );
     if rb == tb {
         Ok(OneCompiler::LinkedCopy)
     } else {
         Err(Error::refused(format!(
-            "one-compiler gate FAIL — bin/rustc and bin/trustc are not byte-identical ({}); \
-             tippy refuses a rustc that is not the selected trustc",
+            "one-compiler gate FAIL — bin/{alias} and bin/{canonical} are not byte-identical ({}); \
+             a Trust bundle's {alias} must BE its {canonical}",
             first_difference(&rb, &tb)
         )))
     }
@@ -953,14 +1025,20 @@ impl<'a> Staged<'a> {
         if b.def.closure {
             require_target_std(&root)?;
         }
+        if b.req.program == "trust" {
+            let aliases = trust_aliases(b.tools, &root)?;
+            eprintln!("atpkg-publish: same-surface Trust aliases — {aliases:?}");
+        }
         for f in thin_fat(b.tools, &root, b.triple)? {
             eprintln!("atpkg-publish: thinned fat Mach-O {f}");
         }
         for f in strip_retired(&root, b.def.exposes)? {
             eprintln!("atpkg-publish: stripped retired public entrypoint {f}");
         }
-        let one = one_compiler(b.tools, &root)?;
-        eprintln!("atpkg-publish: one compiler — {one:?}");
+        if b.req.program != "trust" {
+            let one = one_compiler(b.tools, &root)?;
+            eprintln!("atpkg-publish: one compiler — {one:?}");
+        }
         if b.req.strip {
             let (s, l) = strip_symbols(b.tools, &root)?;
             eprintln!(
@@ -1255,7 +1333,11 @@ fn gates(
 ) -> std::result::Result<atpkg::manifest::Provenance, (Error, Started)> {
     let read = |e: Error| (e, Started::Nothing);
     let ran = |e: Error| (e, Started::Staged);
-    compiler_gate(root).map_err(read)?;
+    if b.req.program == "trust" {
+        trust_alias_gate(root).map_err(read)?;
+    } else {
+        compiler_gate(root).map_err(read)?;
+    }
     let probe = |p: &Path| tools::version(b.tools, p);
     if b.own_compiler && b.proven {
         super::lineage::stamp_with_components(

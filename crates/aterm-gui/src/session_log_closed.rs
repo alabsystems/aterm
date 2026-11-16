@@ -312,6 +312,7 @@ impl ClosedLogs {
     }
 
     /// The closes linked, oldest first (the disk worktree step's roster reads them).
+    #[cfg(any(target_os = "macos", test))] // the roster that reads them is macOS's
     pub(crate) fn exits(&self) -> impl DoubleEndedIterator<Item = &ClosedExit> {
         self.slots.iter().map(|s| &s.exit)
     }

@@ -591,7 +591,7 @@ struct WindowsSpelling {
 #[cfg(any(windows, test))]
 impl WindowsSpelling {
     fn admit(program: &Path, physical: &Path) -> Option<Self> {
-        use aterm_sysprobe::paths::{plain, windows_key};
+        use aterm_path::{plain, windows_key};
         // Validate both roots/components, but do not compare folded keys: folding could
         // hide a different target on a case-sensitive Windows directory.
         windows_key(program)?;

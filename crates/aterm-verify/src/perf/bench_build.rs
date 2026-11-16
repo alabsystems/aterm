@@ -12,13 +12,14 @@
 //! at the load they find, so a change to it or to [`prepare`] changes that floor lane too.
 
 use std::io::BufRead as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use aterm_uds::spawnfd::{Command, Stdio};
 
 use super::arena::{self, Halt};
 use super::workspace_root;
-use crate::perf::driver::{CargoDriver, built_executable};
+use crate::perf::driver::CargoDriver;
 
 /// THE BENCHES' OWN TABLE of arms, mounted from the fabric bench: the cargo profile
 /// each builds with, where its binaries land, and the opt-level it promises.
@@ -26,7 +27,11 @@ use crate::perf::driver::{CargoDriver, built_executable};
 pub(crate) mod bench_profile;
 
 pub(crate) mod flags;
+mod prepared;
 pub(crate) mod units;
+
+use prepared::{BuildContext, Runtime};
+pub(crate) use prepared::{Compiler, PreparedBench};
 
 use bench_profile::Profile;
 
@@ -51,61 +56,8 @@ pub(crate) fn prepare<'a>(
     driver: &'a CargoDriver,
     profile: Profile,
     build_args: &[&str],
-) -> Result<(Targo<'a>, Built, String), Halt> {
-    let targo = Targo::new(driver);
-    let removed: Vec<String> = std::env::vars_os()
-        .filter_map(|(key, _)| key.into_string().ok())
-        .filter(|key| flags::is_env_source(key))
-        .collect();
-    let sources = config_rustflags(&targo)?;
-    if let Some(why) = flags::refusal(&sources) {
-        return Err(Halt::Fail(format!(
-            "the `{}` arm's build is not what the arm says: {why}",
-            profile.name()
-        )));
-    }
-    let audit = audit(&targo, "bench", build_args)?;
-    if let Some(why) = audit.refusal(units::Promise::of(profile)) {
-        return Err(Halt::Fail(format!(
-            "the `{}` arm's build is not what the arm says: {why}",
-            profile.name()
-        )));
-    }
-    let mut build = format!(
-        "`{}` — {}. Cargo's plan, read before the run: {}; {}",
-        profile.name(),
-        profile.describe(),
-        audit.summary(),
-        flags::describe(&sources)
-    );
-    if !removed.is_empty() {
-        build.push_str(&format!(" (the caller's {} removed)", removed.join(", ")));
-    }
-    build.push_str("; its identity record the constant one (no identity input reaches it)");
-    eprintln!("  {build}");
-    let load_before = load_average();
-    let built = build_bench(&targo, build_args)?;
-    if Profile::of_binary(&built) != Some(profile) {
-        return Err(Halt::Fail(format!(
-            "cargo built the `{}` arm's aterm at {}, outside the arm's `{}` directory",
-            profile.name(),
-            built.display(),
-            profile.dir()
-        )));
-    }
-    let built = std::fs::canonicalize(&built)
-        .map_err(|why| Halt::Fail(format!("cannot resolve the aterm cargo built: {why}")))?;
-    let identity = bench_profile::identity(&built)
-        .map_err(|why| Halt::Fail(format!("the aterm cargo just built cannot be read: {why}")))?;
-    Ok((
-        targo,
-        Built {
-            path: built,
-            identity,
-            lane_build: build,
-        },
-        load_before,
-    ))
+) -> Result<(PreparedBench<Targo<'a>>, String), Halt> {
+    PreparedBench::prepare(Targo::new(driver), profile, build_args)
 }
 
 /// How a bench run is admitted: whether what it reads is time or counts.
@@ -119,123 +71,114 @@ pub(crate) enum Entry {
     Counted,
 }
 
-/// Build `build_args`'s bench without executing it, then execute Cargo's exact artifact with the
-/// words of `knobs` (the variable and its words) and the separate OS-native output path in its
-/// named variable (`output`), selecting `built` as its app. A timed `entry` first obtains fresh
-/// measurement-entry evidence. Echo stderr lines beginning with `progress`, and return stdout.
+/// Execute the already prepared bench with runtime words and an OS-native output path.
+/// Each timed run obtains fresh entry evidence; counted runs take no timing admission.
 ///
 /// # Errors
-/// A bench that does not start, or exits unsuccessfully (with both tails); a
-/// timed run whose admission is refused or lapsed.
-pub(crate) fn run_bench(
-    targo: &Targo<'_>,
-    build_args: &[&str],
+/// Changed prepared inputs, failed execution, or refused/lapsed timing admission.
+pub(crate) fn run_bench<C: Compiler>(
+    prepared: &PreparedBench<C>,
     knobs: (&str, &str),
     output: (&str, &Path),
     progress: &str,
-    built: &Built,
     entry: Entry,
 ) -> Result<String, Halt> {
-    let (env, words) = knobs;
-    let mut bench_args = vec!["-q", "--no-run", "--message-format=json-render-diagnostics"];
-    bench_args.extend_from_slice(build_args);
-    eprintln!("  $ {}", targo.display("bench", &bench_args));
-    let messages = targo.output("bench", &bench_args, "the measurement executable build")?;
-    let name = build_args
-        .windows(2)
-        .find(|args| args[0] == "--bench")
-        .map(|args| args[1])
-        .ok_or_else(|| Halt::Fail("measurement build names no bench target".into()))?;
-    let executable = built_executable(&messages, name, "bench")?;
-    eprintln!(
-        "  $ ATERM_TEST_EXECUTABLE={:?} {env}=\"{words}\" {}={:?} {} --bench",
-        built.path,
-        output.0,
-        output.1,
-        executable.display()
-    );
-    let mut command = crate::exec::check_command(&executable);
-    targo.environment(&mut command);
-    command.current_dir(workspace_root()).arg("--bench");
-    let admitted = match entry {
-        Entry::Timed => Some(super::measurement_entry().map_err(Halt::Timing)?),
-        Entry::Counted => None,
-    };
-    set_bench_environment(&mut command, env, words, output, &built.path);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not execute {}: {e}", executable.display()))?;
-    let stdout = child.stdout.take().map(|mut out| {
-        std::thread::spawn(move || {
-            use std::io::Read as _;
-            let mut text = String::new();
-            let _ = (&mut out).take(16 * 1024 * 1024).read_to_string(&mut text);
-            let _ = std::io::copy(&mut out, &mut std::io::sink());
-            text
-        })
-    });
-    let mut tail: Vec<String> = Vec::new();
-    if let Some(err) = child.stderr.take() {
-        use std::io::Read as _;
-        const MAX_BENCH_STDERR_LINE: usize = 64 << 10;
-        let mut reader = std::io::BufReader::new(err);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match (&mut reader)
-                .take((MAX_BENCH_STDERR_LINE as u64) + 1)
-                .read_until(b'\n', &mut buf)
-            {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            if !buf.ends_with(b"\n") && buf.len() > MAX_BENCH_STDERR_LINE {
-                while let Ok(chunk) = reader.fill_buf() {
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    let nl = chunk.iter().position(|&b| b == b'\n');
-                    let len = chunk.len();
-                    if let Some(nl) = nl {
-                        reader.consume(nl + 1);
-                        break;
-                    }
-                    reader.consume(len);
-                }
-            }
-            let line = String::from_utf8_lossy(&buf)
-                .trim_end_matches(['\r', '\n'])
-                .to_string();
-            if line.starts_with(progress) {
-                eprintln!("  {line}");
-            }
-            tail.push(line);
-            if tail.len() > TAIL {
-                tail.remove(0);
-            }
-        }
+    prepared.run(knobs, output, progress, entry, &mut NativeRuntime)
+}
+
+struct NativeRuntime;
+
+impl Runtime for NativeRuntime {
+    type Admission = aterm_capacity::Claim;
+
+    fn admit(&mut self) -> Result<Self::Admission, Halt> {
+        super::measurement_entry().map_err(Halt::Timing)
     }
-    let status = child
-        .wait()
-        .map_err(|e| format!("could not wait for measurement executable: {e}"))?;
-    let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
-    if let Some(admitted) = &admitted {
+
+    fn validate(&mut self, admitted: &Self::Admission) -> Result<(), Halt> {
         admitted
             .timing_admission()
-            .map_err(|why| Halt::Timing(why.to_string()))?;
+            .map(|_| ())
+            .map_err(|why| Halt::Timing(why.to_string()))
     }
-    if !status.success() {
-        let out_tail: Vec<&str> = stdout.lines().rev().take(TAIL).collect();
-        return Err(Halt::Fail(format!(
-            "{name} exited {:?}\n--- stderr (tail) ---\n{}\n--- stdout (tail) ---\n{}",
-            status.code(),
-            tail.join("\n"),
-            out_tail.into_iter().rev().collect::<Vec<_>>().join("\n")
-        )));
+
+    fn capture(
+        &mut self,
+        command: &mut Command,
+        progress: &str,
+        name: &str,
+    ) -> Result<String, Halt> {
+        let executable = PathBuf::from(command.get_program());
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not execute {}: {e}", executable.display()))?;
+        let stdout = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut text = String::new();
+                let _ = (&mut out).take(16 * 1024 * 1024).read_to_string(&mut text);
+                let _ = std::io::copy(&mut out, &mut std::io::sink());
+                text
+            })
+        });
+        let mut tail: Vec<String> = Vec::new();
+        if let Some(err) = child.stderr.take() {
+            use std::io::Read as _;
+            const MAX_BENCH_STDERR_LINE: usize = 64 << 10;
+            let mut reader = std::io::BufReader::new(err);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match (&mut reader)
+                    .take((MAX_BENCH_STDERR_LINE as u64) + 1)
+                    .read_until(b'\n', &mut buf)
+                {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if !buf.ends_with(b"\n") && buf.len() > MAX_BENCH_STDERR_LINE {
+                    while let Ok(chunk) = reader.fill_buf() {
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        let nl = chunk.iter().position(|&b| b == b'\n');
+                        let len = chunk.len();
+                        if let Some(nl) = nl {
+                            reader.consume(nl + 1);
+                            break;
+                        }
+                        reader.consume(len);
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+                if line.starts_with(progress) {
+                    eprintln!("  {line}");
+                }
+                tail.push(line);
+                if tail.len() > TAIL {
+                    tail.remove(0);
+                }
+            }
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("could not wait for measurement executable: {e}"))?;
+        let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+        if !status.success() {
+            let out_tail: Vec<&str> = stdout.lines().rev().take(TAIL).collect();
+            return Err(Halt::Fail(format!(
+                "{name} exited {:?}\n--- stderr (tail) ---\n{}\n--- stdout (tail) ---\n{}",
+                status.code(),
+                tail.join("\n"),
+                out_tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            )));
+        }
+        Ok(stdout)
     }
-    Ok(stdout)
 }
 
 /// `targo` as a lane runs it: in the workspace's build directory, with the caller's rustflags
@@ -244,6 +187,7 @@ pub(crate) fn run_bench(
 pub(crate) struct Targo<'a> {
     driver: &'a CargoDriver,
     build_dir: Option<String>,
+    root: PathBuf,
 }
 
 impl<'a> Targo<'a> {
@@ -262,6 +206,7 @@ impl<'a> Targo<'a> {
         Targo {
             driver,
             build_dir: crate::perf::driver::workspace_build_dir().map(str::to_string),
+            root: workspace_root(),
         }
     }
 
@@ -282,7 +227,7 @@ impl<'a> Targo<'a> {
     pub(crate) fn command(&self, verb: &str) -> Result<Command, String> {
         super::driver::prepare_workspace_build_dir(verb, self.build_dir.as_deref())?;
         let mut cmd = self.driver.base_command();
-        cmd.args(self.lead(verb)).current_dir(workspace_root());
+        cmd.args(self.lead(verb)).current_dir(&self.root);
         self.environment(&mut cmd);
         super::driver::apply_workspace_layout(&mut cmd)?;
         Ok(cmd)
@@ -364,17 +309,42 @@ pub(crate) fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, 
         .map_err(|why| Halt::Fail(format!("cargo's config does not read: {why}")))
 }
 
-fn build_bench(targo: &Targo<'_>, build_args: &[&str]) -> Result<PathBuf, Halt> {
-    let mut args = vec!["-q"];
-    args.extend_from_slice(build_args);
-    args.extend(["--no-run", "--message-format", "json-render-diagnostics"]);
-    eprintln!("  $ {}", targo.display("bench", &args));
-    let messages = targo.output("bench", &args, "the bench's build")?;
-    built_binary(&messages, "aterm").map_err(|why| Halt::Fail(format!("the bench's build: {why}")))
-}
+impl Compiler for Targo<'_> {
+    fn context(&self) -> Result<BuildContext, Halt> {
+        let root = std::fs::canonicalize(&self.root)
+            .map_err(|why| format!("cannot resolve bench workspace: {why}"))?;
+        let directory = std::fs::metadata(&root)
+            .map_err(|why| format!("cannot identify bench workspace: {why}"))?;
+        Ok(BuildContext {
+            root,
+            root_identity: (directory.dev(), directory.ino()),
+            program: self.driver.program.clone(),
+            build_dir: self.build_dir.clone(),
+        })
+    }
 
-fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
-    built_executable(messages, name, "bin")
+    fn sources(&self) -> Result<Vec<flags::Source>, Halt> {
+        config_rustflags(self)
+    }
+
+    fn audit(&self, args: &[&str]) -> Result<units::Audit, Halt> {
+        audit(self, "bench", args)
+    }
+
+    fn compile(&self, args: &[&str]) -> Result<String, Halt> {
+        let mut words = vec!["-q"];
+        words.extend_from_slice(args);
+        words.extend(["--no-run", "--message-format", "json-render-diagnostics"]);
+        eprintln!("  $ {}", self.display("bench", &words));
+        self.output("bench", &words, "the bench's build")
+    }
+
+    fn runtime_command(&self, executable: &Path) -> Result<Command, Halt> {
+        let mut command = crate::exec::check_command(executable);
+        self.environment(&mut command);
+        command.current_dir(&self.root);
+        Ok(command)
+    }
 }
 
 fn set_bench_environment(

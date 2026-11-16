@@ -36,14 +36,16 @@ pub struct Finding {
 /// as a finding names none.
 pub fn sentence(kind: &str) -> Option<&'static str> {
     Some(match kind {
-        "facts-machine-unknown" => "A Mac's own facts bind a machine the registry does not have",
+        "facts-machine-unknown" => {
+            "A machine's own facts bind a machine row the registry does not have"
+        }
         "facts-differ" => {
-            "A Mac's own facts say another chip, memory or disk than its machine row states"
+            "A machine's own facts say another chip, memory or disk than its machine row states"
         }
         "facts-bind-one-machine" => "Two live enrollments bind one machine",
         "hw-hint-clone" => {
-            "Two live enrollments state one hardware hint: a copied Mac, or an identifier virtual \
-             machines share"
+            "Two live enrollments state one hardware hint: a copied machine, or an identifier \
+             virtual machines share"
         }
         "mailbox-obs-key-mismatch" => {
             "A mailbox observation's key does not name the mailbox it states"
@@ -59,13 +61,19 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
         "account-obs-key-mismatch" => {
             "An account observation's key does not name the account it states"
         }
-        "account-seen-unregistered" => "This Mac saw or used an account no registry row names yet",
+        "account-seen-unregistered" => {
+            "This machine saw or used an account no registry row names yet"
+        }
         "account-seen-unmarked" => {
-            "This Mac saw or used an account its own Accounts in use rows do not list yet"
+            "This machine saw or used an account its own Accounts in use rows do not list yet"
         }
         "account-ambiguous" => {
             "Two or more live accounts at one realm say this address, so a login of it matches \
              none"
+        }
+        "account-provider-retired" => {
+            "This machine saw a login at a provider the owner retired, so no account is added for \
+             it"
         }
         "preference-key-mismatch" => {
             "A link's key names another machine and account than its cells say"
@@ -75,7 +83,7 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
         "account-login-retired" => "A live account's login is a retired address",
         "account-identity-retired" => "A live account's identity is a retired address",
         "label-ambiguous" => {
-            "A machine's label is another live machine's alias, so it names two Macs"
+            "A machine's label is another live machine's alias, so it names two machines"
         }
         "address-key-elsewhere" => "An address row says an address another row is keyed by",
         "alias-of-retired" => "An address is an alias of a retired address",
@@ -85,6 +93,43 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
         "mailbox-guess-differs" => "An address's mailbox is not the one guessed for it",
         "protected-address-has-mailbox" => "A protected address names a mailbox",
         "duplicate-number" => "Two live phone rows hold one number",
+        _ => return None,
+    })
+}
+
+/// A lab finding of `kind`'s heading, a few words in sentence case, for each word [`sentence`]
+/// says; `None` for any other word, whose heading is the table layer's or none
+/// ([`check::headed`] asks both).
+pub fn heading(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "facts-machine-unknown" => "Facts name an unknown machine",
+        "facts-differ" => "Facts differ from the machine row",
+        "facts-bind-one-machine" => "Two enrollments, one machine",
+        "hw-hint-clone" => "Two enrollments, one hardware hint",
+        "mailbox-obs-key-mismatch" => "Reading keyed to another mailbox",
+        "mailbox-obs-mailbox-unknown" => "Reading of an unknown mailbox",
+        "mailbox-obs-on-retired-mailbox" => "Reading of a retired mailbox",
+        "mailbox-obs-ambiguous" => "Address in two mailboxes",
+        "mailbox-discovery-differs" => "Mailbox differs from discovery",
+        "account-obs-key-mismatch" => "Reading keyed to another account",
+        "account-seen-unregistered" => "Account seen, not registered",
+        "account-seen-unmarked" => "Account seen, not listed",
+        "account-ambiguous" => "Login matches several accounts",
+        "account-provider-retired" => "Login at a retired provider",
+        "preference-key-mismatch" => "Link key names another pair",
+        "preference-on-retired-machine" => "Link to a retired machine",
+        "preference-for-retired-account" => "Link to a retired account",
+        "account-login-retired" => "Retired login address",
+        "account-identity-retired" => "Retired identity address",
+        "label-ambiguous" => "Label names two machines",
+        "address-key-elsewhere" => "Address another row is keyed by",
+        "alias-of-retired" => "Alias of a retired address",
+        "alias-cycle" => "Alias loop",
+        "address-mailbox-retired" => "Retired mailbox named",
+        "address-mailbox-hint-retired" => "Guessed mailbox is retired",
+        "mailbox-guess-differs" => "Mailbox differs from its guess",
+        "protected-address-has-mailbox" => "Protected address with a mailbox",
+        "duplicate-number" => "Phone number held twice",
         _ => return None,
     })
 }
@@ -385,13 +430,11 @@ pub fn observed(
     obs: &OwnedRead,
     now_ms: u64,
 ) -> Vec<Seen> {
-    use super::observe::{Holds, holds};
-    let addresses = cell::project(&ADDRESS, cells);
-    let index = super::registry::AddressIndex::of(&addresses);
-    let accounts = cell::project(&ACCOUNT, cells);
+    use super::observe::{Holds, Known, holds};
+    let known = Known::of(cells);
     let mut found: BTreeMap<Finding, Vec<String>> = BTreeMap::new();
     for (s, pending) in seen {
-        let finding = match holds(s, &index, &accounts) {
+        let finding = match holds(s, &known) {
             Holds::Unborn(pk) => Finding {
                 kind: "account-seen-unregistered",
                 collection: ACCOUNT.name,
@@ -513,7 +556,7 @@ pub fn lab(table: &Table, cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) 
             });
         }
     }
-    // Machines: a live label that is another live machine's alias names two Macs.
+    // Machines: a live label that is another live machine's alias names two machines.
     let machine_aliases: Vec<(&String, &crate::typed::cell::Field)> = machines
         .rows
         .iter()

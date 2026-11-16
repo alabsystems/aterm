@@ -16,7 +16,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
 use crate::port::{GithubError, GithubFailure, Secret, System};
 use crate::sync::repository_refresh::{Admission, Execution, RepositoryPass, Ticket};
-use aterm_converge::{Class, Layer, Remedy, Requires, StoodAside};
+use aterm_converge::{Class, Explain, Layer, Remedy, Requires, StoodAside};
 use aterm_secrets::converge::RepositoryWork;
 use aterm_types::macos_setup::FailureKind;
 use std::collections::BTreeSet;
@@ -36,6 +36,13 @@ const ACCESSIBLE: &str =
 const GITHUB_STEP: &str = "github.settings";
 /// Preserved checkout work is separate from the settings remedy.
 const REPOSITORIES_STEP: &str = "github.repositories";
+
+fn preserved_reason(standing: &repos::Partition, reasons: &str) -> String {
+    format!(
+        "{}; preserved work or dependency metadata blocks completion: {reasons}",
+        standing.counts().summary()
+    )
+}
 
 /// The line of a row that stood aside because another pass holds the repository lease
 /// ([`Wait::OtherPass`]).
@@ -1171,10 +1178,9 @@ impl Item for NativeRepositories {
             {
                 Probe::Person {
                     step: REPOSITORIES_STEP.into(),
-                    how: format!(
-                        "{}; preserved work or dependency metadata blocks completion: {}",
-                        counts.summary(),
-                        repos::named(&standing.notes).unwrap_or_default()
+                    how: preserved_reason(
+                        &standing,
+                        &repos::named(&standing.notes).unwrap_or_default(),
                     ),
                 }
             } else if counts.ready == counts.total() {
@@ -1261,6 +1267,43 @@ impl Item for NativeRepositories {
 
     fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
         self.reading.detail()
+    }
+
+    fn explain(&self, probe: &Probe) -> Option<Explain> {
+        let Probe::Person { step, how } = probe else {
+            return None;
+        };
+        if step != REPOSITORIES_STEP {
+            return None;
+        }
+        let (empty_inventory, standing) = self.last_read()?;
+        if empty_inventory
+            || !standing.missing.is_empty()
+            || !standing.dependencies.is_empty()
+            || !standing.unborn.is_empty()
+            || !standing.git_waits.is_empty()
+            || standing.notes.is_empty()
+        {
+            return None;
+        }
+        let compact = preserved_reason(
+            &standing,
+            &repos::named(&standing.notes).unwrap_or_default(),
+        );
+        // Only enrich this captured verdict. Keep any hook-installer result that the probe
+        // appended after its compact reason, without another probe or an older hook record.
+        let suffix = how.strip_prefix(&compact)?;
+        let how = format!(
+            "{}{suffix}",
+            preserved_reason(&standing, &standing.notes.join("; "))
+        );
+        Some(Explain {
+            why: how.clone(),
+            remedy: Remedy::Person {
+                pane: step.clone(),
+                how,
+            },
+        })
     }
 
     /// The row ended with nothing after its last probe: the lease that probe or its apply kept
@@ -1901,6 +1944,9 @@ impl Item for Acquisition {
     }
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
         self.0.probe(sys, ctx)
+    }
+    fn explain(&self, probe: &Probe) -> Option<Explain> {
+        self.0.explain(probe)
     }
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         self.0.apply(sys, ctx)

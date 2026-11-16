@@ -146,7 +146,7 @@ impl ProcArgs {
 fn name_fold() -> fn(char) -> char {
     #[cfg(windows)]
     {
-        aterm_sysprobe::paths::fold_case
+        aterm_path::fold_case
     }
     #[cfg(not(windows))]
     {

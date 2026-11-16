@@ -98,7 +98,10 @@ impl Record {
         let Some(kind) = Kind::from_word(&k) else {
             let body = Body::Unknown { k };
             let record = Record { seq, ms, body };
-            return Ok(Decoded { record, unknown: 0 });
+            return Ok(Decoded {
+                record,
+                unknown: object.unknown(),
+            });
         };
         let mut unknown = 0;
         let body = body(kind, &mut object, &mut unknown)?;

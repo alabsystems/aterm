@@ -50,6 +50,11 @@ aterm-phase = { workspace = true }
 # (`aterm_tempfile::manifest_dir`).
 aterm-tempfile = { workspace = true }
 
+# Every test is in slog_suite; the library has none, so it builds no test harness of its own
+# (its doctests still run).
+[lib]
+test = false
+
 [[test]]
 name = "slog_suite"
 path = "tests/slog_suite.rs"

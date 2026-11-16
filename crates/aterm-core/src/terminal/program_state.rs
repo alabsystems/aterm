@@ -469,10 +469,18 @@ impl ProgramStateReport {
     /// program's report ([`Self::other`]) is never one.
     #[must_use]
     pub fn run_sign(&self) -> Option<String> {
+        self.sign().map(body_of)
+    }
+
+    /// [`Self::run_sign`] by value: the known programs' report standing while its writer's group
+    /// is in front, else `None`. A reader that runs with each parse (the session's reader, which
+    /// keeps it off the term lock) takes it with no allocation.
+    #[must_use]
+    pub const fn sign(&self) -> Option<ProgramState> {
         if self.writer != self.front {
             return None;
         }
-        self.carried()
+        self.state
     }
 }
 

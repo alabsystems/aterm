@@ -82,6 +82,34 @@ impl Sessions {
     }
 }
 
+/// The newest clock of `t`'s profiles, where every profile's clock was read and none was
+/// written within `window_s` of `now`: what [`assess`] reads of the profiles, and what an
+/// entry-bound look reads before it walks a directory at all.
+///
+/// # Errors
+/// A profile whose clock could not be read, or one written inside the window.
+pub fn unwritten(t: &TargetDir, now: i64, window_s: i64) -> Result<i64, String> {
+    let mut newest = i64::MIN;
+    for p in &t.profiles {
+        let Some(m) = p.last_used else {
+            return Err(format!(
+                "{}: its caches' clock could not be read",
+                p.path.display()
+            ));
+        };
+        newest = newest.max(m);
+    }
+    let age = now.saturating_sub(newest);
+    if age < window_s {
+        return Err(format!(
+            "a profile was written into {} ago, inside the {} window",
+            human_age(age),
+            human_age(window_s)
+        ));
+    }
+    Ok(newest)
+}
+
 /// Clause 4a for the build directory `dir` of `checkout`.
 ///
 /// # Errors
@@ -172,7 +200,7 @@ impl SessionCwd {
 pub fn under(path: &Path, dir: &Path, table: Option<&Table>) -> Option<bool> {
     match table {
         Some(t) if cfg!(windows) => t.is_under(path, dir),
-        _ => aterm_sysprobe::paths::is_under(path, dir),
+        _ => aterm_path::is_under(path, dir),
     }
 }
 
@@ -277,24 +305,7 @@ pub fn assess(
     if t.profiles.is_empty() {
         return Err("it holds no cargo profile".to_owned());
     }
-    let mut newest = i64::MIN;
-    for p in &t.profiles {
-        let Some(m) = p.last_used else {
-            return Err(format!(
-                "{}: its caches' clock could not be read",
-                p.path.display()
-            ));
-        };
-        newest = newest.max(m);
-    }
-    let age = cx.now.saturating_sub(newest);
-    if age < cx.window_s {
-        return Err(format!(
-            "a profile was written into {} ago, inside the {} window",
-            human_age(age),
-            human_age(cx.window_s)
-        ));
-    }
+    let newest = unwritten(t, cx.now, cx.window_s)?;
     sessions_clear(
         cx.session_cwds,
         cx.cwd_unknown,

@@ -12,6 +12,8 @@ use super::{
 use crate::Result;
 use astream_wire::sync::Digest;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::{cell::RefCell, rc::Rc};
 
 /// One read of a typed table, the quota applied.
 #[derive(Clone, Debug)]
@@ -237,5 +239,46 @@ impl View {
     /// The stored schema row of `collection`: the highest version any eligible operation wrote.
     pub fn schema(&self, collection: &str) -> SchemaState {
         owned::schema_state(&self.ops, collection)
+    }
+}
+
+/// One [`View`]'s collections, each projected ([`View::project`]) at the first ask and handed
+/// out again at every later one, so a reader that asks for one collection several times pays
+/// for one projection of it: the shared-file materializer asks for MACHINE's rows for the
+/// machines file itself and for cells each of its three files computes from them. It borrows
+/// the view, which no one can change while it is borrowed, so what it hands out is that view's
+/// projection. It knows a collection by its name, which no two collections of a table share;
+/// a view is one table's, so a name names one collection of it.
+#[cfg(unix)]
+pub(crate) struct Projections<'v> {
+    view: &'v View,
+    memo: RefCell<BTreeMap<&'static str, Rc<Projection>>>,
+}
+
+#[cfg(unix)]
+impl<'v> Projections<'v> {
+    /// No collection of `view` projected yet.
+    pub(crate) const fn new(view: &'v View) -> Self {
+        Self {
+            view,
+            memo: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// The view these are projections of.
+    pub(crate) const fn view(&self) -> &'v View {
+        self.view
+    }
+
+    /// `collection`'s rows ([`View::project`]), projected at the first ask of its name.
+    pub(crate) fn project(&self, collection: &Collection) -> Rc<Projection> {
+        if let Some(projection) = self.memo.borrow().get(collection.name) {
+            return Rc::clone(projection);
+        }
+        let projection = Rc::new(self.view.project(collection));
+        self.memo
+            .borrow_mut()
+            .insert(collection.name, Rc::clone(&projection));
+        projection
     }
 }

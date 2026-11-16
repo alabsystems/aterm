@@ -284,6 +284,9 @@ const TABLE: &[Verb] = &[
                 Downloads or other apps' data), each with its size, last write and the age of \
                 its measure; measures what was never measured or measured longest ago first; \
                 removes nothing\n\
+                aterm pkg machine cache second-hashes — how many units verify's compiles built \
+                under a second hash beside another of their package and kind, by the input that \
+                moved first and by the package it moved in; reads its record, removes nothing\n\
                 aterm pkg machine cache retire ABS — retire one registered ordinary cache, with \
                                                     identity, Cargo lock and process-use checks\n\
                 aterm pkg machine cache retain ABS — keep one existing exact cache root; no \
@@ -1998,7 +2001,14 @@ fn selfupdate_plan(
             ));
         }
     }
-    match selfupdate::classify(row, args) {
+    // A word a harness leads: its twin intercepts no verb and runs the launch under the harness,
+    // whose `run` hands over a self-update verb it reads (kimi-alab's, HX-09b).
+    let verdict = if crate::harness::twin_harness(layout, row.program).is_some() {
+        selfupdate::classify_handed(args)
+    } else {
+        selfupdate::classify(row, args)
+    };
+    match verdict {
         Verdict::Help => return forward(Some(selfupdate::help_line(row))),
         Verdict::PassThrough => return forward(None),
         Verdict::Declined(d) => {
@@ -2573,18 +2583,6 @@ fn wait_then_run(
         eprintln!("{}", not_installed_fix(layout, program));
         return ExitCode::from(127);
     }
-    #[cfg(unix)]
-    if let Some(shim) = led_shim(layout, tool) {
-        #[expect(
-            clippy::disallowed_types,
-            reason = "a pending stub becomes the landed program's shim by exec: its caller's descriptors are the shim's"
-        )]
-        let mut command = std::process::Command::new(&shim);
-        command.args(passthrough);
-        let err = crate::platform::exec_or_run(&mut command);
-        eprintln!("atpkg: could not run {}: {err}", shim.display());
-        return ExitCode::from(126);
-    }
     let mut rest = Vec::with_capacity(passthrough.len() + 2);
     rest.push(tool.to_string());
     rest.push("--".to_string());
@@ -2592,16 +2590,23 @@ fn wait_then_run(
     cmd_run(&rest)
 }
 
-/// THE SHIM A PENDING STUB HANDS A PROGRAM A HARNESS LEADS ONCE IT LANDS: its `bin/` shim,
-/// whose harness hand-off ([`crate::platform::sh_harness_prelude`]) runs the launch under the
-/// harness that leads its word ([`crate::harness::twin_harness`]). That harness's `run` does what
-/// the launcher's blocks once did for the word (the yolo default, and grok-alab's sign-in gate:
-/// HX-09b, HX-10d, HX-13a); [`cmd_run`] would exec the store build past the hand-off
+/// THE SHIM [`cmd_run`] HANDS A LAUNCH OF A WORD A HARNESS LEADS: its `bin/` shim, whose harness
+/// hand-off ([`crate::platform::sh_harness_prelude`]) runs the launch under the harness that
+/// leads its word ([`crate::harness::twin_harness`]), as a typed word's twin does. That harness's
+/// `run` does what the launcher's blocks once did for the word (kimi-alab's and grok-alab's yolo
+/// default and self-update intercept, grok-alab's sign-in gate: HX-09b, HX-10d), so `aterm kimi
+/// upgrade`, `aterm pkg run grok` and a pending stub's launch once its program lands
+/// ([`wait_then_run`]) reach it; execing the store build would pass it by
 /// (`docs/DESIGN-harness-repos-2026-10-24.md` D44). `None` for a word no harness leads, which
-/// keeps `cmd_run`'s path, and for a tool name atpkg refuses.
+/// runs the store build, and for a tool name atpkg refuses. Only an agent program's shim
+/// carries a hand-off ([`crate::platform::twin_prelude`]), so any other program is answered
+/// before the registry is read.
 #[cfg(unix)]
 fn led_shim(layout: &crate::store::Layout, tool: &str) -> Option<std::path::PathBuf> {
     let program = crate::stub::program_of_in(layout, tool);
+    if !crate::stub::is_agent_program(&program) {
+        return None;
+    }
     crate::harness::twin_harness(layout, &program)?;
     Some(layout.shim(&crate::store::ToolName::new(tool)?))
 }
@@ -3824,6 +3829,26 @@ fn cmd_run(rest: &[String]) -> ExitCode {
             return ExitCode::from(127);
         }
     };
+    let child_path =
+        crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
+    #[cfg(unix)]
+    if let Some(shim) = led_shim(&layout, tool) {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "aterm pkg run becomes the led word's shim by exec: its caller's descriptors are the shim's"
+        )]
+        let mut command = std::process::Command::new(&shim);
+        aterm_uds::spawn::set_flags(&mut command, 0);
+        command.args(args).env("PATH", &child_path);
+        // The build's declared environment, as the store build gets it below, whether or not
+        // the shim was laid with it.
+        for (name, value) in env.entries() {
+            command.env(name, value);
+        }
+        let err = crate::platform::exec_or_run(&mut command);
+        eprintln!("atpkg: could not run {}: {err}", shim.display());
+        return ExitCode::from(126);
+    }
     if runs_self_update_verb(&layout, tool, args)
         && let Some(name) = crate::store::ToolName::new(tool)
     {
@@ -3855,8 +3880,6 @@ fn cmd_run(rest: &[String]) -> ExitCode {
         }
         crate::yolo::Launch::AsTyped => args,
     };
-    let child_path =
-        crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
     #[expect(
         clippy::disallowed_types,
         reason = "aterm pkg run becomes the tool by exec: its caller's descriptors are the tool's"
@@ -7047,6 +7070,13 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
             days(idle),
             days(after)
         ),
+        Unused::SharedUnits { units, idle, after } => format!(
+            "candidate: {units} unit(s) of the shared dependency store targo fills, the most \
+             recently used of them unused for {} (age threshold {}); each goes only while no \
+             build holds its lock, and the next build that needs one builds it again",
+            days(idle),
+            days(after)
+        ),
         Unused::Leftover {
             idle,
             after,
@@ -7364,6 +7394,20 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 HOLDERS_LISTING_BUDGET,
             );
             println!("{}", holders_listing(&survey, now, &home));
+            ExitCode::SUCCESS
+        }
+        [sub, action] if sub == "cache" && action == "second-hashes" => {
+            let Some(state) = aterm_types::dirs::account_state_dir() else {
+                eprintln!("atpkg: the second-hash record needs an aterm state directory");
+                return ExitCode::from(2);
+            };
+            print!(
+                "{}",
+                aterm_capacity::second_hash::SecondHashes::load(
+                    &state.join(aterm_capacity::second_hash::RECORD)
+                )
+                .listing()
+            );
             ExitCode::SUCCESS
         }
         [sub, action, root] if sub == "cache" && action == "retire" => {

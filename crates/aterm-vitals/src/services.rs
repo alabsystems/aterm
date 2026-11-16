@@ -24,14 +24,12 @@
 
 use std::collections::HashMap;
 
+use aterm_process_facts::services::{
+    Identity, Member, Reading, Service, episode, kernel_member, system_uid,
+};
+
 use crate::explain::{CoalRow, Lead, Part, Voucher};
 use crate::model::Snapshot;
-
-/// macOS keeps the uids below this for its own accounts (root, `_windowserver`, `_spotlight`).
-pub const SYSTEM_UID_BELOW: u32 = 500;
-
-/// `nobody`'s uid (-2), a system account above [`SYSTEM_UID_BELOW`].
-pub const NOBODY_UID: u32 = u32::MAX - 1;
 
 /// A service is large from this footprint, or from [`LARGE_SHARE`] of memory where that is more.
 pub const LARGE_FLOOR: u64 = 8 << 30;
@@ -57,19 +55,11 @@ pub const HOLD_MS: u64 = 10 * 60_000;
 /// [`crate::events::SWAP_ACTIVE_BPS`] reads swapping.
 pub const SWAP_PRESSED_BPS: f64 = crate::events::SWAP_ACTIVE_BPS;
 
-/// Whether `uid` is one of the system's own accounts.
-#[must_use]
-pub const fn system_uid(uid: u32) -> bool {
-    uid < SYSTEM_UID_BELOW || uid == NOBODY_UID
-}
-
-/// Whether `pid` belongs to the kernel's own coalition: `kernel_task` (pid 0) and launchd
-/// (pid 1), which the kernel places in it. Its footprint is mostly the kernel's, which no
-/// restart frees, so it is never a service.
-#[must_use]
-pub const fn kernel_member(pid: u32) -> bool {
-    pid <= 1
-}
+/// The shortest span the [`Judge`] measures swap traffic over. A reading sooner than this after
+/// the swap counter's baseline (a wake or a pressure move ended the watch's rest early) keeps
+/// that baseline and the last swap verdict, so a few megabytes paged in the seconds after a wake
+/// are not read as a megabyte a second.
+pub const SWAP_SPAN_MS: u64 = 60_000;
 
 /// The footprint from which a service of a machine with `total` bytes of memory is large.
 #[must_use]
@@ -189,6 +179,16 @@ pub const FSEVENTSD: Restart = Restart {
 pub const RESTARTS: &[Restart] = &[FSEVENTSD];
 
 impl Restart {
+    /// The name, image and uid a native reader may observe, without restart authority.
+    #[must_use]
+    pub const fn identity(&self) -> Identity<'static> {
+        Identity {
+            name: self.name,
+            path: self.path,
+            uid: self.uid,
+        }
+    }
+
     /// Whether `service` is this one, by its name, uid and image, and alone in its coalition
     /// (the footprint is its own).
     #[must_use]
@@ -219,148 +219,6 @@ pub fn restart_of(service: &Service) -> Option<&'static Restart> {
 #[must_use]
 pub fn restart_named(name: &str) -> Option<&'static Restart> {
     RESTARTS.iter().find(|r| r.name == name)
-}
-
-/// One service as read: a resource coalition of the system's own accounts and its lead.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Service {
-    /// The coalition's id.
-    pub coalition: u64,
-    /// Its lead's pid: its earliest-born live member.
-    pub pid: u32,
-    /// When the lead started: unix seconds.
-    pub start_s: u64,
-    /// The microseconds within [`Self::start_s`].
-    pub start_us: u32,
-    /// The lead's uid.
-    pub uid: u32,
-    /// The kernel's short name for the lead (`p_comm`): data, never an instruction.
-    pub name: String,
-    /// The lead's image, where read: only from [`followed_from`] ([`fold`]).
-    pub path: Option<String>,
-    /// Its live members.
-    pub live: u32,
-    /// The coalition's live footprint, bytes.
-    pub footprint: u64,
-}
-
-impl Service {
-    /// The process this reading measured, `<pid>-<start second>`: one episode's name, which a
-    /// new process in its place (a restart) never shares.
-    #[must_use]
-    pub fn episode(&self) -> String {
-        episode(self.pid, self.start_s)
-    }
-}
-
-/// `<pid>-<start second>`: the process an episode is of ([`Service::episode`]).
-#[must_use]
-pub fn episode(pid: u32, start_s: u64) -> String {
-    format!("{pid}-{start_s}")
-}
-
-/// One live process as a reader saw it: the kernel's record of it and its resource coalition.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Member {
-    /// Its pid.
-    pub pid: u32,
-    /// Its uid.
-    pub uid: u32,
-    /// The kernel's short name for it (`p_comm`).
-    pub name: String,
-    /// When it started: unix seconds.
-    pub start_s: u64,
-    /// The microseconds within [`Self::start_s`].
-    pub start_us: u32,
-    /// Its resource coalition's id.
-    pub coalition: u64,
-}
-
-impl Member {
-    /// The process, `<pid>-<start second>` ([`episode`]).
-    #[must_use]
-    pub fn episode(&self) -> String {
-        episode(self.pid, self.start_s)
-    }
-}
-
-/// The reading of a machine with `total` bytes of memory whose live processes are `members`:
-/// each coalition whose every member runs as a system account ([`system_uid`]) and none is the
-/// kernel's ([`kernel_member`]) is a service, led by its earliest-born member (the lower pid on a
-/// tie), with its footprint as `footprint` reads it by coalition id. A coalition whose footprint
-/// does not read is one of [`Reading::unread`], by its lead. `path` reads the image of each lead
-/// from [`followed_from`], the only ones a restart is matched to. The memory strain is left
-/// unread ([`Reading::pressure_warn`], [`Reading::swapped_kib`]) for the reader to fill.
-pub fn fold(
-    members: &[Member],
-    total: u64,
-    mut footprint: impl FnMut(u64) -> Option<u64>,
-    mut path: impl FnMut(u32) -> Option<String>,
-) -> Reading {
-    let mut groups: HashMap<u64, Vec<&Member>> = HashMap::new();
-    for m in members {
-        groups.entry(m.coalition).or_default().push(m);
-    }
-    let mut out = Vec::new();
-    let mut unread = Vec::new();
-    for (coalition, group) in groups {
-        if !group
-            .iter()
-            .all(|m| !kernel_member(m.pid) && system_uid(m.uid))
-        {
-            continue;
-        }
-        let Some(lead) = group.iter().min_by_key(|m| (m.start_s, m.start_us, m.pid)) else {
-            continue;
-        };
-        let Some(footprint) = footprint(coalition) else {
-            unread.push((*lead).clone());
-            continue;
-        };
-        out.push(Service {
-            coalition,
-            pid: lead.pid,
-            start_s: lead.start_s,
-            start_us: lead.start_us,
-            uid: lead.uid,
-            name: lead.name.clone(),
-            path: None,
-            live: u32::try_from(group.len()).unwrap_or(u32::MAX),
-            footprint,
-        });
-    }
-    out.sort_by(|a, b| {
-        b.footprint
-            .cmp(&a.footprint)
-            .then(a.coalition.cmp(&b.coalition))
-    });
-    unread.sort_by_key(|m| (m.coalition, m.pid));
-    let from = followed_from(total);
-    for service in out.iter_mut().filter(|s| s.footprint >= from) {
-        service.path = path(service.pid);
-    }
-    Reading {
-        total,
-        services: out,
-        unread,
-        pressure_warn: None,
-        swapped_kib: None,
-    }
-}
-
-/// One read of every service, and of the memory strain they are read against.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Reading {
-    /// The machine's physical memory, bytes.
-    pub total: u64,
-    /// Every service whose footprint was read, largest first.
-    pub services: Vec<Service>,
-    /// The lead of each service whose footprint did not read: not under its bar, unknown.
-    pub unread: Vec<Member>,
-    /// Whether the kernel's memory pressure level is past normal; `None` where unread.
-    pub pressure_warn: Option<bool>,
-    /// KiB swapped in plus out since boot; `None` where unread.
-    pub swapped_kib: Option<u64>,
 }
 
 /// One service the [`Judge`] follows: read from [`followed_from`], or unread since it was.
@@ -417,7 +275,9 @@ pub struct Told {
     /// The lead of each service whose footprint this reading did not read.
     pub unread: Vec<Member>,
     /// Whether memory is under pressure now: the kernel's level past normal, or swap moving at
-    /// [`SWAP_PRESSED_BPS`] or more since the reading before.
+    /// [`SWAP_PRESSED_BPS`] or more over the last span of [`SWAP_SPAN_MS`] or more the judge
+    /// measured, where every reading since that span ended, this one included, read the swap
+    /// counter: one that did not tells no swap until the next span ends ([`Judge::absorb`]).
     pub pressed: bool,
     /// When the reading was taken, on the judge's clock.
     pub at_ms: u64,
@@ -444,8 +304,11 @@ impl Told {
 pub struct Judge {
     /// Each service followed, by its lead's pid and start.
     followed: HashMap<(u32, u64, u32), Seen>,
-    /// The last swap counter read and when: `(at_ms, kib)`.
+    /// The swap counter the next span is measured from, and when it was read: `(at_ms, kib)`.
     swap: Option<(u64, u64)>,
+    /// Whether swap moved at [`SWAP_PRESSED_BPS`] or more over the last span measured; `false`
+    /// before one, and after a reading whose swap counter did not read.
+    swap_pressed: bool,
     told: Option<Told>,
 }
 
@@ -462,6 +325,13 @@ impl Judge {
     /// bar for [`HOLD_MS`] (or carried, [`Self::carry`]) until it leaves every size; a service
     /// whose footprint did not read keeps what it was; a new process in a service's place
     /// starts over.
+    ///
+    /// Swap is measured over a span of [`SWAP_SPAN_MS`] or more, from the counter of the reading
+    /// that ended the last span: the first reading sets that baseline and tells no swap; a
+    /// reading sooner than the span keeps the baseline and tells the last span's verdict, however
+    /// little time a ring left since the reading before; one whose swap counter did not read
+    /// tells no swap and keeps the baseline, and so does each reading after it until one ends a
+    /// span.
     pub fn absorb(&mut self, at_ms: u64, reading: Option<&Reading>) -> Option<&Told> {
         let Some(reading) = reading else {
             return self.told.as_ref();
@@ -503,14 +373,21 @@ impl Judge {
                 followed.insert(key, was.clone());
             }
         }
-        let swap_bps = match (self.swap, reading.swapped_kib) {
-            (Some((then_ms, then_kib)), Some(kib)) if at_ms > then_ms => {
-                kib.saturating_sub(then_kib) as f64 * 1024.0 * 1000.0 / (at_ms - then_ms) as f64
+        match (self.swap, reading.swapped_kib) {
+            (Some((then_ms, then_kib)), Some(kib)) => {
+                let span_ms = at_ms.saturating_sub(then_ms);
+                if span_ms >= SWAP_SPAN_MS {
+                    let bps =
+                        kib.saturating_sub(then_kib) as f64 * 1024.0 * 1000.0 / span_ms as f64;
+                    self.swap_pressed = bps >= SWAP_PRESSED_BPS;
+                    self.swap = Some((at_ms, kib));
+                }
             }
-            _ => 0.0,
-        };
-        if let Some(kib) = reading.swapped_kib {
-            self.swap = Some((at_ms, kib));
+            (None, Some(kib)) => {
+                self.swap = Some((at_ms, kib));
+                self.swap_pressed = false;
+            }
+            (_, None) => self.swap_pressed = false,
         }
         let mut services: Vec<Seen> = followed.values().cloned().collect();
         services.sort_by(|a, b| {
@@ -524,7 +401,7 @@ impl Judge {
             total,
             services,
             unread: reading.unread.clone(),
-            pressed: reading.pressure_warn == Some(true) || swap_bps >= SWAP_PRESSED_BPS,
+            pressed: reading.pressure_warn == Some(true) || self.swap_pressed,
             at_ms,
         });
         self.told.as_ref()
@@ -636,7 +513,7 @@ pub fn rows_over(rows: &[CoalRow], total: u64) -> Vec<RowOver> {
     out
 }
 
-/// The services of a direct read past its large bar, largest first ([`fold`] left out the
+/// The services of a direct read past its large bar, largest first ([`aterm_process_facts::services::fold`] left out the
 /// kernel's coalition and every one of another account's).
 #[must_use]
 pub fn reading_over(reading: &Reading) -> Vec<RowOver> {

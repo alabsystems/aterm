@@ -43,9 +43,7 @@ fn first_standing(seen: &[Option<Projection>]) -> Option<usize> {
 #[test]
 fn a_steady_fill_stands_after_ten_minutes_of_crossings_and_not_before() {
     let mut f = Fill::new();
-    assert!(f.cold());
     let seen = fill_at(&mut f, 100 * GIB, 40.0 * MB, 0, 40);
-    assert!(!f.cold(), "it read its rates");
     let at = first_standing(&seen).expect("a 40 MB/s fill 53 GiB above its floor stands");
     // The 5- and 10-minute rates read from the eighth look or so, and the streak then needs
     // ten more minutes: never before 17 looks, and within 20.
@@ -58,11 +56,6 @@ fn a_steady_fill_stands_after_ten_minutes_of_crossings_and_not_before() {
     assert!(
         seen[at..].iter().all(Option::is_some),
         "it stands while the fill goes on"
-    );
-    let free = (100 * GIB as i64 - (40.0 * MB * 39.0 * 60.0) as i64) as u64;
-    assert!(
-        f.crossing(free, FLOOR, Some(TOTAL)).is_some(),
-        "and presses the ask"
     );
 }
 
@@ -207,7 +200,6 @@ fn a_cold_ring_projects_nothing_and_a_standing_one_lapses_when_readings_stop() {
     let mut f = Fill::new();
     let seen = fill_at(&mut f, 60 * GIB, 80.0 * MB, 0, 7);
     assert_eq!(first_standing(&seen), None, "under ten minutes of ring");
-    assert!(f.cold());
     let mut f = Fill::new();
     let seen = fill_at(&mut f, 100 * GIB, 40.0 * MB, 0, 25);
     assert!(seen.last().copied().flatten().is_some(), "stands");
@@ -219,35 +211,8 @@ fn a_cold_ring_projects_nothing_and_a_standing_one_lapses_when_readings_stop() {
         .collect();
     assert!(after[0].is_some(), "the first look after waking keeps it");
     assert!(
-        f.crossing(40 * GIB, FLOOR, Some(TOTAL)).is_none(),
-        "but a look with no rate presses no ask"
-    );
-    assert!(
         after.last().copied().flatten().is_none(),
         "lapsed: {after:?}"
-    );
-}
-
-#[test]
-fn a_pass_that_frees_the_horizons_fill_presses_the_ask_no_more() {
-    let mut f = Fill::new();
-    let seen = fill_at(&mut f, 100 * GIB, 10.0 * MB, 0, 25);
-    let p = seen
-        .last()
-        .copied()
-        .flatten()
-        .expect("10 MB/s from 100 GiB stands");
-    assert!(f.crossing(85 * GIB, FLOOR, Some(TOTAL)).is_some());
-    // The pass took free space past the floor plus two hours of the fill.
-    let after = FLOOR + p.need + GIB;
-    assert!(
-        f.pressing().is_some(),
-        "the pass stays pressed until the projection lapses"
-    );
-    assert_eq!(
-        f.crossing(after, FLOOR, Some(TOTAL)),
-        None,
-        "the ask is not"
     );
 }
 

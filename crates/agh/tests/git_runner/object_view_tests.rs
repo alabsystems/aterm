@@ -115,12 +115,15 @@ fn native_push_preserves_the_source_object_depth_boundary() {
         .fx(fx)
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
-    gh.run_git(&GitRun::push_refs(
-        &common::slug("fixture-dev/app"),
-        &source,
-        push_batch(&[("refs/heads/main", &before, &after)]),
-        false,
-    ))
+    journaled_push(
+        &gh,
+        &GitRun::push_refs(
+            &common::slug("fixture-dev/app"),
+            &source,
+            push_batch(&[("refs/heads/main", &before, &after)]),
+            false,
+        ),
+    )
     .unwrap_or_else(|error| panic!("{}", error.why));
     assert!(
         *seen.lock().unwrap(),

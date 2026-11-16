@@ -46,6 +46,7 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
 
 fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
     restore::WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,
@@ -247,6 +248,57 @@ fn the_restore_s_close_regrids_every_tab_to_its_window_once() {
     assert_eq!(sites(&app), once, "one re-grid each, booked restore");
     app.regrid_restored_windows();
     assert_eq!(sites(&app), once, "a tab at its size books nothing");
+}
+
+/// DK-4 ON A COLD RESTORE (the sliced drain): a held window owed its default dock inside is
+/// paid by no park while the drain runs (its close's re-grid would plan around the commit), and
+/// once the drain's finalizer has re-gridded it, the next park pays the dock as one `site=dock`
+/// resize per program, after the restore's one `site=restore`.
+#[test]
+fn a_held_window_owes_its_dock_until_the_sliced_drain_finishes() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut wl = window(&["A", "B", "C"], 0);
+    // Saved at another grid than the window takes, so the drain's close re-grids each tab.
+    (wl.cols, wl.maximized) = (140, Some(true));
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![wl.clone()]));
+    {
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
+        (ws.rows, ws.cols) = (27, 140);
+    }
+    app.take_dock_record(wid, wl.dock, crate::app_window::DockBirth::of_row(&wl));
+    app.config.navigator = Some(crate::app_config::NavigatorConfig { dock: Some(true) });
+    // The seat a windowed launch makes at its attach; the drain itself runs headless here.
+    app.headless = false;
+    assert!(!app.seat_birth_dock(wid), "held: not born wider");
+    app.headless = true;
+    assert!(app.windows[&wid].dock.owes_birth_dock());
+
+    let now = Instant::now();
+    let deadline = now + aterm_spec::wait::MUST_HAPPEN;
+    while !slice(&mut app) {
+        app.settle_messages(now);
+        assert_eq!(
+            app.windows[&wid].dock.cells, 0,
+            "no park pays the dock while the drain runs"
+        );
+        assert!(Instant::now() < deadline, "the drain never ended");
+    }
+    app.settle_messages(now);
+    assert_eq!(
+        app.windows[&wid].dock.cells, 30,
+        "paid once the drain is done"
+    );
+    let sessions = app.window_terminal_sessions(wid);
+    assert_eq!(sessions.len(), 3, "every tab is a shell");
+    for id in &sessions {
+        assert_eq!(super::tests::grid_of(&app, *id), (27, 110), "session {id}");
+        assert_eq!(
+            super::tests::resize_sites(&app, *id),
+            ["site=restore", "site=dock"],
+            "session {id}"
+        );
+    }
 }
 
 #[test]
@@ -1571,4 +1623,54 @@ fn a_restored_worker_is_titled_by_its_line_with_its_task_file_gone() {
         LINE,
         "the restored worker is named by its line, not its folder or its agent"
     );
+}
+
+/// A finished restore's deferred sweep keeps a last-window quit's published result, whether
+/// the load worker or the quit claims the sweep first. A quit can also claim it before load.
+#[test]
+fn session_table_deferred_restore_sweep_keeps_the_quits_results() {
+    for load_first in [false, true] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let mut desk = two_done_workers(scratch.path());
+        let results = desk.results();
+        let (open, gate) = std::sync::mpsc::channel();
+        let table = crate::session_table::SessionTable::at_with(
+            scratch.path().join("rows"),
+            crate::session_table::Budget::MACHINE,
+            Some(gate),
+        );
+        table.serve(&desk.app.store);
+        // Model the taken layout's old IDs and results, after placement registered the tabs.
+        let layout = desk.app.capture_restore_manifest();
+        let tasks = crate::task_launch::RestoredTasks::of(&layout);
+        desk.app.finish_restore_placement(&[], &tasks);
+        assert!(matches!(
+            desk.app.close_window_logical(WindowId(0)),
+            crate::CloseOutcome::Exit
+        ));
+        if load_first {
+            open.send(()).unwrap();
+            assert!(table.loaded_within(Duration::from_secs(60)));
+            assert!(table.flush());
+        }
+        let mut published = None;
+        desk.app.settle_quit_desk_and_tasks(
+            |app| app.write_quit_desk_with(|_, _| Ok(())),
+            |_, quit| published.clone_from(&quit.published),
+        );
+        assert!(published.is_some());
+        assert!(
+            desk.app.restored_tasks_sweep.is_none(),
+            "quit can take the pending sweep"
+        );
+        if !load_first {
+            open.send(()).unwrap();
+            assert!(table.loaded_within(Duration::from_secs(60)));
+            assert!(table.flush());
+        }
+        assert!(
+            results.iter().all(|path| path.is_file()),
+            "the published layout still names readable results"
+        );
+    }
 }

@@ -191,7 +191,13 @@ pub fn scope_owed(sys: &dyn System) -> bool {
     spotlight_scope::owed(&Port(sys))
 }
 
-/// `paths`' last components, comma-separated.
+/// Whether first-time exclusions need an automatic password request.
+#[must_use]
+pub fn automatic_scope_owed(sys: &dyn System) -> bool {
+    spotlight_scope::automatic_owed(&Port(sys))
+}
+
+/// The folders' last components, comma-separated.
 fn folder_names(paths: &BTreeSet<PathBuf>) -> String {
     paths
         .iter()

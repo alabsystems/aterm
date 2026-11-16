@@ -40,6 +40,7 @@ fn vars() -> TapVars {
         pid: Some("68537".to_string()),
         login: None,
         home: None,
+        route: None,
     }
 }
 
@@ -697,6 +698,7 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
         ctx_left: None,
         dur_us: 0,
         row: None,
+        route: None,
     }
 }
 
@@ -2833,5 +2835,39 @@ fn the_launch_gate_taps_a_plain_launch_in_a_tab_and_each_guard_alone_refuses() {
             ..facts(&argv)
         },
         "a profile store config",
+    );
+}
+
+/// EVERY READING CARRIES WHEN ITS FILE WAS LAST WRITTEN ([`readings_in`]), read of the file
+/// that was opened: a reader that looks at no process tells a file a live tap still moves
+/// from one its process left behind by that time alone. A file that reads as another tab's
+/// or process's than its name says tells nothing.
+#[test]
+fn readings_in_carries_when_each_file_was_last_written() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let kept = reading(68_537, 4_000, None, Some(12));
+    let name = file_name(&kept.sid, kept.pid).unwrap();
+    let path = dir.path().join(&name);
+    std::fs::write(&path, kept.to_json()).unwrap();
+    // The same text under another process's name.
+    std::fs::write(
+        dir.path().join(file_name(&kept.sid, kept.pid + 1).unwrap()),
+        kept.to_json(),
+    )
+    .unwrap();
+    let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_792_000_123);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(written)
+        .unwrap();
+    assert_eq!(
+        readings_in(dir.path(), 8),
+        vec![Kept {
+            stem: name.trim_end_matches(".json").to_owned(),
+            reading: kept,
+            written_at: 1_792_000_123,
+        }]
     );
 }

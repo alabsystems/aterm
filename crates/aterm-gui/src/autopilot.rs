@@ -687,12 +687,7 @@ impl SetByWords {
             Actor::Bridge => "over the fabric".to_string(),
             Actor::Aterm => "by its timer".to_string(),
             Actor::Sid(sid) => sid_place(sid.as_str()).map_or_else(
-                || {
-                    format!(
-                        "from session {}",
-                        aterm_messages::presence::short_sid(sid.as_str())
-                    )
-                },
+                || format!("from session {}", crate::presence::short_sid(sid.as_str())),
                 |place| format!("from {place}"),
             ),
             Actor::Fleet(token) => fleet_words(token.as_str(), fleet_name),
@@ -732,7 +727,7 @@ fn fleet_words(token: &str, fleet_name: impl FnOnce(&str) -> Option<String>) -> 
     if aterm_types::control_verbs::is_minted_sid(sid) {
         format!(
             "over the fleet from {mac} (session {})",
-            aterm_messages::presence::short_sid(sid)
+            crate::presence::short_sid(sid)
         )
     } else {
         format!("over the fleet from {mac}")
@@ -1087,7 +1082,7 @@ impl App {
             .store
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .by_sid(&aterm_session::SessionId::new(sid))
+            .by_sid(&aterm_session::SessionId::parse(sid)?)
             .map(|h| h.local_id)?;
         self.pool.get(local)?;
         let place = self.session_place(sid);

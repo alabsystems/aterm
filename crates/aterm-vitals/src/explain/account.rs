@@ -5,16 +5,13 @@
 
 use std::sync::Arc;
 
-use super::detect::{self, Candidate, CauseId, Context, FLOOR_PM, above_floor, throttle};
+use super::detect::{self, Candidate, CauseId, Context, FLOOR_PM, throttle};
 use super::{CoalLane, Parts, WhyFacts};
 use crate::model::Snapshot;
+use crate::published_cpu::CpuExecutionWindow;
 
 /// Minimum memory footprint in bytes (alongside [`FLOOR_PM`]) for a role above `minor`.
 pub const MEM_FLOOR_BYTES: u64 = 1 << 30;
-/// Busy below this share of the cores is calm, per mille (the `quiet` preset's line).
-pub const CALM_PM: i64 = 250;
-/// A covering cause this large makes the CPU the bare answer, millicores.
-pub const BARE_CAUSE_MC: i64 = 1000;
 
 /// What a `sys why` reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,15 +69,12 @@ pub struct You {
     pub role: Role,
     /// Whether it is `minor` only because the figure is below the floor (a calm machine).
     pub calm: bool,
-    /// Its figure: CPU millicores (its split figure, reaped work included where read), or
-    /// footprint bytes; `None` where unread.
+    /// Its diagnostic published CPU growth per observation interval, or footprint bytes;
+    /// `None` where unread. CPU growth does not establish execution in that interval.
     pub figure: Option<i64>,
-    /// Share of the CPU busy account, per mille. Memory footprint is a different charge
-    /// account from physical used RAM, so memory has no percentage here.
+    /// No physical CPU or RAM share is established by the diagnostic counter accounts.
     pub share_pm: Option<u16>,
-    /// On the CPU, for a caller in a tab, while its figure is a lower bound ([`Self::figure`]):
-    /// while there is any, or while the reap credit's ledger knows it missed some of the tab's
-    /// work ([`super::CoalSplit::short_tabs`]), when it may read 0.
+    /// Missing physical CPU bound, unavailable without execution-window evidence.
     pub unattributed_mc: Option<i64>,
 }
 
@@ -93,6 +87,7 @@ impl You {
             Role::Part => "this tab is part of the cause",
             Role::Minor => "this tab is not the cause",
             Role::None => "this tab uses none of it",
+            Role::Unavailable("execution_window_unknown") => "this tab's share is not read now",
             Role::Unavailable(_) if self.figure.is_some() && self.unattributed_mc.is_none() => {
                 "whether this tab is the largest part is not read now"
             }
@@ -152,28 +147,6 @@ pub struct Account {
     pub cannot: Vec<(&'static str, &'static str)>,
 }
 
-impl Account {
-    /// Returns whether the CPU's tab share is a lower bound and the rest of aterm is an upper
-    /// bound.
-    #[must_use]
-    pub fn bounded(&self, snap: &Snapshot) -> bool {
-        let cut = snap.procs_truncated || self.facts.as_deref().is_some_and(|f| f.procs_truncated);
-        cut || self.you.unattributed_mc.is_some()
-            || self.parts.is_none()
-            || self.facts.as_deref().is_some_and(|f| {
-                f.split.via == super::Via::Subtraction
-                    || f.split.ownership_incomplete
-                    || f.provenance_incomplete
-            })
-    }
-
-    /// Returns whether the CPU's tab figure is a lower bound (`tab_mc=≥`).
-    #[must_use]
-    pub fn tab_at_least(&self, snap: &Snapshot) -> bool {
-        self.bounded(snap) || !snap.delegated.is_empty()
-    }
-}
-
 fn per_mille(part: i64, whole: i64) -> Option<u16> {
     (whole > 0).then(|| {
         let pm = (i128::from(part.max(0)) * 1000 + i128::from(whole) / 2) / i128::from(whole);
@@ -225,45 +198,26 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
     {
         cannot.push(("finished_tab_work", "not_sampled"));
     }
-    // The process sweep cannot witness every lifetime or a delegation over a socket.
-    // These limits hold even when the sampled coalition counters partition CPU exactly.
+    // Ownership coverage does not bound native counter publication lag. The process sweep
+    // also cannot witness every lifetime or a delegation over a socket.
     if subject == WhySubject::Cpu && facts.is_some() {
+        cannot.push(("cpu_execution_window", "execution_window_unknown"));
         cannot.push(("every_process_start", "not_sampled"));
         cannot.push(("between_sweep_orphans", "not_sampled"));
         cannot.push(("socket_delegation", "unsupported"));
     }
-    let open = facts.as_ref().map_or(&[][..], |f| f.open.as_slice());
-    let held = match facts.as_deref() {
-        Some(f) if subject == WhySubject::Cpu => detect::with_machine(f.causes.clone(), snap),
-        _ => detect::machine(snap),
-    };
+    // Retained CPU causes or episodes cannot qualify an execution window. Independent current
+    // machine contexts remain evidence even when no physical CPU attribution can be made.
+    let held = detect::machine(snap);
     let causes: Vec<Shown> = held
         .iter()
         .filter(|c| subject == WhySubject::Cpu || c.id == CauseId::Context(Context::Pressure))
         .map(|c| Shown {
             cause: c.clone(),
-            opened_unix_ms: open.iter().find(|o| o.id == c.id).map(|o| o.opened_unix_ms),
+            opened_unix_ms: None,
         })
         .collect();
-    let first = causes.first().map(|s| (s.cause.id, None));
-    let headline = match subject {
-        WhySubject::Cpu => causes
-            .iter()
-            .find(|s| s.cause.id.covering())
-            .map(|s| {
-                let context = Context::ORDER
-                    .into_iter()
-                    .find(|c| s.cause.contexts.contains(c));
-                (s.cause.id, context)
-            })
-            .or(first),
-        WhySubject::Mem => first,
-    };
-    for s in &causes {
-        if let CauseId::Activity(a) = s.cause.id {
-            cannot.extend_from_slice(a.activity().cannot);
-        }
-    }
+    let headline = causes.first().map(|shown| (shown.cause.id, None));
     if subject == WhySubject::Mem {
         cannot.push(("wired_by_process", "needs_privilege:root"));
         cannot.push(("uncharged_memory", "unsupported"));
@@ -273,17 +227,7 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
         .as_ref()
         .is_some_and(|m| m.sample.pressure.rank().is_some());
     let read = match subject {
-        WhySubject::Cpu => {
-            pressure_read
-                && snap.thermal.is_some()
-                && (facts.is_some() || !lane.on())
-                && (facts.is_some()
-                    || snap
-                        .cpu
-                        .as_ref()
-                        .and_then(crate::model::CpuView::current_busy)
-                        .is_some())
-        }
+        WhySubject::Cpu => false,
         WhySubject::Mem => pressure_read,
     };
     let services = match subject {
@@ -381,63 +325,16 @@ fn cpu_you(
             unread(if stalled { "stalled" } else { "truncated" }),
         );
     }
-    let whole = split.global_mc;
-    let unattributed = split.unattributed_mc;
-    let short = split.short_tabs.iter().any(|k| panes.contains(k));
-    let ambiguous = split.ambiguous_tabs.iter().any(|k| panes.contains(k));
-    let role_at = |extra: i64| {
-        let fig = parts.tab + extra;
-        let others = [
-            (parts.aterm_rest - extra).max(0),
-            parts.others,
-            parts.services,
-            parts.unaccounted,
-        ];
-        let largest = others.iter().all(|p| fig >= *p);
-        you_role(fig, whole, largest, above_floor(fig, whole))
-    };
-    let (role, calm) = role_at(0);
-    // What the tab may hold past its figure: the work in no figure, or, where the ledger knows it
-    // missed some of the tab's of a size it cannot tell, all the rest of aterm's side.
-    let mut extra = if short || ambiguous {
-        unattributed.max(parts.aterm_rest)
-    } else {
-        unattributed
-    };
-    // Unknown CPU outside the measured app account could also belong to this tab.
-    extra = extra.saturating_add(parts.unaccounted.max(0));
-    let bound = role_at(extra).0;
-    let mut you = You {
+    let you = You {
         tab,
-        role,
-        calm,
-        figure: Some(parts.tab),
-        share_pm: (!ambiguous
-            && !split.ownership_incomplete
-            && !f.provenance_incomplete
-            && parts.unaccounted <= 0
-            && split.via == super::Via::Coalitions)
-            .then(|| per_mille(parts.tab, whole))
-            .flatten(),
-        unattributed_mc: (tab.is_some()
-            && (unattributed > 0
-                || short
-                || ambiguous
-                || split.ownership_incomplete
-                || parts.unaccounted > 0
-                || f.provenance_incomplete))
-            .then_some(unattributed),
+        role: match split.cpu_accounting.execution_window {
+            CpuExecutionWindow::Unavailable => Role::Unavailable("execution_window_unknown"),
+        },
+        calm: false,
+        figure: Some(split.tab_reported_of(panes)),
+        share_pm: None,
+        unattributed_mc: None,
     };
-    if tab.is_some() && bound != role {
-        you.role = Role::Unavailable(if ambiguous {
-            "ambiguous_reap"
-        } else {
-            "not_sampled"
-        });
-        you.calm = false;
-        you.unattributed_mc.get_or_insert(unattributed);
-        you.share_pm = None;
-    }
     (Some(parts), you)
 }
 
@@ -529,59 +426,20 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
 /// Select the default subject for a bare `sys why` query.
 #[must_use]
 pub fn bare_subject(snap: &Snapshot) -> Bare {
-    let mem = snap.mem.as_ref();
     let huge_service = crate::services::over_in(snap)
         .iter()
         .any(|o| o.size == crate::services::Size::Huge);
     if memory_pressed(snap) || huge_service {
         return Bare::Subject(WhySubject::Mem);
     }
-    let facts = snap.why.as_deref();
-    let covering = facts.and_then(|f| {
-        let held = f
-            .causes
-            .iter()
-            .filter(|c| c.id.covering())
-            .map(|c| c.covers_mc);
-        let open = f.open.iter().map(|o| o.covers_mc);
-        held.chain(open).max()
-    });
-    if throttle(snap).is_some() || covering.is_some_and(|mc| mc >= BARE_CAUSE_MC) {
+    if throttle(snap).is_some() {
         return Bare::Subject(WhySubject::Cpu);
     }
-    let cores = snap.cpu.as_ref().map_or(0, |c| c.total());
-    let capacity = i64::try_from(cores).unwrap_or(0) * 1000;
-    let busy = facts.map_or_else(
-        || {
-            snap.cpu
-                .as_ref()
-                .and_then(|c| c.current_busy())
-                .map(|busy| (f64::from(busy) * 1000.0).round() as i64)
-        },
-        |f| Some(f.split.global_mc),
-    );
-    let Some(busy) = busy else {
-        return Bare::Subject(WhySubject::Cpu);
-    };
-    let Some(cpu_pm) = per_mille(busy, capacity).map(i64::from) else {
-        return Bare::Subject(WhySubject::Cpu);
-    };
-    let settled = mem.is_some_and(|m| m.sample.pressure.rank() == Some(0) && m.rates.is_some())
-        && snap.thermal.is_some();
-    let causes_read = facts.is_some() || !snap.coal_lane.on();
-    if settled && causes_read && covering.is_none() && cpu_pm < CALM_PM {
-        return Bare::Calm;
-    }
-    let mem_pm = mem.map_or(0, |m| {
-        per_mille(
-            i64::try_from(m.sample.used()).unwrap_or(i64::MAX),
-            i64::try_from(m.sample.total).unwrap_or(i64::MAX),
-        )
-        .map_or(0, i64::from)
-    });
-    if mem_pm > cpu_pm {
-        Bare::Subject(WhySubject::Mem)
-    } else {
-        Bare::Subject(WhySubject::Cpu)
-    }
+    // Low or zero published growth cannot establish a calm execution interval, and unlike
+    // memory footprint no native CPU source supplies the physical share this comparison needs.
+    Bare::Subject(WhySubject::Cpu)
 }
+
+#[cfg(test)]
+#[path = "account_tests.rs"]
+mod tests;

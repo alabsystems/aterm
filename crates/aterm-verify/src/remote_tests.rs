@@ -86,9 +86,13 @@ fn url(tool: Tool, args: &[OsString]) -> Option<Output> {
 }
 
 fn input(args: &[OsString]) -> Value {
+    file_input(args, "--input")
+}
+
+fn file_input(args: &[OsString], flag: &str) -> Value {
     let index = args
         .iter()
-        .position(|word| word == "--input")
+        .position(|word| word == flag)
         .expect("structured input");
     aterm_json::from_slice(&std::fs::read(&args[index + 1]).expect("live input")).expect("JSON")
 }
@@ -218,14 +222,7 @@ fn journal_timeout_names_each_github_fetch_stage_and_stops() {
                     assert_eq!(tool, Tool::Agh);
                     assert_eq!(&args[..3], words(&["repo", "fetch", PRIVATE_SLUG]));
                     assert_eq!(args[3], root.as_os_str());
-                    assert_eq!(
-                        input(args),
-                        json!([{
-                            "source":BEFORE,
-                            "into":"refs/agh/verify/aterm/ls96-ref-private",
-                            "expected_oid":BEFORE,
-                        }])
-                    );
+                    assert_eq!(file_input(args, "--objects"), json!([BEFORE]));
                     String::new()
                 }
                 2 => {
@@ -538,7 +535,7 @@ fn main_refresh_is_its_own_fetch_even_when_a_sibling_rewrites_the_shared_ref() {
 }
 
 #[test]
-fn github_fetch_keeps_the_observed_commit_when_main_or_the_journal_advances() {
+fn github_fetch_keeps_the_observed_commit_when_remote_and_sibling_cache_advance() {
     let root = aterm_tempfile::tempdir().expect("root");
     for reference in ["refs/heads/main", "refs/aterm/record"] {
         let calls = Cell::new(0);
@@ -562,23 +559,20 @@ fn github_fetch_keeps_the_observed_commit_when_main_or_the_journal_advances() {
             } else if call == 1 {
                 assert_eq!(&args[..3], words(&["repo", "fetch", "fixture/repo"]));
                 assert_eq!(args[3], root.path().as_os_str());
-                let batch = input(args);
-                let source = batch[0]["source"].as_str().expect("source");
-                let fetched = if source == reference {
-                    current.get()
-                } else {
-                    source
-                };
-                // agh rejects a snapshot whose fetched OID differs from expected_oid.
-                if Some(fetched) != batch[0]["expected_oid"].as_str() {
-                    return Ok(out(9, ""));
+                // A sibling changed the shared destination after agh read its old value.
+                // Ref publication must refuse that CAS; importing objects has no ref to race.
+                if args.iter().any(|arg| arg == "--input") {
+                    let batch = input(args);
+                    assert_eq!(batch[0]["expected_oid"].as_str(), Some(BEFORE));
+                    return Ok(out(9, "shared cache ref changed"));
                 }
-                assert_eq!(fetched, BEFORE, "import the observation, not the moved ref");
-                let into = format!(
-                    "refs/agh/verify/{}",
-                    reference.strip_prefix("refs/").unwrap()
+                let objects = file_input(args, "--objects");
+                assert_eq!(
+                    objects,
+                    json!([BEFORE]),
+                    "import the observation, not the moved ref"
                 );
-                assert_eq!(batch[0]["into"].as_str(), Some(into.as_str()));
+                assert_eq!(current.get(), AFTER, "the remote really advanced");
                 imported.set(true);
                 Ok(out(0, ""))
             } else {

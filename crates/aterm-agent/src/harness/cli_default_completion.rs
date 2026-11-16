@@ -218,7 +218,7 @@ fn complete_with(
                     fleet: None,
                 },
                 false,
-                source.guard.as_ref(),
+                (source.guard.as_ref(), accounts::Admits::EveryPlan),
             )
             .map_err(SyncError::into_message)?;
     }

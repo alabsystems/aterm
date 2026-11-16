@@ -44,7 +44,13 @@ enum Event {
     /// The real primitive took every lock of a profile (`Stage::Locked`):
     /// the row, the profile.
     Locked(PathBuf, PathBuf),
-    /// The real primitive starts deleting under them (`Stage::Deleting`).
+    /// What it takes sits in a stage of its own, the locks still held
+    /// (`Stage::Staged`): the removal, as the model has it.
+    Staged(PathBuf, PathBuf),
+    /// It let the profile's locks go (`Stage::Released`).
+    Released(PathBuf, PathBuf),
+    /// The real primitive starts deleting (`Stage::Deleting`): in place under
+    /// the locks, or the stage it took under them once they are let go.
     Deleting(PathBuf, PathBuf),
     Removed(PathBuf, Option<Tier>),
     Failed(PathBuf),
@@ -148,7 +154,7 @@ fn recent(path: &str, last_used: i64) -> Row {
     )
 }
 
-/// A projection standing at 2 MB/s, about 13.4 GiB over the horizon (§8.2).
+/// A projection standing at 2 MB/s, about 13.4 GiB over the horizon.
 fn projection(free: u64) -> disk::fill::Projection {
     let floor = Config::default().auto_free_gib * GIB_BYTES;
     disk::fill::Projection::of(2_000_000, free, floor, None)
@@ -244,6 +250,7 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
     let mut locked = false;
     let mut removed = false;
     let mut held: Vec<&PathBuf> = Vec::new();
+    let mut staged: Vec<&PathBuf> = Vec::new();
     // Tier 0's steps are its own: admitted, journalled, its writer's lock probed, removed.
     let mut current: Option<Tier> = None;
     let word_of = |tier: Option<Tier>, died: &'static str, other: &'static str| {
@@ -264,6 +271,7 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                 step(m, s, "JournalDied")?;
                 (locked, removed) = (false, false);
                 held.clear();
+                staged.clear();
             }
             Event::Writing(_) => step(m, s, "WriterHolds")?,
             Event::Removing(_, tier) => {
@@ -278,6 +286,7 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                 step(m, s, "Journal")?;
                 (locked, removed) = (false, false);
                 held.clear();
+                staged.clear();
             }
             Event::Locked(_, profile) => {
                 held.push(profile);
@@ -286,13 +295,37 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                     locked = true;
                 }
             }
-            Event::Deleting(_, profile) => {
-                // Each profile is deleted under its own locks, the first one
-                // the unit's removal.
+            Event::Staged(_, profile) => {
+                // What a profile gives up leaves it under its own locks: that
+                // move is the removal, the first one the unit's.
                 if !held.contains(&profile) {
                     return Err(format!(
-                        "{} is deleted without its locks held",
+                        "{} is staged without its locks held",
                         profile.display()
+                    ));
+                }
+                staged.push(profile);
+                if !removed {
+                    step(m, s, word_of(current, "RemoveDied", "Remove"))?;
+                    removed = true;
+                }
+            }
+            Event::Released(_, profile) => held.retain(|p| *p != profile),
+            Event::Deleting(_, at) => {
+                // Each profile is deleted in place under its own locks, or
+                // after them only the stage it filled under them (the hook
+                // names that stage, in the folder that staged); the first one
+                // the unit's removal.
+                let lawful = if disk::target::is_stage_path(at) {
+                    at.parent()
+                        .is_some_and(|folder| staged.iter().any(|p| p.as_path() == folder))
+                } else {
+                    held.contains(&at)
+                };
+                if !lawful {
+                    return Err(format!(
+                        "{} is deleted without its locks held",
+                        at.display()
                     ));
                 }
                 if !removed {
@@ -373,6 +406,9 @@ enum Whole {
     /// NEGATIVE CONTROL: its contents deleted first, the real primitive (and
     /// its locks) after.
     DeletesBeforeLocking,
+    /// NEGATIVE CONTROL: a profile's locks taken and let go, then its contents
+    /// deleted where they are, nothing staged; the real primitive after.
+    DeletesInPlaceAfterRelease,
 }
 
 fn run(rep: &Report, script: &[u64]) -> (Option<Applied>, Vec<Event>) {
@@ -408,22 +444,39 @@ fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec
                     *n += 1;
                     lay(&scratch.0.join(format!("unit-{n}/target")))
                 };
-                if whole != Whole::Real {
-                    let first = dir.join("debug");
-                    events
-                        .borrow_mut()
-                        .push(Event::Deleting(row.path.clone(), first.clone()));
-                    std::fs::remove_dir_all(first.join("deps")).expect("deleted first");
+                let first = dir.join("debug");
+                match whole {
+                    Whole::Real => {}
+                    Whole::DeletesBeforeLocking => {
+                        events
+                            .borrow_mut()
+                            .push(Event::Deleting(row.path.clone(), first.clone()));
+                        std::fs::remove_dir_all(first.join("deps")).expect("deleted first");
+                    }
+                    Whole::DeletesInPlaceAfterRelease => {
+                        events.borrow_mut().extend([
+                            Event::Locked(row.path.clone(), first.clone()),
+                            Event::Released(row.path.clone(), first.clone()),
+                            Event::Deleting(row.path.clone(), first.clone()),
+                        ]);
+                        std::fs::remove_dir_all(first.join("deps")).expect("deleted in place");
+                    }
                 }
                 let mut hook = |stage: disk::target::Stage, at: &Path| {
                     let e = match stage {
                         disk::target::Stage::Locked => {
                             Event::Locked(row.path.clone(), at.to_path_buf())
                         }
+                        disk::target::Stage::Staged => {
+                            Event::Staged(row.path.clone(), at.to_path_buf())
+                        }
+                        disk::target::Stage::Released => {
+                            Event::Released(row.path.clone(), at.to_path_buf())
+                        }
                         disk::target::Stage::Deleting => {
                             Event::Deleting(row.path.clone(), at.to_path_buf())
                         }
-                        disk::target::Stage::Released => return,
+                        disk::target::Stage::Staging => return,
                     };
                     events.borrow_mut().push(e);
                 };
@@ -629,7 +682,10 @@ fn run_died(
                         disk::target::Stage::Deleting => {
                             Event::Deleting(row.path.clone(), at.to_path_buf())
                         }
-                        disk::target::Stage::Released => return,
+                        // A died build's piece is deleted where it is, under its locks.
+                        disk::target::Stage::Staging
+                        | disk::target::Stage::Staged
+                        | disk::target::Stage::Released => return,
                     };
                     events.borrow_mut().push(e);
                 },
@@ -1007,6 +1063,34 @@ fn a_whole_removal_that_deletes_before_it_locks_is_rejected() {
         caught.contains("Remove") || caught.contains("without its locks"),
         "{caught}"
     );
+}
+
+/// After a removal lets its locks go it deletes only what it staged under them.
+///
+/// NEGATIVE CONTROL: a whole removal that takes a profile's locks, lets them go and then deletes
+/// that profile's contents where they are is rejected, where the real removals of the same plan
+/// conform (staging, on unix, what they delete after their locks).
+#[test]
+fn a_removal_that_lets_go_and_then_deletes_in_place_is_rejected() {
+    let m = disk_reclaim_pass_model();
+    let (measure, free) = levels()[2];
+    let rep = report_at(free, None);
+    let plan = disk::pass_plan(&rep).expect("short admits tiers 1-4");
+    let script: &[u64] = &[3 * GIB_BYTES];
+    let (_, events) = run(&rep, script);
+    #[cfg(unix)]
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Staged(..))),
+        "the real primitives staged what they took: {events:#?}"
+    );
+    let mut s = looked(&m, measure, false).expect("the look");
+    project(&m, &mut s, &plan, &events)
+        .unwrap_or_else(|why| panic!("the real removals conform: {why}\n{events:#?}"));
+    let (_, events) = run_with(&rep, script, Whole::DeletesInPlaceAfterRelease);
+    let mut s = looked(&m, measure, false).expect("the look");
+    let caught = project(&m, &mut s, &plan, &events)
+        .expect_err("the checker must reject a delete in place after the locks are let go");
+    assert!(caught.contains("without its locks"), "{caught}");
 }
 
 #[test]

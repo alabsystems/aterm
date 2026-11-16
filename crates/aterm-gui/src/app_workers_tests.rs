@@ -377,7 +377,7 @@ fn a_session_on_a_parked_tab_still_answers_the_control_verbs() {
         app.store
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .by_sid(&aterm_session::SessionId::new(&sid))
+            .by_sid(&aterm_session::SessionId::parse(&sid).expect("a session's id"))
             .is_some(),
         "the control plane addresses it by sid whatever the bit says"
     );

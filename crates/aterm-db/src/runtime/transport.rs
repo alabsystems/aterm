@@ -7,7 +7,7 @@
 use super::{
     census::{self, Event},
     discovery::{Hints, MemoryScope, Outcome, REMEMBERED_MAX, REMEMBERED_NAME, Remembered},
-    moved::{Moves, Subject},
+    moved::{Moves, Source, Subject},
     report::{AuthenticatedConnection, RepairRound, bounded_failure},
 };
 use crate::{
@@ -381,6 +381,20 @@ thread_local! {
     /// MUTANT of [`Transport::refresh`], on for one test thread: a link a turn dropped that
     /// reopens on a source still among the addresses says this Mac's network changed.
     static REOPEN_OPENS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Transport::finish`], on for one test thread: a round's receipt of what it
+    /// brought counts every record it acknowledged, those this Mac already held included, as
+    /// before 2026-11-14.
+    pub(super) static HELD_RECEIPTS_BRING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Transport::finish`], on for one test thread: what a table exchange that broke
+    /// off brought names its seat a source, as before 2026-11-14.
+    pub(super) static INTERRUPTED_RECEIPTS_HOLD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Transport::look`], on for one test thread: a table store a look found grown by
+    /// no more than its rounds brought (or not grown) is offered as one written here, to every
+    /// seat whose last lists are older than the store, as on 2026-11-15 before this was bounded.
+    pub(super) static BROUGHT_STORES_OFFERED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Where a transport keeps the endpoints it verified across restarts ([`Hints::remember`]): a
@@ -624,6 +638,13 @@ impl Transport {
     #[cfg(test)]
     pub(super) fn take_finished_rounds(&mut self) -> u64 {
         std::mem::take(&mut self.finished_rounds)
+    }
+
+    /// Whether a round of this transport's, dialled or served, is in flight: begun and not yet
+    /// joined (tests).
+    #[cfg(test)]
+    pub(super) fn rounds_in_flight(&self) -> bool {
+        !self.workers.is_empty()
     }
 
     /// This transport with `bus` as its `Bus` predicate, read at each seats refresh.
@@ -915,21 +936,71 @@ impl Transport {
                     }
                 }
                 if let Some(actor) = repair.authenticated_actor() {
-                    // What this round received from the seat, whether or not it then completed:
-                    // if the next look finds that moved, the seat holds what moved it
-                    // ([`Moves::received`]). The look reads what this Mac holds; these counts
+                    // What this round brought from the seat that this Mac did not hold, by an
+                    // exchange that completed: if the next look finds that moved by no more than
+                    // such rounds brought together, and no look while this round ran found it
+                    // moved, it names the seat a source, which holds what this round carried both
+                    // ways ([`Moves::received`]). A look that ran while it was in flight may have
+                    // found what it added: its receipt then covers nothing ([`Moves::take`]). A
+                    // record this Mac held already (another round brought it after this one read
+                    // the store's inventory) brings nothing, so a write here in the same look is
+                    // not taken as the seat's. The look reads what this Mac holds; these counts
                     // only say when to look and whom not to offer it back to.
-                    if report.control.as_ref().is_ok_and(|r| r.received > 0) {
-                        self.moves.received(Subject::Control, actor, started);
+                    //
+                    // A table exchange that broke off names no source of what it brought, and its
+                    // ingest only asks for the look: it may have brought this side the seat's
+                    // records without giving the seat this side's (a responder receives each
+                    // batch before it sends its own, and an initiator that broke off between the
+                    // conflicts and the operations sent none of its operations), so the seat may
+                    // lack a write here that its receipt would cover. The look then offers what
+                    // the round brought to every seat, that one included, which costs one walk
+                    // dial that brings it nothing.
+                    #[cfg(test)]
+                    let (held_bring, interrupted_hold) = (
+                        HELD_RECEIPTS_BRING.with(std::cell::Cell::get),
+                        INTERRUPTED_RECEIPTS_HOLD.with(std::cell::Cell::get),
+                    );
+                    #[cfg(not(test))]
+                    let (held_bring, interrupted_hold) = (false, false);
+                    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+                    if let Ok(control) = &report.control
+                        && let added = if held_bring {
+                            control.received
+                        } else {
+                            control.added
+                        }
+                        && added > 0
+                    {
+                        self.moves
+                            .received(Subject::Control, actor, started, count(added));
                     }
                     if repair.membership().is_some_and(|r| r.received > 0) {
-                        self.moves.received(Subject::Members, actor, started);
+                        self.moves.received(Subject::Members, actor, started, 0);
                     }
-                    if let Some(app) = repair.application().or(repair.application_interrupted())
+                    let table = repair.application().map(|app| (app, true)).or_else(|| {
+                        repair
+                            .application_interrupted()
+                            .map(|app| (app, interrupted_hold))
+                    });
+                    if let Some((app, completed)) = table
                         && let Some(table) = app.table
-                        && app.received + app.conflicts_received > 0
+                        && let added = if held_bring {
+                            app.received + app.conflicts_received
+                        } else {
+                            app.added
+                        }
+                        && added > 0
                     {
-                        self.moves.received(Subject::Table(table), actor, started);
+                        if completed {
+                            self.moves.received(
+                                Subject::Table(table),
+                                actor,
+                                started,
+                                count(added),
+                            );
+                        } else {
+                            self.moves.poll();
+                        }
                     }
                     // A completed round, whichever side dialled it, settles its seat for what
                     // moved here before it began, unless its membership or table exchange broke
@@ -1104,15 +1175,37 @@ impl Transport {
     /// ([`Hints::moved`]). A turn looks after it joined the rounds that ended and before it
     /// accepts or dials one, so every round that begins at `now` or later began after the look
     /// read: such a round, and no earlier one, may settle a seat for what this look found
-    /// ([`Hints::settle`]). A look that found anything moved counts once
-    /// ([`census::Event::Announce`]), however much it found.
+    /// ([`Hints::settle`]). The rounds still in flight began before it, and only their receipts
+    /// may be judged by an earlier look's ([`Moves::take`]). A look that found anything moved
+    /// counts once ([`census::Event::Announce`]), however much it found.
+    ///
+    /// A walk offers a table to a seat whose last lists did not show this Mac listing it only
+    /// for what the look found grown here ([`Source::Here`]), its store younger than those lists
+    /// (`crate::replica::Listing::takes`): a write here such a seat cannot have, which would
+    /// otherwise wait for its audit. A store this Mac took up empty, or from what rounds brought
+    /// alone, is passed with no instant: its sources hold it, and a seat that takes the table up
+    /// takes it in its own rounds, while one whose policy excludes it would spend a round that
+    /// moves nothing on each such store, and a follow-up of the lead it lacks.
     fn look(&mut self, now: Instant) {
-        let moved = self.moves.take();
+        let oldest = self.workers.iter().map(|worker| worker.started).min();
+        let moved = self.moves.take(now, oldest);
         if !moved.is_empty() {
             census::count(Event::Announce);
         }
-        for (subject, sources) in moved {
-            self.hints.moved(subject, sources, now);
+        #[cfg(test)]
+        let brought_offered = BROUGHT_STORES_OFFERED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let brought_offered = false;
+        for (subject, source) in moved {
+            let (here, sources) = match source {
+                Source::Here => (true, Vec::new()),
+                Source::Seats(seats) => (brought_offered, seats),
+            };
+            let held = match subject {
+                Subject::Table(table) if here => self.moves.held_since(&table),
+                Subject::Table(_) | Subject::Control | Subject::Members => None,
+            };
+            self.hints.moved(subject, held, sources, now);
         }
     }
 

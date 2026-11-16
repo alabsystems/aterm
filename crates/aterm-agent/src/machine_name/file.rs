@@ -440,6 +440,40 @@ pub fn replace(
     replace_with_lock(state, edit, take_name_lock)
 }
 
+/// Hold the name writer before admitting a source, then persist only inside that admission.
+pub(super) struct Writer<'a> {
+    state: &'a Path,
+    name: MachineName,
+    _lock: PrivateLock,
+}
+
+pub(super) fn writer(state: &Path) -> io::Result<Writer<'_>> {
+    let lock = take_name_lock(state, LOCK_HANG)?;
+    let name = read(state)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("{FILE}: not created yet"))
+    })?;
+    Ok(Writer {
+        state,
+        name,
+        _lock: lock,
+    })
+}
+
+impl Writer<'_> {
+    pub(super) fn name(&self) -> &MachineName {
+        &self.name
+    }
+
+    pub(super) fn replace(&mut self, name: MachineName) -> io::Result<()> {
+        if name != self.name {
+            let text = name.to_toml().map_err(io::Error::other)?;
+            write_private(self.state, FILE, text.as_bytes())?;
+            self.name = name;
+        }
+        Ok(())
+    }
+}
+
 fn replace_with_lock(
     state: &Path,
     edit: impl FnOnce(&mut MachineName) -> io::Result<()>,

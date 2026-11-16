@@ -99,7 +99,15 @@ fn sweeps_preserve_live_versioned_bytes_without_authorizing_old_grants() {
             assert_eq!(helper(now), expected, "version {version} at {now}");
         }
         super::sweep(&dirs, expiry + 1);
-        assert!(!path.exists(), "expired version {version} remained");
+        if version == super::GRANT_VERSION {
+            assert!(!path.exists(), "expired version {version} remained");
+        } else {
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "another version's record was removed"
+            );
+        }
         assert_eq!(helper(expiry + 1), b"quit=1\n");
     }
 }
@@ -113,6 +121,7 @@ fn sweep_keeps_unknown_payloads_and_retires_only_understood_expired_envelopes() 
             b"{\"v\":",
             b"{}",
             b"{\"v\":3,\"expires_at\":1}",
+            b"{\"v\":1,\"expires_at\":1}",
             b"{\"v\":1}",
             b"{\"v\":2,\"expires_at\":\"1\"}",
             b"{\"v\":2,\"expires_at\":-1}",
@@ -131,24 +140,22 @@ fn sweep_keeps_unknown_payloads_and_retires_only_understood_expired_envelopes() 
                 assert_eq!(std::fs::read(&path).unwrap(), *bytes);
             }
         }
-        // Authorization is deliberately malformed, but the known envelope still establishes
-        // expiry. Cleanup neither validates nor repairs credential authority.
-        for version in [1, 2] {
-            let nonce = format!("{:032x}", version + 100);
-            let name = if staging {
-                format!(".{nonce}.tmp")
-            } else {
-                format!("{nonce}.json")
-            };
-            let bytes =
-                format!(r#"{{"v":{version},"expires_at":{NOW},"credential_binding":"bad"}}"#);
-            let path = dirs.grants().join(name);
-            crate::test_fixtures::setup_file(&path, bytes.as_bytes());
-            super::sweep(&dirs, NOW);
-            assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
-            super::sweep(&dirs, NOW + 1);
-            assert!(!path.exists(), "known expired envelope was kept");
-        }
+        // Authorization is deliberately malformed, but this folder's own envelope still
+        // establishes expiry. Cleanup neither validates nor repairs credential authority.
+        let version = super::GRANT_VERSION;
+        let nonce = format!("{:032x}", version + 100);
+        let name = if staging {
+            format!(".{nonce}.tmp")
+        } else {
+            format!("{nonce}.json")
+        };
+        let bytes = format!(r#"{{"v":{version},"expires_at":{NOW},"credential_binding":"bad"}}"#);
+        let path = dirs.grants().join(name);
+        crate::test_fixtures::setup_file(&path, bytes.as_bytes());
+        super::sweep(&dirs, NOW);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+        super::sweep(&dirs, NOW + 1);
+        assert!(!path.exists(), "known expired envelope was kept");
     }
 }
 
@@ -251,6 +258,116 @@ fn a_version_one_sweep_never_reaches_a_live_grant() {
     super::sweep(&dirs, NOW + ttl.as_secs() + 1);
     assert!(!dirs.grants().join(&name).exists());
     assert_eq!(std::fs::read(&its_own).unwrap(), version_one.as_bytes());
+}
+
+/// The grants folder is named for the record's version, and what this agh writes there holds
+/// that version and reads back. So a record that changes again moves to a folder of its own
+/// by construction, and no folder holds two versions' records.
+#[test]
+fn the_grants_folder_carries_the_record_version() {
+    let root = crate::test_fixtures::scratch_dir("grant-folder-version");
+    let dirs = crate::config::Dirs::under(root.path());
+    let folder = format!("grants-v{}", super::GRANT_VERSION);
+    assert_eq!(dirs.grants(), dirs.state.join(&folder));
+    let slug = crate::Slug::parse("fixture-dev/app").unwrap();
+    let ttl = super::super::GRANT_MAX;
+    let grant = super::write(&dirs, &slug, "dev", [0x5a; 32], NOW, ttl).unwrap();
+    let made: Vec<String> = std::fs::read_dir(&dirs.state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(made, [folder]);
+    let bytes = std::fs::read(dirs.grants().join(format!("{}.json", grant.nonce))).unwrap();
+    let record: aterm_json::Value = aterm_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        record.get("v").and_then(aterm_json::Value::as_u64),
+        Some(super::GRANT_VERSION)
+    );
+    assert_eq!(super::Grant::from_json(&grant.nonce, &bytes), Some(grant));
+}
+
+/// Two installed agh versions share agh's state directory. A grant record of another version
+/// (the one before this agh's, or the one after it) in this agh's grants folder, with a nonce,
+/// slug and spawner this agh would answer, is refused by the helper's reader, and this agh's
+/// sweep never removes it, expired or not: it is not this agh's record to judge, which is the
+/// mistake 0.201.0's sweep made with version-2 grants. The control, this agh's own record
+/// with the same fields, is answered and then retired once expired.
+#[test]
+fn a_record_of_another_version_is_refused_and_never_removed() {
+    use super::GrantView as _;
+
+    let (_root, dirs) = sweep_world();
+    let slug = crate::Slug::parse("fixture-dev/app").unwrap();
+    let pid = std::process::id();
+    let start = start_of(i32::try_from(pid).unwrap()).unwrap();
+    let expiry = NOW + 10;
+    let own = super::Grant {
+        nonce: "ab".repeat(16),
+        slug: slug.clone(),
+        profile: "dev".into(),
+        credential_binding: [0xa5; 32],
+        pid,
+        start,
+        expires_at: expiry,
+    };
+    let mut others = Vec::new();
+    for version in [super::GRANT_VERSION - 1, super::GRANT_VERSION + 1] {
+        for staging in [false, true] {
+            let nonce = format!("{:030x}{version:x}{}", 0, u8::from(staging));
+            let mut record: aterm_json::Value = aterm_json::from_str(
+                &super::Grant {
+                    nonce: nonce.clone(),
+                    ..own.clone()
+                }
+                .to_json(),
+            )
+            .unwrap();
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("v".into(), aterm_json::Value::from(version));
+            let bytes = record.to_string().into_bytes();
+            assert_eq!(super::Grant::from_json(&nonce, &bytes), None, "v{version}");
+            let name = if staging {
+                format!(".{nonce}.tmp")
+            } else {
+                format!("{nonce}.json")
+            };
+            let path = dirs.grants().join(name);
+            crate::test_fixtures::setup_file(&path, &bytes);
+            assert_eq!(
+                super::LiveGrants::new(&dirs).find(&nonce, &slug, NOW),
+                None,
+                "v{version} was answered"
+            );
+            others.push((path, bytes, version));
+        }
+    }
+    let own_path = dirs.grants().join(format!("{}.json", own.nonce));
+    crate::test_fixtures::setup_file(&own_path, own.to_json().as_bytes());
+    assert_eq!(
+        super::LiveGrants::new(&dirs).find(&own.nonce, &slug, NOW),
+        Some(own.clone())
+    );
+
+    for now in [
+        NOW,
+        expiry + 1,
+        expiry + super::super::GRANT_MAX.as_secs() + 1,
+    ] {
+        super::sweep(&dirs, now);
+        for (path, bytes, version) in &others {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                *bytes,
+                "v{version} was removed at {now}"
+            );
+        }
+    }
+    assert!(
+        !own_path.exists(),
+        "the control: an expired own record is retired"
+    );
 }
 
 #[test]

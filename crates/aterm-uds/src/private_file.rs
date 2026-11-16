@@ -704,7 +704,9 @@ fn open_in(
         Opening::Read | Opening::Owned => {
             astream_sys::open_nonblocking(&path, astream_sys::Links::Refuse)
         }
-        Opening::ReadWrite => open_rw_created_0600(&path, libc::O_NOFOLLOW | libc::O_CLOEXEC),
+        Opening::ReadWrite => {
+            open_rw_created_0600(&path, libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        }
     };
     let file = match opened {
         Ok(file) => file,
@@ -1262,9 +1264,11 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
 /// An exclusive lock on `<dir>/<name>`, lifted from aterm-net's `fleet_member` (`BookLock`).
 ///
 /// - **How it is opened.** `name` must be one path component, and `dir` must pass
-///   [`check_private_dir`]. The file is opened read-write, created exactly 0600 whatever the
-///   umask, with `O_NOFOLLOW | O_NONBLOCK`, so it is never a link and the open never waits
-///   on a FIFO. Anything but a regular file is refused.
+///   [`check_private_dir`]. The file is opened read-write with `O_NOFOLLOW | O_NONBLOCK`, so
+///   it is never a link and the open never waits on a FIFO. [`take`](Self::take) creates a
+///   missing file exactly 0600 whatever the umask; [`take_existing`](Self::take_existing)
+///   creates nothing. [`take_private`](Self::take_private) creates 0600 with the strict
+///   private-file checks that `take_existing` applies. Anything but a regular file is refused.
 /// - **How it is taken.** An exclusive `flock`, tried again with a backoff that starts at
 ///   1 ms and doubles to 50 ms until `within` has passed.
 /// - **How it is released.** `LOCK_UN` in `Drop`, before the close. That is `clippy.toml`'s
@@ -1304,6 +1308,81 @@ impl PrivateLock {
         Self::take_with(dir, name, within, busy, || {})
     }
 
+    /// Take the lock on `<dir>/<name>` under [`open_private_rw`]'s strict private-file rules,
+    /// creating a missing file exactly 0600, and waiting at most `within`. An existing file's
+    /// mode and bytes are unchanged. The file is kept out of children and its lock is taken
+    /// through that same admitted descriptor.
+    ///
+    /// # Errors
+    ///
+    /// As [`take_existing`](Self::take_existing), except that a missing file is created and
+    /// a missing directory is `NotFound`.
+    pub fn take_private(
+        dir: &Path,
+        name: &str,
+        within: Duration,
+        busy: &str,
+    ) -> io::Result<PrivateLock> {
+        one_component_io(name)?;
+        let file = crate::kept_out(|| open_private_rw(dir, name)).map_err(Self::private_error)?;
+        Self::lock_opened(file, within, busy, || {})
+    }
+
+    /// Take an existing private lock on `<dir>/<name>`, waiting at most `within`, without
+    /// creating or changing the mode of either the directory or its file. `None` means that
+    /// the directory or file is missing. The file is opened read-write, without following a
+    /// symlink or waiting on a FIFO, and judged on that descriptor under [`open_private`]'s
+    /// owner, access-list, mode, regular-file and single-link rules before taking its lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`take`](Self::take), and `PermissionDenied` when the file is not private or has
+    /// another link. A missing path is `Ok(None)`, never created to probe its lock.
+    pub fn take_existing(
+        dir: &Path,
+        name: &str,
+        within: Duration,
+        busy: &str,
+    ) -> io::Result<Option<PrivateLock>> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        one_component_io(name)?;
+        match check_private_dir(dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            checked => checked?,
+        }
+        let path = dir.join(name);
+        let opened = crate::kept_out(|| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+        });
+        let file = match opened {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(Self::private_error(PrivateFileError::Symlink));
+            }
+            Err(error) => return Err(error),
+        };
+        let file = match judge_opened(file, Opening::ReadWrite) {
+            Ok((file, _metadata, _loose)) => file,
+            Err(PrivateFileError::Missing) => return Ok(None),
+            Err(error) => return Err(Self::private_error(error)),
+        };
+        Self::lock_opened(file, within, busy, || {}).map(Some)
+    }
+
+    /// The held file's description, borrowed for bounded reads, writes and durability calls
+    /// without reopening its name or duplicating its descriptor. Keep this lock alive until
+    /// those operations finish, and leave unlocking to its drop.
+    #[must_use]
+    pub fn file(&self) -> &std::fs::File {
+        &self.0
+    }
+
     /// [`take`](Self::take), with a `busy` text made at run time (one that names `dir`, say)
     /// and `held` called each time the lock is found held, before the backoff's sleep (a
     /// test's hook to see a writer wait).
@@ -1319,10 +1398,7 @@ impl PrivateLock {
         held: impl FnMut(),
     ) -> io::Result<PrivateLock> {
         let file = Self::open(dir, name)?;
-        // `None`: a wait no clock can represent, which has no deadline.
-        let deadline = Instant::now().checked_add(within);
-        crate::file_lock::lock_exclusive_with_deadline(&file, deadline, busy, held)?;
-        Ok(Self(file))
+        Self::lock_opened(file, within, busy, held)
     }
 
     /// THE LOCK ON `<dir>/<name>` WHENEVER ITS HOLDER LETS IT GO, opened as [`take`](Self::take)
@@ -1367,6 +1443,30 @@ impl PrivateLock {
     pub fn wait_until_free(dir: &Path, name: &str, held: impl FnOnce()) -> io::Result<()> {
         let file = Self::open(dir, name)?;
         crate::file_lock::wait_unlocked(&file, held)
+    }
+
+    fn private_error(error: PrivateFileError) -> io::Error {
+        let kind = match &error {
+            PrivateFileError::Missing => io::ErrorKind::NotFound,
+            PrivateFileError::Malformed(_) => io::ErrorKind::InvalidData,
+            _ => io::ErrorKind::PermissionDenied,
+        };
+        match error {
+            PrivateFileError::Io(error) => error,
+            error => io::Error::new(kind, error),
+        }
+    }
+
+    fn lock_opened(
+        file: std::fs::File,
+        within: Duration,
+        busy: &str,
+        held: impl FnMut(),
+    ) -> io::Result<PrivateLock> {
+        // `None`: a wait no clock can represent, which has no deadline.
+        let deadline = Instant::now().checked_add(within);
+        crate::file_lock::lock_exclusive_with_deadline(&file, deadline, busy, held)?;
+        Ok(Self(file))
     }
 
     /// The lock file `<dir>/<name>`, admitted as [`take`](Self::take) says, not yet locked.

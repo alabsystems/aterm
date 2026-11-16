@@ -554,6 +554,13 @@ pub const RECORDS_BOUND_HEADER: &str = "X-Aterm-Records-Bound";
 /// query before reading the body. No larger history is handed to those readers.
 pub const CROSSED_POST_QUERY: &str = "crossed=2";
 
+/// Header on a records GET reply (`"1"`) whose records are a causally closed prefix of what the
+/// server holds past the GET's `have=` and not all of it: the most one reply carries
+/// ([`crate::membership_log::store::REPLY_CAP`]) ended it. Such a reply states no
+/// [`RECORDS_HEADS_HEADER`], so no puller takes it for the server's whole log, and the puller asks
+/// again past what it took (`docs/DESIGN-vault-log-2026-11-14.md` step 3).
+pub const RECORDS_MORE_HEADER: &str = "X-Aterm-Records-More";
+
 /// What a records reply said of its server's records ([`RECORDS_BOUND_HEADER`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReplyBound {
@@ -599,7 +606,7 @@ fn check_records_reply(
 ) -> crate::Result<()> {
     let incompatible = match remote {
         ReplyBound::Stated(peer) => !local.can_exchange(peer),
-        ReplyBound::Unstated => local.crossed,
+        ReplyBound::Unstated => local.fenced(),
         ReplyBound::Unheard => false,
     };
     if incompatible {
@@ -1259,8 +1266,13 @@ pub(crate) struct ReceivedRecordsAnswer {
     /// What the server stated of its records ([`RECORDS_BOUND_HEADER`]).
     pub(crate) bound: ReplyBound,
     /// The heads digest the server stated its records had as it answered
-    /// ([`RECORDS_HEADS_HEADER`]): `None` from a server before it, or one holding no genesis.
+    /// ([`RECORDS_HEADS_HEADER`]): `None` from a server before it, one holding no genesis, or a
+    /// reply that brought only a prefix ([`Self::more`]).
     pub(crate) heads: Option<[u8; 32]>,
+    /// The records are a causally closed prefix of what the server holds past the pull's
+    /// `have=`, and more follow ([`RECORDS_MORE_HEADER`]): the puller asks again past them. Only
+    /// a reply that states a records bound and carries a record says so.
+    pub(crate) more: bool,
 }
 
 #[cfg(unix)]
@@ -1273,6 +1285,7 @@ impl ReceivedRecordsAnswer {
             boot: None,
             bound: ReplyBound::Unheard,
             heads: None,
+            more: false,
         }
     }
 }
@@ -1351,16 +1364,24 @@ impl RecordReception {
             exchange.header(RECORDS_NEED_HEADER),
             exchange.header(RECORDS_BOOT_HEADER),
         );
-        let heads = records_heads(exchange.header(RECORDS_HEADS_HEADER));
+        // A prefix vouches for no digest of the server's log, whatever its head says.
+        let said_more = exchange.header(RECORDS_MORE_HEADER) == Some("1");
+        let heads = records_heads(exchange.header(RECORDS_HEADS_HEADER)).filter(|_| !said_more);
         let received = exchange.consume_body(|reader| {
             crate::membership_log::untaken::ReceivedFrames::read_from_with_known(reader, known)
         })?;
+        // Only a cut reply says more follow: a server of the fence states a bound, and a cut
+        // carries at least one record (`Store::missing_within`). Any other answer that says so
+        // (a LAN host's, one before the fence) is no reason to ask again or to count the pass
+        // stale.
+        let more = said_more && bound.stated().is_some() && received.byte_len() > 0;
         Ok(Self::Received(ReceivedRecordsAnswer {
             received,
             needs,
             boot,
             bound,
             heads,
+            more,
         }))
     }
 
@@ -1380,6 +1401,7 @@ impl RecordReception {
                     boot: answer.boot,
                     bound: answer.bound,
                     heads,
+                    more: false,
                 })
             }
         }
@@ -1810,7 +1832,9 @@ fn post_records_body_answered_until(
             .min(EXCHANGE),
         None => EXCHANGE,
     };
-    let target = if bound.crossed {
+    let target = if bound.format != crate::crossing::FORMAT_ONE {
+        with_query(&records_url(url), crate::crossing::FORMAT_POST_QUERY)
+    } else if bound.crossed {
         with_query(&records_url(url), CROSSED_POST_QUERY)
     } else {
         records_url(url)

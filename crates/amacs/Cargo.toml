@@ -3,9 +3,8 @@
 
 [package]
 name = "amacs"
-# Integration tests are declared below, not discovered: every file is a module
-# of the one `amacs_suite` binary. With autotests off a `tests/*.rs` file listed
-# nowhere never compiles. The engine's own tests live in its source files.
+# The engine's tests live in its source files; it has no integration suite. With
+# autotests off a `tests/*.rs` file no [[test]] row names never compiles.
 autotests = false
 version = "0.0.0"
 edition.workspace = true
@@ -37,10 +36,6 @@ aterm-spec = { workspace = true }
 aterm-models-native = { workspace = true }
 # The editor's smart-selection test drives the engine's word rules.
 aterm-core = { workspace = true }
-
-[[test]]
-name = "amacs_suite"
-path = "tests/amacs_suite.rs"
 
 [lints]
 workspace = true

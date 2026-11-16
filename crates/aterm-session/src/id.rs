@@ -11,19 +11,20 @@ use crate::{fill_random, from_hex, hex};
 
 /// A session's stable identity: its tab's ID ([`TabId`], `t` and 10 lower-case Crockford base32
 /// characters, 50 bits), minted when the tab opens and kept until it closes, across a relaunch,
-/// an update and a cold restore. A tab opened before that form keeps its earlier ID (`s-` and 20
-/// lower-case hex digits) until it closes, so every reader takes both; only the `t` form is
-/// minted. Recorded in `<id>/meta`. Not derived from a pid: pids are reused, and an edge bound
+/// an update and a cold restore. A shell opened before that form holds a legacy ID (`s-` and 20
+/// lower-case hex digits) until aterm restores or closes its tab, so a session's ID is read
+/// ([`SessionId::parse`]) as either; only the `t` form is minted. Every value is one of the two:
+/// it is minted, read with [`SessionId::parse`] or made from a [`TabId`]. Recorded in `<id>/meta`. Not derived from a pid: pids are reused, and an edge bound
 /// to a reused pid would silently target a stranger.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SessionId(String);
 
 impl SessionId {
-    /// Wrap an existing id string (e.g. read back from `<id>/meta`). Code minting a
-    /// fresh identity uses [`SessionId::mint`].
+    /// The session whose ID is the tab ID `id`: the one constructor that needs no reading.
+    #[must_use]
     #[inline]
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+    pub fn from_tab(id: TabId) -> Self {
+        Self(id.as_str().to_owned())
     }
 
     /// The id as a string slice (the on-wire / on-disk form).
@@ -56,8 +57,7 @@ impl SessionId {
         Self::mint(|_| false)
     }
 
-    /// The tab ID this names, or `None` for a name that is no tab ID (one [`SessionId::new`]
-    /// wrapped as given).
+    /// The tab ID this names, or `None` for a legacy tab's `s-` ID.
     #[must_use]
     #[inline]
     pub fn tab(&self) -> Option<TabId> {
@@ -83,9 +83,10 @@ impl SessionId {
 /// Whether `s` is a session ID aterm minted: a tab ID ([`aterm_types::tab_id::is_tab_id`]), the
 /// `t` and 10 Crockford base32 characters [`SessionId::mint`] mints, or a legacy tab's `s-` and 20
 /// lowercase hex digits ([`aterm_types::tab_id::is_legacy`]), which a shell opened before the `t`
-/// form still holds until aterm restores or closes its tab. THE parser of a minted sid: a name someone chose (an edge's
-/// `src=`, which `grant` takes as given) is a session only when it reads as one, so a session log
-/// never attributes a record to a word that was never a session's.
+/// form still holds until aterm restores or closes its tab. THE parser of a minted sid: a name
+/// someone chose (an edge's `src=`, a request's `from=`) is a session only when it reads as one,
+/// so `grant` refuses any other and a session log never attributes a record to a word that was
+/// never a session's.
 #[must_use]
 #[inline]
 pub fn is_minted_sid(s: &str) -> bool {

@@ -198,19 +198,22 @@ fn every_snapshot_of_the_tools_shell_is_judged_and_none_is_unknown() {
     let s = Scratch::new("which");
     let err = s.read(&s.worker("/bin/zsh", &[])).expect_err("no snapshot");
     assert!(err.contains("no shell snapshot of zsh"), "{err}");
-    assert!(unwritten(&err), "{err}");
+    assert!(err.starts_with(NO_SNAPSHOT), "{err}");
     s.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
     let err = s
         .read(&s.worker("/bin/zsh", &[]))
         .expect_err("no zsh snapshot");
-    assert!(unwritten(&err), "a bash snapshot is no zsh one: {err}");
+    assert!(
+        err.starts_with(NO_SNAPSHOT),
+        "a bash snapshot is no zsh one: {err}"
+    );
     s.snapshot("zsh", 2, &zsh_snapshot("", "", ""));
     assert!(s.read(&s.worker("/bin/zsh", &[])).is_ok());
     s.snapshot("zsh", 3, &zsh_snapshot("", "setopt globsubst\n", ""));
     let err = s
         .read(&s.worker("/bin/zsh", &[]))
         .expect_err("an option it cannot model");
-    assert!(!unwritten(&err), "a snapshot stands: {err}");
+    assert!(!err.starts_with(NO_SNAPSHOT), "a snapshot stands: {err}");
     assert_eq!(
         tool_kinds(
             &s.worker("/bin/zsh", &["CLAUDE_CODE_SHELL=/bin/bash"]),

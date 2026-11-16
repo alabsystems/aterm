@@ -276,7 +276,9 @@ fn lost_nonce_engine() -> Mutex<Terminal> {
 /// Test session `n`'s tab ID (the `t` form), in a range of its own so no other test's typed
 /// re-key shares its entry.
 fn sid(n: u32) -> SessionId {
-    SessionId::new(aterm_types::tab_id::TabId::from_bits(0x7e_0000 + u64::from(n)).as_str())
+    SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(
+        0x7e_0000 + u64::from(n),
+    ))
 }
 
 /// A degraded tab gets a private one-use `<sid>.<n>` file beside the channel's `<sid>`,
@@ -366,9 +368,9 @@ fn a_typed_rekey_is_refused_where_nothing_is_lost() {
         ShellIntegrationPosture::Degraded
     );
     assert_eq!(
-        typed::issue_in(dir.path(), &term, &SessionId::new("../x")).err(),
-        Some(typed::Refusal::NoDir),
-        "a sid naming no file of ours"
+        SessionId::parse("../x"),
+        None,
+        "a name of no file of ours is no session, so nothing is issued for it"
     );
 }
 
@@ -696,9 +698,9 @@ fn an_earlier_tabs_rekey_lands_where_its_shell_reads() {
     assert_ne!(minted, captured, "a t ID names another file");
     for malformed in ["s-../x", "s-", "t000000000", "T0000000000", "tqn5r6e014u"] {
         assert_eq!(
-            path_for(&SessionId::new(malformed)),
+            SessionId::parse(malformed),
             None,
-            "{malformed} names no file"
+            "{malformed} names no session, so no file"
         );
     }
 

@@ -312,3 +312,164 @@ pub(crate) fn crown_row_bytes(
     // SAFETY: shared storage of exactly `row * h` bytes whose writing command buffer completed.
     Ok(unsafe { ffi::buffer_bytes(&rb, row * h) })
 }
+
+#[cfg(test)]
+impl MetalBlit {
+    /// Run the production dock encoder over the ordinary frame blit.
+    pub(crate) fn run_docked(
+        &self,
+        source: (&[u8], u32, u32),
+        uniform: &[u8],
+        dest: (u32, u32),
+        dock: crate::renderer::TrayQuad<'_>,
+        dock_uniform: &[u8],
+        scissor: [u32; 4],
+    ) -> Result<Vec<u8>, String> {
+        use super::encoder::{EncodeSession, RenderPassDesc, StoreAction};
+        use super::ffi::LoadAction;
+        use super::loss::{CbOutcome, LossLatch};
+        use super::present::{DockPass, PostPass, TrayPass, draw_dock, encode_dock_stage};
+        use super::resources::MetalResourceDevice;
+        let _pool = ffi::AutoreleasePool::new();
+        let source_row = (source.1 as usize)
+            .checked_mul(4)
+            .ok_or("source row overflow")?;
+        let source_len = source_row
+            .checked_mul(source.2 as usize)
+            .ok_or("source size overflow")?;
+        let dock_row = (dock.pw as usize)
+            .checked_mul(4)
+            .ok_or("dock row overflow")?;
+        let dock_len = dock_row
+            .checked_mul(dock.ph as usize)
+            .ok_or("dock size overflow")?;
+        let row = (dest.0 as usize)
+            .checked_mul(self.format.bytes_per_texel())
+            .ok_or("destination row overflow")?;
+        let readback_len = row
+            .checked_mul(dest.1 as usize)
+            .ok_or("destination size overflow")?;
+        let [x0, y0, x1, y1] = scissor;
+        if source.0.len() != source_len
+            || uniform.len() != Self::UNIFORM_BYTES
+            || dock.rgba.len() != dock_len
+            || dock_uniform.len() != Self::UNIFORM_BYTES
+            || x0 > x1
+            || y0 > y1
+            || x1 > dest.0
+            || y1 > dest.1
+        {
+            return Err("invalid frame, dock, uniform or scissor".into());
+        }
+        let latch = std::sync::Arc::new(LossLatch::default());
+        let mint = MetalResourceDevice::new(&self.device, std::sync::Arc::clone(&latch));
+        let session = EncodeSession::new(&self.device, latch)?;
+        let usage = ffi::TEXTURE_USAGE_RENDER_TARGET | ffi::TEXTURE_USAGE_SHADER_READ;
+        let target = mint.texture_2d(self.format, dest.0 as usize, dest.1 as usize, usage)?;
+        let stage = mint.texture_2d(Self::SRC_FORMAT, dock.pw as usize, dock.ph as usize, usage)?;
+        let input = mint.texture_2d(
+            PixelFormat::Rgba8Unorm,
+            dock.pw as usize,
+            dock.ph as usize,
+            ffi::TEXTURE_USAGE_SHADER_READ,
+        )?;
+        let frame_input = mint.texture_2d(
+            Self::SRC_FORMAT,
+            source.1 as usize,
+            source.2 as usize,
+            ffi::TEXTURE_USAGE_SHADER_READ,
+        )?;
+        let frame_u = mint.buffer(Self::UNIFORM_BYTES)?;
+        // SAFETY: the shared textures have exactly the checked dimensions and matching formats.
+        unsafe {
+            ffi::texture_upload(
+                frame_input.obj(),
+                ffi::MtlRegion::full_2d(source.1 as usize, source.2 as usize),
+                source.0,
+                source_row,
+            );
+            ffi::texture_upload(
+                input.obj(),
+                ffi::MtlRegion::full_2d(dock.pw as usize, dock.ph as usize),
+                dock.rgba,
+                dock_row,
+            );
+        }
+        let tu = [
+            0.0_f32,
+            0.0,
+            dock.pw as f32,
+            dock.ph as f32,
+            dock.pw as f32,
+            dock.ph as f32,
+            0.0,
+            0.0,
+        ];
+        let tray_u = mint.buffer(size_of::<crate::renderer::TrayUniform>())?;
+        let blit_u = mint.buffer(Self::UNIFORM_BYTES)?;
+        // SAFETY: fresh shared uniform buffers of exactly the written byte lengths, not submitted yet.
+        unsafe {
+            ffi::buffer_write(&frame_u, uniform);
+            ffi::buffer_write(&tray_u, aterm_bits::bytes_of(&tu));
+            ffi::buffer_write(&blit_u, dock_uniform);
+        }
+        let tray_spec = Pipeline::Tray.spec();
+        let tray_lib = pipelines::compile(&self.device, tray_spec)?;
+        let tray_pso = pipelines::build(&self.device, &tray_lib, tray_spec, Self::SRC_FORMAT)?;
+        let tb = tray_spec.binds;
+        let bb = Pipeline::Blit.spec().binds;
+        let readback = mint.buffer(readback_len)?;
+        let mut cb = session.begin()?;
+        let dock_pass = DockPass {
+            stage: Some((
+                &stage,
+                TrayPass {
+                    pso: &tray_pso,
+                    card_tex: input.obj(),
+                    tex_slot: tb.fragment_textures[0] as usize,
+                    sampler: &self.sampler,
+                    sampler_slot: tb.fragment_samplers[0] as usize,
+                    uniform: &tray_u,
+                    uniform_slot: tb.vertex_uniform.ok_or("tray vertex uniform missing")? as usize,
+                },
+            )),
+            blit: PostPass {
+                pso: &self.pipeline,
+                tex: stage.obj(),
+                tex_slot: bb.fragment_textures[0] as usize,
+                sampler: &self.sampler,
+                sampler_slot: bb.fragment_samplers[0] as usize,
+                uniform: &blit_u,
+                uniform_slot: bb.fragment_buffers[0] as usize,
+            },
+            rect: scissor,
+        };
+        encode_dock_stage(&mut cb, &dock_pass)?;
+        {
+            let pass = cb.render_pass(&RenderPassDesc {
+                target: &target,
+                load: LoadAction::Clear(ffi::ClearColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
+                store: StoreAction::Store,
+                viewport: None,
+                scissor: None,
+            })?;
+            pass.set_pipeline(&self.pipeline);
+            pass.set_fragment_texture(frame_input.obj(), bb.fragment_textures[0] as usize);
+            pass.set_fragment_sampler(&self.sampler, bb.fragment_samplers[0] as usize);
+            pass.set_fragment_buffer(&frame_u, bb.fragment_buffers[0] as usize);
+            pass.draw_fullscreen_triangle()?;
+            draw_dock(&pass, &dock_pass)?;
+        }
+        cb.copy_texture_to_buffer(&target, dest.0 as usize, dest.1 as usize, &readback, row)?;
+        if cb.commit().wait_outcome() != CbOutcome::Completed {
+            return Err("dock present did not complete".into());
+        }
+        // SAFETY: the shared readback is exactly row * height bytes and its GPU writer completed.
+        Ok(unsafe { ffi::buffer_bytes(&readback, readback_len) })
+    }
+}

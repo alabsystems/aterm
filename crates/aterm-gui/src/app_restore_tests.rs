@@ -2038,6 +2038,7 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
 
 fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayout {
     restore::WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,
@@ -2063,7 +2064,7 @@ fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayo
     }
 }
 
-fn bare_leaf() -> restore::TerminalLeafRestore {
+pub(super) fn bare_leaf() -> restore::TerminalLeafRestore {
     restore::TerminalLeafRestore {
         pinned: false,
         sid: None,
@@ -2111,7 +2112,7 @@ fn updates_settings() -> restore::NativeTabRestore {
     }
 }
 
-fn adopt_as(app: &mut App, session: u64, parent_id: u64) {
+pub(super) fn adopt_as(app: &mut App, session: u64, parent_id: u64) {
     app.pool
         .sessions
         .get_mut(&session)
@@ -4806,7 +4807,7 @@ fn handed_off_masters_are_adopted_or_closed_never_leaked() {
     }
 }
 
-fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
+pub(super) fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
     crate::spawn::Adopted {
         repaint: false,
         local_id,
@@ -5565,7 +5566,7 @@ fn split_of(
     }
 }
 
-fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
+pub(super) fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
     let mut layout = single_leaf_window(bare_leaf());
     layout.restored_tabs = roots
         .into_iter()
@@ -8735,7 +8736,7 @@ pub(super) fn grid_of(app: &App, id: u64) -> (u16, u16) {
 
 /// A successor whose window took a new grid at attach before the restore placed its other two
 /// tabs, each on a handed-over shell still at the grid its engine was parked at.
-fn handoff_into_moved_window(grid: (u16, u16)) -> (App, Vec<u64>) {
+pub(super) fn handoff_into_moved_window(grid: (u16, u16)) -> (App, Vec<u64>) {
     let wid = WindowId(0);
     let mut new = App::headless_for_test();
     new.handoff_successor = true;
@@ -8801,7 +8802,12 @@ fn a_handoff_s_close_regrids_each_handed_over_tab_its_window_moved_under() {
 }
 
 /// What a restore's close leaves window `wid` when its OS window has a size still to bring.
-fn owe_restore_regrid(app: &mut App, wid: WindowId, fullscreen: bool, at: std::time::Instant) {
+pub(super) fn owe_restore_regrid(
+    app: &mut App,
+    wid: WindowId,
+    fullscreen: bool,
+    at: std::time::Instant,
+) {
     app.windows
         .get_mut(&wid)
         .expect("the window")
@@ -8813,7 +8819,7 @@ fn owe_restore_regrid(app: &mut App, wid: WindowId, fullscreen: bool, at: std::t
 }
 
 /// Draw window `wid` through the real redraw path on a scripted CPU surface.
-fn present_scripted(app: &mut App, wid: WindowId) {
+pub(super) fn present_scripted(app: &mut App, wid: WindowId) {
     app.windows.get_mut(&wid).expect("the window").present = Some(crate::PresentTarget::Cpu {
         surface: crate::present::CpuSurface::Scripted(Default::default()),
     });
@@ -9447,16 +9453,19 @@ fn a_restored_worker_whose_agent_does_not_come_back_reads_exited() {
     );
 }
 
-/// THE DISK WORKER IS DISPOSABLE: a cold restart does not relaunch it, and its record reads
-/// exited. NEGATIVE CONTROL: another worker's agent is owed its relaunch, and a disk worker whose
-/// shell came back running keeps working.
+/// A DISK WORKER AN EARLIER BUILD LEFT IS DISPOSABLE: a cold restart does not relaunch it, and its
+/// record reads exited. One whose shell a keeper handed back running is over there instead
+/// (`failed why=expired`, its Autopilot Off): this build has neither its approval rule nor its
+/// time limit, so it is not left working as an ordinary session. NEGATIVE CONTROL: another
+/// worker's agent is owed its relaunch, and another worker whose shell came back running keeps
+/// working with no Autopilot word of aterm's Off.
 #[test]
 fn a_cold_restart_does_not_resume_the_disk_worker() {
-    use crate::task_record::TaskState::{Exited, Working};
+    use crate::task_record::TaskState::{Exited, Failed, Working};
+    use alab_policy::config::Autopilot;
     let disk = format!(
-        "/state/aterm/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        aterm_agent::harness::disk::fence::WORKER_FOLDER
+        "/state/aterm/{}/disk-worker",
+        aterm_agent::harness::cli::HARNESS
     );
     let row = |folder: &str| {
         format!(
@@ -9535,14 +9544,72 @@ fn a_cold_restart_does_not_resume_the_disk_worker() {
         "CONTROL: a person's agent comes back"
     );
 
-    let shell = crate::stub_session(9);
-    assert!(
-        !crate::task_record::seed_restored(&shell.ctx, &row(&disk), true, true),
-        "CONTROL: a shell that came back running keeps its worker"
-    );
+    let kept = |folder: &str| {
+        let shell = crate::stub_session(9);
+        assert!(
+            !crate::task_record::seed_restored(&shell.ctx, &row(folder), true, true),
+            "a shell that came back running is not a relaunch the restore leaves out"
+        );
+        let record = shell
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .map(|t| (t.state, t.why));
+        (record, shell.ctx.meta.lock().unwrap().autopilot_word())
+    };
+    let expired = Some((Failed, Some(crate::task_record::WHY_EXPIRED)));
     assert_eq!(
-        shell.ctx.timeline.lock().unwrap().task().map(|t| t.state),
-        Some(Working)
+        kept(&disk),
+        (expired, Some(Autopilot::Off)),
+        "a disk worker whose shell came back running is over, and turned off"
+    );
+    let (record, word) = kept("/Users//me/project");
+    assert_eq!(
+        record,
+        Some((Working, Some("restored"))),
+        "CONTROL: another worker whose shell came back running keeps working"
+    );
+    assert_ne!(word, Some(Autopilot::Off), "CONTROL: and is not turned off");
+}
+
+/// A RETIRED DISK WORKER'S OFF STANDS WHEN ITS LEAF'S WORDS ARE SEEDED AFTER ITS RECORD. The
+/// update seeds the record first (`task_record::seed_carried`, which turns the worker off in
+/// aterm's name), then the restored leaf's own words (`App::seed_restored_user_meta`), whose
+/// saved Autopilot is the one the worker ran under. NEGATIVE CONTROL (in the test): another
+/// worker seeded the same way takes the leaf's word; without the `driver_wrote` guard in
+/// `seed_restored_user_meta` the disk worker reads `cruise` again and the first assert fails.
+#[test]
+fn a_reseeded_leaf_leaves_a_retired_disk_workers_off_standing() {
+    use alab_policy::config::Autopilot;
+    let row = |folder: &str| {
+        format!(
+            "rev=4 state=working from=ctl since=1700000000000 result_bytes=0 attention=0 \
+             trusted_cwd={}",
+            crate::control::pct_encode(folder)
+        )
+    };
+    let cruise = restore::TerminalLeafRestore {
+        local_id: Some(0),
+        autopilot: Some(Autopilot::Cruise.word().to_string()),
+        ..bare_leaf()
+    };
+    let word = |folder: &str| {
+        let session = crate::stub_session(9);
+        crate::task_record::seed_carried(&session.ctx, Some(&row(folder)));
+        App::seed_restored_user_meta(&session, &cruise);
+        session.ctx.meta.lock().unwrap().autopilot_word()
+    };
+    let disk = format!(
+        "/state/aterm/{}/disk-worker",
+        aterm_agent::harness::cli::HARNESS
+    );
+    assert_eq!(word(&disk), Some(Autopilot::Off));
+    assert_eq!(
+        word("/Users//me/project"),
+        Some(Autopilot::Cruise),
+        "CONTROL: another worker takes its leaf's word"
     );
 }
 

@@ -22,7 +22,9 @@
 //!
 //! A VIEW'S REVISION NEVER MOVES ON SCREEN WITHOUT AN INVALIDATION AND A FRAME: the raster on
 //! glass answers the pointer only while its stamp is the view's. A change a view paints is a
-//! band at its revision; one it lists off its screen is a frame that rasters one pixel
+//! band at its revision; one it lists off its screen asks for no frame (a reader of its nodes
+//! compiles the page as it stands, `App::note_native_nodes_behind`), save where an assistive
+//! client reads the window's tree, which is told by a frame that rasters one pixel
 //! ([`TREE_ONLY`]); one it does not list asks it for nothing. A view nobody sees moves its
 //! revision with each change, so a reader of its page compiles the list as it stands, and is
 //! drawn whole, with a frame asked for, when it shows.
@@ -31,6 +33,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::app_native::TREE_ONLY;
 use crate::native_app::{AppKind, AppViewState, DamageRegion, NativeApp};
 use crate::navigator::{
     NavAction, NavRow, NavTree, NavigatorViewState, SPLIT_COLS, Shows, band_of,
@@ -47,18 +50,6 @@ const NAV_AGE_STEP: Duration = Duration::from_secs(60);
 /// The page's title where the machine has no name.
 const THIS_MACHINE: &str = "This machine";
 
-/// The damage of a view whose compiled page moved and whose pixels did not: a row it lists off
-/// its screen reads differently, which is a node a screen reader and `inspect` read. A page is
-/// one compile, from which its pixels, the tree the pointer is routed by and the tree a client
-/// reads all come, so the view owes a frame; this is the least a frame rasters. The frame
-/// compiles the page, finds no paint node changed, and paints this one pixel as it was.
-const TREE_ONLY: DamageRegion = DamageRegion::Rect {
-    x: 0,
-    y: 0,
-    width: 1,
-    height: 1,
-};
-
 /// What a row's title reads of a walk ([`App::tab_label_of_session`]): a session nothing has
 /// titled is named by its tab's place on the strip (`tab 3`) while its tab is shown, and by what
 /// it runs, at no place, while its tab is parked.
@@ -68,6 +59,26 @@ enum Seat {
     Shown(u32),
     /// In a parked tab.
     Parked,
+}
+
+/// What a session says of itself, as its reader's last feed left it
+/// ([`crate::vitals_jobs::JobFeed`]): whether its shell runs a command (its OSC 133 C with no D
+/// yet), and its program's own word on itself (its OSC 7501 report, as
+/// [`crate::program_state::survey_word`] words it: `busy` for a turn in progress, `idle` for one
+/// ended). With Tab Status off nothing observes the session, and its row is read from these.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OwnWord {
+    runs: bool,
+    program: Option<&'static str>,
+}
+
+impl OwnWord {
+    fn of(feed: &crate::vitals_jobs::JobFeed) -> Self {
+        Self {
+            runs: feed.runs(),
+            program: feed.program().map(crate::program_state::survey_word),
+        }
+    }
 }
 
 /// What a row's latest words were read from. Equal stamps: the words are what they were.
@@ -127,6 +138,11 @@ pub(crate) struct NavListed {
 /// `App::nav` holds one only while a navigator is open.
 #[derive(Debug, Default)]
 pub(crate) struct NavWatch {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    title_requested: bool,
+    pending_title: Option<String>,
+    /// A dock-only list has no uncovered shown host: keep no provider work until it returns.
+    suspended: bool,
     /// The layout, the set of sessions, a focus or the machine's name may have moved.
     structure: bool,
     /// Sessions whose title, word, agent or creator may have moved.
@@ -151,11 +167,11 @@ pub(crate) struct NavWatch {
     seats: Vec<(u64, Seat)>,
     /// Each walked session's seat, as its row's title reads it.
     seat_of: HashMap<u64, Seat>,
-    /// The sessions whose shell said a command was running when their row was last built
-    /// ([`crate::vitals_jobs::JobFeed::runs`]).
-    said: BTreeSet<u64>,
-    /// Whether Tab Status was on when the rows were last marked for it: which of the two a
-    /// row's `running` is read from.
+    /// What each session said of itself when its row was last built ([`OwnWord`]), kept only
+    /// where it said something.
+    said: HashMap<u64, OwnWord>,
+    /// Whether Tab Status was on when the rows were last marked for it: whether a row's word is
+    /// read from what it observed or from what the session says of itself.
     observed: bool,
     /// The views whose revision moved while nobody saw them: each is drawn whole, and asked
     /// for a frame, when it shows.
@@ -187,6 +203,9 @@ struct NavWalk {
 
 impl NavWatch {
     fn idle(&self, now: Instant) -> bool {
+        if self.suspended && !self.structure {
+            return true;
+        }
         !(self.structure
             || self.screen_stale
             || !self.rows.is_empty()
@@ -232,7 +251,9 @@ impl App {
 
     /// `session`'s title, state or creator may have moved.
     pub(crate) fn navigator_mark_row(&mut self, session: u64) {
-        if let Some(nav) = self.nav.as_deref_mut() {
+        if let Some(nav) = self.nav.as_deref_mut()
+            && !nav.suspended
+        {
             nav.rows.insert(session);
         }
     }
@@ -248,13 +269,14 @@ impl App {
     }
 
     /// `session` printed: its latest words may have moved ([`Self::navigator_mark_words`]).
-    /// With Tab Status off nothing observes its shell, and the shell's own word on whether a
-    /// command runs arrives as output: it is read here, off the term lock, and a row built from
-    /// the other answer is marked. The output pass calls this after it stores the session's
-    /// output latch (`SessionPool::output_pass`): a word the reader feeds after that store posts
-    /// a wake of its own or leaves the hold dirty, and one fed before it is the word read here.
+    /// With Tab Status off nothing observes the session, and what it says of itself (its shell's
+    /// word on whether a command runs, its program's own report) arrives as output: it is read
+    /// here, off the term lock, and a row built from another answer is marked. The output pass
+    /// calls this after it stores the session's output latch (`SessionPool::output_pass`): a word
+    /// the reader feeds after that store posts a wake of its own or leaves the hold dirty, and
+    /// one fed before it is the word read here.
     pub(crate) fn navigator_note_output(&mut self, session: u64) {
-        let Some(nav) = self.nav.as_deref_mut() else {
+        let Some(nav) = self.nav.as_deref_mut().filter(|nav| !nav.suspended) else {
             return;
         };
         if nav.screen.contains(&session) {
@@ -262,17 +284,17 @@ impl App {
         }
         if !self.config.tab_status_or_default()
             && nav.held.contains_key(&session)
-            && self
-                .pool
-                .get(session)
-                .is_some_and(|live| live.ctx.job_feed.runs() != nav.said.contains(&session))
+            && self.pool.get(session).is_some_and(|live| {
+                OwnWord::of(&live.ctx.job_feed)
+                    != nav.said.get(&session).copied().unwrap_or_default()
+            })
         {
             nav.rows.insert(session);
         }
     }
 
-    /// The configuration was applied. A row reads whether its shell runs a command from what
-    /// Tab Status observed while that is on and from the shell's own word while it is off, so
+    /// The configuration was applied. A row's word is read from what Tab Status observed while
+    /// that is on and from what the session says of itself while it is off ([`OwnWord`]), so
     /// turning it on or off marks every row.
     pub(crate) fn navigator_note_tab_status(&mut self) {
         let observed = self.config.tab_status_or_default();
@@ -333,24 +355,59 @@ impl App {
             .min()
     }
 
-    /// The page's title: the machine's name as the machine writes it, else its host's name, else
-    /// `This machine`.
+    /// The cached machine name, else the process host name, else `This machine`.
     pub(crate) fn machine_title(&self) -> String {
         if let Some(name) = self.machine_name_now() {
             return name;
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        if let Some(name) = aterm_types::dirs::state_dir()
-            .and_then(|state| aterm_agent::machine_name::file::read(&state).ok().flatten())
-            .map(|name| name.name())
-            .filter(|name| !name.is_empty() && name != "unnumbered")
+        if let Some(name) = self
+            .nav
+            .as_deref()
+            .map(|nav| nav.pending_title.as_deref().unwrap_or(&nav.machine))
+            .filter(|name| !name.is_empty())
         {
-            return name;
+            return name.to_owned();
         }
         aterm_uds::process::lan_host_name()
             .map(|host| host.trim_end_matches(".local").trim().to_owned())
             .filter(|host| !host.is_empty())
             .unwrap_or_else(|| THIS_MACHINE.to_owned())
+    }
+
+    /// The non-macOS Unix name file is read once, on a worker; the page reads only its snapshot.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn request_navigator_title(&self, nav: &mut NavWatch) {
+        if nav.title_requested || !nav.views.iter().any(|view| view.visible) {
+            return;
+        }
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        let fallback = nav.machine.clone();
+        match std::thread::Builder::new()
+            .name("navigator-title".into())
+            .spawn(move || {
+                let title = aterm_types::dirs::state_dir()
+                    .and_then(|state| aterm_agent::machine_name::file::read(&state).ok().flatten())
+                    .map(|name| name.name())
+                    .filter(|name| !name.is_empty() && name != "unnumbered")
+                    .unwrap_or(fallback);
+                let _ = proxy.send_event(crate::Wake::NavigatorTitleReady(title));
+            }) {
+            Ok(_) => nav.title_requested = true,
+            Err(error) => aterm_log::info!("navigator: title reader could not start: {error}"),
+        }
+    }
+
+    #[cfg(any(test, all(unix, not(target_os = "macos"))))]
+    pub(crate) fn navigator_title_ready(&mut self, title: String) {
+        if let Some(nav) = self.nav.as_mut()
+            && nav.machine != title
+            && nav.pending_title.as_ref() != Some(&title)
+        {
+            nav.pending_title = Some(title);
+            nav.structure = true;
+        }
     }
 
     /// The machine's own name where this process already holds it (macOS: the title bar's).
@@ -384,6 +441,50 @@ impl App {
             .is_some_and(|instance| self.is_navigator_view(view, instance))
     }
 
+    fn ensure_navigator_instance(&mut self) -> Result<AppInstanceId, String> {
+        match self.navigator_instance_id() {
+            Some(instance) => Ok(instance),
+            None => self
+                .native_runtime
+                .insert_instance(NativeApp::Navigator(Box::default()))
+                .map_err(|error| format!("The navigator could not open: {error:?}")),
+        }
+    }
+
+    /// Allocate one window-owned view of the same page; it takes neither a tab nor its keys.
+    pub(crate) fn create_dock_navigator(&mut self, wid: WindowId) -> Result<ViewId, String> {
+        if !self.windows.contains_key(&wid) {
+            return Err("No window for the navigator".into());
+        }
+        self.land_native_layout_faces();
+        let person_in = self
+            .focused_session_id(wid)
+            .or_else(|| self.shown_front(wid).map(|front| front.session));
+        let instance = self.ensure_navigator_instance()?;
+        let view = self
+            .view_store
+            .insert_native(instance)
+            .map_err(|error| format!("The navigator could not open: {error:?}"))?;
+        if let Err(error) = self.native_runtime.attach_view(
+            view,
+            instance,
+            AppViewState::Navigator(Box::new(NavigatorViewState::in_dock(person_in))),
+        ) {
+            self.view_store.remove(view);
+            return Err(format!("The navigator could not open: {error:?}"));
+        }
+        let observed = self.config.tab_status_or_default();
+        self.nav
+            .get_or_insert_with(|| {
+                Box::new(NavWatch {
+                    observed,
+                    ..NavWatch::default()
+                })
+            })
+            .structure = true;
+        Ok(view)
+    }
+
     /// Open the navigator in the front window: as the left pane of the active tab, about
     /// [`SPLIT_COLS`] cells wide, where `split` and the tab is terminals with room for it; else as
     /// a tab of its own. A tab that already holds it gets the keys on it. Whether it is a split.
@@ -396,13 +497,7 @@ impl App {
                 .as_ref()
                 .map(|terminal| terminal.session)
         });
-        let instance = match self.navigator_instance_id() {
-            Some(instance) => instance,
-            None => self
-                .native_runtime
-                .insert_instance(NativeApp::Navigator(Box::default()))
-                .map_err(|error| format!("The navigator could not open: {error:?}"))?,
-        };
+        let instance = self.ensure_navigator_instance()?;
         let state =
             || AppViewState::Navigator(Box::new(NavigatorViewState::starting_in(person_in)));
         let ws = self
@@ -514,6 +609,22 @@ impl App {
     fn navigator_views_now(&self, instance: AppInstanceId, views: &mut Vec<NavView>) {
         views.clear();
         for (&window, ws) in &self.windows {
+            if let Some(view) = ws.dock.view
+                && self.is_navigator_view(view, instance)
+            {
+                let viewport = (!ws.occluded)
+                    .then(|| self.native_ui_viewport_for(window, view).ok())
+                    .flatten();
+                views.push(NavView {
+                    window,
+                    view,
+                    visible: viewport.is_some(),
+                    keys: false,
+                    at_hand: false,
+                    size: viewport
+                        .map_or((0, 0), |rect| (rect.width.to_bits(), rect.height.to_bits())),
+                });
+            }
             let active = ws.tab_set.active_id();
             for tab in ws.tab_set.tabs() {
                 let front = active == Some(tab.id);
@@ -583,9 +694,9 @@ impl App {
     }
 
     /// One session's row as it reads now, with `line` and `moved_ms` as its last read left them;
-    /// `said` is its shell's own word on whether a command runs. The store's lock is not held:
-    /// the row reads it for its creator.
-    fn navigator_row(&self, handle: &SessionHandle, line: Option<String>, said: bool) -> NavRow {
+    /// `said` is what the session says of itself. The store's lock is not held: the row reads it
+    /// for its creator.
+    fn navigator_row(&self, handle: &SessionHandle, line: Option<String>, said: OwnWord) -> NavRow {
         let (task, taken_off, from, task_agent, gone, asks, agent_word, program) = {
             let timeline = handle
                 .ctx
@@ -619,9 +730,25 @@ impl App {
             _ => self.tab_label_of_session(session),
         };
         let creator = from.and_then(|from| {
-            self.local_session_of(&aterm_session::SessionId::new(&from))
+            aterm_session::SessionId::parse(&from)
+                .and_then(|from| self.local_session_of(&from))
                 .filter(|creator| *creator != session)
         });
+        // Tab Status reads an agent by its screen, and a shell that says nothing of itself too
+        // (by the program that holds its terminal), so its readings stand while it is on. Off,
+        // nothing observes the session, and what it says of itself is the fact: its program's
+        // own report, and its shell's word on whether a command runs. The shell's word alone
+        // would read an agent `working` for as long as its process lives.
+        let (agent_word, running) = if self.config.tab_status_or_default() {
+            (
+                agent_word,
+                self.session_status
+                    .status(session)
+                    .is_some_and(|status| crate::session_status::status_indicators(status).busy),
+            )
+        } else {
+            (said.program.unwrap_or("-"), said.runs)
+        };
         NavRow {
             session,
             title,
@@ -633,16 +760,7 @@ impl App {
                 taken_off,
                 asks,
                 agent_word,
-                // Tab Status reads a shell that says nothing of itself too (by the program that
-                // holds its terminal), so its reading stands while it is on. Off, nothing
-                // observes the session, and the shell's own word is the fact.
-                running: if self.config.tab_status_or_default() {
-                    self.session_status
-                        .status(session)
-                        .is_some_and(|status| crate::session_status::status_indicators(status).busy)
-                } else {
-                    said
-                },
+                running,
             }),
             line,
             moved_ms: handle.ctx.screen_moves.moved_ms(),
@@ -733,7 +851,30 @@ impl App {
                 nav.owed
                     .retain(|view| nav.views.iter().any(|at| at.view == *view));
             }
+            if nav.views.iter().all(|view| {
+                self.windows.get(&view.window).is_none_or(|ws| {
+                    ws.dock.view == Some(view.view) && (ws.occluded || ws.dock.cells == 0)
+                })
+            }) {
+                nav.suspended = true;
+                nav.rows.clear();
+                nav.words.clear();
+                nav.trailing.clear();
+                nav.screen.clear();
+                nav.age_at = None;
+                nav.words_read_at = None;
+                nav.screen_stale = true;
+                nav.walk = walk;
+                self.nav = Some(nav);
+                return;
+            }
+            let resumed = std::mem::replace(&mut nav.suspended, false);
             self.navigator_walk(&mut walk);
+            if resumed {
+                nav.rows
+                    .extend(walk.pinned.iter().chain(&walk.parked).copied());
+                rearrange = true;
+            }
             if walk.seats != nav.seats {
                 // A session's seat is its tab's place while the tab is shown, and no place
                 // while it is parked, as its title reads it ([`Seat`]). A session another
@@ -771,6 +912,15 @@ impl App {
                 rearrange = true;
             }
         }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        self.request_navigator_title(&mut nav);
+        if let Some(title) = nav.pending_title.take()
+            && nav.machine != title
+        {
+            nav.machine = title;
+            rearrange = true;
+            facts = true;
+        }
         // A list holds its order while a person's keyboard is on it, and takes the strip's once
         // it goes elsewhere: a list in a window that is not the key one holds nothing.
         let keys = nav.views.iter().any(|view| view.at_hand);
@@ -792,11 +942,11 @@ impl App {
                 }
                 continue;
             };
-            let said = handle.ctx.job_feed.runs();
-            if said {
-                nav.said.insert(session);
-            } else {
+            let said = OwnWord::of(&handle.ctx.job_feed);
+            if said == OwnWord::default() {
                 nav.said.remove(&session);
+            } else {
+                nav.said.insert(session, said);
             }
             let held = nav.held.get(&session);
             let row = self.navigator_row(&handle, held.and_then(|row| row.line.clone()), said);
@@ -834,7 +984,7 @@ impl App {
             nav.stamps
                 .retain(|session, _| arranged.index_of(*session).is_some());
             nav.said
-                .retain(|session| arranged.index_of(*session).is_some());
+                .retain(|session, _| arranged.index_of(*session).is_some());
             reshaped = !same_shape(&old, &arranged);
             if reshaped || !changed.is_empty() {
                 tree = Arc::new(arranged);
@@ -1021,12 +1171,25 @@ impl App {
                         let band = band_of(span, width);
                         self.invalidate_native_view_cache(at.window, at.view, band);
                     }
-                    // A ROW THIS VIEW LISTS OFF ITS SCREEN CHANGED: no pixel of it is on the
-                    // glass, and its node says the new words. The revision stays (moved with no
-                    // frame it would leave the raster on glass refused for the pointer, and the
-                    // next frame a whole raster), and the view asks for the least frame there is.
+                    // A ROW THIS VIEW LISTS OFF ITS SCREEN CHANGED: no pixel or target of it is
+                    // on the glass, and only its node says the new words. The revision stays
+                    // (moved with no frame it would leave the raster on glass refused for the
+                    // pointer, and the next frame a whole raster). Where an assistive client
+                    // reads the window's tree it is told by the least frame there is; elsewhere
+                    // the view asks for no frame, and a reader of its nodes (`inspect`) compiles
+                    // the page as it stands. Scrolled onto the screen, the row is drawn from the
+                    // list as published.
                     Shows::Listed => {
-                        self.invalidate_native_view_cache(at.window, at.view, TREE_ONLY);
+                        if self
+                            .windows
+                            .get(&at.window)
+                            .is_some_and(|window| window.assistive_client())
+                        {
+                            self.invalidate_native_view_cache(at.window, at.view, TREE_ONLY);
+                        } else {
+                            self.note_native_nodes_behind(at.window, at.view);
+                            continue;
+                        }
                     }
                     // Nothing of what changed is in this view's page: it compiles as it did.
                     Shows::Nothing => continue,

@@ -46,6 +46,7 @@
 //! in the harness's own process ([`reexec`]). It keeps no clock (callers pass
 //! `now_ms`) and writes no journal ([`Link::take_notes`]).
 
+mod c3_child;
 pub mod claim;
 pub mod config;
 #[cfg(any(test, feature = "fake"))]
@@ -61,11 +62,13 @@ pub mod stream;
 pub mod wire;
 
 pub use claim::{
-    Account, Child, ChildProcess, Contract, Grant, Policy, Restart, SafePoint, Scope, Status,
-    Warrant,
+    Account, Child, ChildProcess, Contract, Grant, NativeChild, Policy, Restart, SafePoint, Scope,
+    Status, Warrant,
 };
 pub use config::{Config, ConfigError, EnvNames, HostedMark};
-pub use link::{Drained, Facts, Failure, Link, Reading, Relaunch, Verdict};
+pub use link::{
+    ChildStart, Drained, Facts, Failure, Link, NativeObservation, Reading, Relaunch, Verdict,
+};
 pub use record::{Body, Decoded, Kind, LineError, Needs, Record, StreamReply};
 pub use run::{Run, RunError};
 pub use stream::{AnswerError, Counts, Hand, Incoming, Received, SendError};

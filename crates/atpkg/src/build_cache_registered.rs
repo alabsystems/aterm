@@ -4344,14 +4344,19 @@ fn never_managed(home: &Path, manifest: &Path) -> bool {
 /// alias this reader cannot tell is judged on every line it may run ([`super::untold_lines`]):
 /// the words after its name up to a `--` Targo's, each prefix of them, so a `--target-dir` among
 /// them is read whatever the alias makes of the words after it; it owes custody where any of
-/// them, the environment or a config names a target under HOME. What the alias's own words name
-/// is unread there, and [`observe`] poisons every registered root's owners. A line `miri` hands
-/// back whose target this reader cannot tell ([`super::MiriCall::target_unread`]) owes custody
-/// wherever its package is one atpkg could manage. A call Targo refuses ([`super::targo_line`]
-/// reads no line for it) builds nothing and owes none. A `-C` it refuses for want of its gate
-/// ([`super::directory_refused`]) is judged as the same call honoured, so one that names an
-/// output there is refused, naming the gate ([`observe_for_producer`]): a gate this reader
-/// misread would otherwise let a build Targo honours through unrecorded.
+/// them, the environment or a config names a target under HOME, or where a config's line that is
+/// no comment spells a directory's key, as the alias's definition there may
+/// ([`super::configs_mention_dirs`]). What the alias's own words name is unread there, and
+/// [`observe`] poisons every registered root's owners. A config's text is read for what its
+/// `build` table names ([`super::configs_unresolved`]): an alias's words there (`build-dev =
+/// "run --target-dir target/tools …"`) name no target for a call that does not run it, and a line
+/// that runs it holds them. A line `miri` hands back whose target this reader cannot tell
+/// ([`super::MiriCall::target_unread`]) owes custody wherever its package is one atpkg could
+/// manage. A call Targo refuses ([`super::targo_line`] reads no line for it) builds nothing and
+/// owes none. A `-C` it refuses for want of its gate ([`super::directory_refused`]) is judged as
+/// the same call honoured, so one that names an output there is refused, naming the gate
+/// ([`observe_for_producer`]): a gate this reader misread would otherwise let a build Targo honours
+/// through unrecorded.
 fn requires_managed_explicit(
     args: &[String],
     tool: super::Tool,
@@ -4369,7 +4374,7 @@ fn requires_managed_explicit(
     let alias = |verb: &str| user_alias(verb, typed, tool, machine);
     with_miri(typed, tool, machine, |miri| {
         let unread = super::miri_call(typed, tool, &alias, miri).target_unread;
-        let owes = |line: &[String]| {
+        let owes = |line: &[String], untold: bool| {
             let line = super::without_directory(line);
             let manifest = named_manifest(&line, tool);
             owes_custody(
@@ -4379,14 +4384,17 @@ fn requires_managed_explicit(
                 home,
                 cwd.as_deref(),
                 machine,
-                unread,
+                Unread {
+                    target: unread,
+                    alias: untold,
+                },
             )
         };
         if let Some(line) = super::targo_line(typed, tool, &alias, miri) {
-            return owes(&line);
+            return owes(&line, false);
         }
         super::untold_lines(typed, tool, &alias, miri)
-            .is_some_and(|lines| lines.iter().any(|line| owes(line)))
+            .is_some_and(|lines| lines.iter().any(|line| owes(line, true)))
     })
 }
 
@@ -4437,9 +4445,24 @@ fn named_manifest(line: &[String], tool: super::Tool) -> Option<String> {
     manifest
 }
 
+/// What [`owes_custody`] cannot read of the line it judges.
+#[derive(Clone, Copy)]
+struct Unread {
+    /// The line builds into a target this reader cannot tell ([`super::MiriCall::target_unread`]).
+    target: bool,
+    /// The line is one of those an alias this reader cannot tell may run
+    /// ([`super::untold_lines`]): the alias's own words, which a config's text may hold, are
+    /// unread.
+    alias: bool,
+}
+
 /// [`requires_managed_explicit`]'s judgement of a call whose manifest is `manifest_arg`, `args`
-/// the line Targo runs, Targo working in `cwd`, `target_unread` where it builds into a target
-/// this reader cannot tell ([`super::MiriCall::target_unread`]).
+/// the line Targo runs, Targo working in `cwd`, `unread` what of that line this reader cannot
+/// tell. A config the walk reads owes custody where its `build` table names a target or build
+/// directory, or one where the line reads it ([`super::configs_unresolved`]); for a line an
+/// untold alias may run, also where any of its lines that is no comment spells a directory's key
+/// ([`super::configs_mention_dirs`]), as the alias's own words may. An alias this reader reads
+/// has its words in the line, judged with the call's own.
 fn owes_custody(
     manifest_arg: Option<&str>,
     args: &[String],
@@ -4447,7 +4470,7 @@ fn owes_custody(
     home: &Path,
     cwd: Option<&Path>,
     machine: &super::Machine<'_>,
-    target_unread: bool,
+    unread: Unread,
 ) -> bool {
     // A package home is Targo's against the directory it works in, wherever the scan stands;
     // the build directory is judged apart, in both spellings.
@@ -4520,7 +4543,7 @@ fn owes_custody(
     };
 
     // Its package is one atpkg could manage, and its target may be anywhere.
-    if target_unread {
+    if unread.target {
         return true;
     }
 
@@ -4559,8 +4582,10 @@ fn owes_custody(
         }
     }
 
-    let configs =
-        |root: &Path| super::configs_unresolved(root, tool, &at, super::reads_artifacts(args));
+    let configs = |root: &Path| {
+        super::configs_unresolved(root, tool, &at, super::reads_artifacts(args))
+            || (unread.alias && super::configs_mention_dirs(root, tool, &at))
+    };
     // A `--config` file is read against the directory Targo works in, whatever its configs'.
     if super::unresolved_words(args, tool, &at) {
         return true;

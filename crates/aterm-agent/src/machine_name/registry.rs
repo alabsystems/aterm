@@ -19,7 +19,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use aterm_net::fleet_member::name_record::ByKind;
-use aterm_types::machine_name::Nickname;
+use aterm_types::machine_name::{Nickname, Number};
+
+use crate::harness::alab_roster::{self, ReceiptGuard, SourceSnapshot};
 
 /// How long a command gives the publisher to sign its write before it answers `queued`: the
 /// bound `aterm file set` gives it.
@@ -86,7 +88,7 @@ fn own_row(state: &Path) -> Option<String> {
 pub fn row_nick(state: &Path) -> Option<Option<Nickname>> {
     #[cfg(test)]
     if let Some(row) = ROW.with(|row| row.borrow().clone()) {
-        return Some(row);
+        return Some(row.nickname);
     }
     Some(match aterm_db::file::here_nickname(&live(state)?)? {
         aterm_db::alab::view::MachineNickname::Named {
@@ -97,17 +99,113 @@ pub fn row_nick(state: &Path) -> Option<Option<Nickname>> {
     })
 }
 
+/// One local follow decision. Its observation alone cannot authorize persistence.
+#[derive(Clone)]
+pub(super) struct Follow {
+    number: Option<Number>,
+    pub(super) nickname: Option<Nickname>,
+    guard: Option<ReceiptGuard>,
+    row: Option<(
+        aterm_secrets::client::Paths,
+        String,
+        aterm_db::alab::view::MachineNickname,
+    )>,
+}
+
+impl Follow {
+    pub(super) fn names(&self, number: Option<Number>) -> bool {
+        #[cfg(test)]
+        if self.guard.is_none() {
+            return true;
+        }
+        self.number.is_some() && self.number == number
+    }
+
+    pub(super) fn with_admitted<T>(
+        &self,
+        persist: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        #[cfg(test)]
+        if self.guard.is_none() {
+            return persist();
+        }
+        self.guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("the registry follow has no native admission"))?
+            .with_admitted(|| {
+                if let Some((paths, key, nickname)) = &self.row
+                    && aterm_db::file::live_here_nickname(paths)
+                        != Some((key.clone(), nickname.clone()))
+                {
+                    return Err("the live machine nickname changed before admission".into());
+                }
+                persist().map_err(|why| why.to_string().into())
+            })
+            .map_err(|why| std::io::Error::other(why.to_string()))
+    }
+}
+
+/// Automatic following requires a live, vouched file row matching the captured own binding.
+/// The host's guard re-admits the full native source, membership and policy through the write.
+/// Explicit edits keep using [`row_nick`]'s overlay even while publication is pending.
+pub(super) fn for_follow(state: &Path) -> Option<Follow> {
+    #[cfg(test)]
+    if let Some(row) = ROW.with(|row| row.borrow().clone()) {
+        return Some(row);
+    }
+    let paths = live(state)?;
+    let config = aterm_types::dirs::aterm_config_path()?;
+    let captured = alab_roster::capture_for(&config);
+    let SourceSnapshot::Present(lab) = captured.snapshot() else {
+        return None;
+    };
+    let own = lab.me.as_ref()?;
+    let name = lab.machine_name.as_ref()?.as_ref().ok()?;
+    if own.label.as_deref() != Some(name.num.to_string().as_str()) {
+        return None;
+    }
+    let (row, observed) = aterm_db::file::live_here_nickname(&paths)?;
+    if row != own.key.as_str() {
+        return None;
+    }
+    let nickname = match &observed {
+        aterm_db::alab::view::MachineNickname::Named {
+            word,
+            automatic: false,
+        } => Some(Nickname::parse(word).ok()?),
+        aterm_db::alab::view::MachineNickname::Conflict => return None,
+        _ => None,
+    };
+    let expected = name.nick.as_ref().and_then(|(nick, class)| {
+        (*class == aterm_net::fleet_member::name_record::NickClass::Chosen).then_some(nick)
+    });
+    if nickname.as_ref() != expected {
+        return None;
+    }
+    Some(Follow {
+        number: Some(name.num),
+        nickname,
+        guard: Some(captured.native_guard().ok()?.clone()),
+        row: Some((paths, row, observed)),
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     /// The row a test's [`row_nick`] reads in place of the registry, while [`with_row`] runs.
-    static ROW: std::cell::RefCell<Option<Option<Nickname>>> = const { std::cell::RefCell::new(None) };
+    static ROW: std::cell::RefCell<Option<Follow>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Run `body` while [`row_nick`] reads this Mac's row as holding the chosen nickname `row`
 /// (`None`: none chosen), on this thread.
 #[cfg(test)]
 pub(crate) fn with_row<T>(row: Option<&str>, body: impl FnOnce() -> T) -> T {
-    let row = row.map(|word| Nickname::parse(word).expect("a nickname"));
+    let row = Follow {
+        number: None,
+        nickname: row.map(|word| Nickname::parse(word).expect("a nickname")),
+        guard: None,
+        row: None,
+    };
     let held = ROW.with(|cell| cell.replace(Some(row)));
     let out = body();
     ROW.with(|cell| cell.replace(held));

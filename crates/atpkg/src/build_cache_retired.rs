@@ -69,8 +69,10 @@ mod pending;
 #[path = "build_cache_retired_registry.rs"]
 mod registry;
 
+/// Open to the build cache's gone-registration pass ([`super::gone_entries`]), which pins what a
+/// refused entry's private stores hold and asks this check again before the entry goes.
 #[path = "build_cache_retired_history.rs"]
-mod history;
+pub(super) mod history;
 
 /// Nothing in a leftover was written for this long before it goes.
 pub const UNWRITTEN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -3279,7 +3281,7 @@ pub fn unrooted_module_roots(
                 checkout.display()
             )
         })?;
-    history::unrooted(git, checkout, wt, &admin)
+    history::unrooted(git, checkout, wt, &admin, None, &mut |_| Ok(Vec::new()))
 }
 
 pub use history::Unrooted;

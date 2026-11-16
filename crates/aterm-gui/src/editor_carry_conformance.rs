@@ -331,6 +331,7 @@ fn parked_record(attempt_id: u64) -> crate::PendingUpdateHandoff {
         teardown: crate::DeferredHandoffTeardown::None,
         commit_drain_started: None,
         commit_flush: None,
+        table_flush: None,
         held_commit: None,
         revoked_by_activity: false,
     }
@@ -352,6 +353,7 @@ fn editor_only_layout(manifest: &crate::restore::RestoreManifest) -> crate::rest
         .expect("the capture holds the editor leaf")
         .clone();
     crate::restore::WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

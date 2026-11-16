@@ -26,9 +26,11 @@ impl Store {
         let root = self.layout.build_dir("git", build);
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let program = root.join("bin/git");
+        let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
         std::fs::write(&program, format!(
-            "#!/bin/sh\nprintf 'git version 2.{build}.0\\n'\nprintf 'exec=%s\\n' \"$GIT_EXEC_PATH\"\n\
-             printf 'args=%s lazy=%s\\n' \"$*\" \"$GIT_NO_LAZY_FETCH\"\n"
+            "#!{}\nprintf 'git version 2.{build}.0\\n'\nprintf 'exec=%s\\n' \"$GIT_EXEC_PATH\"\n\
+             printf 'args=%s lazy=%s\\n' \"$*\" \"$GIT_NO_LAZY_FETCH\"\n",
+            shell.display()
         )).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let env = atpkg::shim_env::ShimEnv::admit(&["GIT_EXEC_PATH=managed-exec".into()]).unwrap();

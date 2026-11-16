@@ -265,7 +265,7 @@ fn the_hold_clears_on_resolve_and_on_orphan() {
             reply,
         });
         let ok = EditOk::parse(&answer.try_recv().expect("answered inline")).unwrap();
-        let (reply, done) = std::sync::mpsc::channel();
+        let (reply, done) = crate::control::control_media::DoorReply::pair();
         let waiter = WaiterId(waiter);
         app.await_edit(AwaitCall {
             waiter,
@@ -344,7 +344,7 @@ fn an_unwaited_edit_holds_only_after_its_waiter_arrives() {
     let ok = EditOk::parse(&answer.try_recv().expect("admission answered")).unwrap();
     assert_eq!(typed("send", sid), None, "opening alone holds no input");
 
-    let (reply, _done) = std::sync::mpsc::channel();
+    let (reply, _done) = crate::control::control_media::DoorReply::pair();
     app.await_edit(AwaitCall {
         waiter: WaiterId(ticket.0),
         key: AwaitKey::Ticket(ticket),
@@ -428,7 +428,7 @@ fn an_edit_nobody_waits_on_holds_nothing() {
     );
     assert_eq!(count(sid), 1);
 
-    let (reply, _done) = std::sync::mpsc::channel();
+    let (reply, _done) = crate::control::control_media::DoorReply::pair();
     app.await_edit(AwaitCall {
         waiter: WaiterId(u64::MAX - 3),
         key: AwaitKey::Ticket(unwaited.ticket),

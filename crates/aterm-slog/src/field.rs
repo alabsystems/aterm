@@ -232,6 +232,7 @@ keys! {
     Account "account" Host Cap::Text(64),
     TitleFp "title_fp" Content Cap::Id,
     WhyText "why_text" Host Cap::Text(aterm_types::control_verbs::REQUEST_WHY_BYTES),
+    Hseq "hseq" Wire Cap::U,
 }
 
 impl Key {

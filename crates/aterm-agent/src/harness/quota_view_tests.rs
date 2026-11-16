@@ -3005,56 +3005,6 @@ const NO_FIGURE_STATES: [(Figure, Option<Why>); 5] = [
     (Figure::SigningIn, None),
 ];
 
-/// `aterm help harness` SAYS THE ROW'S OWN WORDS (§2.1, §2.3, §2.5): the manual's harness topic
-/// names every reason a week has no figure in the row's words, whole ([`Why::words`]) and
-/// narrow ([`Why::brief`]), an account with no login here in the one word the row says of it at
-/// every width (`signed out`, `signing in`: [`Figure::words`]), the lean in the grammar its
-/// phrase is built in (`alt2 not read from ~Sat 06:00`, `read earlier` for a bound), the names
-/// [`distinct`] cuts apart (`tidepool…1.2`, `tidepool…1.5`), and no `?` for a week with no
-/// figure, nor a second word for no login (`no login`, `not signed in`). Negative control: the
-/// manual of 2026-11-12 said "`?` unread" and "`? alt2 unread from ~Sat 06:00`".
-#[test]
-fn the_manual_says_the_rows_own_words() {
-    const MANUAL: &str = include_str!("../../../aterm-cli/src/manual.rs");
-    let at = MANUAL.find("name: \"harness\"").expect("the harness topic");
-    let topic = &MANUAL[at..];
-    let end = topic[1..]
-        .find("Topic {")
-        .map_or(topic.len(), |end| end + 1);
-    let manual = topic[..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let named = |words: &str| manual.contains(&format!("`{words}`"));
-    for why in UNREAD {
-        assert!(named(why.words()), "{why:?}: `{}`", why.words());
-        assert!(manual.contains(why.brief()), "{why:?}: {}", why.brief());
-    }
-    for login in [Figure::SignedOut, Figure::SigningIn] {
-        assert!(named(&login.words()), "{login:?}: `{}`", login.words());
-    }
-    for other in ["no login", "not signed in"] {
-        assert!(!named(other), "a second word for no login: `{other}`");
-    }
-    assert!(manual.contains(&format!("`{}`", Why::Earlier.brief())));
-    let lean = |name: &str, why: Why| format!("`{name} {} from ~Sat 06:00`", why.brief());
-    assert!(
-        manual.contains(&lean("alt2", Why::NeverRead)),
-        "the lean's grammar"
-    );
-    let pool = [
-        ("tidepool.m1.2@example.com", "pool1"),
-        ("tidepool.m1.5@example.com", "pool2"),
-    ];
-    for cut in distinct(&pool, Names::Local) {
-        assert!(named(&cut), "`{cut}`");
-    }
-    assert!(
-        !manual.contains("`?`") && !manual.contains("`? "),
-        "a `?` for an unread week"
-    );
-}
-
 /// NO CLASS SAYS A QUESTION MARK (§2.1): an account whose week has no figure says why in
 /// words ([`Why::words`]; [`Why::brief`] beside a narrow name), and one with no login here
 /// says its login ([`Figure::words`]), on the row at every room, in its title, aloud and in

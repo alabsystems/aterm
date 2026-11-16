@@ -12,8 +12,6 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::paths;
-
 /// Maximum mounts returned by [`table`]; longer tables mark [`Table::complete`] false.
 pub const MAX_MOUNTS: usize = 256;
 
@@ -227,7 +225,7 @@ impl Table {
 
     /// Check whether `path` is at or under `dir`, resolving Windows volume mounts and
     /// `subst` drives (`None` if placement is ambiguous) and using `Path::starts_with`
-    /// as [`paths::is_under`] elsewhere.
+    /// as [`aterm_path::is_under`] elsewhere.
     #[must_use]
     pub fn is_under(&self, path: &Path, dir: &Path) -> Option<bool> {
         under_in(path, dir, self, cfg!(windows))
@@ -319,7 +317,7 @@ pub(crate) fn mounts_in<'a>(
                         return true;
                     };
                     if on.ends_with('\\') {
-                        paths::key_under(&on, dir)
+                        aterm_path::key_under(&on, dir)
                     } else {
                         under_keys(&on, dir, t) != Some(false)
                     }
@@ -346,7 +344,7 @@ pub(crate) fn long_spelling_in<'p>(
     if !windows {
         return Cow::Borrowed(path);
     }
-    let Some(short) = paths::short_spelled(path) else {
+    let Some(short) = aterm_path::short_spelled(path) else {
         return Cow::Borrowed(path);
     };
     if !mount_in(short.lead, t, true).is_some_and(|m| m.local && !m.automounted) {
@@ -364,7 +362,7 @@ pub(crate) fn long_spelling_in<'p>(
         long.push_str(name);
     }
     let long = PathBuf::from(long);
-    if paths::windows_key(&long).is_some() {
+    if aterm_path::windows_key(&long).is_some() {
         Cow::Owned(long)
     } else {
         Cow::Borrowed(path)
@@ -399,7 +397,7 @@ pub(crate) fn under_in(path: &Path, dir: &Path, t: &Table, windows: bool) -> Opt
 
 /// Check whether placed Windows key `path` is under `dir` across all volume mount spellings.
 fn under_keys(path: &str, dir: &str, t: &Table) -> Option<bool> {
-    if paths::key_under(path, dir) {
+    if aterm_path::key_under(path, dir) {
         return Some(true);
     }
     if !t.complete {
@@ -408,7 +406,7 @@ fn under_keys(path: &str, dir: &str, t: &Table) -> Option<bool> {
     let (path, dir) = (spellings(path, &t.mounts)?, spellings(dir, &t.mounts)?);
     Some(
         path.iter()
-            .any(|p| dir.iter().any(|d| paths::key_under(p, d))),
+            .any(|p| dir.iter().any(|d| aterm_path::key_under(p, d))),
     )
 }
 
@@ -437,16 +435,16 @@ pub(crate) fn point_in(path: &Path, t: &Table, windows: bool) -> Option<bool> {
     )
 }
 
-/// Verbatim [`paths::windows_key`] for a mount-manager path (`NETWORK` maps to itself).
+/// Verbatim [`aterm_path::windows_key`] for a mount-manager path (`NETWORK` maps to itself).
 fn point_key(on: &Path) -> Option<String> {
     let s = on.to_str()?;
     if s == NETWORK {
         return Some(NETWORK.to_owned());
     }
     if s.starts_with(r"\\?\") || s.starts_with(r"\??\") {
-        return paths::windows_key(on);
+        return aterm_path::windows_key(on);
     }
-    paths::windows_key(Path::new(&format!(r"\\?\{s}")))
+    aterm_path::windows_key(Path::new(&format!(r"\\?\{s}")))
 }
 
 /// Deepest non-`subst` mount containing `key`, and the relative suffix beneath it.
@@ -454,7 +452,7 @@ fn holder<'a, 'k>(key: &'k str, mounts: &'a [Mount], strict: bool) -> Option<(&'
     let mut best: Option<(&Mount, usize)> = None;
     for m in mounts.iter().filter(|m| m.fstype != SUBST) {
         let on = point_key(&m.on)?;
-        if paths::key_under(key, &on)
+        if aterm_path::key_under(key, &on)
             && !(strict && on.len() == key.len())
             && best.is_none_or(|(_, len)| on.len() >= len)
         {
@@ -542,18 +540,18 @@ fn windows_placed(path: &Path, mounts: &[Mount]) -> Option<String> {
                     .is_some_and(|c| c.eq_ignore_ascii_case(name))
             })?;
             let on = on.on.to_str()?.trim_end_matches('\\');
-            paths::windows_key(Path::new(&format!(r"\\?\{on}\{rest}")))?
+            aterm_path::windows_key(Path::new(&format!(r"\\?\{on}\{rest}")))?
         }
-        None => paths::windows_key(path)?,
+        None => aterm_path::windows_key(path)?,
     };
     for _ in 0..SUBST_HOPS {
         let Some((on, target)) = mounts.iter().filter(|m| m.fstype == SUBST).find_map(|m| {
-            let on = paths::windows_key(&m.on)?;
-            paths::key_under(&key, &on).then_some((on, m.from.as_str()))
+            let on = aterm_path::windows_key(&m.on)?;
+            aterm_path::key_under(&key, &on).then_some((on, m.from.as_str()))
         }) else {
             return Some(key);
         };
-        let target = paths::windows_key(Path::new(target))?;
+        let target = aterm_path::windows_key(Path::new(target))?;
         let rest = key[on.len()..].trim_start_matches('\\');
         key = match (rest.is_empty(), target.ends_with('\\')) {
             (true, _) => target,

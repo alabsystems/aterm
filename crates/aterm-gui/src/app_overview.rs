@@ -44,7 +44,7 @@ pub(crate) fn size_words(bytes: u64) -> String {
 }
 
 fn short_sid(sid: &str) -> String {
-    aterm_messages::presence::short_sid(sid)
+    crate::presence::short_sid(sid)
 }
 
 /// The Stop Worker sheet's words for the worker labelled `label`: its title, its body and its
@@ -137,12 +137,13 @@ impl App {
             .as_ref()
             .filter(|t| t.from != crate::task_record::FROM_CTL)
             .map(|t| {
-                let local = self
-                    .store
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .by_sid(&SessionId::new(&t.from))
-                    .map(|h| h.local_id);
+                let local = SessionId::parse(&t.from).and_then(|from| {
+                    self.store
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .by_sid(&from)
+                        .map(|h| h.local_id)
+                });
                 match local {
                     Some(manager) => Driver::WorkerOf(self.tab_label_of_session(manager)),
                     None => Driver::WorkerOfElsewhere(short_sid(&t.from)),
@@ -297,22 +298,22 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner())
                 .task()
                 .map(|t| t.from.clone());
-            let Some(from) = from.filter(|from| from != crate::task_record::FROM_CTL) else {
+            // `ctl` and anything else that names no session manage nothing here.
+            let Some(manager) = from.as_deref().and_then(SessionId::parse) else {
                 continue;
             };
             let worker = (h.sid.clone(), self.tab_label_of_session(h.local_id));
-            if let Some(line) = manages.iter_mut().find(|m| m.manager.as_str() == from) {
+            if let Some(line) = manages.iter_mut().find(|m| m.manager == manager) {
                 line.workers.push(worker);
                 continue;
             }
-            let manager = SessionId::new(&from);
             let manager_local = handles
                 .iter()
                 .find(|other| other.sid == manager)
                 .map(|other| other.local_id);
             let manager_label = match manager_local {
                 Some(local) => self.tab_label_of_session(local),
-                None => format!("{} (not here)", short_sid(&from)),
+                None => format!("{} (not here)", short_sid(manager.as_str())),
             };
             manages.push(Manages {
                 manager,

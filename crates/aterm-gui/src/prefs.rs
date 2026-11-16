@@ -548,6 +548,9 @@ pub(crate) const EDIT_WINDOW_COLORSPACE: &str = "window_colorspace";
 pub(crate) const EDIT_RESTORE_SESSION: &str = "restore_session";
 /// Opt-in shell custody, read at launch.
 pub(crate) const EDIT_KEEPER_ENABLED: &str = "keeper.enabled";
+/// Windows born with the navigator docked beside the terminal (`[navigator] dock`, on by
+/// default outside a scratch world), read when a window opens or is restored.
+pub(crate) const EDIT_NAVIGATOR_DOCK: &str = "navigator.dock";
 /// Session activity on disk (on by default), read at launch.
 pub(crate) const EDIT_SESSION_LOG_JOURNAL: &str = "session_log.journal";
 /// Live activity in terminal tab tooltips and menus (on by default).
@@ -610,6 +613,11 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     NestedLeaf {
         key: EDIT_KEEPER_ENABLED,
         label: "Keep shells running after an aterm crash",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: EDIT_NAVIGATOR_DOCK,
+        label: "Show the navigator in new windows",
         kind: EditKind::Bool,
     },
     NestedLeaf {
@@ -2771,6 +2779,11 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
     match key {
         EDIT_AMACS_DEFAULT_EDITOR => boolean(Some(cfg.amacs.config.default_editor), true),
         EDIT_KEEPER_ENABLED => boolean(Some(cfg.keeper_enabled()), crate::keeper_link::DEFAULT_ON),
+        // The default as windows here are born with it: off in a scratch world or under CI.
+        EDIT_NAVIGATOR_DOCK => boolean(
+            cfg.navigator_dock(),
+            crate::app_window::docks_by_default(None, false, &crate::converge_lane::env_set),
+        ),
         EDIT_SESSION_LOG_JOURNAL => boolean(Some(cfg.session_log_journal()), true),
         EDIT_SESSION_LOG_CLAUSE => boolean(Some(cfg.session_log_clause()), true),
         EDIT_UPDATE_ENABLED => boolean(upd.and_then(|u| u.enabled), true),
@@ -3022,7 +3035,8 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_TAB_STRIP_ROWS
         | EDIT_SHOW_BUILD_BADGE
         | EDIT_ACTIVE_TAB_COLOR
-        | EDIT_SPLIT_FOCUS_MARK => Section::Window,
+        | EDIT_SPLIT_FOCUS_MARK
+        | EDIT_NAVIGATOR_DOCK => Section::Window,
         EDIT_WINDOW_PADDING
         | EDIT_WINDOW_PADDING_TOP
         | EDIT_RESTORE_SESSION
@@ -3190,7 +3204,8 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_ACCENT_COLOR
         | EDIT_BORDER_COLOR
         | EDIT_SEARCH_MATCH_COLOR
-        | EDIT_SPLIT_FOCUS_MARK => ("Tabs & panes", 3),
+        | EDIT_SPLIT_FOCUS_MARK
+        | EDIT_NAVIGATOR_DOCK => ("Tabs & panes", 3),
         EDIT_SHOW_BUILD_BADGE => ("Build badge", 5),
         EDIT_RESTORE_SESSION
         | EDIT_KEEPER_ENABLED
@@ -3296,6 +3311,10 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
             "New tabs set EDITOR to amacs, aterm's own editor, so git commit and an agent's \
              Ctrl-G open their file in an aterm tab. An EDITOR or VISUAL you set yourself always \
              wins."
+        }
+        EDIT_NAVIGATOR_DOCK => {
+            "Windows opened or restored from now on start with the navigator beside the \
+             terminal. View > Show Navigator shows or hides it in one window."
         }
         EDIT_KEEPER_ENABLED => {
             "Each launch starts the PTY keeper if none runs. Turning this off takes effect next launch; `aterm keeper stop` ends the one running. Reopening a saved layout alone starts new shells."
@@ -3505,6 +3524,7 @@ pub(crate) fn shared_row_notes<'a>(
 pub(crate) enum ApplicationTiming {
     AfterRestart,
     NewSessions,
+    NewWindows,
     WhenAtermClosesOrRestarts,
     NextToolsCheck,
     DailyLaunchApply,
@@ -3520,6 +3540,7 @@ impl ApplicationTiming {
         match self {
             Self::AfterRestart => "Applies after restart",
             Self::NewSessions => "Applies to new sessions",
+            Self::NewWindows => "Applies to new windows",
             Self::WhenAtermClosesOrRestarts => "Applies when aterm closes or restarts",
             Self::NextToolsCheck => "Applies at the next ALab tools check",
             // A start claims the day's apply (aterm's own, or an `aterm` terminal session's);
@@ -3560,6 +3581,7 @@ pub(crate) fn application_timing(key: &str) -> Option<ApplicationTiming> {
         | EDIT_SHELL_ARGS
         | EDIT_AMACS_DEFAULT_EDITOR => T::NewSessions,
         EDIT_HDR_GLOW => T::EnablingNeedsNewWindow,
+        EDIT_NAVIGATOR_DOCK => T::NewWindows,
         EDIT_RESTORE_SESSION => T::WhenAtermClosesOrRestarts,
         EDIT_REROUTE_ANNOUNCE => T::NextCargoRun,
         EDIT_PACKAGES_AUTO_INSTALL
@@ -4028,6 +4050,7 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_WINDOW_COLORSPACE => &["colorspace", "srgb", "p3", "gamut", "color"],
         EDIT_RESTORE_SESSION => &["restore", "session", "reopen", "launch", "windows"],
         EDIT_KEEPER_ENABLED => &["keeper", "recovery", "crash", "shell", "session"],
+        EDIT_NAVIGATOR_DOCK => &["navigator", "dock", "sidebar", "sessions", "list", "window"],
         EDIT_SESSION_LOG_JOURNAL => &["history", "journal", "activity", "privacy", "session"],
         EDIT_SESSION_LOG_CLAUSE => &["activity", "tooltip", "tab", "session"],
         EDIT_FONT_FEATURES => &["opentype", "features", "ss01", "zero", "stylistic"],

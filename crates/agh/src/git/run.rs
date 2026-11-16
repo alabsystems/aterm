@@ -15,6 +15,9 @@ use crate::slug::Slug;
 
 use super::GIT_BUDGET;
 
+/// Only the journaled resource boundary supplies admission for a mutable atomic push.
+type Admission<'a> = Option<&'a mut dyn FnMut() -> Result<()>>;
+
 /// An anonymous smart-HTTP child has no whole-transfer latency budget. It may run for as long
 /// as bytes or descendant CPU/I/O keep advancing, but one minute without that evidence ends the
 /// attempt and lets the shared idempotent-read policy decide whether another attempt is allowed.
@@ -124,12 +127,16 @@ pub enum GitOp {
         /// Read without a credential or fallback identity.
         anonymous: bool,
     },
-    /// `git ls-remote --refs <url> [<ref>]`; exact HEAD includes that pseudoref.
+    /// `git ls-remote --refs <url> [<ref>]`; exact HEAD includes that pseudoref. With
+    /// `peeled`, `git ls-remote <url> [<ref> <ref>^{}]`: HEAD and each annotated tag's `^{}`
+    /// line included.
     LsRemote {
         /// One ref, or every one.
         reference: Option<String>,
         /// Use credential-free smart HTTP and include peeled tag targets.
         anonymous: bool,
+        /// Include HEAD and each annotated tag's peeled line (`agh repo refs`).
+        peeled: bool,
     },
     /// `git push --porcelain --force-with-lease=<ref>:<expect> <url> :<ref>`, from an empty
     /// scratch repository (`git init --quiet --bare` in the run's private scratch), so no
@@ -212,7 +219,8 @@ impl GitRun {
         )
         .with_budget(Duration::from_secs(30))
     }
-    /// Push only these local object IDs, with exact leases and atomicity.
+    /// Describe an exact atomic push. `Github::run_git` accepts only its dry run;
+    /// a mutable push goes through the journaled `Refs::push_atomic` resource.
     #[must_use]
     pub fn push_refs(
         slug: &Slug,
@@ -364,6 +372,21 @@ impl GitRun {
             GitOp::LsRemote {
                 reference: reference.map(str::to_string),
                 anonymous: false,
+                peeled: false,
+            },
+        )
+    }
+
+    /// `ls-remote` of `slug` with HEAD and each annotated tag's peeled line: `agh repo refs`,
+    /// read by [`super::advertised_ref_rows`].
+    #[must_use]
+    pub fn advertisement(slug: &Slug, reference: Option<&str>) -> GitRun {
+        GitRun::of(
+            slug,
+            GitOp::LsRemote {
+                reference: reference.map(str::to_string),
+                anonymous: false,
+                peeled: true,
             },
         )
     }
@@ -376,6 +399,7 @@ impl GitRun {
             GitOp::LsRemote {
                 reference: None,
                 anonymous: true,
+                peeled: false,
             },
         )
     }
@@ -561,7 +585,7 @@ impl HelperCommand {
 ///
 /// The refusals of each step; off unix `write::unix_only()`.
 pub(crate) fn run(gh: &Github, run: &GitRun) -> Result<GitOut> {
-    run_with_credential(gh, run, None)
+    run_inner(gh, run, None, None)
 }
 
 /// Journaled operations pass the same credential Arc that named their durable intent.
@@ -569,14 +593,24 @@ pub(crate) fn run_with_credential(
     gh: &Github,
     run: &GitRun,
     credential: Option<std::sync::Arc<crate::identity::Credential>>,
+    admission: &mut dyn FnMut() -> Result<()>,
+) -> Result<GitOut> {
+    run_inner(gh, run, credential, Some(admission))
+}
+
+fn run_inner(
+    gh: &Github,
+    run: &GitRun,
+    credential: Option<std::sync::Arc<crate::identity::Credential>>,
+    admission: Admission<'_>,
 ) -> Result<GitOut> {
     #[cfg(unix)]
     {
-        unix::run(gh, run, credential)
+        unix::run(gh, run, credential, admission)
     }
     #[cfg(not(unix))]
     {
-        let _ = (gh, run, credential);
+        let _ = (gh, run, credential, admission);
         Err(crate::write::unix_only())
     }
 }
@@ -610,7 +644,7 @@ mod unix {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use super::{ANONYMOUS_READ_PROGRESS_WINDOW, GitOp, GitOut, GitRun};
+    use super::{ANONYMOUS_READ_PROGRESS_WINDOW, Admission, GitOp, GitOut, GitRun};
     use crate::client::Github;
     use crate::config::Dirs;
     use crate::error::{Error, Forbid, Kind, Result, SideEffect, Sub};
@@ -983,6 +1017,7 @@ mod unix {
     /// either independently.
     enum ChildNetwork<'a> {
         Ordinary,
+        Admitted(&'a mut dyn FnMut() -> Result<()>),
         AnonymousHttp { trace: Option<&'a Path> },
     }
 
@@ -1083,6 +1118,23 @@ mod unix {
             self.git_supplied(args, cwd, canonical, None, None, ChildNetwork::Ordinary)
         }
 
+        fn git_admitted(
+            &self,
+            args: &[OsString],
+            cwd: Option<&Path>,
+            canonical: &[u8],
+            admission: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<ChildOut> {
+            self.git_supplied(
+                args,
+                cwd,
+                canonical,
+                None,
+                None,
+                ChildNetwork::Admitted(admission),
+            )
+        }
+
         fn git_input(
             &self,
             args: &[OsString],
@@ -1123,12 +1175,14 @@ mod unix {
         ) -> Result<ChildOut> {
             let mut spec = ChildSpec::new(&self.git).budget(self.budget);
             spec.stdout_records = self.stdout_records.clone();
-            let (curl_trace, progress_window) = match network {
-                ChildNetwork::Ordinary => (None, self.progress_window),
+            let (curl_trace, progress_window, admission) = match network {
+                ChildNetwork::Ordinary => (None, self.progress_window, None),
+                ChildNetwork::Admitted(admit) => (None, self.progress_window, Some(admit)),
                 ChildNetwork::AnonymousHttp { trace } => (
                     trace,
                     self.progress_window
                         .or(Some(ANONYMOUS_READ_PROGRESS_WINDOW)),
+                    None,
                 ),
             };
             if let Some(window) = progress_window {
@@ -1160,6 +1214,9 @@ mod unix {
             }
             if let Some(dir) = cwd.or(self.work.as_deref()) {
                 spec = spec.cwd(dir);
+            }
+            if let Some(admit) = admission {
+                admit().map_err(unsent)?;
             }
             let out = self.gh.fx().git(&spec, canonical);
             if self.reads {
@@ -1975,6 +2032,7 @@ mod unix {
         gh: &Github,
         run: &GitRun,
         credential: Option<std::sync::Arc<crate::identity::Credential>>,
+        admission: Admission<'_>,
     ) -> Result<GitOut> {
         check_op(run)?;
         let slug = &run.slug;
@@ -2066,7 +2124,7 @@ mod unix {
                 children.retain_certificate_default(slug)?;
             }
             let routed = profile.clone();
-            return finish(&children, run, &remote, profile, None)
+            return finish(&children, run, &remote, profile, None, admission)
                 .map_err(|error| name_routed_authentication(error, routed.as_deref()));
         }
         // Replay returned above: no live credential or grant is resolved there.
@@ -2180,7 +2238,7 @@ mod unix {
         }
         let nonce = guard.as_ref().map(|g| g.grant.nonce.clone());
         let routed = profile.clone();
-        let result = finish(&children, run, &remote, profile, nonce)
+        let result = finish(&children, run, &remote, profile, nonce, admission)
             .map_err(|error| name_routed_authentication(error, routed.as_deref()));
         drop(guard);
         drop(scratch);
@@ -2467,42 +2525,58 @@ mod unix {
         if shallow {
             return Ok(());
         }
-        let key = [
-            crate::fx::canon::git_request(run),
-            b"\nstep have-closure".to_vec(),
-        ]
-        .concat();
-        let mut original_graph = children.clone();
-        original_graph
-            .env
-            .push((os("GIT_GRAFT_FILE"), os("/dev/null")));
-        let checked = original_graph
-            .git(
-                &[
-                    os("--git-dir"),
-                    os(common),
-                    os("-c"),
-                    os("core.commitGraph=false"),
-                    os("rev-list"),
-                    os("--objects"),
-                    os("--all"),
-                    os("--quiet"),
-                    os("--missing=print"),
-                ],
-                None,
-                &key,
-            )
-            .map_err(unsent)?;
-        if checked.code != Some(0) {
-            return Err(
-                failed(&run.op, &checked, children.gh.redactor(), &run.slug, false)
-                    .with_next("fetch step: have-closure"),
-            );
-        }
+        let checked = complete_object_walk(children, run, common, None, "have-closure")?;
         if checked.stdout.is_empty() && !checked.stdout_may_be_truncated() {
             lend_objects(children, run, scratch, common, false)?;
         }
         Ok(())
+    }
+
+    /// Walk the original object graph, without trusting shallow boundaries, grafts or the
+    /// commit-graph cache. Overriding the boundary for the walk itself also ignores one another
+    /// fetch creates after the caller's initial nonshallow observation.
+    /// A successful empty, complete answer proves every requested root's historical closure.
+    /// `None` retains the existing all-ref have check; exact roots do not consult other refs.
+    fn complete_object_walk(
+        children: &Children<'_>,
+        run: &GitRun,
+        common: &str,
+        roots: Option<&[&str]>,
+        step: &str,
+    ) -> Result<ChildOut> {
+        let key = [
+            crate::fx::canon::git_request(run),
+            format!("\nstep {step}").into_bytes(),
+        ]
+        .concat();
+        let mut original_graph = children.clone();
+        original_graph.env.extend([
+            (os("GIT_GRAFT_FILE"), os("/dev/null")),
+            (os("GIT_SHALLOW_FILE"), os("/dev/null")),
+        ]);
+        let mut args = vec![
+            os("--git-dir"),
+            os(common),
+            os("-c"),
+            os("core.commitGraph=false"),
+            os("rev-list"),
+            os("--objects"),
+        ];
+        if roots.is_none() {
+            args.push(os("--all"));
+        }
+        args.extend([os("--quiet"), os("--missing=print")]);
+        if let Some(roots) = roots {
+            args.extend(roots.iter().map(|root| os(*root)));
+        }
+        let checked = original_graph.git(&args, None, &key).map_err(unsent)?;
+        if checked.code != Some(0) {
+            return Err(
+                failed(&run.op, &checked, children.gh.redactor(), &run.slug, false)
+                    .with_next(format!("fetch step: {step}")),
+            );
+        }
+        Ok(checked)
     }
 
     /// Main borrows objects through its own immutable, fully checked snapshot only.
@@ -4362,8 +4436,126 @@ mod unix {
         Ok((updated, oid.to_owned()))
     }
 
-    /// Fetch one explicit snapshot into scratch; validate every raw OID before importing
-    /// objects. Ref-publishing batches then atomically compare/update the caller's cache refs.
+    /// A complete requested commit closure, with its physical stores held through publication.
+    struct LocalBatch {
+        observed: ChildOut,
+        stores: Vec<(PathBuf, std::fs::File)>,
+    }
+
+    impl LocalBatch {
+        fn check(&self) -> Result<()> {
+            check_object_intake_directories(&self.stores)
+        }
+    }
+
+    /// Literal commit roots can already be complete in the caller. Ref names still need a
+    /// remote observation, and a missing object or a noncommit keeps the existing transfer.
+    /// No local ref, shallow boundary, graft or accelerator establishes the closure.
+    fn local_batch(
+        children: &Children<'_>,
+        run: &GitRun,
+        common: &str,
+        shallow: bool,
+        sources: &[(&str, &str)],
+    ) -> Result<Option<LocalBatch>> {
+        if shallow
+            || sources.is_empty()
+            || sources
+                .iter()
+                .any(|(source, expected)| source != expected || !crate::path::is_sha(source))
+        {
+            return Ok(None);
+        }
+        let stores = if children.scratch_git.is_some() {
+            hold_source_store(Path::new(common), None)?
+        } else {
+            Vec::new()
+        };
+        check_object_intake_directories(&stores)?;
+        let mut original = children.clone();
+        original.env.extend([
+            (os("GIT_GRAFT_FILE"), os("/dev/null")),
+            (os("GIT_NO_LAZY_FETCH"), os("1")),
+        ]);
+        let key = [
+            crate::fx::canon::git_request(run),
+            b"\nstep batch-local-types".to_vec(),
+        ]
+        .concat();
+        let input = format!(
+            "{}\n",
+            sources
+                .iter()
+                .map(|(source, _)| *source)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let inventory = original
+            .git_input(
+                &[
+                    os("--git-dir"),
+                    os(common),
+                    os("cat-file"),
+                    os("--batch-check=%(objectname) %(objecttype)"),
+                ],
+                None,
+                &key,
+                input.as_bytes(),
+            )
+            .map_err(unsent)?;
+        check_object_intake_directories(&stores)?;
+        if inventory.code != Some(0) {
+            return Err(failed(
+                &run.op,
+                &inventory,
+                children.gh.redactor(),
+                &run.slug,
+                false,
+            )
+            .with_next("fetch step: batch-local-types"));
+        }
+        let text = std::str::from_utf8(&inventory.stdout)
+            .ok()
+            .filter(|_| !inventory.stdout_may_be_truncated())
+            .and_then(|text| text.strip_suffix('\n'))
+            .ok_or_else(|| Error::protocol("incomplete local batch object inventory"))?;
+        let rows = text.split('\n').collect::<Vec<_>>();
+        if rows.len() != sources.len() {
+            return Err(Error::protocol(
+                "local batch object inventory count differs",
+            ));
+        }
+        let mut commits = true;
+        for ((source, _), row) in sources.iter().zip(rows) {
+            let kind = row
+                .strip_prefix(*source)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .ok_or_else(|| Error::protocol("local batch object identity differs"))?;
+            match kind {
+                "commit" => {}
+                "missing" | "blob" | "tree" | "tag" => commits = false,
+                _ => return Err(Error::protocol("invalid local batch object kind")),
+            }
+        }
+        if !commits {
+            return Ok(None);
+        }
+        let roots = sources
+            .iter()
+            .map(|(source, _)| *source)
+            .collect::<Vec<_>>();
+        let observed =
+            complete_object_walk(&original, run, common, Some(&roots), "batch-local-closure")?;
+        check_object_intake_directories(&stores)?;
+        if !observed.stdout.is_empty() || observed.stdout_may_be_truncated() {
+            return Ok(None);
+        }
+        Ok(Some(LocalBatch { observed, stores }))
+    }
+
+    /// Fetch one explicit snapshot into scratch, unless every literal commit's full original
+    /// closure is already present. Ref-publishing batches atomically compare/update the caller's
+    /// cache refs under the same checks on either path.
     fn fetch_batch(
         children: &Children<'_>,
         run: &GitRun,
@@ -4491,73 +4683,81 @@ mod unix {
         if before.len() != batch.rows().len() {
             return Err(Error::local("incomplete old cache refs"));
         }
-        let scratch = children.scratch_git.as_deref();
-        let mut init = vec![os("init"), os("--quiet"), os("--bare")];
-        if let Some(path) = scratch {
-            init.push(path.as_os_str().to_os_string());
-        }
-        step("init", init, None, None)?;
-        lend_complete_objects(children, run, scratch, common, shallow)?;
-        let mut fetch_input = String::new();
-        for (index, (source, _)) in sources.iter().enumerate() {
-            let _ = writeln!(fetch_input, "+{source}:refs/agh/batch/{index}");
-        }
-        step(
-            "fetch",
-            vec![
-                os("fetch"),
-                os("--quiet"),
-                os("--no-tags"),
-                os("--no-write-fetch-head"),
-                os("--recurse-submodules=no"),
-                os("--stdin"),
-                os(remote.url()),
-            ],
-            scratch,
-            Some(fetch_input.as_bytes()),
-        )?;
-        let fetched = step(
-            "oids",
-            vec![
-                os("for-each-ref"),
-                os("--format=%(refname) %(objectname)"),
-                os("refs/agh/batch/"),
-            ],
-            scratch,
-            None,
-        )?;
-        let fetched = std::str::from_utf8(&fetched.stdout)
-            .map_err(|_| Error::local("invalid fetched refs"))?;
-        let mut seen = std::collections::BTreeSet::new();
-        for line in fetched.lines() {
-            let (reference, oid) = line
-                .split_once(' ')
-                .ok_or_else(|| Error::local("malformed fetched ref"))?;
-            let index = reference
-                .strip_prefix("refs/agh/batch/")
-                .and_then(|index| index.parse::<usize>().ok())
-                .ok_or_else(|| Error::local("unexpected fetched ref"))?;
-            let (_, expected) = sources
-                .get(index)
-                .ok_or_else(|| Error::local("extra fetched ref"))?;
-            if !seen.insert(index) || oid != *expected {
-                return Err(Error::refused(
-                    "fetched source differs from its expected raw object ID; cache refs unchanged",
+        let local = local_batch(children, run, common, shallow, &sources)?;
+        let imported = if let Some(local) = &local {
+            local.observed.clone()
+        } else {
+            let scratch = children.scratch_git.as_deref();
+            let mut init = vec![os("init"), os("--quiet"), os("--bare")];
+            if let Some(path) = scratch {
+                init.push(path.as_os_str().to_os_string());
+            }
+            step("init", init, None, None)?;
+            lend_complete_objects(children, run, scratch, common, shallow)?;
+            let mut fetch_input = String::new();
+            for (index, (source, _)) in sources.iter().enumerate() {
+                let _ = writeln!(fetch_input, "+{source}:refs/agh/batch/{index}");
+            }
+            step(
+                "fetch",
+                vec![
+                    os("fetch"),
+                    os("--quiet"),
+                    os("--no-tags"),
+                    os("--no-write-fetch-head"),
+                    os("--recurse-submodules=no"),
+                    os("--stdin"),
+                    os(remote.url()),
+                ],
+                scratch,
+                Some(fetch_input.as_bytes()),
+            )?;
+            let fetched = step(
+                "oids",
+                vec![
+                    os("for-each-ref"),
+                    os("--format=%(refname) %(objectname)"),
+                    os("refs/agh/batch/"),
+                ],
+                scratch,
+                None,
+            )?;
+            let fetched = std::str::from_utf8(&fetched.stdout)
+                .map_err(|_| Error::local("invalid fetched refs"))?;
+            let mut seen = std::collections::BTreeSet::new();
+            for line in fetched.lines() {
+                let (reference, oid) = line
+                    .split_once(' ')
+                    .ok_or_else(|| Error::local("malformed fetched ref"))?;
+                let index = reference
+                    .strip_prefix("refs/agh/batch/")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .ok_or_else(|| Error::local("unexpected fetched ref"))?;
+                let (_, expected) = sources
+                    .get(index)
+                    .ok_or_else(|| Error::local("extra fetched ref"))?;
+                if !seen.insert(index) || oid != *expected {
+                    return Err(Error::refused(
+                        "fetched source differs from its expected raw object ID; cache refs unchanged",
+                    ));
+                }
+            }
+            if seen.len() != sources.len() {
+                return Err(Error::local(
+                    "incomplete fetched snapshot; cache refs unchanged",
                 ));
             }
-        }
-        if seen.len() != sources.len() {
-            return Err(Error::local(
-                "incomplete fetched snapshot; cache refs unchanged",
-            ));
-        }
-        check_parents()?;
-        let roots: Vec<_> = sources.iter().map(|(_, oid)| *oid).collect();
-        let imported = import_fetched_objects(children, run, common, &roots)?;
+            check_parents()?;
+            let roots: Vec<_> = sources.iter().map(|(_, oid)| *oid).collect();
+            import_fetched_objects(children, run, common, &roots)?
+        };
         if batch.rows().is_empty() {
             return Ok(imported);
         }
         check_parents()?;
+        if let Some(local) = &local {
+            local.check()?;
+        }
         let mut transaction = "start\noption no-deref\n".to_string();
         for (row, old) in batch.rows().iter().zip(before) {
             let _ = writeln!(
@@ -4567,7 +4767,7 @@ mod unix {
             );
         }
         transaction.push_str("prepare\ncommit\n");
-        step(
+        let updated = step(
             "update",
             vec![
                 os("-C"),
@@ -4581,7 +4781,11 @@ mod unix {
             ],
             None,
             Some(transaction.as_bytes()),
-        )
+        )?;
+        if let Some(local) = &local {
+            local.check()?;
+        }
+        Ok(updated)
     }
 
     pub(super) fn inventory_change(
@@ -4700,6 +4904,7 @@ mod unix {
         dir: &Path,
         batch: &crate::github::refs::AtomicRefBatch,
         dry_run: bool,
+        admission: Admission<'_>,
     ) -> Result<ChildOut> {
         push_native_refs(
             children,
@@ -4708,6 +4913,7 @@ mod unix {
             dir,
             NativeRefBatch::Ordinary(batch),
             dry_run,
+            admission,
         )
     }
 
@@ -4718,6 +4924,7 @@ mod unix {
         dir: &Path,
         transaction: &crate::git::ControlRefTransaction,
         dry_run: bool,
+        admission: Admission<'_>,
     ) -> Result<ChildOut> {
         const ZERO: &str = "0000000000000000000000000000000000000000";
         let updates = transaction
@@ -4739,6 +4946,7 @@ mod unix {
                 updates,
             },
             dry_run,
+            admission,
         )
     }
 
@@ -4749,6 +4957,7 @@ mod unix {
         dir: &Path,
         batch: NativeRefBatch<'_>,
         dry_run: bool,
+        mut admission: Admission<'_>,
     ) -> Result<ChildOut> {
         use std::collections::{BTreeMap, BTreeSet};
         const ZERO: &str = "0000000000000000000000000000000000000000";
@@ -5460,12 +5669,19 @@ mod unix {
                 os(format!("{}:{}", u.after, u.reference))
             }
         }));
+        if !dry_run && admission.is_none() {
+            return Err(Error::usage(
+                "a mutable atomic push requires the journaled refs resource boundary",
+            ));
+        }
         let started = children.gh.fx().mono()?;
         let mut pause = std::time::Duration::from_secs(1);
         let out = loop {
-            let out = children
-                .git(&args, scratch, &canonical)
-                .map_err(|e| if dry_run { unsent(e) } else { e })?;
+            let result = match admission.take().filter(|_| !dry_run) {
+                Some(admit) => children.git_admitted(&args, scratch, &canonical, admit),
+                None => children.git(&args, scratch, &canonical),
+            };
+            let out = result.map_err(|e| if dry_run { unsent(e) } else { e })?;
             if out.code == Some(0) {
                 break out;
             }
@@ -5624,6 +5840,7 @@ mod unix {
         remote: &Remote,
         profile: Option<String>,
         grant: Option<String>,
+        admission: Admission<'_>,
     ) -> Result<GitOut> {
         let slug = &run.slug;
         let redactor = children.gh.redactor();
@@ -5764,7 +5981,7 @@ mod unix {
                 batch,
                 dry_run,
             } => {
-                let out = push_refs(children, run, remote, dir, batch, *dry_run)?;
+                let out = push_refs(children, run, remote, dir, batch, *dry_run, admission)?;
                 return Ok(GitOut {
                     stdout: kept(&out.stdout, redactor),
                     stderr: kept(&out.stderr, redactor),
@@ -5778,7 +5995,8 @@ mod unix {
                 transaction,
                 dry_run,
             } => {
-                let out = push_control(children, run, remote, dir, transaction, *dry_run)?;
+                let out =
+                    push_control(children, run, remote, dir, transaction, *dry_run, admission)?;
                 return Ok(GitOut {
                     stdout: kept(&out.stdout, redactor),
                     stderr: kept(&out.stderr, redactor),
@@ -5800,14 +6018,22 @@ mod unix {
             GitOp::LsRemote {
                 reference,
                 anonymous,
+                peeled,
             } => {
+                let head = reference.as_deref() == Some("HEAD");
                 let mut args = vec![os("ls-remote")];
-                if !anonymous && reference.as_deref() != Some("HEAD") {
+                if !anonymous && !peeled && !head {
                     args.push(os("--refs"));
                 }
                 args.push(url);
                 if let Some(reference) = reference {
                     args.push(os(reference.as_str()));
+                    // git matches a pattern against the name as advertised, so an exact ref
+                    // names its `^{}` line as a second pattern; a branch or lightweight tag has
+                    // none and prints one line.
+                    if *peeled && !head {
+                        args.push(os(format!("{reference}^{{}}")));
+                    }
                 }
                 (args, None)
             }

@@ -2723,7 +2723,10 @@ impl Default for NativeRuntime {
 }
 
 impl NativeRuntime {
-    /// Take the Tables reader's answers; whether the page changed.
+    /// Take the Tables reader's answers; whether the page changed. An answer can change what
+    /// a view's grid draws (a Write that ends the change a hidden column was drawn for), so
+    /// each view's selection is moved off a column no longer drawn
+    /// ([`crate::native_tables::TablesViewState::settle_columns`]).
     pub(crate) fn poll_tables(&mut self) -> bool {
         let mut changed = false;
         for app in self.instances.values_mut() {
@@ -2731,16 +2734,23 @@ impl NativeRuntime {
                 changed |= tables.poll();
             }
         }
-        if changed {
-            for mut state in self.views.values_mut() {
-                if let AppViewState::Tables(view) = &mut *state {
+        let tables = self.instances.values().find_map(|app| match app {
+            NativeApp::Tables(tables) => Some(&**tables),
+            _ => None,
+        });
+        let mut settled = false;
+        for mut state in self.views.values_mut() {
+            if let AppViewState::Tables(view) = &mut *state {
+                let moved = tables.is_some_and(|tables| view.settle_columns(tables));
+                if changed || moved {
                     view.common.presentation_revision =
                         view.common.presentation_revision.wrapping_add(1);
                     state.touch();
                 }
+                settled |= moved;
             }
         }
-        changed
+        changed || settled
     }
 
     /// The Tables page's model, for a test to wait on its reader.

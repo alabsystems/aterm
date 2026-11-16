@@ -10,14 +10,15 @@
 //! ```
 //!
 //! Three kinds of lane. The FLOOR lanes ([`floors`], [`deck`], [`wasm`], [`vte_engine`],
-//! [`vte_marks`], `cli_start`, [`fabric_counts`]) measure headless, opening no window, and
-//! judge each metric against its committed baseline in
-//! `crates/aterm-verify/perf/golden/`; whatever every one but `fabric-counts` measured then
-//! meets the same-box trend ledger ([`trend`]), and a green run appends to it. `fabric-counts`
-//! keeps no trend: a same-box ratio means nothing for its exact counts, which its baseline and
-//! each count's law judge alone. A bare `verify perf` runs every floor lane. Each lane waits for a quiet machine first but
-//! `vte-engine`, `vte-marks`, `cli-start` and `fabric-counts`, which run at the load they
-//! find, report it, and judge cycles, instructions or exact counts, not time. The ARENA lanes
+//! [`vte_marks`], `cli_start`, [`fabric_counts`], [`files_idle`]) measure headless, opening no
+//! window, and judge each metric against its committed baseline in
+//! `crates/aterm-verify/perf/golden/`; whatever every one but `fabric-counts` and `files-idle`
+//! measured then meets the same-box trend ledger ([`trend`]), and a green run appends to it.
+//! `fabric-counts` and `files-idle` keep no trend: a same-box ratio means nothing for their exact
+//! counts, which their baselines (and `fabric-counts`' laws) judge alone. A bare `verify perf`
+//! runs every floor lane. Each lane waits for a quiet machine first but `vte-engine`,
+//! `vte-marks`, `cli-start`, `fabric-counts` and `files-idle`, which run at the load they find,
+//! report it, and judge cycles, instructions or exact counts, not time. The ARENA lanes
 //! ([`arena`]) open real windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
 //! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`], [`journal`]) are headless but just as unjudgeable —
@@ -60,6 +61,8 @@ mod fabric;
 mod fabric_counts;
 #[cfg(unix)]
 mod fabric_open_peak;
+#[cfg(unix)]
+mod files_idle;
 mod floors;
 #[cfg(unix)]
 mod journal;
@@ -168,6 +171,7 @@ pub(crate) enum Lane {
     VteMarks,
     CliStart,
     FabricCounts,
+    FilesIdle,
     Start,
     Compare,
     Cat,
@@ -194,7 +198,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 28] = [
+    pub(crate) const ALL: [Lane; 29] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -212,6 +216,7 @@ impl Lane {
         Lane::VteMarks,
         Lane::CliStart,
         Lane::FabricCounts,
+        Lane::FilesIdle,
         Lane::Start,
         Lane::Compare,
         Lane::Cat,
@@ -244,6 +249,7 @@ impl Lane {
             Lane::VteMarks => "vte-marks",
             Lane::CliStart => "cli-start",
             Lane::FabricCounts => "fabric-counts",
+            Lane::FilesIdle => "files-idle",
             Lane::Start => "start",
             Lane::Compare => "compare",
             Lane::Cat => "cat",
@@ -276,7 +282,8 @@ impl Lane {
             | Lane::VteEngine
             | Lane::VteMarks
             | Lane::CliStart
-            | Lane::FabricCounts => Kind::Floor,
+            | Lane::FabricCounts
+            | Lane::FilesIdle => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
             Lane::Fabric
             | Lane::RestoreE2e
@@ -294,10 +301,10 @@ impl Lane {
     }
 
     /// Whether the lane waits for a quiet machine before it starts ([`quiet`]). `vte-engine`,
-    /// `vte-marks`, `cli-start` and `fabric-counts` do not: they measure at the load they find,
-    /// report that load beside their numbers, and are judged by what the clock and the core a
-    /// sample ran on do not move (performance-core cycles; instructions retired; a world's exact
-    /// structural counts).
+    /// `vte-marks`, `cli-start`, `fabric-counts` and `files-idle` do not: they measure at the
+    /// load they find, report that load beside their numbers, and are judged by what the clock
+    /// and the core a sample ran on do not move (performance-core cycles; instructions retired;
+    /// a world's exact structural counts; one thread's exact counts).
     fn takes_quiet_claim(self) -> bool {
         !matches!(
             self,
@@ -305,6 +312,7 @@ impl Lane {
                 | Lane::VteMarks
                 | Lane::CliStart
                 | Lane::FabricCounts
+                | Lane::FilesIdle
                 | Lane::AdmissionWait
         )
     }
@@ -369,6 +377,13 @@ impl Lane {
                  and 32 sessions (0, E05), ping-pong's fleet-mailbox transactions (0, D01), \
                  messaging's refusals for the rate (0, E06) and each restart's cold reads (2N - \
                  1, then N - 1, D10d); no ratio and no time"
+            }
+            Lane::FilesIdle => {
+                "an idle hour of the shared files' materializer as exact counts on one thread: \
+                 the first pass and 60 regular passes over a second-generation registry carrying \
+                 rows from old membership epochs, each counting table views projected, MACHINE \
+                 claim projections and contexts, durable writes, folder modes, carried records \
+                 authenticated, read batch fences and kept key asks; no ratio and no time"
             }
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
@@ -444,6 +459,7 @@ impl Lane {
                 "unix, targo (builds aterm and its fabric_bench bench in the test profile, as \
                  `verify perf fabric` does)"
             }
+            Lane::FilesIdle => "unix, targo (builds aterm-db's library tests in the test profile)",
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
             Lane::Cat => {
@@ -1010,8 +1026,8 @@ const OPTIONS: &[OptSpec] = &[
         value: Some("wait|now"),
         lanes: &Lane::ALL,
         help: "wait for a quiet machine before each lane but those that run at the load they \
-               find (vte-engine, vte-marks, cli-start, fabric-counts; default wait, saying why \
-               once a minute), or start each at once (now)",
+               find (vte-engine, vte-marks, cli-start, fabric-counts, files-idle; default wait, \
+               saying why once a minute), or start each at once (now)",
     },
 ];
 
@@ -1176,8 +1192,8 @@ fn list() -> String {
         s.push_str(match kind {
             Kind::Floor => {
                 "FLOOR lanes (the default; judged against crates/aterm-verify/perf/golden, \
-                 then the same-box trend; fabric-counts by its baseline and laws alone, with no \
-                 trend)\n"
+                 then the same-box trend; fabric-counts by its baseline and laws alone and \
+                 files-idle by its baseline alone, with no trend)\n"
             }
             Kind::Arena => {
                 "ARENA lanes (only when named; real windows, minutes; measured, never judged: \
@@ -1389,6 +1405,13 @@ fn main(args: &[String]) -> ExitCode {
             #[cfg(not(unix))]
             Lane::FabricCounts => LaneRun::skip(
                 "the fabric bridge is unix-only (aterm-link)",
+                "run it on macOS or Linux",
+            ),
+            #[cfg(unix)]
+            Lane::FilesIdle => files_idle::run(record),
+            #[cfg(not(unix))]
+            Lane::FilesIdle => LaneRun::skip(
+                "aterm-db compiles the shared files' materializer on unix only",
                 "run it on macOS or Linux",
             ),
             #[cfg(unix)]

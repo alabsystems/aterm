@@ -232,51 +232,11 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
 }
 
 /// A session whose starter trusted it the credit-claim folder under the harness state is a
-/// credit-claim worker ([`ApprovalCtx::claim_worker`]), and no disk-free worker. CONTROL: no
-/// trusted folder, the disk-free worker's folder and another trusted folder are not.
+/// credit-claim worker ([`ApprovalCtx::claim_worker`]). CONTROL: no trusted folder, another
+/// folder under the harness state (the retired disk worker's) and another trusted folder are
+/// not.
 #[test]
 fn a_trusted_claim_folder_makes_a_claim_worker() {
-    let env = ApprovalEnv {
-        home: Some(PathBuf::from("/Users//owner")),
-        uid: 501,
-        tmpdir: None,
-        worker: WorkerSource::Session,
-    };
-    let of = |trusted: Option<&str>| {
-        let facts = BoxFacts {
-            trusted_cwd: trusted.map(PathBuf::from),
-            ..BoxFacts::default()
-        };
-        let ctx = ApprovalCtx::from(
-            &SupervisorConfig::default(),
-            &env,
-            &[],
-            &facts,
-            Arc::new(LiveProbe),
-        );
-        (ctx.claim_worker, ctx.disk_worker)
-    };
-    assert_eq!(
-        of(Some(
-            "/Users//owner/Library/Application Support/aterm/harness/claude-harness/credit-claim"
-        )),
-        (true, false)
-    );
-    assert_eq!(of(None), (false, false));
-    assert_eq!(
-        of(Some(
-            "/Users//owner/Library/Application Support/aterm/harness/claude-harness/disk-worker"
-        )),
-        (false, true)
-    );
-    assert_eq!(of(Some("/Users//owner/src/app")), (false, false));
-}
-
-/// A session whose starter trusted it the disk-worker folder under the harness state is a
-/// disk-free worker ([`ApprovalCtx::disk_worker`]). CONTROL: no trusted folder, and another
-/// trusted folder, are not.
-#[test]
-fn a_trusted_disk_worker_folder_makes_a_disk_worker() {
     let env = ApprovalEnv {
         home: Some(PathBuf::from("/Users//owner")),
         uid: 501,
@@ -295,17 +255,16 @@ fn a_trusted_disk_worker_folder_makes_a_disk_worker() {
             &facts,
             Arc::new(LiveProbe),
         )
-        .disk_worker
+        .claim_worker
     };
     assert!(of(Some(
-        "/Users//owner/Library/Application Support/aterm/harness/claude-harness/disk-worker"
+        "/Users//owner/Library/Application Support/aterm/harness/claude-harness/credit-claim"
     )));
     assert!(!of(None));
+    assert!(!of(Some(
+        "/Users//owner/Library/Application Support/aterm/harness/claude-harness/disk-worker"
+    )));
     assert!(!of(Some("/Users//owner/src/app")));
-    assert!(!of(every_fact()
-        .trusted_cwd
-        .as_deref()
-        .and_then(Path::to_str)));
 }
 
 /// A BOX UNDER LAND READS BACK AS WRITTEN: its facts carry the priority `land` (and a person's

@@ -131,8 +131,17 @@ pub(crate) const WHY_OFF: &str = "off";
 /// `why=` of a worker a manager or a script, no person, took off Autopilot before it landed.
 pub(crate) const WHY_OFF_CTL: &str = "off-ctl";
 
-/// `why=` of a worker its time budget ran out on (the disk worker's alone today).
+/// `why=` of a worker aterm ended the time of: a credit claim's worker whose budget ran out
+/// (`crate::worker_reaper`), and a disk worker an earlier build left running
+/// ([`RETIRED_DISK_WORKER`]).
 pub(crate) const WHY_EXPIRED: &str = "expired";
+
+/// The folder, under the harness state directory, that builds before the disk worker's removal
+/// started that worker in and named as its task record's trusted folder. No build starts one
+/// now; a record that still names the folder is one such build left, which ends at start
+/// ([`seed_carried`], [`seed_restored`]) and is told as its own report told it, with no generic
+/// one beside it ([`reports_its_own_end`]).
+const RETIRED_DISK_WORKER: &str = "disk-worker";
 
 /// `why=` of a worker Land stopped typing to because the same reply came back with no work
 /// (`aterm_agent::supervise::REPEATED_WHY`).
@@ -245,18 +254,17 @@ pub(crate) fn stall_words(why: Option<&str>) -> String {
     }
 }
 
-/// Whether a worker trusted to folder `trusted_cwd` has its own report of how it ended, so no
-/// generic one goes beside it (no landing record, no failed record or fact):
-/// a credit claim's worker (its claim-worker record in Messages,
-/// `App::note_worker_conclusion`) and aterm's disk worker (its disk-worker record, from the disk
-/// watch), each an automatic report and never an item to look at.
+/// Whether a worker trusted to folder `trusted_cwd` gets no generic report of how it ended (no
+/// landing record, no failed record or fact): a credit claim's worker, which has its own
+/// (its claim-worker record in Messages, `App::note_worker_conclusion`), and a disk worker an
+/// earlier build left ([`disposable_worker`]), which ends in aterm's own name with one log line.
+/// Each is an automatic end and never an item to look at.
 #[must_use]
 pub(crate) fn reports_its_own_end(trusted_cwd: Option<&str>) -> bool {
-    trusted_cwd.is_some_and(|folder| {
-        let folder = Path::new(folder);
-        aterm_agent::harness::credit_offers::is_claim_folder(folder)
-            || aterm_agent::harness::disk::fence::is_worker_folder(folder)
-    })
+    let claim = trusted_cwd
+        .map(Path::new)
+        .is_some_and(aterm_agent::harness::credit_offers::is_claim_folder);
+    claim || disposable_worker(trusted_cwd)
 }
 
 /// The most bytes [`TaskRecord::line`] takes once percent-encoded, as its row carries it: the
@@ -806,6 +814,27 @@ impl TaskRecord {
                 path.display()
             ),
         }
+    }
+
+    /// A stored record of a disk worker an earlier build left ([`disposable_worker`]) that is
+    /// still open (`working` or `stalled`) is over as this build seeds it: `failed why=expired`
+    /// from now, as it read when its time ran out, with no ask standing. Whether it was open;
+    /// one that had ended is left as it ended. The caller then turns its session off
+    /// ([`retire_session`]).
+    fn retire(&mut self, now: Instant, now_unix_ms: u64) -> bool {
+        if !matches!(self.state, TaskState::Working | TaskState::Stalled) {
+            return false;
+        }
+        self.rev += 1;
+        self.entered = self.rev;
+        self.state = TaskState::Failed;
+        self.why = Some(WHY_EXPIRED);
+        self.exit = None;
+        self.attention = false;
+        self.asks = Asks::default();
+        self.since = now;
+        self.since_unix_ms = now_unix_ms;
+        true
     }
 }
 
@@ -1916,11 +1945,14 @@ pub(crate) fn row_carried(row: &str) -> Vec<PathBuf> {
 /// never have had its line typed, and the launcher that would have typed it ended with the process:
 /// it reads `working` from now, so the startup deadline judges what its screen shows. Otherwise, where its agent is not coming
 /// back, it reads `exited why=exit`: gone (a plain quit forgets it, and no keeper handed its shell
-/// back), or a disposable worker whose shell did not come back running. aterm's disk worker is
-/// disposable: a later need starts a new one, so a cold restart never relaunches it
+/// back), or a disposable worker whose shell did not come back running. A disk worker an earlier
+/// build left is disposable: nothing starts one now, so a cold restart never relaunches it
 /// ([`disposable_worker`]). Returns whether this is such a worker, whose agent the restore leaves
 /// unlaunched. One whose relaunch is over without its agent is marked exited then
-/// ([`mark_restored_over`]).
+/// ([`mark_restored_over`]). Such a worker in a shell a keeper handed back may still run there,
+/// with neither the approval rule nor the time limit the build that started it held it to: its
+/// open record reads `failed why=expired` and its session is turned off, as a seamless update
+/// ends one ([`seed_carried`], [`retire_session`]).
 ///
 /// The record keeps the result its row names only where that result stands
 /// ([`TaskRecord::settle_result`]). The session has a new ID and the file keeps its name, so the
@@ -1939,9 +1971,14 @@ pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, followed: bool, kept: b
         return false;
     };
     record.settle_result(tasks.as_deref());
-    let disposable = !kept && disposable_worker(record.trusted_cwd.as_deref());
+    let retired = disposable_worker(record.trusted_cwd.as_deref());
+    let disposable = !kept && retired;
     let gone = (!followed && !kept) || disposable;
+    // A disk worker an earlier build left, in a shell a keeper handed back: its agent may run
+    // on there, and this build has neither its approval rule nor its time limit.
+    let expired = retired && !gone && record.retire(now, now_unix_ms);
     match record.state {
+        _ if expired => record.carried_entered = Some(record.entered),
         TaskState::Working | TaskState::Stalled if gone => {
             record.rev += 1;
             record.entered = record.rev;
@@ -1972,8 +2009,38 @@ pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, followed: bool, kept: b
     timeline.seed_task(record);
     timeline.seed_carried_results(carried.into_iter().collect());
     drop(timeline);
+    if expired {
+        retire_session(ctx);
+    }
     crate::session_timeline::keep_worker_autopilot(ctx);
     disposable
+}
+
+/// The session of a disk worker an earlier build left, whose record was just seeded as over
+/// ([`TaskRecord::retire`]): what the supervisor asked of it is taken down, since nobody owes a
+/// worker that is over an answer, and its Autopilot goes Off in aterm's own name, so Land types
+/// nothing more into it and an Autopilot word put back on its tab later does not undo that (a
+/// driver's write stands: `session_timeline::restore_carried_meta`,
+/// `App::seed_restored_user_meta`). The end is the record's seeded state, so nothing tells it as
+/// news; one log line says it.
+fn retire_session(ctx: &SessionCtx) {
+    {
+        let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        crate::session_timeline::put_supervisor_attention(&mut meta, &mut timeline, None);
+    }
+    let _ = crate::session_timeline::apply_autopilot(
+        ctx,
+        Some(alab_policy::config::Autopilot::Off.word().to_string()),
+        None,
+        aterm_slog::Actor::Aterm,
+        None,
+    );
+    aterm_log::info!(
+        "task: @{} is a disk worker an earlier build left running; this build runs none, so its \
+         task is over (failed why=expired) and its Autopilot is Off",
+        ctx.self_id.as_str()
+    );
 }
 
 /// The result `record`, just read from a stored row for `ctx`'s session, names under an earlier
@@ -1986,12 +2053,16 @@ fn carried_result(ctx: &SessionCtx, record: &TaskRecord) -> Option<PathBuf> {
         .and_then(|path| crate::task_launch::carried_result_of(path, &ctx.self_id))
 }
 
-/// Whether a worker trusted to folder `trusted_cwd` is disposable: aterm's disk worker, which a
-/// cold restart does not resume ([`seed_restored`]).
+/// Whether a worker trusted to folder `trusted_cwd` is disposable: a disk worker an earlier
+/// build left ([`RETIRED_DISK_WORKER`]), which a cold restart does not resume
+/// ([`seed_restored`]) and a seamless update ends ([`seed_carried`]).
 #[must_use]
 pub(crate) fn disposable_worker(trusted_cwd: Option<&str>) -> bool {
     trusted_cwd.is_some_and(|folder| {
-        aterm_agent::harness::disk::fence::is_worker_folder(Path::new(folder))
+        aterm_agent::harness::credit_offers::is_harness_folder(
+            Path::new(folder),
+            RETIRED_DISK_WORKER,
+        )
     })
 }
 
@@ -2046,13 +2117,20 @@ pub(crate) fn note_program_block(
 /// restore brought back before this update) is noted as [`seed_restored`] notes it, and so is
 /// each the row says the predecessor's tab named under another ID ([`row_carried`]): the session
 /// keeps its ID, no sweep runs, and only this tab's close or quit removes them.
+///
+/// A disk worker an earlier build left running ([`disposable_worker`]) is over here: this build
+/// has neither its approval rule nor its time limit, so a record of it still open reads `failed
+/// why=expired` with no ask standing ([`TaskRecord::retire`]), and its session is turned off
+/// ([`retire_session`]): the ask a stalled one carried is taken down, and its Autopilot goes
+/// Off in aterm's own name.
 pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     let Some(row) = row else {
         return;
     };
     let tasks = tasks_dir();
-    let Some(mut record) =
-        TaskRecord::from_carry_row(row, tasks.as_deref(), Instant::now(), unix_ms_now())
+    let now = Instant::now();
+    let now_unix_ms = unix_ms_now();
+    let Some(mut record) = TaskRecord::from_carry_row(row, tasks.as_deref(), now, now_unix_ms)
     else {
         aterm_log::warn!(
             "task: the carried task record does not read ({row:?}); the session crosses without one"
@@ -2060,6 +2138,8 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
         return;
     };
     record.settle_result(tasks.as_deref());
+    let retired =
+        disposable_worker(record.trusted_cwd.as_deref()) && record.retire(now, now_unix_ms);
     record.carried_entered = Some(record.entered);
     let mut carried: Vec<PathBuf> = Vec::new();
     for path in carried_result(ctx, &record).into_iter().chain(
@@ -2073,12 +2153,18 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     }
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    record.asks = asks_standing(&meta, &timeline);
-    record.attention = !record.asks.is_empty();
+    // A worker that is over stands with no ask, whatever its tab carried.
+    if !retired {
+        record.asks = asks_standing(&meta, &timeline);
+        record.attention = !record.asks.is_empty();
+    }
     timeline.seed_task(record);
     timeline.seed_carried_results(carried);
     drop(timeline);
     drop(meta);
+    if retired {
+        retire_session(ctx);
+    }
     crate::session_timeline::keep_worker_autopilot(ctx);
 }
 

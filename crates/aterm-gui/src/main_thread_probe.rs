@@ -230,51 +230,25 @@ mod imp {
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
     }
 
+    /// This executable's load address and its `LC_UUID` as `xxxxxxxx-xxxx-…` hex, or `unknown`
+    /// where it carries none, as `aterm_sysprobe::image::mapped` reads them from its mapping.
     fn exe_identity() -> Option<(usize, String)> {
-        let mut info = DlInfo {
-            fname: std::ptr::null(),
-            fbase: std::ptr::null_mut(),
-            sname: std::ptr::null(),
-            saddr: std::ptr::null_mut(),
-        };
-        // SAFETY: `register` is code in this executable; `info` is live.
-        if unsafe { dladdr(register as *const c_void, &raw mut info) } == 0 || info.fbase.is_null()
-        {
-            return None;
-        }
-        let base = info.fbase as usize;
-        // SAFETY: `base` is the mapped header of this executable.
-        let ncmds = unsafe { std::ptr::read_unaligned((base + 16) as *const u32) };
-        let mut cmd_at = base + 32;
-        for _ in 0..ncmds.min(512) {
-            // SAFETY: load commands follow the header inside the mapping.
-            let (cmd, size) = unsafe {
-                (
-                    std::ptr::read_unaligned(cmd_at as *const u32),
-                    std::ptr::read_unaligned((cmd_at + 4) as *const u32),
-                )
-            };
-            const LC_UUID: u32 = 0x1b;
-            if cmd == LC_UUID {
-                // SAFETY: an LC_UUID command carries 16 bytes after its header.
-                let bytes = unsafe { std::ptr::read_unaligned((cmd_at + 8) as *const [u8; 16]) };
+        let mapped = aterm_sysprobe::image::mapped()?;
+        let uuid = mapped.uuid.map_or_else(
+            || "unknown".into(),
+            |bytes| {
                 let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
-                let uuid = format!(
+                format!(
                     "{}-{}-{}-{}-{}",
                     &hex[0..8],
                     &hex[8..12],
                     &hex[12..16],
                     &hex[16..20],
                     &hex[20..32]
-                );
-                return Some((base, uuid));
-            }
-            if size < 8 {
-                break;
-            }
-            cmd_at += size as usize;
-        }
-        Some((base, "unknown".into()))
+                )
+            },
+        );
+        Some((mapped.base, uuid))
     }
 
     fn symbolize(pc: u64, exe_base: Option<usize>) -> String {

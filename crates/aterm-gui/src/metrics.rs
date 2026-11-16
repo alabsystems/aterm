@@ -3481,8 +3481,30 @@ pub(crate) fn emit_summary(
         crate::spare::emit_metrics(s);
         #[cfg(unix)]
         emit_commons_cadence(s);
+        emit_accounts_upkeep(s);
     }
     emit_gpu(ctx, s);
+}
+
+/// The accounts' upkeep's counts in this process since it started
+/// (`aterm_agent::harness::accounts_upkeep_counts::counts`), and, on unix, what its receipt
+/// admissions read of the lab registry and the strict reads of it that were no admission
+/// (`aterm_db::alab::admission_counts`): each only rises, so no `reset` clears one and a reader
+/// subtracts two readings.
+fn emit_accounts_upkeep(s: &mut dyn wire::FieldSink) {
+    let counts = aterm_agent::harness::accounts_upkeep_counts::counts();
+    s.count("accounts_upkeep_passes", counts.passes);
+    s.count("accounts_pool_syncs", counts.pool_syncs);
+    s.count("accounts_pool_syncs_guarded", counts.pool_syncs_guarded);
+    s.count("accounts_receipt_admissions", counts.receipt_admissions);
+    #[cfg(unix)]
+    {
+        let read = aterm_db::alab::admission_counts();
+        s.count("accounts_admission_reads", read.reads);
+        s.count("accounts_admission_records", read.records);
+        s.count("accounts_admission_bytes", read.bytes);
+        s.count("accounts_observation_reads", read.observations);
+    }
 }
 
 /// Commons repair's counts in this process since it started (`aterm_db::runtime::cadence`):

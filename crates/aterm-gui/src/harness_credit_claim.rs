@@ -306,8 +306,8 @@ pub(crate) struct Gate {
     pub(crate) autopilot: Autopilot,
     /// `[harness] claim_credits` under the master switch.
     pub(crate) claim_credits: bool,
-    /// The session is a worker aterm started for its own ends (a credit claim's or the disk
-    /// worker's, by its task record's trusted folder,
+    /// The session is a worker aterm started for its own ends (a credit claim's, or a disk
+    /// worker an earlier build left, by its task record's trusted folder,
     /// [`crate::task_record::reports_its_own_end`]), or one the store no longer holds
     /// ([`own_worker`]): its own idle turn end starts no claim.
     pub(crate) own_worker: bool,
@@ -534,16 +534,17 @@ pub(crate) fn step(
 }
 
 /// Whether session `sid` is one of aterm's own workers ([`Gate::own_worker`]): its task record
-/// trusts a claim folder or the disk worker's folder
+/// trusts a claim folder, or the folder of a disk worker an earlier build left
 /// ([`crate::task_record::reports_its_own_end`]). A session the store does not hold is read as
 /// one, so a look of a session that went starts nothing.
 pub(crate) fn own_worker(store: &crate::session_store::Store, sid: &str) -> bool {
-    let Some(handle) = store
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .by_sid(&aterm_session::SessionId::new(sid))
-        .cloned()
-    else {
+    let Some(handle) = aterm_session::SessionId::parse(sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .cloned()
+    }) else {
         return true;
     };
     let timeline = handle
@@ -656,9 +657,9 @@ pub(crate) fn ran_out(folder: Option<&str>, stood: Duration) -> bool {
 
 impl crate::App {
     /// Start a claim worker for `offer`, found by the supervised session `from`
-    /// ([`super::HostNote::CreditClaim`]), the way the disk worker starts: a background Claude
-    /// Code tab under Autopilot Land, trusted the claim folder ([`worker_folder_under`]), so the
-    /// harness fences its boxes, and named for its offer ([`worker_role`]). The try is already
+    /// ([`super::HostNote::CreditClaim`]): a background Claude Code tab under Autopilot Land,
+    /// trusted the claim folder ([`worker_folder_under`]), so the harness fences its boxes, and
+    /// named for its offer ([`worker_role`]). The try is already
     /// recorded and its link held ([`step`]): a landed tab holds it by its session, and a worker
     /// that did not start gives it back ([`Claims::refused`]). The tab it opens, or why none
     /// opened, is a fact for later in the digest.
@@ -742,12 +743,13 @@ impl crate::App {
     /// ([`Claims::spawned`]) and its tab is named for its offer ([`worker_role`]), before anything
     /// reads its place, so no chip or message names it by the line its shell is typing.
     pub(crate) fn claim_worker_landed(&mut self, sid: &str, offer: &Offer) {
-        let handle = self
-            .store
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .by_sid(&aterm_session::SessionId::new(sid))
-            .cloned();
+        let handle = aterm_session::SessionId::parse(sid).and_then(|id| {
+            self.store
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .by_sid(&id)
+                .cloned()
+        });
         let Some(handle) = handle else {
             CLAIMS.refused(offer.id, &offer.url);
             return;

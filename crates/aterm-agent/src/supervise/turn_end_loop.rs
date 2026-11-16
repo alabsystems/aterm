@@ -2823,19 +2823,17 @@ impl<C: Ctl> Session<'_, C> {
     /// claim when due, so a probe however long lets no lease lapse; `None` once
     /// the loop is stopped, what the repository holds unknown.
     ///
-    /// A disk-free worker's repository reads clean by its task record, unasked:
-    /// its trusted folder is the worker folder
-    /// ([`crate::harness::disk::fence::is_worker_folder`]), and nothing it does
+    /// A credit-claim worker's repository reads clean, unasked: its trusted
+    /// folder is its claim folder
+    /// ([`crate::harness::credit_offers::is_claim_folder`]), and nothing it does
     /// is landed anywhere, so a `cd` into a checkout holding another session's
-    /// work neither holds it nor has Land nudge it to land that work
-    /// (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4, "Land for a worker"). A credit-claim
-    /// worker's reads clean so, by its claim folder
-    /// ([`crate::harness::credit_offers::is_claim_folder`]): it lands nothing either.
+    /// work neither holds it nor has Land nudge it to land that work.
     fn repo_asked(&mut self, host: &dyn IdleHost) -> Option<crate::harness::repo_work::RepoRead> {
-        if self.trusted_cwd.as_deref().is_some_and(|folder| {
-            crate::harness::disk::fence::is_worker_folder(folder)
-                || crate::harness::credit_offers::is_claim_folder(folder)
-        }) {
+        if self
+            .trusted_cwd
+            .as_deref()
+            .is_some_and(crate::harness::credit_offers::is_claim_folder)
+        {
             return Some(crate::harness::repo_work::RepoRead::Clean);
         }
         loop {

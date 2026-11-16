@@ -30,11 +30,14 @@ use aterm_diskwalk::{
 };
 use aterm_sysprobe::volumes::{Table, VolumeKey};
 use aterm_types::MutexExt as _;
+use aterm_uds::file_watch::{FileEvents, FileWatch, Waker};
 
 use crate::tab_model::TabId;
 
 mod scopes;
 mod stores;
+
+use scopes::PANE_STALE_AFTER;
 
 pub(crate) use scopes::{
     CwdReport, DeckWindow, GlanceBudget, Live, LiveFrom, Membership, OwnDirs, PaneFacts, Pool,
@@ -60,8 +63,18 @@ pub(crate) const REWALK_COST_FACTOR: u32 = 20;
 pub(crate) const GLANCE_REWALK_AFTER: Duration = Duration::from_secs(600);
 /// At glance pace a walk is walked again no sooner than this many times its own duration.
 pub(crate) const GLANCE_COST_FACTOR: u32 = 50;
-/// How often the thread derives each demanded pane's folders again.
+/// How often the thread derives each demanded pane's folders again while it is active
+/// ([`Engine::look_due`]).
 pub(crate) const DISCOVER_EVERY: Duration = Duration::from_secs(5);
+/// How often a walker at rest takes its pair of looks, [`DISCOVER_EVERY`] apart
+/// ([`Engine::look_due`]).
+pub(crate) const REST_EVERY: Duration = Duration::from_secs(60);
+/// How long after its last look a pane's next look continues it on a walker that may rest: the
+/// longest gap that walker's schedule leaves between two looks, [`REST_EVERY`] less
+/// [`DISCOVER_EVERY`], with the slack [`PANE_STALE_AFTER`] leaves over one [`DISCOVER_EVERY`].
+const PANE_STALE_AT_REST: Duration = Duration::from_secs(
+    PANE_STALE_AFTER.as_secs() + REST_EVERY.as_secs() - 2 * DISCOVER_EVERY.as_secs(),
+);
 /// The most build-start lines one pane's session names roots from, the newest first: a tab
 /// that built in more worktrees than this holds the newest.
 const MAX_BUILT_PER_PANE: usize = 64;
@@ -542,6 +555,9 @@ pub(crate) enum ToWalker {
         pace: Pace,
         at: Instant,
     },
+    /// A volume may have been mounted or unmounted ([`hear_mounts`]): the mount table is read
+    /// again at once.
+    Mounts,
     /// End the thread (tests: the process's walker lives as long as it).
     #[cfg(test)]
     Stop,
@@ -855,8 +871,9 @@ fn spawn_walker(
             at,
         });
     }
+    let mounts = hear_mounts(shared);
     match crate::qos::spawn_lane_thread("aterm-diskwalk", class.role, move || {
-        walker_main(inbox, out, proxy, class.disk)
+        walker_main(inbox, out, proxy, class.disk, mounts)
     }) {
         Ok(_) => {
             shared.set_walker_state(WalkerState::Running);
@@ -866,6 +883,114 @@ fn spawn_walker(
             shared.set_walker_state(WalkerState::Failed);
             Err(error)
         }
+    }
+}
+
+/// The one key [`hear_mounts`]' watch holds: `/`, as a folder.
+const MOUNTS_KEY: u64 = 0;
+
+/// The watch that tells the walker a volume was mounted or unmounted, where the platform tells
+/// of one: its folder key on `/` looks again at every mount and unmount (macOS's `VQ_MOUNT` and
+/// `VQ_UNMOUNT`; on Linux a change of `/proc/self/mountinfo`, the file the mount table is read
+/// from) and tells each look ([`FileWatch::watch_directory`]), as it tells a change of `/`'s
+/// own entries, and each tell sends [`ToWalker::Mounts`] ([`mounts_heard`]). With it, whether
+/// that key is armed now ([`MountEars`]): the walker rests only while it is. `None` on any
+/// other platform (Windows tells of no mount) and where the watch does not start: that walker
+/// never rests ([`Engine::active`]).
+fn hear_mounts(shared: &'static Shared) -> Option<(FileWatch, Arc<AtomicBool>)> {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return None;
+    }
+    let started = aterm_uds::file_watch::platform_events().and_then(|events| {
+        let ears = MountEars::over(events);
+        let armed = Arc::clone(&ears.armed);
+        FileWatch::spawn(
+            "aterm-diskwalk-mounts",
+            Box::new(ears),
+            mounts_heard(shared),
+        )
+        .map(|watch| (watch, armed))
+    });
+    match started {
+        Ok((watch, armed)) => {
+            watch.watch_directory(MOUNTS_KEY, PathBuf::from("/"));
+            Some((watch, armed))
+        }
+        Err(error) => {
+            aterm_log::warn!("disk walker: mounts are not heard, so it never rests: {error}");
+            None
+        }
+    }
+}
+
+/// What the mount watch tells: each tell is one [`ToWalker::Mounts`] down the walker's inbox.
+fn mounts_heard(shared: &'static Shared) -> Box<dyn FnMut(u64) + Send> {
+    Box::new(move |_| shared.send(ToWalker::Mounts))
+}
+
+/// The platform's file events under [`hear_mounts`]' watch, keeping whether its key's last arm
+/// took (`armed`). A mount or unmount looks again only at an armed key (macOS's `EVFILT_FS`
+/// touches the keys kqueue holds armed, Linux's `/proc/self/mountinfo` the keys with their own
+/// inotify watch), so a key whose arm did not take (descriptors or inotify watches ran out)
+/// hears none, and the watch arms it again in its rounds. An arm that takes there is looked at
+/// and told; an arm lost is lost in the arm again that follows one of the key's events, and
+/// that look tells too while the folder's entries were armed: either way the walker hears of
+/// it ([`ToWalker::Mounts`]) and reads `armed` anew. Every call is the platform's own.
+struct MountEars {
+    events: Box<dyn FileEvents>,
+    armed: Arc<AtomicBool>,
+}
+
+impl MountEars {
+    fn over(events: Box<dyn FileEvents>) -> Self {
+        Self {
+            events,
+            armed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The watch holds the one key ([`MOUNTS_KEY`]), so whatever it arms is that key's arm.
+    fn took(&self, armed: bool) {
+        self.armed.store(armed, Ordering::Release);
+    }
+}
+
+impl FileEvents for MountEars {
+    fn arm(&mut self, key: u64, path: &Path) -> std::io::Result<()> {
+        let arm = self.events.arm(key, path);
+        self.took(arm.is_ok());
+        arm
+    }
+
+    fn arm_directory(&mut self, key: u64, path: &Path) -> std::io::Result<()> {
+        let arm = self.events.arm_directory(key, path);
+        self.took(arm.is_ok());
+        arm
+    }
+
+    fn disarm(&mut self, key: u64) {
+        self.events.disarm(key);
+        self.armed.store(false, Ordering::Release);
+    }
+
+    fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> std::io::Result<()> {
+        self.events.wait(timeout, touched)
+    }
+
+    fn waker(&self) -> Waker {
+        self.events.waker()
+    }
+
+    fn hears_every_writer(&self, key: u64) -> bool {
+        self.events.hears_every_writer(key)
+    }
+
+    fn pins_folders(&self) -> bool {
+        self.events.pins_folders()
+    }
+
+    fn listens_for(&self, path: &Path) -> bool {
+        self.events.listens_for(path)
     }
 }
 
@@ -1408,6 +1533,23 @@ struct Engine {
     /// Periodic discoveries so far, and when the last ran.
     round: u64,
     periodic_at: Option<Instant>,
+    /// The mount watch's word whether its key on `/` is armed now ([`hear_mounts`],
+    /// [`MountEars`]); `None` without a mount watch. The walker may rest only while that key is
+    /// armed ([`Self::active`]): then it hears every mount and unmount, so a rest leaves the
+    /// mount table it judges paths by no older.
+    ears: Option<Arc<AtomicBool>>,
+    /// Until when the walker looks every [`DISCOVER_EVERY`]: [`LIFT_FOR`] after the last
+    /// activity a discovery took in ([`Self::discover_if_due`]).
+    active_until: Option<Instant>,
+    /// Activity since a discovery last took it in: facts that changed, a look-pace ask, a mount
+    /// or unmount heard. A glance ask is none: a drawn deck asks every [`DECK_ASK_EVERY`].
+    stirred: bool,
+    /// A mount or unmount heard since the mount table was last read.
+    remounted: bool,
+    /// The last periodic look opened a pair at rest: the next is [`DISCOVER_EVERY`] after it.
+    opened: bool,
+    /// The mount table's read ([`aterm_sysprobe::volumes::table`]; a test counts its own).
+    table: Box<dyn Fn() -> Table>,
     /// The facts' shape and the scopes the last discovery covered.
     discovered: Option<(u64, BTreeSet<DiskScope>)>,
     /// Since when each root no demanded scope holds has been left.
@@ -1441,12 +1583,18 @@ fn walker_main(
     out: Arc<Mailbox>,
     proxy: Option<Proxy>,
     disk: aterm_diskwalk::DiskIo,
+    mounts: Option<(FileWatch, Arc<AtomicBool>)>,
 ) {
     let policy_out = aterm_diskwalk::set_walker_thread_policy(disk);
     if !policy_out.failed.is_empty() {
         aterm_log::warn!("disk walker: I/O policy not taken: {:?}", policy_out.failed);
     }
-    Engine::new(inbox, out, proxy).run();
+    let (watch, ears) = mounts.unzip();
+    let mut engine = Engine::new(inbox, out, proxy);
+    engine.ears = ears;
+    engine.run();
+    // The watch's tells come down the inbox: it is kept as long as the thread runs.
+    drop(watch);
 }
 
 impl Engine {
@@ -1468,6 +1616,12 @@ impl Engine {
             lifts: HashMap::new(),
             round: 0,
             periodic_at: None,
+            ears: None,
+            active_until: None,
+            stirred: false,
+            remounted: false,
+            opened: false,
+            table: Box::new(aterm_sysprobe::volumes::table),
             discovered: None,
             left: BTreeMap::new(),
             records: BTreeMap::new(),
@@ -1570,6 +1724,13 @@ impl Engine {
                 if detail == Detail::Frees {
                     ask.frees_at = Some(at);
                 }
+                if pace == Pace::Look {
+                    self.stirred = true;
+                }
+            }
+            ToWalker::Mounts => {
+                self.remounted = true;
+                self.stirred = true;
             }
             #[cfg(test)]
             ToWalker::Stop => return false,
@@ -1602,13 +1763,15 @@ impl Engine {
         true
     }
 
-    /// Take new facts. A changed front program or report waits for the next discovery and
-    /// rebuilds nothing; a pane that opens or closes asks for a discovery at once; a changed home,
-    /// deny override or opt-in rebuilds the policy.
+    /// Take new facts. Facts that changed are activity ([`Self::look_due`]). A changed front
+    /// program or report waits for the next discovery and rebuilds nothing; a pane that opens or
+    /// closes asks for a discovery at once; a changed home, deny override or opt-in rebuilds the
+    /// policy.
     fn take_facts(&mut self, facts: Facts) {
         if facts == self.facts {
             return;
         }
+        self.stirred = true;
         let policy_moved = facts.policy_inputs() != self.facts.policy_inputs();
         let shape_moved = facts.shape() != self.facts.shape();
         self.facts = facts;
@@ -1616,10 +1779,11 @@ impl Engine {
             self.shape_seq += 1;
         }
         if policy_moved || self.policy.is_none() {
+            let table = &self.table;
             self.policy = self.facts.home.as_deref().map(|home| {
                 Policy::new(
                     Deny::for_home(home, &self.facts.overrides, &self.facts.opt_in),
-                    aterm_sysprobe::volumes::table(),
+                    table(),
                 )
             });
             self.lifts.clear();
@@ -1632,18 +1796,8 @@ impl Engine {
         {
             self.tally.0 += 1;
         }
-        let live = !self.live(now).is_empty();
-        let mut until = self
-            .profiles_at
-            .map_or(now + PROFILES_EVERY, |t| t + PROFILES_EVERY);
-        if live {
-            until = until.min(now + DISCOVER_EVERY);
-            if let Some(t) = self.next_due(now) {
-                until = until.min(t);
-            }
-        }
         match self.inbox.recv_timeout(
-            until
+            self.wakes_at(now)
                 .saturating_duration_since(now)
                 .max(Duration::from_millis(1)),
         ) {
@@ -1651,6 +1805,25 @@ impl Engine {
             Err(RecvTimeoutError::Timeout) => true,
             Err(RecvTimeoutError::Disconnected) => false,
         }
+    }
+
+    /// Until when a walker that sleeps at `now` sleeps, a message aside: the next profiles
+    /// read, and, while a scope is demanded and a policy held, no later than the next periodic
+    /// look ([`Self::look_due`], or [`DISCOVER_EVERY`] from `now` before the first) and the next
+    /// walk owed ([`Self::next_due`]). So a walker at rest sleeps from one pair of looks to the
+    /// next. With no policy (no home yet) no look runs, and none is due.
+    fn wakes_at(&self, now: Instant) -> Instant {
+        let live = !self.live(now).is_empty() && self.policy.is_some();
+        let mut until = self
+            .profiles_at
+            .map_or(now + PROFILES_EVERY, |t| t + PROFILES_EVERY);
+        if live {
+            until = until.min(self.look_due().unwrap_or(now + DISCOVER_EVERY));
+            if let Some(t) = self.next_due(now) {
+                until = until.min(t);
+            }
+        }
+        until
     }
 
     /// The scopes demanded at `now`, each at the pace its freshest ask names.
@@ -1767,18 +1940,99 @@ impl Engine {
         paths
     }
 
+    /// A discovery where one is due at `now`: a periodic one when [`Self::look_due`] has come,
+    /// one at once when the shape or the demanded scopes moved. Activity (what stirred the
+    /// walker, a heard mount or unmount among it, or a scope demanded that the last discovery
+    /// did not cover) keeps it active for [`LIFT_FOR`] from `now`; a scope whose asks lapsed is
+    /// none. A mount or unmount heard reads the mount table at once: in the periodic look where
+    /// one is due, else alone ([`Self::read_mounts`]), with or without a scope demanded, so the
+    /// join and leave rule still counts only looks [`DISCOVER_EVERY`] or more apart.
     fn discover_if_due(&mut self, now: Instant) {
+        let remounted = std::mem::take(&mut self.remounted);
         let live = self.live(now);
         if live.is_empty() || self.policy.is_none() {
+            if remounted {
+                self.read_mounts();
+            }
             return;
         }
         let scopes: BTreeSet<DiskScope> = live.keys().copied().collect();
-        let periodic = self
-            .periodic_at
-            .is_none_or(|t| now.saturating_duration_since(t) >= DISCOVER_EVERY);
         let prompt = self.discovered.as_ref() != Some(&(self.shape_seq, scopes.clone()));
+        let asked_anew = self
+            .discovered
+            .as_ref()
+            .is_none_or(|(_, covered)| !scopes.is_subset(covered));
+        if std::mem::take(&mut self.stirred) || asked_anew {
+            self.active_until = Some(now + LIFT_FOR);
+        }
+        let periodic = self.look_due().is_none_or(|due| now >= due);
+        if remounted && !periodic {
+            self.read_mounts();
+        }
         if periodic || prompt {
             self.discover(now, periodic);
+        }
+    }
+
+    /// The mount table read again into the policy, and home's pool and each claim's pool judged
+    /// by it, with no look: no round counted and no pane read. The board is published again
+    /// where a pool moved.
+    fn read_mounts(&mut self) {
+        let Some(policy) = self.policy.as_mut() else {
+            return;
+        };
+        policy.mounts = (self.table)();
+        let policy = policy.clone();
+        let before = (self.home_pool.clone(), self.pools.clone());
+        self.home_pool = self
+            .facts
+            .home
+            .as_deref()
+            .and_then(|h| (self.reads.pool)(h, &policy.mounts));
+        self.refresh_pools(&policy);
+        if (&self.home_pool, &self.pools) != (&before.0, &before.1) {
+            self.dirty = true;
+        }
+    }
+
+    /// When the next periodic look is due: [`DISCOVER_EVERY`] after the last while the walker
+    /// is active then ([`Self::active`]) and after a look that opened a pair at rest; else
+    /// [`REST_EVERY`] less [`DISCOVER_EVERY`] after the last, a look that opens the next pair.
+    /// So a walker at rest looks twice in a row, [`DISCOVER_EVERY`] apart, once every
+    /// [`REST_EVERY`], and a pane's folders still join and leave on two looks in a row
+    /// ([`Membership`]). `None` before the first.
+    fn look_due(&self) -> Option<Instant> {
+        let at = self.periodic_at?;
+        let soon = at + DISCOVER_EVERY;
+        Some(if self.opened || self.active(soon) {
+            soon
+        } else {
+            at + REST_EVERY - DISCOVER_EVERY
+        })
+    }
+
+    /// Whether the walker looks every [`DISCOVER_EVERY`] at `now`: it hears no mount now (no
+    /// mount watch, or its key on `/` is not armed: [`MountEars`]), or the last activity was
+    /// less than [`LIFT_FOR`] before.
+    fn active(&self, now: Instant) -> bool {
+        !self.hears_mounts() || self.active_until.is_some_and(|until| now < until)
+    }
+
+    /// Whether the mount watch's key on `/` is armed now, so every mount and unmount is heard.
+    fn hears_mounts(&self) -> bool {
+        self.ears
+            .as_ref()
+            .is_some_and(|armed| armed.load(Ordering::Acquire))
+    }
+
+    /// How long after a pane's last look its next continues it ([`Membership::observe`]): the
+    /// longest gap the schedule of a walker with a mount watch may leave, else one that looks
+    /// every [`DISCOVER_EVERY`].
+    const fn stale_after(&self) -> Duration {
+        if self.ears.is_some() {
+            PANE_STALE_AT_REST
+        } else {
+            PANE_STALE_AFTER
         }
     }
 
@@ -1793,11 +2047,13 @@ impl Engine {
             return;
         };
         if periodic {
-            policy.mounts = aterm_sysprobe::volumes::table();
+            policy.mounts = (self.table)();
             self.policy = Some(policy.clone());
+            self.opened = !self.opened && !self.active(now);
             self.round += 1;
             self.periodic_at = Some(now);
         }
+        let stale_after = self.stale_after();
         let home = self.facts.home.clone();
         if periodic || self.home_pool.is_none() {
             self.home_pool = home
@@ -1817,7 +2073,7 @@ impl Engine {
             let fresh = self
                 .panes
                 .get(&pane.key)
-                .is_some_and(|l| l.membership.fresh(now));
+                .is_some_and(|l| l.membership.fresh(now, stale_after));
             if !periodic && fresh {
                 continue;
             }
@@ -1830,7 +2086,7 @@ impl Engine {
             let named: BTreeSet<PathBuf> = seen.named.iter().map(|c| c.path.clone()).collect();
             let round = self.round;
             let life = self.panes.entry(pane.key).or_default();
-            life.membership.observe(&named, round, now);
+            life.membership.observe(&named, round, now, stale_after);
             for c in seen.named {
                 life.claims.insert(c.path.clone(), c);
             }
@@ -3030,42 +3286,27 @@ fn profile_executables(deps: &Path, policy: &Policy, budget: Duration) -> Option
     }
 }
 
-/// The digest entry for one raised folder (`vitals.huge-dir.<hash>.entries`).
-pub(crate) fn huge_entry(h: &HugeDir) -> aterm_messages::exceptions::Entry {
-    use aterm_messages::exceptions::{Entry, Family};
-    use aterm_messages::need::{Reason, Resurface, Then, Why};
-    let subject = format!(
-        "{:016x}",
-        aterm_hash::fnv1a_64(h.path.as_os_str().as_encoded_bytes())
-    );
-    let (reason, step) = if h.executables {
-        (
-            "a binary launched from it makes tccd read the whole folder",
-            "Remove old build outputs in it with targo clean",
-        )
-    } else {
-        (
-            "anything that lists it is slow",
-            "Move the files it no longer needs out of it",
-        )
-    };
-    Entry::new(
-        Family::HugeDir,
-        &subject,
-        "entries",
-        &format!("{} entries in one folder", group(h.entries)),
-        Why::OnlyYou(Reason::new(reason)),
-        Then::step(step),
-    )
-    .severity(aterm_messages::Severity::Warn)
-    .resurface(Resurface::WAIT)
-    .more(h.sentence())
-    .log_line(format!(
-        "vitals huge-dir path={} entries={} executables={}",
-        h.path.display(),
-        h.entries,
-        h.executables
-    ))
+/// The walker's one log line for each folder of `raised` that `said` does not hold yet, `said`
+/// then narrowed to `raised`: a folder is logged once each time it enters the raised set, and
+/// nothing is filed for it.
+pub(crate) fn huge_news(
+    said: &mut BTreeSet<PathBuf>,
+    raised: &BTreeMap<PathBuf, HugeDir>,
+) -> Vec<String> {
+    let lines = raised
+        .iter()
+        .filter(|(path, _)| !said.contains(*path))
+        .map(|(_, h)| {
+            format!(
+                "vitals huge-dir path={} entries={} executables={}",
+                h.path.display(),
+                h.entries,
+                h.executables
+            )
+        })
+        .collect();
+    *said = raised.keys().cloned().collect();
+    lines
 }
 
 fn fold_outside(
@@ -3112,20 +3353,8 @@ fn fold_raised(
     out
 }
 
-fn group(n: u32) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// What the loop keeps: the walker's publications, when it next looks at the panes' facts and
-/// what it last sent, what the deck last asked, and the §10.8 set it last stated.
+/// what it last sent, what the deck last asked, and the §10.8 set it last logged.
 #[derive(Default)]
 pub(crate) struct DiskwalkHost {
     from_walker: Option<Arc<Mailbox>>,
@@ -3137,6 +3366,8 @@ pub(crate) struct DiskwalkHost {
     facts_owed: bool,
     sent_facts: Option<Facts>,
     huge_seen: u64,
+    /// The raised folders whose log line this process wrote ([`huge_news`]).
+    huge_said: BTreeSet<PathBuf>,
     /// When the deck last asked, and what.
     deck_asked: Option<(Instant, Vec<(DiskScope, Pace)>)>,
     /// Each pane's last OSC 7 report read, kept while its terminal is busy.
@@ -3244,8 +3475,10 @@ impl crate::App {
             && p.huge_seq != self.diskwalk.huge_seen
         {
             self.diskwalk.huge_seen = p.huge_seq;
-            let entries: Vec<_> = p.huge.values().map(huge_entry).collect();
-            self.except_replace(aterm_messages::exceptions::Family::HugeDir, &entries);
+            // A fact for the log and for `sys disk`'s `warnings`: nothing is filed for it.
+            for line in huge_news(&mut self.diskwalk.huge_said, &p.huge) {
+                aterm_log::info!("{line}");
+            }
         }
         self.ask_for_deck(now);
         let wanted = DISKWALK.facts_wanted.swap(false, Ordering::Relaxed);

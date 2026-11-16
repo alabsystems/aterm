@@ -114,7 +114,7 @@ fn every_alias_is_a_clone_inside_its_own_rows_build() {
             (s.vendor, s.product, s.head_url, s.anchor, s.apple_team),
             (s.url_prefixes, s.url_query, s.digest_docs, s.shim_env),
             (s.self_update_verbs, s.yolo_flags, s.yolo_markers),
-            s.revision_versions,
+            (s.yolo_after, s.yolo_skip, s.revision_versions),
         )
     };
     assert_eq!(lane(old), lane(codex));
@@ -295,6 +295,8 @@ fn keeps_no_launcher_block(program: &str, shim_env: &[&str]) {
     assert_eq!(row.self_update_verbs, none, "{program}: self_update_verbs");
     assert_eq!(row.yolo_flags, none, "{program}: yolo_flags");
     assert_eq!(row.yolo_markers, none, "{program}: yolo_markers");
+    assert_eq!(row.yolo_after, none, "{program}: yolo_after");
+    assert_eq!(row.yolo_skip, none, "{program}: yolo_skip");
     assert_eq!(row.shim_env, shim_env, "{program}: shim_env stays");
     let raw: Vec<String> = shim_env.iter().map(|e| (*e).to_string()).collect();
     assert_eq!(
@@ -364,9 +366,137 @@ fn the_grok_row_keeps_no_launcher_block() {
     keeps_no_launcher_block("grok", &["GROK_DISABLE_AUTOUPDATER=1"]);
 }
 
-/// HX-13a: muse-alab's `run` sets the yolo default, so muse's row keeps no launcher block (Muse
-/// Code has no update verb and its shim exports nothing).
+/// HX-13c, not yet: muse keeps aterm's launcher block while no harness leads `muse`. muse-alab's
+/// `run` carries the same block (HX-13a), but its seed record leads no word (and its pinned
+/// release's record says `leads = []`) until its harness-proof passes (HX-13), so no twin hands a
+/// `muse` launch to it (`the_grok_twin_hands_its_session_to_grok_alab_once_installed` checks
+/// muse's twin has no hand-off). Without this block a typed `muse`, `aterm muse` and a muse
+/// worker would start Muse Code with approvals and sandbox on. Read as production reads it: the
+/// seed rows ([`crate::harness_record::SEEDS`]) and the registry they compose with no installed
+/// record, then [`spec`], [`crate::yolo::policy_of`], [`crate::yolo::decide`] and the twin's
+/// prelude. Once a seed row leads `muse`, (a) fails here: HX-13c then deletes muse's block and
+/// this test becomes `keeps_no_launcher_block("muse", &[])`. While none does, (b) fails if the
+/// block goes.
 #[test]
-fn the_muse_row_keeps_no_launcher_block() {
-    keeps_no_launcher_block("muse", &[]);
+fn the_muse_row_keeps_its_launcher_block_while_no_harness_leads_muse() {
+    // (a) No harness leads `muse`.
+    let seed = crate::harness_record::SEEDS
+        .iter()
+        .find(|seed| seed.id == "muse-alab")
+        .expect("muse-alab has a seed row");
+    assert_eq!(
+        seed.leads,
+        &[] as &[&str],
+        "muse-alab's seed leads a word: HX-13 landed, so HX-13c deletes muse's launcher block"
+    );
+    let registry = crate::harness_record::compose_from(
+        &crate::store::Layout {
+            prefix: std::path::PathBuf::new(),
+        },
+        &crate::harness_record::Holdings::default(),
+        &crate::config::HarnessConfig::default(),
+        &crate::harness_record::Trust::of(crate::Anchor::of(Vec::new(), 0), Vec::new()),
+    );
+    assert_eq!(
+        registry.leader_of("muse").map(|row| &row.declaration.id),
+        None,
+        "a seed leads `muse`: HX-13 landed, so HX-13c deletes muse's launcher block"
+    );
+    // (b) So the row keeps the block it had before 454e6c8a851 deleted it.
+    let flags: &[&str] = &[
+        "--disable-approval",
+        "--disable-sandbox",
+        "--trust-workspace",
+        "--disable-request-user-input",
+    ];
+    let row = spec("muse").expect("muse has a row");
+    assert_eq!(row.yolo_flags, flags, "muse: yolo_flags");
+    assert_eq!(
+        row.yolo_markers,
+        &[
+            "--disable-approval",
+            "--disable-sandbox",
+            "--trust-workspace",
+            "--disable-request-user-input",
+            "--approval-mode",
+            "--approval-mode=",
+            "--permission-profile",
+            "--permission-profile=",
+            "--approval-judge",
+            "--approval-judge=",
+            "--sandbox-network",
+            "--sandbox-network=",
+            "--disable-write",
+            "--disable-shell",
+            "--config",
+            "--config=",
+            "-c",
+        ],
+        "muse: yolo_markers"
+    );
+    assert_eq!(row.yolo_after, &["exec", "resume"], "muse: yolo_after");
+    assert_eq!(
+        row.yolo_skip,
+        &[
+            "resume",
+            "config",
+            "export",
+            "trace",
+            "model-profile",
+            "skills",
+            "voice",
+            "plugins",
+            "sandbox",
+            "schema",
+            "serve",
+            "session-message",
+            "mcp",
+            "auth",
+            "login",
+            "logout",
+            "usage",
+            "init",
+        ],
+        "muse: yolo_skip"
+    );
+    assert_eq!(
+        row.self_update_verbs,
+        &[] as &[&str],
+        "Muse Code has no update verb"
+    );
+    assert_eq!(row.shim_env, &[] as &[&str], "muse's shim exports nothing");
+    assert_eq!(crate::yolo::policy_of("muse").flags, flags);
+    assert_eq!(
+        crate::yolo::word_options("muse").values,
+        &["--model"],
+        "the word scan reads Muse Code's `--model` value"
+    );
+    let owned = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        crate::yolo::decide("muse", &[]),
+        crate::yolo::Launch::Default(owned(flags)),
+        "a bare `muse` gets the yolo default"
+    );
+    assert_eq!(
+        crate::yolo::decide("muse", &owned(&["--yolo"])),
+        crate::yolo::Launch::Flag(owned(flags)),
+        "`muse --yolo` expands to the flags"
+    );
+    let prelude = crate::platform::twin_prelude(
+        "muse",
+        std::path::Path::new("/p"),
+        None,
+        crate::selfupdate::verbs_of("muse"),
+        &crate::yolo::policy_of("muse"),
+    );
+    if cfg!(windows) {
+        assert_eq!(prelude, "", "the .cmd twin renders no prelude");
+    } else {
+        for block in [crate::yolo::ECHO_PREFIX, crate::yolo::DEFAULT_ECHO_PREFIX] {
+            assert!(
+                prelude.contains(block),
+                "muse: {block:?} not in its twin: {prelude}"
+            );
+        }
+    }
 }

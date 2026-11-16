@@ -1516,7 +1516,7 @@ fn a_spell_of_break_reads_alone_settles_no_held_line() {
 }
 
 /// A HELD LINE HOLDS WHAT THE HOST WOULD TYPE INTO THE AGENT ([`IdlePoint::line_held`]): the
-/// window host's own lines (a carry-on, the ask to free disk space, the upgrade's step) would
+/// window host's own lines (a carry-on, the upgrade's step) would
 /// queue behind the line the worker may still hold and join it, so every break and idle point
 /// the host is offered while a line stands held says so, and none other does; the host is still
 /// offered each, for its steps that type nothing. Through [`break_spell`] the breaks before the

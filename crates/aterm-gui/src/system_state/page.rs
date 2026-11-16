@@ -1520,7 +1520,7 @@ impl<'a, 'b> Page<'a, 'b> {
         self.scrolls = scrolls;
         let height = if scrolls { room } else { content };
         let live = if scrolls {
-            room - FADE_STRIP.min(room / 4.0)
+            grid_below(room - FADE_STRIP.min(room / 4.0))
         } else {
             room
         };

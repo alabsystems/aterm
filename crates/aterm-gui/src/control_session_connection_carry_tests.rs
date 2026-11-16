@@ -13,9 +13,7 @@ fn the_carry_holds_each_triple_once() {
         assert!(
             cmd_grant(&target.ctx, Scope::Owner, &format!("{src} read-screen")).starts_with("OK ")
         );
-        assert!(
-            cmd_grant(&target.ctx, Scope::Owner, "s-controller read-screen").starts_with("OK ")
-        );
+        assert!(cmd_grant(&target.ctx, Scope::Owner, "t00000ctr0c read-screen").starts_with("OK "));
     }
     for op in ["signal", "write-input"] {
         assert!(cmd_grant(&target.ctx, Scope::Owner, &format!("{src} {op}")).starts_with("OK "));
@@ -34,7 +32,7 @@ fn the_carry_holds_each_triple_once() {
         (src.as_str(), dst.as_str(), "read-screen"),
         (src.as_str(), dst.as_str(), "signal"),
         (src.as_str(), dst.as_str(), "write-input"),
-        ("s-controller", dst.as_str(), "read-screen"),
+        ("t00000ctr0c", dst.as_str(), "read-screen"),
         (dst.as_str(), dst.as_str(), "signal"),
     ];
     expected.sort_unstable();

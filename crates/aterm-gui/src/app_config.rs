@@ -257,6 +257,7 @@ pub(crate) struct Config {
     pub(crate) machine: Option<MachineConfig>,
     pub(crate) sys: Option<SysConfig>,
     pub(crate) keeper: Option<KeeperConfig>,
+    pub(crate) navigator: Option<NavigatorConfig>,
     pub(crate) session_log: Option<SessionLogConfig>,
     #[serde(skip)]
     pub(crate) harness: HarnessPolicy,
@@ -2022,6 +2023,15 @@ pub(crate) struct KeeperConfig {
     pub(crate) enabled: Option<bool>,
 }
 
+/// The `[navigator]` table: `dock`, whether windows are born with the navigator docked beside
+/// the terminal (`App::docks_at_birth`).
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[cfg_attr(test, derive(Debug))]
+#[serde(default)]
+pub(crate) struct NavigatorConfig {
+    pub(crate) dock: Option<bool>,
+}
+
 /// The `[swarm]` table (`[swarm] enabled = false` turns off swarm participation).
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
@@ -2056,6 +2066,12 @@ impl Config {
     /// (`keeper_link::part`).
     pub(crate) fn keeper_setting(&self) -> Option<bool> {
         self.keeper.as_ref().and_then(|keeper| keeper.enabled)
+    }
+
+    /// What `[navigator] dock` says, if anything: unset, windows dock at birth outside a scratch
+    /// world and CI (`crate::app_window::docks_by_default`).
+    pub(crate) fn navigator_dock(&self) -> Option<bool> {
+        self.navigator.as_ref().and_then(|navigator| navigator.dock)
     }
 
     /// Whether the PTY keeper is on (`[keeper] enabled`, default on where a keeper exists, macOS).
@@ -6543,6 +6559,16 @@ impl App {
         let Some(size) = self.windows.get(&wid).and_then(|ws| ws.pending_resize) else {
             return;
         };
+        // A size the initial-frame settle vetoed and parked is the OS's answer once its fallback
+        // fires: a default dock the OS refused the wider frame for goes inside first.
+        #[cfg(any(target_os = "linux", test))]
+        if let Some(settle) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.initial_frame_settle)
+        {
+            self.judge_birth_dock_frame(wid, size, settle);
+        }
         if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
             let ws = &mut **route_guard_ws;
             ws.last_resize_at = Some(crate::metrics::host_now());
@@ -6571,6 +6597,14 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.os_window.as_ref())
             .map_or(size, |w| w.inner_size());
+        // A client with no area holds no grid: a minimized Windows window reads 0x0, which would
+        // shrink every PTY to 1x1 and rewrap all scrollback. The `Resized` arm drops the event
+        // for the same reason; this holds the callers that re-grid inside a size they read
+        // (a chrome-row change, a font or padding change, a dock commit). The size that comes
+        // back with the window re-grids it once.
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
         if let Some(live) = self
             .windows
             .get(&wid)
@@ -6623,6 +6657,9 @@ impl App {
             },
             Source::Human,
         );
+        if self.minimum_fits_again(wid, size) {
+            self.push_least_window_size_inside(wid);
+        }
     }
 
     fn sync_synthetic_strip_head(&mut self, wid: WindowId, frame_h_px: u32) {
@@ -6845,8 +6882,20 @@ impl App {
     /// ([`native_settings::least_view`]). A window holding Settings at its least shows every
     /// control whole with a line of its name, and a press's status on a line of its own, at every
     /// text scale; with only the fixed 164x98, 2x text squeezed Settings into a 164x96 view that
-    /// held no control with its name and its status. A terminal's window keeps the 164x98.
+    /// held no control with its name and its status. A terminal-only frame's nominal floor is 164x98.
+    /// An inside chrome commit can offer a smaller platform minimum to keep the observed client
+    /// held; this nominal geometry value remains unchanged ([`Self::push_least_window_size_inside`]).
     pub(crate) fn least_window_size(&self, wid: WindowId) -> PhysicalSize<u32> {
+        self.least_window_size_with_inset(wid, self.win_side_inset_px(wid))
+    }
+
+    /// [`Self::least_window_size`] were window `wid`'s side inset `inset_px` wide: the least a
+    /// dock rise must find already held before it commits ([`Self::set_dock_at`]).
+    pub(crate) fn least_window_size_with_inset(
+        &self,
+        wid: WindowId,
+        inset_px: usize,
+    ) -> PhysicalSize<u32> {
         let (cw, ch) = self.win_cell_size(wid);
         let (cw, ch) = (cw.max(1), ch.max(1));
         let pad = self.win_pad(wid);
@@ -6869,7 +6918,7 @@ impl App {
         let base_h = over + pad + ch;
         let min_h = base_h + floor_h.saturating_sub(base_h).div_ceil(ch) * ch;
         PhysicalSize::new(
-            u32::try_from(min_w.saturating_add(self.win_side_inset_px(wid))).unwrap_or(u32::MAX),
+            u32::try_from(min_w.saturating_add(inset_px)).unwrap_or(u32::MAX),
             u32::try_from(min_h).unwrap_or(u32::MAX),
         )
     }
@@ -6905,18 +6954,97 @@ impl App {
         (rows.max(least_rows), cols.max(least_cols))
     }
 
-    /// Window `wid`'s platform window is told its least size ([`Self::least_window_size`]) where
-    /// that moved since it was last told: up as a Settings tab comes, down as the last goes.
+    /// Whether an actual resize now fits a previously limited nominal minimum on both axes.
+    pub(crate) fn minimum_fits_again(&self, wid: WindowId, observed: PhysicalSize<u32>) -> bool {
+        let Some(held) = self.windows.get(&wid).and_then(|ws| ws.least_held) else {
+            return false;
+        };
+        let nominal = self.least_window_size(wid);
+        held != nominal && observed.width >= nominal.width && observed.height >= nominal.height
+    }
+
+    /// THE ONE PUSH: window `wid` is told its least size ([`Self::least_window_size`]) where that
+    /// moved since it was last told: up as a Settings tab comes, down as the last goes. While the
+    /// window holds a side inset, or an inside offer's cap still stands
+    /// (the window's `least_inside`), the offer is the inside one
+    /// ([`Self::push_least_window_size_inside`]), whoever asks after a re-grid (a tab change's
+    /// `sync_window`, a chrome-row change, the Settings hold): AppKit and Windows grow a client
+    /// to a minimum above it, which would re-grid every program again under `site=window` for
+    /// a dock act that already booked its one resize. A metrics change pushes before its
+    /// re-grid instead ([`Self::push_least_window_size_before_regrid`]). A window that must grow
+    /// is grown by name ([`Self::hold_least_window_size`]), never through its minimum.
     pub(crate) fn push_least_window_size(&mut self, wid: WindowId) {
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.dock.cells != 0 || ws.least_inside)
+        {
+            self.push_least_window_size_inside(wid);
+            return;
+        }
         let least = self.least_window_size(wid);
-        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-            let ws = &mut **route_guard_ws;
-            if ws.least_held != Some(least)
-                && let Some(w) = ws.os_window.as_ref()
-            {
+        self.offer_window_minimum(wid, least);
+    }
+
+    /// The push that comes BEFORE a re-grid (a font, line-height, padding or scale change):
+    /// window `wid` is told its nominal least ([`Self::least_window_size`]), uncapped, and an
+    /// inside offer's cap is lifted. AppKit and Windows grow a client to a minimum above it
+    /// inside the call, and the re-grid that follows reads the live client
+    /// ([`Self::on_resize`]), so the growth folds into that one re-grid and books no second
+    /// resize; the terminal keeps at least the least window's grid. The inside offer
+    /// ([`Self::push_least_window_size_inside`]) is for a push AFTER a re-grid (a dock act, a
+    /// tab change, a chrome-row change), where growth would be a second resize; capped here, a
+    /// font step in a window at its least would squeeze every program to a column or two. A
+    /// shown dock is held to its floor at the new cells first ([`Self::fit_dock_to_metrics`]),
+    /// so the inset itself never asks for the growth.
+    pub(crate) fn push_least_window_size_before_regrid(&mut self, wid: WindowId) {
+        let least = self.least_window_size(wid);
+        self.offer_window_minimum(wid, least);
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            ws.least_inside = false;
+        }
+    }
+
+    /// Offer the inside commit's minimum without an implicit platform growth on either axis
+    /// ([`inside_minimum`] of the nominal least and the client the window holds now,
+    /// [`Self::held_inner_px`]). Both Show and Hide use it, and so does every other offer while
+    /// the window is docked or the cap stands. A later actual resize that fits the nominal
+    /// minimum restores it; partial growth keeps the temporary minimum, rather than ratcheting
+    /// it upward. A client with no area (a minimized Windows window) is offered nothing: the
+    /// size it comes back with is judged instead.
+    pub(crate) fn push_least_window_size_inside(&mut self, wid: WindowId) {
+        let Some(observed) = self
+            .held_inner_px(wid)
+            .filter(|held| held.width != 0 && held.height != 0)
+        else {
+            return;
+        };
+        let nominal = self.least_window_size(wid);
+        let cap = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.least_inside)
+            .and_then(|ws| ws.least_held);
+        let least = inside_minimum(nominal, observed, cap);
+        self.offer_window_minimum(wid, least);
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            ws.least_inside = least != nominal;
+        }
+    }
+
+    /// Record the minimum window `wid` is offered and tell its platform window, where it has
+    /// one. A headless window keeps the record alone, so what an act offered is read the same
+    /// way with or without a window manager.
+    fn offer_window_minimum(&mut self, wid: WindowId, least: PhysicalSize<u32>) {
+        if let Some(mut ws) = self.windows.get_mut(&wid)
+            && ws.least_held != Some(least)
+        {
+            if let Some(w) = ws.os_window.as_ref() {
                 tell_least_inner_size(w, least);
-                ws.least_held = Some(least);
             }
+            ws.least_held = Some(least);
+            #[cfg(test)]
+            ws.offers_for_test.push(least);
         }
     }
 
@@ -7126,9 +7254,15 @@ impl App {
                     w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
                 }
             }
-            self.push_least_window_size(wid);
+            // The dock first: at the new cells it may no longer fit beside the explicit-Show
+            // floor (set down) or fit again (raised), both inside this one re-grid.
+            let dock_moved = self.fit_dock_to_metrics(wid, size);
+            self.push_least_window_size_before_regrid(wid);
             self.on_resize(wid, size);
             self.hold_least_window_size(wid);
+            if dock_moved {
+                self.refresh_pointer_after_frame_placement(wid);
+            }
             // A platform window's next present is re-armed; a headless one presents on a capture.
             if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                 let ws = &mut **route_guard_ws;
@@ -7367,7 +7501,9 @@ impl App {
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
         }
-        self.push_least_window_size(wid);
+        // Before the re-grid the scale change brings (the `Resized` that follows it, or the
+        // rest of `on_resize_inner`).
+        self.push_least_window_size_before_regrid(wid);
     }
 
     /// Re-tune the shared backend's font size and pad to window `wid`'s scale before it composes (top of `redraw_window`), giving per-window DPI on one renderer.
@@ -8538,6 +8674,30 @@ mod reload_dedupe_tests;
 pub(crate) struct HeadlessSize {
     pub(crate) px: PhysicalSize<u32>,
     pub(crate) grid: (u16, u16, u16),
+}
+
+/// THE INSIDE MINIMUM, per axis: the nominal least where the client `observed` already holds
+/// it; else no more than the client, and, while an earlier inside offer's cap stands (`cap`), no
+/// more than that cap. The platform is never told a minimum above the client it holds, so no
+/// offer grows it and books a second program resize; a client that grew without reaching the
+/// nominal leaves the cap where it was, so the person can still shrink it back.
+#[must_use]
+pub(crate) fn inside_minimum(
+    nominal: PhysicalSize<u32>,
+    observed: PhysicalSize<u32>,
+    cap: Option<PhysicalSize<u32>>,
+) -> PhysicalSize<u32> {
+    let axis = |nominal: u32, observed: u32, cap: Option<u32>| {
+        if observed >= nominal {
+            nominal
+        } else {
+            cap.map_or(observed, |cap| cap.min(observed))
+        }
+    };
+    PhysicalSize::new(
+        axis(nominal.width, observed.width, cap.map(|cap| cap.width)),
+        axis(nominal.height, observed.height, cap.map(|cap| cap.height)),
+    )
 }
 
 /// Tell platform window `w` its least inner size ([`App::least_window_size`]): the window manager

@@ -5235,3 +5235,90 @@ fn a_resting_controls_rim_holds_3_to_1_against_its_ground() {
         short.join("\n")
     );
 }
+
+/// A surface laid over a page ([`UiNode::surface`]) takes every press in its bounds that none of
+/// its controls takes, a disabled one's and its words' included, so nothing under it hears the
+/// press; it is no stop of the keys, and the wheel over it goes to its control under the pointer,
+/// else to the surface, even where a node of the page under it is smaller.
+/// NEGATIVE CONTROL: with the compiler leaving a surface's action off its projection (the
+/// `projection.action = Some(action)` line removed), the press on its words reaches the page's
+/// cell under it: `` left: Some("page/cell") right: Some("over") ``.
+#[test]
+fn a_surface_takes_the_presses_and_the_wheel_in_its_bounds() {
+    let words = |key: &str| {
+        UiNode::new(
+            key,
+            UiContent::Text(TextSpec {
+                text: "Words".into(),
+                role: SemanticRole::Text,
+                style: StyleRef::Note,
+            }),
+        )
+        .layout(Layout::default().height(Length::Fixed(40.0)))
+    };
+    let mut off = button("over/off", "Off");
+    if let UiContent::Button(control) = &mut off.content {
+        control.state.enabled = false;
+    }
+    let page = UiNode::new("page", UiContent::Group(GroupSpec::new("Page")))
+        .layout(Layout::column())
+        .children(vec![
+            button("page/cell", "Cell").layout(
+                Layout::default()
+                    .width(Length::Fixed(60.0))
+                    .height(Length::Fixed(160.0)),
+            ),
+        ]);
+    let over = UiNode::new("over", UiContent::Group(GroupSpec::new("Over")))
+        .surface(ActionId::new("over"))
+        .layout(
+            Layout::column()
+                .width(Length::Fixed(200.0))
+                .height(Length::Fixed(120.0)),
+        )
+        .children(vec![words("over/words"), button("over/on", "On"), off]);
+    let root = UiNode::new("root", UiContent::Group(GroupSpec::new("Root")))
+        .layout(Layout::default())
+        .children(vec![page, over]);
+    let ui = UiTree::new(root)
+        .compile(LogicalRect::new(0.0, 0.0, 400.0, 300.0))
+        .unwrap();
+    let hit = |y: f32| ui.hit_test(20.0, y).map(|hit| hit.key.as_str().to_owned());
+    assert_eq!(
+        hit(20.0).as_deref(),
+        Some("over"),
+        "its words are the surface's"
+    );
+    assert_eq!(
+        hit(60.0).as_deref(),
+        Some("over/on"),
+        "its control takes its own"
+    );
+    assert_eq!(
+        hit(100.0).as_deref(),
+        Some("over"),
+        "a disabled control's place is its"
+    );
+    assert_eq!(
+        hit(140.0).as_deref(),
+        Some("page/cell"),
+        "under it is the page's"
+    );
+    assert!(
+        !ui.focus_order.iter().any(|key| key.as_str() == "over"),
+        "no stop of the keys"
+    );
+    let wheel = |y: f32| {
+        ui.surface_target(20.0, y)
+            .map(|key| key.as_str().to_owned())
+    };
+    assert_eq!(wheel(20.0).as_deref(), Some("over"));
+    assert_eq!(wheel(60.0).as_deref(), Some("over/on"));
+    assert_eq!(wheel(140.0), None, "off it, the page's rule");
+    assert!(ui.is_surface(&UiKey::new("over")));
+    ui.validate_parity().unwrap();
+    // A surface is a group's alone.
+    let not_a_group = UiTree::new(button("b", "B").surface(ActionId::new("b")))
+        .compile(LogicalRect::new(0.0, 0.0, 100.0, 100.0));
+    assert!(matches!(not_a_group, Err(CompileError::SurfaceNotGroup(_))));
+}

@@ -57,6 +57,11 @@ impl CapturePresentBudget {
 /// One pixel capture.
 pub(crate) enum CaptureRequest {
     Image(ImageReq),
+    NativeImage {
+        window: WindowId,
+        view: crate::tab_model::ViewId,
+        request: ImageReq,
+    },
     Snapshot {
         path: String,
     },
@@ -82,6 +87,9 @@ impl CaptureRequest {
                 Some(session) => app.windows_displaying(session).next(),
                 None => app.frontmost_window,
             },
+            Self::NativeImage { window, view, .. } => {
+                (app.dock_view(*window) == Some(*view)).then_some(*window)
+            }
             Self::Snapshot { .. } => app.frontmost_window,
             #[cfg(any(target_os = "macos", windows))]
             Self::Window(request) => request.target.or(app.frontmost_window),
@@ -93,6 +101,7 @@ impl CaptureRequest {
             Self::Image(request) => {
                 CaptureCharge::Frame(DestinationDemand::of_image(request.clean))
             }
+            Self::NativeImage { view, .. } => CaptureCharge::NativeView(*view),
             Self::Snapshot { .. } => CaptureCharge::Frame(DestinationDemand::Required),
             #[cfg(any(target_os = "macos", windows))]
             Self::Window(_) => CaptureCharge::Window,
@@ -101,7 +110,7 @@ impl CaptureRequest {
 
     fn cancellation(&self) -> Option<&'static str> {
         match self {
-            Self::Image(request) => request
+            Self::Image(request) | Self::NativeImage { request, .. } => request
                 .cancel
                 .is_cancelled()
                 .then_some("image request cancelled before render"),
@@ -117,6 +126,7 @@ impl CaptureRequest {
     const fn takes_client_tap(&self) -> bool {
         match self {
             Self::Image(request) => !request.clean,
+            Self::NativeImage { .. } => false,
             Self::Snapshot { .. } => true,
             #[cfg(any(target_os = "macos", windows))]
             Self::Window(_) => true,
@@ -136,7 +146,7 @@ impl CaptureRequest {
 
     fn reject(self, error: &str) {
         match self {
-            Self::Image(request) => {
+            Self::Image(request) | Self::NativeImage { request, .. } => {
                 let _ = request.reply.send(Err(error.to_string()));
             }
             Self::Snapshot { .. } => {
@@ -151,7 +161,7 @@ impl CaptureRequest {
 
     fn reject_busy(self) {
         match self {
-            Self::Image(request) => {
+            Self::Image(request) | Self::NativeImage { request, .. } => {
                 crate::control_auth::cleanup_failed_automatic_image(&request.target);
                 let _ = request
                     .reply
@@ -183,7 +193,9 @@ impl CaptureRequest {
 
     fn reject_retargeted(self) {
         let error = match &self {
-            Self::Image(_) => "image target changed while waiting for GPU acquisition",
+            Self::Image(_) | Self::NativeImage { .. } => {
+                "image target changed while waiting for GPU acquisition"
+            }
             Self::Snapshot { .. } => "snapshot target changed while waiting for GPU acquisition",
             #[cfg(any(target_os = "macos", windows))]
             Self::Window(_) => "window capture target changed while waiting",
@@ -329,6 +341,11 @@ impl App {
             }
             match request {
                 CaptureRequest::Image(request) => self.image_body(wid, request),
+                CaptureRequest::NativeImage {
+                    window,
+                    view,
+                    request,
+                } => self.native_image_body(window, view, request),
                 CaptureRequest::Snapshot { path } => self.snapshot_body(wid, path),
                 #[cfg(any(target_os = "macos", windows))]
                 CaptureRequest::Window(request) => self.window_body(wid, request),
@@ -482,6 +499,7 @@ impl DestinationDemand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureCharge {
+    NativeView(crate::tab_model::ViewId),
     Frame(DestinationDemand),
     #[cfg(any(target_os = "macos", windows))]
     Window,
@@ -638,17 +656,10 @@ impl std::fmt::Debug for CapturePixels {
 }
 
 enum PixelStore {
-    #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
-    Rgba8 {
-        width: usize,
-        bytes: Vec<u8>,
-    },
+    Rgba8 { width: usize, bytes: Vec<u8> },
     Packed(Frame),
     Raw(aterm_gpu::video_tap::RawCapture),
-    Softbuffer {
-        width: usize,
-        pixels: Vec<u32>,
-    },
+    Softbuffer { width: usize, pixels: Vec<u32> },
 }
 
 fn exact_pixels(
@@ -683,10 +694,6 @@ impl CapturePixels {
         }
     }
 
-    #[cfg_attr(
-        not(any(target_os = "macos", windows, test)),
-        expect(dead_code, reason = "a window photograph is macOS's and Windows'")
-    )]
     pub(crate) fn rgba8(width: u32, height: u32, bytes: Vec<u8>) -> Result<Self, String> {
         let (width, height) = (width as usize, height as usize);
         exact_pixels("capture RGBA", bytes.len(), width, height, 4)?;
@@ -3021,6 +3028,10 @@ impl App {
         });
 
         DimsSnapshot {
+            dock: selected
+                .and_then(|wid| self.dock_view(wid))
+                .map(crate::tab_model::ViewId::get),
+            dock_cells: selected.map_or(0, |wid| self.windows[&wid].dock.cells),
             session,
             rows,
             cols,
@@ -3141,7 +3152,7 @@ impl App {
         let word_focus = self.motion_focus(wid, raw_focused);
         let motion = self.motion_policy(capture_focused);
         let pet_motion = self.accessibility_motion_policy(capture_focused);
-        let shed_envelope = self.effective_shed_envelope(self.config.motion_mode(), now);
+        let shed_envelope = self.window_shed_envelope(wid, self.config.motion_mode(), now);
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
         let trail_presentation = self.trail_presentation();
@@ -3395,7 +3406,7 @@ impl App {
         );
         let motion = self.motion_policy(capture_focused);
         let pet_motion = self.accessibility_motion_policy(capture_focused);
-        let shed_envelope = self.effective_shed_envelope(self.config.motion_mode(), now);
+        let shed_envelope = self.window_shed_envelope(wid, self.config.motion_mode(), now);
         let sparkle = sparkle.map(|(mut cfg, lexicon)| {
             if !motion.animate(crate::motion::MotionEffect::WordSparkles) {
                 cfg.reduced_motion = true;
@@ -4836,15 +4847,26 @@ impl App {
                         native.push('\n');
                         continue;
                     }
-                    let Some(raster) = window
-                        .leaf_render_cache
-                        .get(&leaf.view)
-                        .and_then(|cache| cache.native.as_ref())
-                    else {
+                    // Where nodes the page lists fell behind its model, no frame comes for them
+                    // (`App::note_native_nodes_behind`): the compile glass shows says their old
+                    // words, and the text is the page compiled as it stands, as `inspect` reads it.
+                    let compiled = window.leaf_render_cache.get(&leaf.view).and_then(|cache| {
+                        if cache.native_nodes_behind {
+                            self.inspected_native_ui(leaf.view)
+                                .ok()
+                                .map(std::borrow::Cow::Owned)
+                        } else {
+                            cache
+                                .native
+                                .as_ref()
+                                .map(|raster| std::borrow::Cow::Borrowed(&raster.compiled))
+                        }
+                    });
+                    let Some(compiled) = compiled else {
                         native.push_str("semantics unavailable\n");
                         continue;
                     };
-                    for line in crate::app_control::semantic_text_lines(&raster.compiled) {
+                    for line in crate::app_control::semantic_text_lines(&compiled) {
                         native.push_str(&line);
                         native.push('\n');
                     }
@@ -5062,6 +5084,12 @@ impl App {
         };
         let destination = self.destination_capture_bytes(wid, width, height);
         match charge {
+            CaptureCharge::NativeView(view) => self
+                .dock_geometry(wid)
+                .filter(|_| self.dock_view(wid) == Some(view))
+                .map_or(0, |host| {
+                    frame_capture_peak(host.size.0 as usize, host.size.1 as usize, None)
+                }),
             CaptureCharge::Frame(DestinationDemand::Never) => {
                 frame_capture_peak(width, height, None)
             }
@@ -7847,3 +7875,109 @@ mod deferred_gpu_capture_tests;
 #[cfg(test)]
 #[path = "app_introspect_headless_settings_preview_capture_tests.rs"]
 mod headless_settings_preview_capture_tests;
+
+impl App {
+    pub(crate) fn render_native_view_image(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        request: ImageReq,
+    ) {
+        self.run_capture(CaptureRequest::NativeImage {
+            window: wid,
+            view,
+            request,
+        });
+    }
+
+    fn native_image_body(&mut self, wid: WindowId, view: crate::tab_model::ViewId, req: ImageReq) {
+        if self.dock_view(wid) != Some(view) {
+            let _ = req
+                .reply
+                .send(Err("image: view is not a shown navigator dock".into()));
+            return;
+        }
+        self.prepare_dock_raster(wid);
+        let current = self.native_dock_artifact(wid, false, false).is_some();
+        let Some(raster) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.leaf_render_cache.get(&view))
+            .and_then(|cache| cache.native.as_ref())
+            .filter(|_| current)
+        else {
+            let _ = req
+                .reply
+                .send(Err("image: dock has no current raster".into()));
+            return;
+        };
+        let pixels = match CapturePixels::rgba8(raster.width, raster.height, raster.rgba.clone()) {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                let _ = req.reply.send(Err(error));
+                return;
+            }
+        };
+        let metadata = req.want_metadata.then(|| {
+            let stamp = raster.stamp;
+            Box::new(PendingMetadata {
+                metadata: crate::control::ImageFrameMetadata {
+                    frame_kind: "native",
+                    phase: if raster.presented {
+                        "presented"
+                    } else {
+                        "staged"
+                    },
+                    window: wid.0,
+                    view: Some(view.get()),
+                    generation: Some(stamp.generation),
+                    config_revision: Some(stamp.config_revision),
+                    update_revision: Some(stamp.update_revision),
+                    document_seq: stamp.document_seq,
+                    presentation_revision: Some(stamp.presentation_revision),
+                    paint_revision: Some(stamp.paint_revision),
+                    capture_serial: self.windows[&wid].capture_present_serial,
+                    width: raster.width,
+                    height: raster.height,
+                    pixel_fingerprint: 0,
+                    compiled_fingerprint: Some(raster.compiled.fingerprint()),
+                    raster_fingerprint: raster.raster_fingerprint(),
+                    raster_model_fingerprint: raster.compiled.fingerprint(),
+                    raster_geometry: stamp.geometry,
+                    overlay_fingerprint: 0,
+                    theme_fingerprint: self.image_theme_fingerprint(),
+                    leaves: vec![crate::control::ImageLeafFrameMetadata {
+                        kind: "native",
+                        view: view.get(),
+                        session: None,
+                        focused: false,
+                        width: raster.width,
+                        height: raster.height,
+                        snapshot_seq: None,
+                        instance: Some(stamp.instance.get()),
+                        generation: Some(stamp.generation),
+                        geometry: Some(stamp.geometry),
+                        config_revision: Some(stamp.config_revision),
+                        update_revision: Some(stamp.update_revision),
+                        document_seq: stamp.document_seq,
+                        presentation_revision: Some(stamp.presentation_revision),
+                        paint_revision: Some(stamp.paint_revision),
+                        compiled_fingerprint: Some(raster.compiled.fingerprint()),
+                        raster_fingerprint: Some(raster.raster_fingerprint()),
+                    }],
+                },
+                raster_is_pixels: false,
+                cell: req.frame_metadata,
+            })
+        });
+        self.submit_encode_job(EncodeJob::Image {
+            pixels,
+            metadata,
+            handoff: req.handoff,
+            target: req.target,
+            want_bytes: req.want_bytes,
+            cancel: req.cancel,
+            reply: req.reply,
+        });
+    }
+}

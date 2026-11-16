@@ -5393,12 +5393,13 @@ impl App {
         look: aterm_agent::harness::permission_click::Look,
     ) {
         use aterm_agent::harness::permission_click::Look;
-        let session = self
-            .store
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_sid(&aterm_session::SessionId::new(tab))
-            .map(|h| h.local_id);
+        let session = aterm_session::SessionId::parse(tab).and_then(|id| {
+            self.store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .by_sid(&id)
+                .map(|h| h.local_id)
+        });
         let Some(session) = session else {
             return;
         };

@@ -35,6 +35,7 @@ mod chain_cache;
 mod commons_excluded;
 mod continuity;
 mod control_recovery;
+mod converge_inputs;
 mod creation;
 pub mod custodian;
 mod enrollment;
@@ -476,6 +477,12 @@ impl Paths {
         self.dir.join("records.crossed")
     }
 
+    /// The format mark beside [`Self::records_file`] ([`crate::crossing::FormatMark`]): stored
+    /// before this Mac holds its first record past format 1, never lowered or removed.
+    pub(crate) fn format_file(&self) -> PathBuf {
+        self.dir.join("records.format")
+    }
+
     /// The files that hold the membership history this Mac acknowledged, which
     /// [`load_acknowledged_records`] reads besides the records: the enrollment claim and the
     /// journal's anchor, receipts and checkpoint. Every acknowledgement replaces the checkpoint,
@@ -830,7 +837,8 @@ pub struct Report {
     /// build wrote may hold, and both names of a folded pair
     /// ([`crate::entry_class::folded_pairs`]). The rest of the vault is applied all the same.
     pub refused: Vec<(String, String)>,
-    /// Whether what this Mac reads changed: another set of entries or another value of one.
+    /// Whether what this Mac reads changed: another set of entries or another value of one,
+    /// the entries it reads under no name (the control records) included.
     pub changed: bool,
 }
 
@@ -843,6 +851,13 @@ pub enum SyncOutcome {
         seq: u64,
         /// What changed.
         report: Report,
+        /// Whether applying it changed anything this Mac's converge pass reads, so the pass is
+        /// owed at once: an opened entry of any class ([`Report::changed`]), what the pass reads
+        /// of the membership log and the admin text ([`converge_inputs`]), this Mac's own way in
+        /// (it was not a member before), the line it trusts, or an apply an earlier pass left
+        /// unfinished or this one made again for the version it already held. A version that
+        /// carried only other Macs' news moves none of them.
+        moved: bool,
     },
     /// Nothing newer.
     Unchanged {
@@ -1052,10 +1067,10 @@ std::thread_local! {
     static STATE_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(debug_assertions)]
 std::thread_local! {
     /// The state lock files this thread observes across reads that must see one state
-    /// ([`Observing`]).
+    /// ([`Observing`]): kept in every build, since a read under one makes no enrolling take
+    /// ([`StateLock::first_enrollment_due`]), which would wait on this thread's own lock.
     static OBSERVING: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1069,26 +1084,18 @@ std::thread_local! {
 /// returns ([`CommonsSourceRead::into_look`]). The holder drops it before any exclusive take of
 /// the same lock. flock(2) grants this thread neither lock while it holds the other, so in a build
 /// with debug assertions an exclusive take of the lock on this thread under it panics rather than
-/// wait on it for good.
+/// wait on it for good, and in every build a read under it makes no take of its own
+/// ([`StateLock::first_enrollment_due`]).
 pub(crate) struct Observing {
     lock: StateLock,
-    #[cfg(debug_assertions)]
     path: PathBuf,
 }
 
 impl Observing {
     fn new(lock: StateLock, paths: &Paths) -> Self {
-        #[cfg(debug_assertions)]
         let path = paths.lock_file();
-        #[cfg(debug_assertions)]
         OBSERVING.with(|held| held.borrow_mut().push(path.clone()));
-        #[cfg(not(debug_assertions))]
-        let _ = paths;
-        Self {
-            lock,
-            #[cfg(debug_assertions)]
-            path,
-        }
+        Self { lock, path }
     }
 
     /// The observation itself.
@@ -1097,7 +1104,6 @@ impl Observing {
     }
 }
 
-#[cfg(debug_assertions)]
 impl Drop for Observing {
     fn drop(&mut self) {
         OBSERVING.with(|held| {
@@ -1315,12 +1321,56 @@ impl StateLock {
         }
     }
 
+    /// Whether `refused` is a read's refusal of records this Mac never acknowledged
+    /// (`retained_history::project_selected`) that an exclusive take has ended, or a writer
+    /// holding the state is ending, so the read is worth making once more: every exclusive take
+    /// enrolls the records it finds where they hold the log this Mac applied
+    /// ([`Self::recovered`]), which a reader cannot. So a read with no vault pass running (a
+    /// person's `aterm secrets get`, git's credential helper) makes that take itself, once.
+    ///
+    /// The take is tried until the sooner of `deadline`, the read's own, and
+    /// [`FIRST_ENROLLMENT_WAIT`] from now: a busy lock is as often another reader's observation
+    /// passing as a writer, and flock(2) does not say which. `true` where the take was made
+    /// (its recovery enrolled what it could), or where the lock was still held then and by a
+    /// writer, whose own take enrolled and whom the read that follows waits for. `false`, with
+    /// no take made, where:
+    ///
+    /// - the refusal is another, or a receipt is ready
+    ///   (`retained_history::first_receipt_due`);
+    /// - this thread observes the state across its reads ([`Observing`]), under which flock(2)
+    ///   grants it no exclusive lock;
+    /// - a search already found that the records held now lack the log this Mac applied
+    ///   (`log_entries::first_enrollment_refused`): a take would enroll nothing;
+    /// - the lock was held to the end by observers alone, who enroll nothing;
+    /// - the take's recovery failed.
+    fn first_enrollment_due(paths: &Paths, refused: &Error, deadline: Instant) -> bool {
+        if refused.kind() != crate::ErrorKind::MembershipHistoryUnavailable
+            || !retained_history::first_receipt_due(paths)
+            || OBSERVING.with(|held| held.borrow().contains(&paths.lock_file()))
+            || log_entries::first_enrollment_refused(paths)
+        {
+            return false;
+        }
+        let until = deadline.min(Instant::now() + first_enrollment_wait());
+        match Self::try_take_until(paths, until) {
+            Ok(Some(_enrolled)) => true,
+            Ok(None) => matches!(Self::observe_classified(paths), Ok(StateObservation::Busy)),
+            Err(_) => false,
+        }
+    }
+
     fn try_take_until(paths: &Paths, deadline: Instant) -> crate::Result<Option<StateLock>> {
         let mut backoff = Duration::from_millis(1);
         loop {
             if let Some(lock) = Self::try_take(paths)? {
                 return Ok(Some(lock));
             }
+            #[cfg(test)]
+            TAKE_BLOCKED.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
@@ -1643,6 +1693,29 @@ pub(crate) fn lock_observations_of(paths: &Paths) -> usize {
 #[cfg(test)]
 pub(crate) fn lock_judgements_of(paths: &Paths) -> usize {
     lock_uses_of(LockUse::Judged, paths)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test's action on each try of [`StateLock::try_take_until`] that found the state lock
+    /// held, run in the waiting thread before it looks at its deadline, so a hold can end, or a
+    /// writer can take the lock, exactly while a take waits.
+    static TAKE_BLOCKED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `take` with `blocked` as this thread's action on each blocked try of a waiting exclusive
+/// take ([`TAKE_BLOCKED`]).
+#[cfg(test)]
+fn while_take_blocked<T>(blocked: impl FnMut() + 'static, take: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Box<dyn FnMut()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TAKE_BLOCKED.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(TAKE_BLOCKED.with(|hook| hook.replace(Some(Box::new(blocked)))));
+    take()
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -2679,6 +2752,13 @@ struct State {
     legacy_manifest: BTreeMap<String, String>,
     /// `own` as an older aterm wrote it, pruned as [`Self::legacy_manifest`] is.
     legacy_own: Option<BTreeSet<String>>,
+    /// [`converge_inputs::Inputs`] as the last apply recorded them: what the converge pass reads
+    /// that is no opened entry. `None` in a state no apply of this build recorded it in (an older aterm's,
+    /// or a plain vault's), which differs from every digest, so the next apply owes its pass.
+    converge_inputs: Option<[u8; 32]>,
+    /// An apply changed something the converge pass reads and no process that starts runners
+    /// has taken the pass it owes yet ([`converge_inputs::owe`], [`converge_inputs::take_owed`]).
+    converge_owed: bool,
 }
 
 /// Fingerprint the successful-round inputs relevant to a service health receipt. Ordinary
@@ -2785,6 +2865,11 @@ fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
             .then(|| digests("held")),
         legacy_manifest: digests("manifest"),
         legacy_own: names("own"),
+        converge_inputs: digest("converge_inputs"),
+        converge_owed: table
+            .get("converge_owed")
+            .and_then(aterm_toml::Value::as_bool)
+            .unwrap_or(false),
     }))
 }
 
@@ -2891,11 +2976,19 @@ fn ordinary_state(state: &State, heard: bool) -> String {
     if let Some(identity) = &state.source_identity {
         text.push_str(&format!("source_identity = {}\n", toml_str(&hex(identity))));
     }
+    if let Some(inputs) = &state.converge_inputs {
+        text.push_str(&format!("converge_inputs = {}\n", toml_str(&hex(inputs))));
+    }
     if heard {
         text.push_str(&format!(
             "heard = {}\n",
             i64::try_from(state.heard).unwrap_or(i64::MAX)
         ));
+        // Whose turn a pass is, not what this Mac holds: no reader of the standing answers
+        // with it, as none answers with `heard`.
+        if state.converge_owed {
+            text.push_str("converge_owed = true\n");
+        }
     }
     text.push_str(&format!(
         "requested = {}\n",
@@ -4544,11 +4637,16 @@ pub(crate) fn stored(paths: &Paths, name: &str) -> Option<Vec<u8>> {
 /// signed vault ([`read_verified_entry`]), or the person's own plain text file for a plain source,
 /// parsed where it lies. No file under `~/.secrets` or any other home path is read. `Ok(None)`
 /// where no vault is configured, this Mac is not in it, or the entry is absent. A writer holding
-/// the vault state is waited for up to [`READ_WAIT`].
+/// the vault state is waited for up to [`READ_WAIT`], which bounds the whole read. Before this
+/// Mac's first retained-history receipt, a read its records refuse takes the state once itself,
+/// as a vault pass would, and reads again ([`read_enrolling`]): no pass need be running for it to
+/// answer.
 ///
 /// # Errors
 /// The name is invalid, reserved, set apart or a Claude Code token (which only its typed read
-/// hands out), the vault state stayed busy past [`READ_WAIT`], or local state cannot be read.
+/// hands out), the vault state stayed busy past [`READ_WAIT`], local state cannot be read, or
+/// this Mac's membership records are not shown to hold the log it applied
+/// ([`crate::ErrorKind::MembershipHistoryUnavailable`]).
 pub fn read_in_place(paths: &Paths, name: &str) -> crate::Result<Option<SecretBytes>> {
     if crate::entry_class::claude_token(&name.to_ascii_lowercase())
         || crate::reserved_name(name)
@@ -4596,6 +4694,38 @@ pub fn read_in_place(paths: &Paths, name: &str) -> crate::Result<Option<SecretBy
 /// How long [`read_in_place`] waits for a writer holding this Mac's vault state (a pass applying
 /// a version) before it says the store is busy.
 pub const READ_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a read's own enrolling take waits for the state lock
+/// ([`StateLock::first_enrollment_due`]), where the read's deadline is not sooner: long enough
+/// for another reader's observation to pass (it holds the lock for one read of the files), and
+/// no part of a writer's wait, which the read that follows makes.
+const FIRST_ENROLLMENT_WAIT: Duration = Duration::from_secs(2);
+
+/// [`FIRST_ENROLLMENT_WAIT`], or a test's own wait on this thread ([`with_current_wait`]).
+fn first_enrollment_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_CURRENT_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    FIRST_ENROLLMENT_WAIT
+}
+
+/// Run `read`, an in-place read that takes its own observation of the state, and where it is
+/// refused for records this Mac never acknowledged make the exclusive take a vault pass would
+/// and read once more ([`StateLock::first_enrollment_due`]). The take is a writer's recovery and
+/// nothing else, so the read acknowledges what the next vault pass would have and no more; with
+/// no pass running it is the writer the first receipt waits for. `deadline` is the read's own:
+/// a read that waits for no writer (`Instant::now()`) tries the take once and waits for none.
+fn read_enrolling<T>(
+    paths: &Paths,
+    deadline: Instant,
+    mut read: impl FnMut() -> crate::Result<T>,
+) -> crate::Result<T> {
+    match read() {
+        Err(refused) if StateLock::first_enrollment_due(paths, &refused, deadline) => read(),
+        read => read,
+    }
+}
 
 /// [`READ_WAIT`], or a test's own wait on this thread ([`with_current_wait`]).
 fn read_wait() -> Duration {
@@ -5206,7 +5336,11 @@ pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store
 /// this Mac acknowledged (the records file missing while that history holds this vault's
 /// genesis, as the flat layout's file gone reads as an empty store, or a snapshot behind it put
 /// back), a log this Mac has not acknowledged once that history was established, or, before
-/// then, a log other than the one this Mac last applied.
+/// then, a log other than the one this Mac last applied: this read enrolls nothing and takes no
+/// lock (a writer calls it under its own), so a log that grew past the applied one is read after
+/// the next exclusive take of the state, which enrolls it where it still holds the applied log
+/// whole (`log_entries::check_legacy_frontier`). An in-place entry read makes that take itself
+/// ([`read_enrolling`]).
 pub fn load_acknowledged_records(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
     Ok(acknowledged_read(paths, false)?.acknowledged)
 }
@@ -5479,6 +5613,11 @@ pub(crate) fn crossing_mark(paths: &Paths) -> crate::crossing::Mark {
     crate::crossing::Mark::at(paths.crossed_file())
 }
 
+/// This Mac's format mark ([`Paths::format_file`]).
+pub(crate) fn format_mark(paths: &Paths) -> crate::crossing::FormatMark {
+    crate::crossing::FormatMark::at(paths.format_file())
+}
+
 /// Whether this Mac has the durable, one-way crossed mark, without opening its records file.
 /// A caller with a verified snapshot must also preserve that snapshot's crossed bound.
 ///
@@ -5488,16 +5627,25 @@ pub fn records_marked_crossed(paths: &Paths) -> crate::Result<bool> {
     crossing_mark(paths).stored()
 }
 
-/// What this Mac states of its records ([`crate::crossing::RecordsBound`]), its log as `store`
-/// holds it.
+/// The records format this Mac's format mark names ([`format_mark`]), without opening its records
+/// file: [`crate::crossing::FORMAT_ONE`] where none is stored.
 ///
 /// # Errors
-/// The mark's path cannot be read.
+/// The mark's path cannot be read, or it names no format this build reads.
+pub fn records_marked_format(paths: &Paths) -> crate::Result<u32> {
+    format_mark(paths).stored()
+}
+
+/// What this Mac states of its records ([`crate::crossing::RecordsBound`]), its log as `store`
+/// holds it: the version-1 bound until its format mark is stored ([`format_mark`]).
+///
+/// # Errors
+/// A mark's path cannot be read, or the format mark names no format this build reads.
 pub fn records_bound(
     paths: &Paths,
     store: &crate::membership_log::Store,
 ) -> crate::Result<crate::crossing::RecordsBound> {
-    crate::crossing::stated(&crossing_mark(paths), store)
+    crate::crossing::stated(&crossing_mark(paths), &format_mark(paths), store)
 }
 
 #[cfg(test)]
@@ -5540,7 +5688,7 @@ fn require_legacy_commons_records(
     paths: &Paths,
     store: &crate::membership_log::Store,
 ) -> crate::Result<()> {
-    if records_bound(paths, store)?.crossed {
+    if records_bound(paths, store)?.fenced() {
         return Err(Error::of_kind(
             crate::ErrorKind::Refused,
             "crossed membership history requires a newer Commons database protocol",
@@ -5805,13 +5953,18 @@ pub(crate) struct RecordsPass {
     /// the history when this pass's merge crosses. Neither is evidence of the newest records;
     /// compatible records it sent before the merge can still be retained.
     pub(crate) unstated: bool,
+    /// A server that answered sent a prefix of what it holds past the pull, and more follow
+    /// ([`transport::ReceivedRecordsAnswer::more`]): the pass is not fresh, and
+    /// [`sync_records_until`] asks again.
+    pub(crate) more: bool,
 }
 
 impl RecordsPass {
     /// Whether the pass read all of the vault's newest records: it left nothing a server sent
-    /// untaken, and a server able to exchange the retained history answered it.
+    /// untaken, no server said more follow, and a server able to exchange the retained history
+    /// answered it.
     pub(crate) const fn fresh(&self) -> bool {
-        !self.untaken && !self.unstated
+        !self.untaken && !self.unstated && !self.more
     }
 }
 
@@ -5870,6 +6023,8 @@ struct PeerRecords {
     boot: Option<String>,
     /// What it stated of its records ([`transport::ReceivedRecordsAnswer::bound`]).
     bound: transport::ReplyBound,
+    /// Its records are a prefix and more follow ([`transport::ReceivedRecordsAnswer::more`]).
+    more: bool,
 }
 
 /// The records a peer sent, as a records pass holds them once every pull has ended.
@@ -5905,6 +6060,7 @@ impl PeerRecords {
             boot,
             bound,
             heads: _,
+            more,
         } = answer;
         let records = if received.byte_len() > fan_out::RECORDS.peek {
             Brought::Judged(judge(received))
@@ -5916,6 +6072,7 @@ impl PeerRecords {
             needs,
             boot,
             bound,
+            more,
         }
     }
 }
@@ -5946,6 +6103,35 @@ fn sync_records_until(
     deadline: Option<Instant>,
     posts_by: Option<Instant>,
 ) -> crate::Result<RecordsPass> {
+    let mut pass = records_pass(paths, wait, extra_peers, browsed, deadline, posts_by)?;
+    // A server answers one reply's causally closed prefix of what this Mac lacks
+    // (`Store::missing_within`): while a server said more follow and the store took some, ask
+    // again at once, past what it took. A pass that takes nothing, or fails, ends it: what the
+    // passes took stays, and the result is not fresh. Each pass that asks again must itself
+    // have grown the store, so the store's own bound ends the asking, whatever a server says.
+    let mut last_added = pass.added;
+    while pass.more && last_added > 0 && deadline.is_none_or(|by| Instant::now() < by) {
+        let Ok(next) = records_pass(paths, None, extra_peers, browsed, deadline, posts_by) else {
+            break;
+        };
+        last_added = next.added;
+        pass = RecordsPass {
+            added: pass.added + next.added,
+            ..next
+        };
+    }
+    Ok(pass)
+}
+
+/// One records pass of [`sync_records_until`].
+fn records_pass(
+    paths: &Paths,
+    wait: Option<Duration>,
+    extra_peers: &[String],
+    browsed: Option<Found<'_>>,
+    deadline: Option<Instant>,
+    posts_by: Option<Instant>,
+) -> crate::Result<RecordsPass> {
     use crate::membership_log::untaken::{Named, Noted, Sent};
 
     let config = configured(paths)?;
@@ -5956,11 +6142,13 @@ fn sync_records_until(
             added: 0,
             untaken: false,
             unstated: false,
+            more: false,
         });
     };
     let local_store = load_records(paths)?;
     let crossed_before = crate::crossing::crossed(&mark, &local_store)?;
-    let bound = crate::crossing::RecordsBound::of(local_store.budgets().held, crossed_before);
+    let bound = crate::crossing::RecordsBound::of(local_store.budgets().held, crossed_before)
+        .at_format(format_mark(paths).stored()?);
     let records_file = paths.records_file();
     let now = Instant::now();
     // The frontier of the store every pull below names `have` from: a pass notes what a server
@@ -6182,6 +6370,8 @@ fn sync_records_until(
     let mut any_answered = false;
     let mut primary_err = None;
     let mut primary_refused = false;
+    // Whether a server that answered sent a prefix that more follow.
+    let mut more = false;
     match primary {
         Ok(transport::ReceivedRecordsAnswer {
             received,
@@ -6189,8 +6379,10 @@ fn sync_records_until(
             boot,
             bound,
             heads: _,
+            more: primary_more,
         }) => {
             any_answered = true;
+            more |= primary_more;
             if primary_named.heads > 0 {
                 UNTAKEN.heard(&records_file, primary_url, needs, now);
             }
@@ -6218,10 +6410,12 @@ fn sync_records_until(
             needs,
             boot,
             bound,
+            more: peer_more,
         }) = res
         else {
             continue;
         };
+        more |= peer_more;
         if named_heads {
             UNTAKEN.heard(&records_file, &url, needs, now);
         }
@@ -6411,13 +6605,13 @@ fn sync_records_until(
         // memory only and serves none of them (F23, rule 7), so they bought nothing on the wire.
         let frontier = sha256(&store.frontier().concat());
         let have = store.have();
-        // Post only to compatible servers. A crossed Mac's query also makes older servers
-        // refuse its body before reading it.
+        // Post only to compatible servers. A crossed or format-2 Mac's query also makes older
+        // servers refuse its body before reading it.
         let due: Vec<Due<'_>> = push_urls
             .iter()
             .filter(|(_, _, stated)| match stated.stated() {
                 Some(peer) => bound.can_exchange(peer),
-                None => !bound.crossed,
+                None => !bound.fenced(),
             })
             .filter_map(|(url, boot, _)| {
                 let boot = boot.as_deref();
@@ -6471,6 +6665,7 @@ fn sync_records_until(
         added,
         untaken,
         unstated: !stated,
+        more,
     })
 }
 
@@ -7974,12 +8169,18 @@ fn apply_until_admitted(
         state.membership = Stored::Plain;
         state.source_identity = Some(source_identity(&config));
         state.heard = heard_now(state.heard);
+        converge_inputs::owe(&mut state, changed || report.changed);
         current()?;
         save_state(paths, &state)?;
         if !changed && !report.changed {
             return Ok(SyncOutcome::Unchanged { seq: 0 });
         }
-        return Ok(SyncOutcome::Applied { seq: 0, report });
+        // A plain file is applied only where its text or its binding changed.
+        return Ok(SyncOutcome::Applied {
+            seq: 0,
+            report,
+            moved: true,
+        });
     };
     let held = floor(paths, &state, &config.name, &config);
     let verified =
@@ -8156,6 +8357,16 @@ fn apply_until_admitted(
         config = next_config;
         save_config(paths, &config)?;
     }
+    // The version and records this Mac already held, applied again: a repair (its cache was not
+    // whole, or its state not bound), which owes its pass whatever it finds.
+    let again = verdict == Verdict::Unchanged
+        && matches!(pinned, Pin::Same)
+        && state.records_digest == current_records_digest;
+    let inputs = converge_inputs::Inputs::read(
+        seeded_log.as_ref().map(|(log, _)| log),
+        &identity,
+        converge_inputs::Admin::of(&envelope, &identity),
+    );
     let (opened, applied_records_digest) = match seeded_log {
         Some((log, digest))
             if log.removes(&identity.recipient())
@@ -8207,7 +8418,14 @@ fn apply_until_admitted(
         return Ok(SyncOutcome::NotIn);
     };
     current()?;
+    // `state.failed` is still the last apply's: one cut short owes its pass.
+    let owed = again
+        || state.failed
+        || state.membership != Stored::In
+        || matches!(pinned, Pin::Rotated(_) | Pin::Replaced(_));
     let report = record_applied(&mut state, &entries);
+    let moved = inputs.record(&mut state) || report.changed || owed;
+    converge_inputs::owe(&mut state, moved);
     if state.membership != Stored::In
         || (handover::holds_allowed(paths) && log_entries::addressed_to(&envelope, &identity)?)
     {
@@ -8233,6 +8451,7 @@ fn apply_until_admitted(
     Ok(SyncOutcome::Applied {
         seq: envelope.seq,
         report,
+        moved,
     })
 }
 
@@ -8258,6 +8477,9 @@ fn apply_configured_log(
         save_state(paths, state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
+    // The records this Mac already held, applied again: a repair, which owes its pass.
+    let owed =
+        state.records_digest == Some(digest) || state.failed || state.membership != Stored::In;
     state.records_digest = Some(digest);
     let Some(entries) = opened else {
         state.membership = match state.membership {
@@ -8268,7 +8490,15 @@ fn apply_configured_log(
         save_state(paths, state)?;
         return Ok(SyncOutcome::NotIn);
     };
+    // A Mac that holds its vault as a log alone holds no envelope, so no admin text.
+    let inputs = converge_inputs::Inputs::read(
+        Some(&configured.log),
+        &identity,
+        converge_inputs::Admin::None,
+    );
     let report = record_applied(state, &entries);
+    let moved = inputs.record(state) || report.changed || owed;
+    converge_inputs::owe(state, moved);
     state.membership = Stored::In;
     state.source_identity = Some(source_identity(config));
     save_state(paths, state)?;
@@ -8276,6 +8506,7 @@ fn apply_configured_log(
     Ok(SyncOutcome::Applied {
         seq: state.seq,
         report,
+        moved,
     })
 }
 
@@ -8520,14 +8751,21 @@ fn failed_over_idle(pass: Pass) -> bool {
 
 /// A local apply can need convergence while the source is still unavailable.
 /// Keep its recovery trigger for the first pass that actually hears the source.
+/// `owed` is a pass another apply left owed ([`converge_inputs::take_owed`]): it starts a runner
+/// as a version this pass applied does, whatever `outcome` is.
 fn converge_after_pass(
     due: &mut crate::converge::Due,
     outcome: &SyncOutcome,
+    owed: bool,
     now_ms: u64,
     routes: crate::converge::Routes,
     last: crate::converge::Last,
     source: SourceSaid,
 ) -> bool {
+    if owed {
+        due.because(crate::converge::Causes::APPLIED);
+        due.request(crate::converge::RepositoryRequest::Repair);
+    }
     if source == SourceSaid::Nothing {
         due.after_unreachable_pass(outcome, now_ms, routes, last)
     } else {
@@ -8586,7 +8824,7 @@ fn pass_line(
     repeated: &mut String,
 ) -> Option<String> {
     let (line, again) = match outcome {
-        SyncOutcome::Applied { seq, report } => (
+        SyncOutcome::Applied { seq, report, .. } => (
             // `, 0 failed` stays for the harness's reader of this line (aterm-agent's
             // `sign_in_ladder`): an apply writes no file, so none fails.
             Some(format!(
@@ -8634,12 +8872,27 @@ fn pass_line(
 /// path the digest of its source and text, and 0).
 type Repaired = Option<([u8; 32], u64)>;
 
-/// Re-acknowledge the raw, verified membership log when the applied digest alone prevents any
-/// read. The explicit repair retains the prior state before changing only that digest, and never
-/// accepts an unverified store or rewrites identity, membership, proof or vault contents.
+/// Accept the raw, verified membership log this Mac holds as the one it applied, when the applied
+/// digest alone prevents any read and no vault pass could show that the log still holds the
+/// applied one (a pass enrolls such a log by itself, `log_entries::check_legacy_frontier`: this
+/// is the door for a store that lost records it applied and cannot get them back). The explicit
+/// repair retains the prior state before changing only that digest, and never accepts an
+/// unverified store or rewrites identity, membership, proof or vault contents. A store short of
+/// the records the applied envelope was written at is refused with nothing written: a reader
+/// after the repair checks the digest alone, and would read a store no enrollment accepts.
 /// Its state-lock wait shares the caller's deadline; a busy writer grants no repair authority.
+///
+/// **What it accepts is not shown to hold the applied log.** The one check is the stamp's
+/// ([`log_entries::covers_applied_stamp`]), which is `true` with no stamped envelope: a verified
+/// store that holds the stamp's records and lacks a later record this Mac applied, or any
+/// verified store on a Mac the log let in with no envelope locker, is accepted, and the values
+/// read after it are that store's, older ones included. No search for the applied heads runs
+/// here: a store that holds them needs no repair. Every `aterm secrets repair` runs this, the
+/// run that migrates installed services too (`cli::repair`), so a caller that wants only the
+/// services lowers this Mac's floor where the digest differs; the texts that name the verb say
+/// so (`cli`'s usage, [`log_entries::legacy_refusal`], SPECS `CL-FRONTIER-REPAIR`).
 pub(crate) fn repair_legacy_frontier(paths: &Paths, deadline: Instant) -> crate::Result<bool> {
-    let Some(_config) = config(paths)? else {
+    let Some(config) = config(paths)? else {
         return Ok(false);
     };
     let _lock = bounded::take(paths, Some(deadline))?;
@@ -8653,6 +8906,17 @@ pub(crate) fn repair_legacy_frontier(paths: &Paths, deadline: Instant) -> crate:
         .map_err(|error| Error::new(format!("applied membership state failed: {error}")))?;
     if state.records_digest == Some(digest) {
         return Ok(false);
+    }
+    if !log_entries::covers_applied_stamp(&Reads::under(paths, &config, &state), &config, log)? {
+        return Err(Error::of_kind(
+            crate::ErrorKind::MembershipHistoryUnavailable,
+            format!(
+                "this Mac's membership records lack records the vault version it applied (seq {}) \
+                 was written at, so `aterm secrets repair` does not accept them; `aterm secrets \
+                 sync` fetches them",
+                state.seq
+            ),
+        ));
     }
     let before = fsx::read_private(&paths.state_file(), MAX_STATE)?
         .ok_or_else(|| Error::new("the applied membership state is unavailable"))?;
@@ -9387,7 +9651,11 @@ fn subscriber_loop_projecting(
                 // keeping a profile that already authenticates.
                 notary.after_round(paths, &config, log);
                 // A version applied, or (its own route read) moved routes or the recheck.
-                projection.after_pass(&outcome, pass.source);
+                // The pass an apply left owed is taken here whatever this round's own outcome:
+                // the apply may have been another process's (`aterm secrets sync`, a publish's
+                // own sync, a reader), which starts no runner.
+                let owed = converge_inputs::take_owed(paths);
+                projection.after_pass(&outcome, owed, pass.source);
                 let requested = || load_state(paths).ok().map(|state| state.requested);
                 let before = requested();
                 ask_again_if_due(paths, &config, log);
@@ -12698,7 +12966,7 @@ fn join_with_until(
                 },
             );
         });
-    if let SyncOutcome::Applied { seq, report } = synced? {
+    if let SyncOutcome::Applied { seq, report, .. } = synced? {
         return Ok(JoinOutcome::Joined {
             seq,
             names: names_of(&report),
@@ -12807,7 +13075,7 @@ fn join_with_until(
                 Source::Path(_) => None,
             };
             match sync_join_approval(paths, wait, expected) {
-                Ok(SyncOutcome::Applied { seq, report }) => {
+                Ok(SyncOutcome::Applied { seq, report, .. }) => {
                     return Ok(JoinOutcome::Joined {
                         seq,
                         names: names_of(&report),

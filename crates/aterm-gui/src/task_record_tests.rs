@@ -2981,21 +2981,173 @@ fn a_hands_failed_mark_is_refused_while_a_loop_carries_the_session() {
     assert!(mark(&h).starts_with("OK task "), "a lapsed claim");
 }
 
-/// WHO HAS THEIR OWN REPORT OF THEIR END: a credit claim's worker and the disk worker, each by its
-/// folder. NEGATIVE CONTROL: any other folder, and none.
+/// WHO GETS NO GENERIC REPORT OF THEIR END: a credit claim's worker and a disk worker an earlier
+/// build left, each by its folder. NEGATIVE CONTROL: any other folder, and none.
 #[test]
 fn a_worker_with_its_own_report_is_told_by_its_folder() {
-    use aterm_agent::harness::{credit_offers, disk};
+    use aterm_agent::harness::credit_offers;
     let under = |name: &str| format!("/state/aterm/{}/{name}", aterm_agent::harness::cli::HARNESS);
-    assert!(reports_its_own_end(Some(&under(
-        disk::fence::WORKER_FOLDER
-    ))));
+    assert!(reports_its_own_end(Some(&under("disk-worker"))));
     assert!(reports_its_own_end(Some(&under(
         credit_offers::CLAIM_FOLDER
     ))));
     assert!(!reports_its_own_end(Some(&under("elsewhere"))));
     assert!(!reports_its_own_end(Some("/work/disk-worker")));
     assert!(!reports_its_own_end(None));
+}
+
+/// A folder `name` under the harness state root, as a worker's record names the one it trusts.
+fn harness_folder(name: &str) -> String {
+    format!("/state/aterm/{}/{name}", aterm_agent::harness::cli::HARNESS)
+}
+
+/// The carry row of a worker's record at rev 3 in `state` (`why`), trusted to `folder`.
+fn worker_row(state: TaskState, why: Option<&'static str>, folder: &str) -> String {
+    let now = Instant::now();
+    TaskRecord {
+        rev: 3,
+        state,
+        from: "ctl".into(),
+        manager_node: None,
+        told: Default::default(),
+        why,
+        checked: None,
+        left: None,
+        exit: None,
+        finished: false,
+        unfinished_exit: false,
+        result_bytes: 0,
+        result_path: None,
+        attention: false,
+        asks: Asks::default(),
+        since_unix_ms: 10_000,
+        since: now,
+        started_unix_ms: 10_000,
+        started: now,
+        entered: 3,
+        carried_entered: None,
+        agent: None,
+        program: None,
+        trusted_cwd: Some(folder.to_string()),
+        fact: None,
+        program_block: None,
+        fact_rev: 0,
+        line: None,
+    }
+    .carry_row(now)
+}
+
+/// A DISK WORKER AN EARLIER BUILD LEFT IS OVER WHERE THIS BUILD ADOPTS IT. Carried across a
+/// seamless update while `working` or `stalled`, its record reads `failed why=expired` and its
+/// Autopilot is Off in aterm's name; the Autopilot word carried for its tab, put back after the
+/// record as the update puts it, leaves that Off standing. NEGATIVE CONTROL (in the test): a
+/// credit claim's worker carried the same way stays `working` and takes the carried word, and a
+/// disk worker's record that had ended (`done`) is carried as it ended.
+#[test]
+fn a_carried_disk_worker_is_over_at_start_with_its_autopilot_off() {
+    use crate::session_timeline::{SessionMeta, restore_carried_meta};
+    use alab_policy::config::Autopilot;
+    use aterm_agent::harness::credit_offers;
+    let (under, row) = (harness_folder, worker_row);
+    let carried_word = SessionMeta {
+        autopilot: Some(Autopilot::Cruise.word().to_string()),
+        ..SessionMeta::default()
+    };
+    // The update's order: the record is seeded onto a bare session, then its carried words.
+    let adopted = |local: u64, row: &str| {
+        let handle = crate::session_store::test_handle(local);
+        seed_carried(&handle.ctx, Some(row));
+        restore_carried_meta(&handle.ctx, &carried_word);
+        let record = handle
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("a record");
+        let word = handle.ctx.meta.lock().unwrap().autopilot_word();
+        (record.state, record.why, word)
+    };
+    assert_eq!(
+        adopted(41, &row(TaskState::Working, None, &under("disk-worker"))),
+        (TaskState::Failed, Some(WHY_EXPIRED), Some(Autopilot::Off)),
+        "a disk worker left working"
+    );
+    let stalled = row(TaskState::Stalled, Some("held"), &under("disk-worker"));
+    assert_eq!(
+        adopted(44, &stalled),
+        (TaskState::Failed, Some(WHY_EXPIRED), Some(Autopilot::Off)),
+        "a disk worker left stalled"
+    );
+    let claim = under(credit_offers::CLAIM_FOLDER);
+    assert_eq!(
+        adopted(42, &row(TaskState::Working, None, &claim)),
+        (TaskState::Working, None, Some(Autopilot::Cruise)),
+        "CONTROL: a credit claim's worker"
+    );
+    let ended = row(TaskState::Done, Some("landed"), &under("disk-worker"));
+    assert_eq!(
+        adopted(43, &ended),
+        (TaskState::Done, Some("landed"), Some(Autopilot::Cruise)),
+        "CONTROL: a disk worker that had ended"
+    );
+}
+
+/// A DISK WORKER AN EARLIER BUILD LEFT STALLED CARRIES NO ASK INTO THIS BUILD. Its tab crossed a
+/// seamless update with the deadline's ask standing on it; the record that is over reads no
+/// attention, and the supervisor's entry is taken down from the session, so no tab that nothing
+/// will drive again waits for a person. NEGATIVE CONTROL (in the test): a credit claim's worker
+/// stalled the same way, with the same ask carried, still reads attention and keeps the entry;
+/// taking [`TaskRecord::retire`]'s two attention lines and `retire_session`'s take-down out
+/// fails the first two asserts.
+#[test]
+fn a_carried_disk_worker_that_stalled_leaves_no_ask_standing() {
+    use aterm_agent::harness::credit_offers;
+    const ASK: &str = "held at a screen aterm does not know";
+    let owner = crate::harness_host::ATTENTION_OWNER;
+    // The update's order: the carried claims are seeded onto the session, then its record.
+    let adopted = |local: u64, folder: &str| {
+        let handle = crate::session_store::test_handle(local);
+        {
+            let mut meta = handle.ctx.meta.lock().unwrap();
+            let mut timeline = handle.ctx.timeline.lock().unwrap();
+            let stands = crate::session_timeline::put_supervisor_attention(
+                &mut meta,
+                &mut timeline,
+                Some(ASK),
+            );
+            assert!(stands, "PREMISE: the carried ask stands");
+        }
+        let row = worker_row(TaskState::Stalled, Some("held"), folder);
+        seed_carried(&handle.ctx, Some(&row));
+        let attention = handle
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .map(|record| (record.state, record.attention));
+        let standing = handle
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .attention_owners
+            .get(owner)
+            .map(str::to_owned);
+        (attention, standing)
+    };
+    assert_eq!(
+        adopted(51, &harness_folder("disk-worker")),
+        (Some((TaskState::Failed, false)), None),
+        "a disk worker left stalled asks nobody"
+    );
+    assert_eq!(
+        adopted(52, &harness_folder(credit_offers::CLAIM_FOLDER)),
+        (Some((TaskState::Stalled, true)), Some(ASK.to_owned())),
+        "CONTROL: another worker's carried ask stands"
+    );
 }
 
 /// A PERSON'S AUTOPILOT OFF ENDS A WORKING TASK AND THEIR SWITCH BACK OPENS IT. aterm's own Off is
@@ -3248,7 +3400,7 @@ fn a_failed_task_reads_its_result_and_a_turn_opens_it() {
 /// A RECORD NEVER NAMES A RESULT FILE THAT IS GONE (tracker ST-01): a stored row whose result
 /// is no longer there (a layout aterm 0.198.0 wrote, whose quit removed the file its row names)
 /// seeds a record that names none and says `result_bytes=0`, so `task` promises no result
-/// `result` cannot read. The same holds on a seamless update's road and for a retired row, for a
+/// `result` cannot read. The same holds on a seamless update's road and for a row, for a
 /// snapshot whose sidecar is gone (`result` answers from neither without the other), and for a
 /// link left at the name, which is no file of the record's. CONTROL: a row whose result stands
 /// keeps its path, its size and its answer, under the session ID the file was written for.

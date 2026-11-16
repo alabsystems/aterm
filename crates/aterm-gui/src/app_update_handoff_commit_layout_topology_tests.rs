@@ -9,6 +9,7 @@ use crate::restore::{
 
 fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> RestoreManifest {
     RestoreManifest::new(vec![WindowLayout {
+        dock: None,
         rows: 40,
         cols: 120,
         active_tab: 0,

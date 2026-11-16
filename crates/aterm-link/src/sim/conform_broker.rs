@@ -808,10 +808,10 @@ impl Real {
     /// refinement arm's `Hello` names none (astream's `Backing::device`), where the model's
     /// names the Apple device it simulates: that arm's `Hello` is read as naming one, every
     /// other word of it compared as the file arms' are.
-    fn read(&mut self, c: u64) -> Response {
+    fn read(&mut self, c: u64) -> Got {
         let conn = self.conns.get_mut(&c).expect("a live real connection");
-        let mut resp = match read_frame(&mut conn.stream) {
-            Ok(Some(frame)) => decode_response(&frame).expect("a frame astream decodes"),
+        let (mut resp, origin) = match read_frame(&mut conn.stream) {
+            Ok(Some(frame)) => got(&frame).expect("a frame astream decodes"),
             Ok(None) => panic!("the real broker closed connection {c}"),
             Err(e) => panic!("no answer from the real broker on {c} in {HANG:?}: {e}"),
         };
@@ -821,7 +821,7 @@ impl Real {
                 flush_drains_device: true,
             });
         }
-        resp
+        (resp, origin)
     }
 
     /// `c` is a tail now: a thread reads its frames.
@@ -846,7 +846,7 @@ impl Real {
     }
 
     /// The next delivery of tail `c`, skipping its marks; `None` at its end.
-    fn deliver(&mut self, c: u64) -> Option<Response> {
+    fn deliver(&mut self, c: u64) -> Option<Got> {
         let deadline = Instant::now() + HANG;
         let rx = self
             .conns
@@ -861,8 +861,8 @@ impl Real {
                     panic!("the real broker delivered nothing on tail {c} in {HANG:?}")
                 });
             match rx.recv_timeout(remaining) {
-                Ok(Ok(Some(frame))) => match decode_response(&frame) {
-                    Some(Response::Mark { .. }) => {}
+                Ok(Ok(Some(frame))) => match got(&frame) {
+                    Some((Response::Mark { .. }, _)) => {}
                     other => return other,
                 },
                 Ok(Ok(None) | Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
@@ -976,10 +976,10 @@ impl Model {
         stream.write_all(&bytes).expect("write to the model");
     }
 
-    fn read(&mut self, c: u64) -> Response {
+    fn read(&mut self, c: u64) -> Got {
         let stream = self.conns.get_mut(&c).expect("a live model connection");
         match read_frame(stream) {
-            Ok(Some(frame)) => decode_response(&frame).expect("a frame astream decodes"),
+            Ok(Some(frame)) => got(&frame).expect("a frame astream decodes"),
             Ok(None) => panic!("the model closed connection {c}"),
             Err(e) => panic!("no answer from the model on {c}: {e}"),
         }
@@ -987,10 +987,10 @@ impl Model {
 
     /// The next frame of tail `c`, `Ok(None)` at its end, or what the model
     /// said instead of either.
-    fn deliver(&mut self, c: u64) -> Result<Option<Response>, String> {
+    fn deliver(&mut self, c: u64) -> Result<Option<Got>, String> {
         let stream = self.conns.get_mut(&c).expect("a model tail");
         match read_frame(stream) {
-            Ok(Some(frame)) => Ok(decode_response(&frame)),
+            Ok(Some(frame)) => Ok(got(&frame)),
             Ok(None) => Ok(None),
             Err(e) => Err(format!("nothing owed ({e})")),
         }
@@ -1105,9 +1105,19 @@ fn class(msg: &str) -> &'static str {
     .unwrap_or("")
 }
 
+/// One answer as an arm read it: the response, and the origin its delivery carried after the
+/// body, on a connection that asked for stamps (`proto::decode_delivery_origin`).
+type Got = (Response, Option<(u64, u64)>);
+
+/// The answer `frame` holds, with the origin a delivery of it carries.
+fn got(frame: &[u8]) -> Option<Got> {
+    decode_response(frame).map(|resp| (resp, astream_broker::proto::decode_delivery_origin(frame)))
+}
+
 /// One answer as the comparison reads it, with a `Mark`'s
-/// durable head apart for the law.
-fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) {
+/// durable head apart for the law. A delivery names its origin where it carried one, so an
+/// answer on a connection that asked for none reads as it always did.
+fn project(tier: Tier, (resp, origin): &Got) -> (String, Option<(Option<u64>, u64)>) {
     match resp {
         Response::PublishAck { offset, deduped } => {
             (format!("ack @{offset} deduped={deduped}"), None)
@@ -1116,7 +1126,13 @@ fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) 
             offset,
             subject,
             body,
-        } => (format!("delivery @{offset} {subject} {body:?}"), None),
+        } => (
+            format!(
+                "delivery @{offset} {subject} {body:?}{}",
+                origin.map_or_else(String::new, |(p, s)| format!(" origin={p}.{s}"))
+            ),
+            None,
+        ),
         // A rate-limited refusal by the bucket that refused it too (`(byte rate exceeded)`): its
         // wait is each arm's clock's, and only the model's stands still.
         Response::Error { code, msg } => (
@@ -1493,7 +1509,7 @@ fn answer(
             let r = real.read(c);
             let m = model.read(c);
             compare(real, c, req, &r, &m, table, laws, tier)?;
-            if ends(req, &r) {
+            if ends(req, &r.0) {
                 break;
             }
         }
@@ -1559,7 +1575,7 @@ fn answer_faulted(
     let mut modelled = Vec::new();
     loop {
         let m = model.read(c);
-        let end = ends(req, &m);
+        let end = ends(req, &m.0);
         modelled.push(m);
         if end {
             break;
@@ -1578,7 +1594,7 @@ fn answer_faulted(
     let mut answered = Vec::new();
     loop {
         let r = real.read(c);
-        let end = ends(req, &r);
+        let end = ends(req, &r.0);
         answered.push(r);
         if end {
             break;
@@ -1620,14 +1636,15 @@ fn compare(
     real: &mut Real,
     c: u64,
     req: &Request,
-    r: &Response,
-    m: &Response,
+    r: &Got,
+    m: &Got,
     table: &Escalation,
     laws: &mut [Law; 2],
     tier: Tier,
 ) -> Result<(), String> {
     let (rp, rd) = project(tier, r);
     let (mp, md) = project(tier, m);
+    let r = &r.0;
     if rp != mp {
         return Err(format!("{req:?}: real {rp}, model {mp}"));
     }
@@ -2746,6 +2763,75 @@ pub(crate) mod scripts {
     }
 }
 
+/// THE SCRIPT OF ORIGIN STAMPS (ATERM-KI-1114-1414).
+pub(crate) mod origins {
+    use super::scripts::{
+        fetch, last, publish, seq, will, will_at, EV, INBOX, LANE, LANE_B, NODE, P, Q,
+    };
+    use super::{Request, Step, Stop};
+
+    /// EACH DELIVERY TO A CONNECTION THAT ASKED FOR ORIGIN STAMPS CARRIES ITS RECORD'S ORIGIN
+    /// (astream's `Request::OriginStamps`), under aterm's rules: two producers' records and a
+    /// fired will's, read by a page, a `Last` and a tail (its later mail written by a retention
+    /// tick's catch-up); a carried cut that holds the mail below
+    /// the base and gives the stream up, the held mail read by a told fetch; and the same records
+    /// under another id once the identity sidecar rots. A connection that never asked reads the
+    /// same page with no origins.
+    pub(crate) fn stamped() -> Vec<Step> {
+        let inbox = || Request::Subscribe {
+            from_offset: 0,
+            filter: INBOX.to_string(),
+        };
+        vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, Request::OriginStamps),
+            Step::Dial(2),
+            Step::Send(2, Request::Hello),
+            Step::Pipeline(
+                1,
+                vec![
+                    publish(P, seq(1, 1), EV, "e1"),     // @0
+                    publish(Q, seq(1, 1), LANE, "m1"),   // @1
+                    publish(P, seq(1, 2), LANE_B, "m2"), // @2
+                    publish(Q, seq(1, 2), EV, "e2"),     // @3
+                ],
+            ),
+            Step::Dial(4),
+            Step::Send(4, will(P, will_at(1), NODE, "away")),
+            Step::End(4), // the will fires
+            Step::Send(1, fetch(0, "/>", 100)),
+            Step::Send(2, fetch(0, "/>", 100)),
+            Step::Send(1, last("/>", "", 100)),
+            Step::Dial(5),
+            Step::Send(5, Request::OriginStamps),
+            Step::Send(5, inbox()),
+            Step::Deliver(5),
+            Step::Deliver(5),
+            // Mail the tail has yet to read when retention ticks: the tick's catch-up writes
+            // it to the tail stamped, as astream's tail thread writes what lands.
+            Step::Send(1, publish(P, seq(1, 3), LANE, "m3")),
+            Step::Tick(0),
+            Step::Tick(0),
+            Step::Cut(4),
+            Step::Deliver(5),
+            Step::Dial(6),
+            Step::Send(6, Request::GapNotices),
+            Step::Send(6, Request::OriginStamps),
+            Step::Send(6, fetch(0, "/f/f/>", 10)),
+            Step::Stop(Stop::Clean),
+            Step::LoseIdentity,
+            Step::Start,
+            Step::Dial(3),
+            Step::Send(3, Request::Hello),
+            Step::Send(3, Request::GapNotices),
+            Step::Send(3, Request::OriginStamps),
+            Step::Send(3, fetch(0, "/f/f/>", 100)),
+            Step::Send(3, fetch(0, "/>", 100)),
+        ]
+    }
+}
+
 /// THE SCRIPTS OF ANOTHER LOG AND A POISONED ONE (ATERM-KI-1111-4).
 pub(crate) mod lossy {
     use super::scripts::{
@@ -2820,9 +2906,11 @@ pub(crate) mod lossy {
     /// offset (the dedup key stood), a new publish lands after them, and a conditional `Retire`
     /// naming the first log is refused `log: ` while one naming the new log is served. The words
     /// a reader matches on a log like this are older than any read-back head it held: a reader
-    /// that took the fresh id for an empty log would read back from 0 and match them
-    /// (aterm-link's `Bridge::read_back_from` and `StateDir::publication_offset_resets`, which
-    /// start at the head the node met the log at, `state::Met::floor`).
+    /// that took the fresh id for an empty log would read back from 0 and match them by their
+    /// words, so aterm-link's read back from anywhere on such a log (`Bridge::read_back_from`,
+    /// `StateDir::publication_offset_resets`, `state::Head::Anywhere`) takes a row only where its
+    /// origin is the entry's too (`Bridge::found_anywhere`, [`origins`]), which the model stamps as
+    /// astream does.
     pub(crate) fn reminted() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
@@ -3714,6 +3802,38 @@ fn the_model_settles_every_empty_open_as_another_log() {
         (ArmMutant::MintKeepsGeneration, Tier::Relaxed),
     ] {
         let Err(e) = run(tier, mutant, &lossy::empty_restarts()) else {
+            panic!("CONTROL {mutant:?} at {tier}: answered as astream answers it");
+        };
+        eprintln!("CONTROL {mutant:?} caught: {e}");
+    }
+}
+
+/// **EACH DELIVERY TO A CONNECTION THAT ASKED FOR ORIGIN STAMPS CARRIES ITS RECORD'S ORIGIN, ON
+/// THE MODEL AS ON ASTREAM** (ATERM-KI-1114-1414): [`origins::stamped`] on every tier the host
+/// serves, on the file arm under aterm's rules, each delivery compared with the origin it
+/// carried ([`project`]): a page, a `Last` and a tail of two producers' records and a fired
+/// will's, the mail a carried cut holds below the base read by a told fetch, the same records
+/// under another id once the identity sidecar rots, and a page to a connection that asked for
+/// none, which carries none. NEGATIVE CONTROLS: a model that refuses the ask, one that stamps a
+/// delivery with the next record's origin, and one that stamps no record held below the base are
+/// each caught.
+#[test]
+fn the_model_stamps_each_delivery_with_its_records_origin_as_astream_does() {
+    let tiers: Vec<Tier> = [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+        .collect();
+    for &tier in &tiers {
+        run(tier, ArmMutant::None, &origins::stamped())
+            .unwrap_or_else(|e| panic!("the file arm at {tier}: {e}"));
+    }
+    let tier = *tiers.first().expect("a tier this host serves");
+    for mutant in [
+        ArmMutant::OriginStampsRefused,
+        ArmMutant::OriginOfTheNextRecord,
+        ArmMutant::HeldRecordsUnstamped,
+    ] {
+        let Err(e) = run(tier, mutant, &origins::stamped()) else {
             panic!("CONTROL {mutant:?} at {tier}: answered as astream answers it");
         };
         eprintln!("CONTROL {mutant:?} caught: {e}");

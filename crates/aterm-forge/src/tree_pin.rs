@@ -28,10 +28,10 @@ const PIN_TOOL: &str = "~/alab-harness/tools/pin";
 /// How many offending paths a refusal lists before it counts the rest.
 const LISTED: usize = 8;
 
-/// A roster directory whose copy holds: the index carries exactly the tree its pin names.
+/// A directory whose copy holds: the index carries exactly the tree its pin names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreePin {
-    /// The roster row's directory, `vendor/<dir>`.
+    /// The copy's directory, relative to the checkout.
     pub dir: &'static str,
     /// Its pin file, repo-relative.
     pub pin: &'static str,
@@ -70,15 +70,28 @@ pub fn tree_pins(root: &Path) -> Result<Vec<TreePin>, TreePinError> {
     crate::provenance::FIRST_PARTY_VENDORED
         .iter()
         .filter_map(|row| Some((row.dir, row.pin?)))
-        .map(|(dir, pin)| {
-            hold(root, dir, pin).map(|Pin { tag, tree }| TreePin {
-                dir,
-                pin,
-                tag,
-                tree,
-            })
-        })
+        .map(|(dir, pin)| tree_pin(root, dir, pin))
         .collect()
+}
+
+/// Hold one explicitly named copy to its pin, independently of this repository's roster.
+/// `dir` and `pin` are paths relative to `root`, naming the copy and its adjacent pin file.
+/// Like [`tree_pins`], this checks the index and working files, including ignored strays;
+/// upstream's `tools/check-pin` separately checks the tag's identity.
+///
+/// # Errors
+/// The copy does not hold its pin, or git could not judge it.
+pub fn tree_pin(
+    root: &Path,
+    dir: &'static str,
+    pin: &'static str,
+) -> Result<TreePin, TreePinError> {
+    hold(root, dir, pin).map(|Pin { tag, tree }| TreePin {
+        dir,
+        pin,
+        tag,
+        tree,
+    })
 }
 
 /// Hold the copy at `dir` to the pin file `pin`, both relative to `root`.
@@ -94,13 +107,13 @@ pub(crate) fn hold(root: &Path, dir: &str, pin: &str) -> Result<Pin, TreePinErro
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(TreePinError::Fail(format!(
-                "`{pin}` does not exist, and the roster pins `{dir}` by it. Repair: {}.",
+                "`{pin}` does not exist, and `{dir}` is pinned by it. Repair: {}.",
                 repin("<tag>")
             )));
         }
         Err(e) => {
             return Err(TreePinError::Fail(format!(
-                "`{pin}` cannot be read as a regular file ({e}), and the roster pins `{dir}` by \
+                "`{pin}` cannot be read as a regular file ({e}), and `{dir}` is pinned by \
                  it. Repair: {}.",
                 repin("<tag>")
             )));

@@ -2198,7 +2198,7 @@ fn tree_package(entry: &str) -> Option<&str> {
 /// package's edges printed once), the members that build differently when X changes, each known by
 /// its directory ([`Members::at`]): X, whatever closes over normal and build edges from it, and
 /// then every dev dependent of any of those. A dev edge is the final hop and never transit: a
-/// member that dev-depends on X links it for its own tests (aterm-models dev-depends on every crate
+/// member that dev-depends on X links it for its own tests (aterm-spec-closure dev-depends on every crate
 /// that anchors a model, so a change to any of them brings its source-spec closure test into the
 /// cone), but its own dependents build no dev-dependency of it. X is in the closure as the tree's
 /// root, so a package only dev edges reach (`astream-term`, which `aterm-conformance`'s differential

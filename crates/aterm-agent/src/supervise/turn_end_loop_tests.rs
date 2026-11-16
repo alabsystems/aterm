@@ -8579,9 +8579,8 @@ impl IdleHost for CarriedHost {
 /// overloaded API) stands at a wall: it reads busy, and is no work past the wall. Its wall's
 /// lasting withhold is told once and stands across every read of it. Before, each read told it
 /// and the same read's busy tap took it down again (on the host's board and in the loop's
-/// record), so the window's seat rule (`disk-free@v1`) nearly always found the board bare, seated
-/// the session and elected it at breaks its line could not go: handed on undelivered, and as the
-/// only seat the episode parked.
+/// record), so a host reading its board nearly always found it bare and offered the session a
+/// line at breaks where it could not go.
 #[test]
 fn a_wall_at_a_carried_break_of_the_agents_own_background_work_stands_across_its_reads() {
     let walled = waiting_on(&[
@@ -14321,16 +14320,14 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         "{lines:#?}"
     );
 }
-/// A DISK-FREE WORKER'S REPOSITORY READS CLEAN BY ITS TASK RECORD
-/// (`Session::repo_asked`, `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4), and a
-/// credit-claim worker's by its claim folder: at a
-/// done claim of a session whose trusted folder is the worker folder, the host's
-/// probe, which would read uncommitted work where the worker stands, is never
-/// asked, and the done check carries no repository suffix. NEGATIVE CONTROL:
-/// the same claim of a session trusted another folder asks the probe and
-/// carries the suffix of what it found.
+/// A CREDIT-CLAIM WORKER'S REPOSITORY READS CLEAN BY ITS CLAIM FOLDER
+/// (`Session::repo_asked`): at a done claim of a session whose trusted folder
+/// is the claim folder, the host's probe, which would read uncommitted work
+/// where the worker stands, is never asked, and the done check carries no
+/// repository suffix. NEGATIVE CONTROL: the same claim of a session trusted
+/// another folder asks the probe and carries the suffix of what it found.
 #[test]
-fn a_disk_workers_repository_reads_clean_without_asking_the_host() {
+fn a_claim_workers_repository_reads_clean_without_asking_the_host() {
     let (screens, dirty) = claim_over_work();
     let suffix = own_repo_work_suffix(&dirty);
     let run = |trusted: &str| {
@@ -14357,18 +14354,14 @@ fn a_disk_workers_repository_reads_clean_without_asking_the_host() {
             host.asked.load(std::sync::atomic::Ordering::SeqCst),
         )
     };
-    for worker in [
-        "/Users//a/Library/Application Support/aterm/harness/claude-harness/disk-worker",
-        "/Users//a/Library/Application Support/aterm/harness/claude-harness/credit-claim",
-    ] {
-        let (turns, lines, asked) = run(worker);
-        assert_eq!(asked, 0, "{worker}: the probe is never asked: {lines:#?}");
-        assert_eq!(
-            turns.first(),
-            Some(&continue_request(&done_check_words(0))),
-            "{worker}: the plain check: {lines:#?}"
-        );
-    }
+    let worker = "/Users//a/Library/Application Support/aterm/harness/claude-harness/credit-claim";
+    let (turns, lines, asked) = run(worker);
+    assert_eq!(asked, 0, "the probe is never asked: {lines:#?}");
+    assert_eq!(
+        turns.first(),
+        Some(&continue_request(&done_check_words(0))),
+        "the plain check: {lines:#?}"
+    );
     let (turns, lines, asked) = run("/Users//a/Developer/parser");
     assert!(asked >= 1, "another session's probe is asked: {lines:#?}");
     assert_eq!(

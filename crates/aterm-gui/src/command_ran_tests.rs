@@ -411,22 +411,32 @@ fn a_file_of_many_names_stands_in_by_the_name_it_was_execd_by() {
     );
 }
 
-/// The real read of a hard-linked image ([`read_names`]): a copy of `cat`, signed ad hoc, run
-/// by its second link, reads as a file of several names whose exec name is that link, so it
+/// The real read of a hard-linked image ([`read_names`]): a persistent signed `cat` stand-in,
+/// run by its second owned link, reads as a file of several names whose exec name is that link, so it
 /// stands in by it. Its names are read, and its folder goes, only once it echoed a line
 /// ([`aterm_uds::deadline::cat_echoes`]): a name the kernel shows at `_dyld_start` is no proof
-/// macOS finished assessing the copy's first exec. NEGATIVE CONTROL (scratch): `image_file`
+/// macOS finished assessing that exec. NEGATIVE CONTROL (scratch): `image_file`
 /// answering no links fails the first assertion.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_hard_linked_image_reads_as_linked_and_shows_the_link_it_ran_by() {
     use aterm_uds::spawnfd::Stdio;
+    let image = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
     let mut kept = aterm_uds::deadline::KeptUntilRan::new(
-        aterm_tempfile::tempdir().expect("a scratch dir").keep(),
+        aterm_tempfile::Builder::new()
+            .prefix("command-ran-links-")
+            .suffix(".noindex")
+            .tempdir_in(
+                image
+                    .parent()
+                    .expect("the persistent image has a directory"),
+            )
+            .expect("owned aliases on the image's volume")
+            .keep(),
     );
     let first = kept.path().join("qzlinka");
     let second = kept.path().join("qzlinkb");
-    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &first);
+    std::fs::hard_link(&image, &first).expect("a first owned link to the persistent image");
     std::fs::hard_link(&first, &second).expect("a second link");
     let _ = std::fs::metadata(&first).expect("the first link, looked up last");
     let mut child = aterm_uds::spawnfd::command(&second)
@@ -439,7 +449,7 @@ fn a_hard_linked_image_reads_as_linked_and_shows_the_link_it_ran_by() {
     let names = read_names(i32::try_from(child.id()).expect("a pid"), &mut |_| false);
     drop(fed);
     aterm_uds::deadline::kill_within(&mut child, aterm_spec::wait::MUST_HAPPEN);
-    assert!(names.linked, "a file of two names: {names:?}");
+    assert!(names.linked, "a file of several names: {names:?}");
     assert_eq!(names.shown(), Some("qzlinkb"), "{names:?}");
     assert_eq!(names.file, file_id(&first), "one file under both names");
 }

@@ -81,10 +81,15 @@ pub struct WorkerCli {
     /// ([`Self::unnamed_posture`]). Every CLI's floor is held here but Claude Code's, whose mode
     /// [`starter`] holds to it once it has read the starter's route ([`claude_starter_args`]),
     /// and codex-alab's, which [`starter_of`] judges beside its starter's own config
-    /// ([`codex_lent`]). Each floor's first word is a posture marker of whatever sets the CLI's
-    /// yolo default, atpkg's managed twin ([`atpkg::yolo::decide`]) or, for Muse Code since
-    /// HX-13a, muse-alab's `run`, which that twin hands the line to as typed; so neither adds a
-    /// yolo flag beside it: the floor holds whether or not the line runs that twin.
+    /// ([`codex_lent`]). Each floor's first word is a posture marker of atpkg's managed twin
+    /// ([`atpkg::yolo::decide`]), so a twin the line runs adds no yolo flag beside it: the floor
+    /// holds whether or not the line runs that twin. No Muse worker line gets Muse Code's yolo
+    /// default from its twin: the floor's `--approval-mode` is one of that twin's markers, and a
+    /// line without a floor starts with `--contributor-mode off`, an option the twin's scan does
+    /// not know, so it runs as typed. The twin keeps its block until muse-alab leads `muse`
+    /// (HX-13c, after HX-13). From then
+    /// muse-alab's `run` reads the line in the twin's place and runs `--approval-mode never` as
+    /// typed, which muse-alab's own tests check (`the_yolo_block_answers_aterms_own_muse_cases`).
     flags: fn(&[String]) -> Result<Vec<String>, String>,
 }
 

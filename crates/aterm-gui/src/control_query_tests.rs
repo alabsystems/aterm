@@ -1703,6 +1703,75 @@ fn metrics_carries_commons_repairs_counts() {
     }
 }
 
+/// Plain `metrics` carries each of the accounts' upkeep's counts for this process
+/// (`aterm_agent::harness::accounts_upkeep_counts::counts`) and, on unix, each count of the
+/// registry's strict reads (`aterm_db::alab::admission_counts`), each under its own key. The
+/// process's counts are moved by a different amount each (the first by `STEP`, the next by
+/// twice it, and so on); every key then reads its own count's amount more than before, give or
+/// take what other threads counted meanwhile, which is far less than one `STEP`.
+///
+/// NEGATIVE CONTROLS (2026-11-13), each applied alone:
+/// - the summary leaving the accounts' counts out (`emit_summary`'s call removed):
+///   `accounts_upkeep_passes: None then None`;
+/// - `emit_accounts_upkeep` printing `pool_syncs` under `accounts_upkeep_passes` and `passes`
+///   under `accounts_pool_syncs`: `accounts_upkeep_passes moved by 2199023255552, its count by
+///   1099511627776`.
+#[test]
+fn metrics_carries_the_accounts_upkeeps_counts() {
+    use crate::metrics::wire::law_tests;
+    use aterm_agent::harness::accounts_upkeep_counts::{UpkeepCounts, add_for_test};
+    const STEP: u64 = 1 << 40;
+    let mut keys = vec![
+        "accounts_upkeep_passes",
+        "accounts_pool_syncs",
+        "accounts_pool_syncs_guarded",
+        "accounts_receipt_admissions",
+    ];
+    if cfg!(unix) {
+        keys.extend([
+            "accounts_admission_reads",
+            "accounts_admission_records",
+            "accounts_admission_bytes",
+            "accounts_observation_reads",
+        ]);
+    }
+    let read = || -> Vec<Option<u64>> {
+        let reply = super::cmd_metrics(None, "");
+        let tokens = law_tests::tokens(reply.trim_end());
+        keys.iter()
+            .map(|key| {
+                let value = tokens.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
+                value.and_then(|value| value.parse().ok())
+            })
+            .collect()
+    };
+    let before = read();
+    add_for_test(UpkeepCounts {
+        passes: STEP,
+        pool_syncs: 2 * STEP,
+        pool_syncs_guarded: 3 * STEP,
+        receipt_admissions: 4 * STEP,
+    });
+    #[cfg(unix)]
+    aterm_db::alab::add_admission_counts_for_test(aterm_db::alab::AdmissionCounts {
+        reads: 5 * STEP,
+        records: 6 * STEP,
+        bytes: 7 * STEP,
+        observations: 8 * STEP,
+    });
+    let after = read();
+    for (i, (key, nth)) in keys.iter().zip(1u64..).enumerate() {
+        let (Some(was), Some(is)) = (before[i], after[i]) else {
+            panic!("{key}: {:?} then {:?}", before[i], after[i]);
+        };
+        let (moved, added) = (is - was, nth * STEP);
+        assert!(
+            (added..added + STEP).contains(&moved),
+            "{key} moved by {moved}, its count by {added}"
+        );
+    }
+}
+
 #[test]
 fn the_per_owner_ledgers_are_self_labelling_in_both_forms() {
     let reply = super::cmd_metrics_json(None, "");

@@ -863,24 +863,37 @@ fn sh_yolo_prelude_with_launcher(
     launcher: Option<&crate::native_defaults::Launcher>,
 ) -> String {
     let launcher = launcher.filter(|_| program == "codex");
-    let crate::yolo::Policy { flags, markers } = *policy;
+    let crate::yolo::Policy {
+        flags,
+        markers,
+        after,
+        skip,
+    } = *policy;
     if flags.is_empty()
         || markers.is_empty()
         || !flags.iter().all(|f| crate::yolo::is_shell_safe_flag(f))
         || !markers.iter().all(|m| crate::yolo::is_shell_safe_marker(m))
-        || !skip_extra
+        || !after
             .iter()
+            .chain(skip.iter())
+            .chain(skip_extra.iter())
             .all(|w| crate::selfupdate::is_shell_safe_verb(w))
         || crate::store::ToolName::new(program).is_none()
         || !crate::selfupdate::is_shell_safe_verb(program)
     {
         return String::new();
     }
+    let skip_all: Vec<&str> = skip
+        .iter()
+        .copied()
+        .chain(skip_extra.iter().copied().filter(|w| !skip.contains(w)))
+        .collect();
     let spelled = flags
         .iter()
         .map(|f| sh_quote_str(f))
         .collect::<Vec<_>>()
         .join(" ");
+    let words = !after.is_empty() || !skip_all.is_empty();
     let fresh = |indent: &str| {
         let mut f = String::new();
         for (i, flag) in flags.iter().enumerate() {
@@ -1037,12 +1050,34 @@ fn sh_yolo_prelude_with_launcher(
          esac\ndone\n\
          if [ \"$__atpkg_value\" = 1 ]; then __atpkg_word_ok=0; fi\n",
     );
-    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]; then\n  __atpkg_say=");
+    if !after.is_empty() {
+        s.push_str(
+            "__atpkg_after=0\n\
+             if [ \"$__atpkg_have_word\" = 1 ]; then\n  \
+             case \"$__atpkg_word\" in\n    ",
+        );
+        s.push_str(
+            &after
+                .iter()
+                .map(|w| sh_quote_str(w))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+        s.push_str(") __atpkg_after=1 ;;\n  esac\nfi\n");
+    }
+    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]");
+    if !after.is_empty() {
+        s.push_str(" && [ \"$__atpkg_word_ok\" = 1 ]");
+    }
+    s.push_str("; then\n  __atpkg_say=");
     s.push_str(&say(crate::yolo::ECHO_PREFIX));
     s.push_str(
         "\n  \
          __atpkg_stop=0\n  __atpkg_at=0\n",
     );
+    if !after.is_empty() {
+        s.push_str("  __atpkg_pending=0\n");
+    }
     s.push_str(
         "  __atpkg_n=$#\n  \
          while [ \"$__atpkg_n\" -gt 0 ]; do\n    \
@@ -1051,19 +1086,40 @@ fn sh_yolo_prelude_with_launcher(
          if [ \"$__atpkg_stop\" = 0 ] && [ \"$1\" = \"--yolo\" ]; then\n      \
          shift\n",
     );
-    s.push_str(&fresh("      "));
+    if after.is_empty() {
+        s.push_str(&fresh("      "));
+    } else {
+        s.push_str(
+            "      if [ \"$__atpkg_after\" = 1 ] && [ \"$__atpkg_at\" -lt \"$__atpkg_word_at\" ]; then\n        \
+             __atpkg_pending=1\n      \
+             else\n",
+        );
+        s.push_str(&fresh("        "));
+        s.push_str("      fi\n");
+    }
     s.push_str(
         "    else\n      \
          if [ \"$1\" = \"--\" ]; then __atpkg_stop=1; fi\n",
     );
-    s.push_str(
-        "      set -- \"$@\" \"$1\"\n      \
-         shift\n",
-    );
+    if after.is_empty() {
+        s.push_str(
+            "      set -- \"$@\" \"$1\"\n      \
+             shift\n",
+        );
+    } else {
+        s.push_str(
+            "      set -- \"$@\" \"$1\"\n      \
+             shift\n      \
+             if [ \"$__atpkg_pending\" = 1 ] && [ \"$__atpkg_at\" = \"$__atpkg_word_at\" ]; then\n        \
+             __atpkg_pending=0\n",
+        );
+        s.push_str(&fresh("          "));
+        s.push_str("      fi\n");
+    }
     s.push_str(
         "    fi\n  done\nelif [ \"$__atpkg_posture\" = 0 ] && [ \"$__atpkg_word_ok\" = 1 ]; then\n",
     );
-    if skip_extra.is_empty() {
+    if !words {
         s.push_str("  __atpkg_say=");
         s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
         if launcher.is_some() {
@@ -1080,25 +1136,59 @@ fn sh_yolo_prelude_with_launcher(
             " \"$@\"\n"
         });
     } else {
-        s.push_str(
-            "  if [ \"$__atpkg_have_word\" = 1 ]; then\n    case \"$__atpkg_word\" in\n      ",
-        );
-        s.push_str(
-            &skip_extra
-                .iter()
-                .map(|w| sh_quote_str(w))
-                .collect::<Vec<_>>()
-                .join("|"),
-        );
-        s.push_str(") ;;\n      *) __atpkg_say=");
-        s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
-        s.push_str(" ;;\n    esac\n  else\n    __atpkg_say=");
-        s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
-        s.push_str("\n  fi\n");
+        if skip_all.is_empty() {
+            s.push_str("  __atpkg_say=");
+            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+            s.push('\n');
+        } else {
+            s.push_str(
+                "  if [ \"$__atpkg_have_word\" = 1 ]; then\n    case \"$__atpkg_word\" in\n      ",
+            );
+            s.push_str(
+                &skip_all
+                    .iter()
+                    .map(|w| sh_quote_str(w))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+            s.push_str(") ;;\n      *) __atpkg_say=");
+            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+            s.push_str(" ;;\n    esac\n  else\n    __atpkg_say=");
+            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+            s.push_str("\n  fi\n");
+        }
         delegate(&mut s);
-        s.push_str("  if [ -n \"$__atpkg_say\" ]; then\n    set -- ");
-        s.push_str(&spelled);
-        s.push_str(" \"$@\"\n  fi\n");
+        if after.is_empty() {
+            s.push_str("  if [ -n \"$__atpkg_say\" ]; then\n    set -- ");
+            s.push_str(&spelled);
+            s.push_str(" \"$@\"\n  fi\n");
+        } else {
+            s.push_str(
+                "  if [ -n \"$__atpkg_say\" ] && [ \"$__atpkg_after\" = 0 ]; then\n    \
+                 set -- ",
+            );
+            s.push_str(&spelled);
+            s.push_str(
+                " \"$@\"\n  \
+                 elif [ -n \"$__atpkg_say\" ]; then\n    \
+                 __atpkg_n=$#\n    \
+                 __atpkg_at=0\n    \
+                 while [ \"$__atpkg_n\" -gt 0 ]; do\n      \
+                 __atpkg_n=$((__atpkg_n - 1))\n      \
+                 __atpkg_at=$((__atpkg_at + 1))\n      \
+                 set -- \"$@\" \"$1\"\n      \
+                 if [ \"$__atpkg_at\" = \"$__atpkg_word_at\" ]; then\n        \
+                 set -- \"$@\" ",
+            );
+            s.push_str(&spelled);
+            s.push_str(
+                "\n      \
+                 fi\n      \
+                 shift\n    \
+                 done\n  \
+                 fi\n",
+            );
+        }
     }
     s.push_str(
         "fi\n\

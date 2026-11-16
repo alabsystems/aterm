@@ -392,6 +392,25 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test thread's own lane for its parks on an Inbox ([`inbox_lane`]) in place of
+    /// [`aterm_control::park::Lane::SERVED`] (None: the product's), so a test counts the slices.
+    static TEST_INBOX_LANE: std::cell::Cell<Option<aterm_control::park::Lane>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The lane every park on a session's Inbox condvar ([`SessionFabric::changed`]) waits by: an
+/// `await inbox` ([`SessionFabric::park_inbox`]), a parked fetch, and a post's `--wait` for its
+/// landing or its receipt.
+fn inbox_lane() -> aterm_control::park::Lane {
+    #[cfg(test)]
+    if let Some(lane) = TEST_INBOX_LANE.with(std::cell::Cell::get) {
+        return lane;
+    }
+    aterm_control::park::Lane::SERVED
+}
+
 fn fetch_wait() -> std::time::Duration {
     #[cfg(any(test, debug_assertions))]
     if let Some(wait) = TEST_FETCH_WAIT.with(std::cell::Cell::get) {
@@ -1794,7 +1813,9 @@ impl SessionFabric {
         *self.fence_bound.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Park an `await inbox` on [`Self::changed`] until `until`, unless a ring wakes it first.
+    /// Park an `await inbox` on [`Self::changed`] until `until`, unless a ring wakes it first:
+    /// on [`inbox_lane`] ([`aterm_control::park::Lane::SERVED`]), so a caller that hangs up rings
+    /// it through the hang-up bell ([`aterm_control::park::Changed::park`]).
     fn park_inbox<'a>(
         &'a self,
         guard: std::sync::MutexGuard<'a, Inbox>,
@@ -1808,8 +1829,7 @@ impl SessionFabric {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(until);
         }
-        self.changed
-            .park(guard, until, aterm_control::park::Lane::SERVED)
+        self.changed.park(guard, until, inbox_lane())
     }
 
     /// Wake every waiter parked on this session's condvar without changing anything.
@@ -3488,8 +3508,8 @@ fn cmd_link_gap<'a>(
         let told: Vec<_> = {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
             match sid {
-                Some(sid) => g
-                    .session(&SessionId::new(sid.to_string()))
+                Some(sid) => SessionId::parse(sid)
+                    .and_then(|sid| g.session(&sid))
                     .into_iter()
                     .collect(),
                 None => g.sessions(),
@@ -4052,7 +4072,7 @@ pub fn bridge_lost_waking(
     for sid in sids {
         let ctx = {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
-            g.session(&SessionId::new(sid.clone()))
+            SessionId::parse(&sid).and_then(|sid| g.session(&sid))
         };
         if let Some(ctx) = ctx {
             let lost = Hold {
@@ -4834,7 +4854,7 @@ pub fn cmd_hold_within_waking(
     }
     let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.session(&SessionId::new(sid)) {
+        match SessionId::parse(sid).and_then(|sid| g.session(&sid)) {
             Some(ctx) => ctx,
             None => return "ERR no such session\n".to_string(),
         }
@@ -4970,7 +4990,7 @@ pub fn owner_off_remote(
     let store = &store.as_store();
     let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        g.session(&SessionId::new(sid))?
+        g.session(&SessionId::parse(sid)?)?
     };
     let holds = ctx.fabric().holds();
     let remote = holds.remote().filter(|_| !holds.has("local"))?.clone();
@@ -5071,7 +5091,7 @@ pub fn cmd_deliver_waking(store: &impl AsStore, rest: &str, wake: &dyn Fn(&Sessi
     };
     let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.session(&SessionId::new(sid)) {
+        match SessionId::parse(sid).and_then(|sid| g.session(&sid)) {
             Some(ctx) => ctx,
             None => return "ERR no such session\n".to_string(),
         }
@@ -5694,7 +5714,7 @@ pub fn cmd_outbox_sent_waking(
     }
     let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        match g.session(&SessionId::new(sid)) {
+        match SessionId::parse(sid).and_then(|sid| g.session(&sid)) {
             Some(ctx) => ctx,
             None => return "ERR no such session\n".to_string(),
         }
@@ -6394,11 +6414,10 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
             inbox.fetches.remove(i);
             return unfetched(&inbox, off, format!("ERR timeout off={off}\n"));
         }
-        inbox = ctx.fabric().changed.park(
-            inbox,
-            park_until(deadline),
-            aterm_control::park::Lane::SERVED,
-        );
+        inbox = ctx
+            .fabric()
+            .changed
+            .park(inbox, park_until(deadline), inbox_lane());
     }
 }
 
@@ -6799,11 +6818,10 @@ fn wait_landing(
         if std::time::Instant::now() >= deadline {
             return Err(format!("ERR timeout id={id}\n"));
         }
-        guard = ctx.fabric().changed.park(
-            guard,
-            park_until(deadline),
-            aterm_control::park::Lane::SERVED,
-        );
+        guard = ctx
+            .fabric()
+            .changed
+            .park(guard, park_until(deadline), inbox_lane());
     }
 }
 
@@ -6862,11 +6880,10 @@ fn wait_receipt_on_log(
         if std::time::Instant::now() >= deadline {
             return format!("ERR timeout id={id} off={off}\n");
         }
-        guard = ctx.fabric().changed.park(
-            guard,
-            park_until(deadline),
-            aterm_control::park::Lane::SERVED,
-        );
+        guard = ctx
+            .fabric()
+            .changed
+            .park(guard, park_until(deadline), inbox_lane());
     }
 }
 

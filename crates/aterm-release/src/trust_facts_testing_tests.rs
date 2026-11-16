@@ -73,3 +73,10 @@ pub(crate) fn gated(name: &str, summary: &str) -> Crate {
         }),
     )
 }
+
+/// Writes `text` as the stored log of the check whose log is named `log`
+/// ([`stored_log`]: `<name@version>.log.zst`), as the lane stores one.
+pub(crate) fn write_log(log: &Path, text: impl AsRef<[u8]>) {
+    let zst = aterm_zstd::compress(text.as_ref(), &aterm_zstd::encode::Options::new());
+    fs::write(stored_log(log), zst).unwrap();
+}

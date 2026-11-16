@@ -676,7 +676,7 @@ fn family(
                         None => {
                             let log = Log::read_with(session, store, scope, att::decode)?;
                             log.writable(session.actor())?;
-                            let view = View::read(table, session, &log);
+                            let view = View::read(table, session, &log)?;
                             (log, view)
                         }
                     };
@@ -912,8 +912,9 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
     works.into_iter().map(|work| work.outcome).collect()
 }
 
-/// The `SharedFile` steps no code here takes: which law a walk checks, what a peer or the
-/// writer succession does, and the areas later slices build.
+/// The `SharedFile` steps no code here takes: which law a walk checks, what custody, a peer or
+/// the writer succession does, an input that moves with no record, and the areas later slices
+/// build.
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1009,6 +1010,14 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
         machine = "SharedFile",
         action = "Grow",
         reason = "A record arriving in this Mac's replica is Commons repair or another writer here: no shared-file code chooses it. shared_file_conforms writes one through the registry."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SharedFile",
+        action = "Unrecorded",
+        reason = "An input of the projection that moves with no record of the table (a later build's rules, a handoff this Mac imports, a Remove that makes a cutoff count) is the environment: no shared-file code chooses it. The reading walk of file::model_read_tests takes it as a later build (file::seam::new_build), and file::tests walks the parts of the projection key such a move changes."
     )
 )]
 #[cfg_attr(

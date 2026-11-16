@@ -2976,6 +2976,11 @@ pub(crate) struct UiNode {
     pub(crate) offscreen: bool,
     pub(crate) segmented: bool,
     pub(crate) joins: Joins,
+    /// A group laid over its page (a list a button opens) that is a surface: every press in its
+    /// bounds that none of its controls takes is its own, heard as this action, and nothing
+    /// under it hears it; the wheel over it is its too ([`CompiledUi::surface_target`]). It is
+    /// no stop of the keys ([`Self::surface`]).
+    pub(crate) surface: Option<ActionId>,
 }
 
 /// Which ends of a boxed group's piece join its neighbours, so a group listed a piece at a time
@@ -3016,7 +3021,15 @@ impl UiNode {
             offscreen: false,
             segmented: false,
             joins: Joins::default(),
+            surface: None,
         }
+    }
+
+    /// Make this group a surface over its page: it takes every press in its bounds that none of
+    /// its controls takes, as `action`, and the wheel over it ([`Self::surface`]).
+    pub(crate) fn surface(mut self, action: ActionId) -> Self {
+        self.surface = Some(action);
+        self
     }
 
     /// Mark this node a segmented control ([`segments_of`]).
@@ -3819,6 +3832,9 @@ pub(crate) struct CompiledUi {
     /// The [`Self::paint`] indices of the nodes that move ([`NodeMotion`]), in paint order:
     /// what the host reads for the next motion frame without a `view()`.
     pub(crate) motion: Vec<usize>,
+    /// Each surface laid over its page ([`UiNode::surface`]) and where it shows, in paint
+    /// order.
+    pub(crate) surfaces: Vec<(UiKey, LogicalRect)>,
 }
 
 /// The picture of a control a list draws in the strip under its room
@@ -4039,6 +4055,24 @@ impl CompiledUi {
             forward,
             &self.focus_order,
         )
+    }
+
+    /// Where a surface laid over its page ([`UiNode::surface`]) shows at `(x, y)`, what
+    /// there takes the wheel: the control of it under the point, else the surface itself. A
+    /// wheel goes to the least node under the pointer elsewhere, which over a surface can be a
+    /// cell of the page under it.
+    pub(crate) fn surface_target(&self, x: f32, y: f32) -> Option<&UiKey> {
+        self.surfaces
+            .iter()
+            .any(|(_, rect)| rect.contains(x, y))
+            .then(|| self.hit_test(x, y).map(|hit| &hit.key))
+            .flatten()
+    }
+
+    /// Whether `key` names a surface laid over its page: a press on it lands on no control, so
+    /// the pointer over it is the arrow and lights nothing.
+    pub(crate) fn is_surface(&self, key: &UiKey) -> bool {
+        self.surfaces.iter().any(|(surface, _)| surface == key)
     }
 
     /// The control whose picture a list draws at `(x, y)` in the strip under its room, where a
@@ -9808,6 +9842,8 @@ pub(crate) enum CompileError {
     DuplicateKey(UiKey),
     CustomWithoutAudit(UiKey),
     PaintOnlyAction(UiKey),
+    /// A surface ([`UiNode::surface`]) that is no group.
+    SurfaceNotGroup(UiKey),
     ObserverMismatch(UiKey),
     #[cfg(debug_assertions)]
     VisibleLabelNotInName(UiKey),
@@ -9982,6 +10018,7 @@ impl Compiler {
             offscreen,
             segmented,
             joins,
+            surface,
         } = node;
         if segmented {
             let segments = segments_of(&children);
@@ -10016,7 +10053,17 @@ impl Compiler {
             return Err(CompileError::CustomWithoutAudit(key));
         }
 
-        let projection = content.semantic();
+        let mut projection = content.semantic();
+        // A surface takes the presses in its bounds as its action, and is no stop of the keys.
+        let surface = match (&content, surface) {
+            (UiContent::Group(_), Some(action)) => {
+                projection.action = Some(action);
+                projection.state = Some(ControlState::default());
+                true
+            }
+            (_, Some(_)) => return Err(CompileError::SurfaceNotGroup(key)),
+            (_, None) => false,
+        };
         let description = content.description();
         let look_first = content.look_first();
         let drags = content.drags();
@@ -10217,6 +10264,9 @@ impl Compiler {
             if let Some(action) = projection.action
                 && projection.state.is_none_or(|state| state.enabled)
             {
+                if surface {
+                    self.output.surfaces.push((key.clone(), shown));
+                }
                 self.output.hits.push(HitRegion {
                     key: key.clone(),
                     rect: shown,

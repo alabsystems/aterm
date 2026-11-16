@@ -284,7 +284,6 @@ fn a_wait_past_its_bound_refuses_naming_the_intent_and_sends_nothing() {
     let said_lines = said(&mut remote, || {});
     let error = remote.write_ref(MAIN, Some(&w.old), &w.new).unwrap_err();
     for words in [
-        format!("intent {foreign} for atomic refs began first: agh never posts twice"),
         format!("agh intent show fixture/app {foreign}"),
         format!(
             "waited {} s for intent {foreign} to close and it is still open",
@@ -311,6 +310,16 @@ fn a_wait_past_its_bound_refuses_naming_the_intent_and_sends_nothing() {
     );
     assert_eq!(fx.slept().len(), looks);
     assert_eq!(w.main(), w.old);
+    assert!(
+        view(&remote, &foreign).open,
+        "the foreign fence remains open"
+    );
+    assert!(
+        fx.children_run()
+            .iter()
+            .all(|child| !child.args.iter().any(|arg| arg == "push")),
+        "neither the expired wait nor the stopped wait may reach receive"
+    );
 }
 
 /// Negative control: a refusal that names no open intent is returned as it came, with no wait
@@ -405,10 +414,10 @@ fn an_earlier_attempt_at_the_same_write_is_settled_by_reading_origin() {
 }
 
 /// Negative control: an earlier attempt whose outcome is unknown, with origin still at the
-/// old object, is not posted again on the strength of that read: its intent stays open, and
-/// past the bound the write refuses.
+/// old object, is not posted again on the strength of that read inside agh's window for it:
+/// its intent stays open, and past this wait's bound the write refuses.
 #[test]
-fn an_earlier_attempt_origin_does_not_hold_is_never_posted_again() {
+fn an_earlier_attempt_origin_does_not_hold_is_not_posted_again_inside_its_window() {
     let w = world();
     let (mut remote, _) = w.remote();
     let own = begin(&remote, &w.request(&remote));

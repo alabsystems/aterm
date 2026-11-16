@@ -201,7 +201,8 @@ pub const SOURCES: &[&str] = &[
 ];
 /// Every plan word a note can carry ([`plan_word`]): Claude Code's plans as its profile names
 /// them ([`super::profile::PlanWord`]) and the ChatGPT plans a Codex login's claims name. It
-/// holds every plan the registry seeds (`aterm_db::alab::seeds::PLANS`, `<provider>-<word>`),
+/// holds the word of every plan row the registry seeds for a provider whose CLI states its
+/// plan (`aterm_db::alab::seeds::PLANS`, `<provider>-<word>` or `<provider>-<word>-<tier>`),
 /// since the accounts relation compares the word it reads with a person's plan row by that key.
 pub const PLANS: &[&str] = &[
     "free",

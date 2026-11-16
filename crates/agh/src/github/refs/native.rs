@@ -57,7 +57,8 @@ impl Refs<'_> {
     }
 
     /// Execute one canonical control transaction with the repository-wide
-    /// durable atomic-write intent. Unknown outcomes fence later writes.
+    /// durable atomic-write intent. Unknown outcomes fence later writes for
+    /// agh's window (`Journal::closable`).
     ///
     /// # Errors
     /// As [`Self::check_control`], plus intent/journal failures. A transient
@@ -156,7 +157,8 @@ impl Refs<'_> {
     /// Push exact local objects with atomic leases and one durable intent.
     /// Transient receive failures re-read remote refs before any retry.
     /// A journaled unknown outcome blocks every later atomic batch for this
-    /// repository until explicitly reconciled.
+    /// repository until it is reconciled or agh's window for it ends
+    /// (`Journal::closable`).
     ///
     /// # Errors
     /// As `check_push`, plus the journal's errors. A missing acknowledgement

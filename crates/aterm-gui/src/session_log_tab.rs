@@ -381,6 +381,8 @@ impl SessionLog {
     }
 
     /// Who opened the placed tab, to carry (`tab v=1 … by=`).
+    // Read only by `SessionLog::host_lines` (`any(unix, test)`, `session_log_carry.rs`).
+    #[cfg(any(unix, test))]
     pub(super) const fn tab_opened_by(&self) -> Option<Actor> {
         self.tab_opened_by
     }

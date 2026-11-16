@@ -19,10 +19,15 @@
 //! It is read only when a harness asks ([`start_us`], [`ChildProcess::of`]),
 //! and forks, execs, signals and reaps nothing. A re-exec reads more of the
 //! child: its kernel identity ([`crate::reexec::Identity`]).
+//!
+//! [`NativeChild::of`] separately reads the native identifier for the negotiated
+//! contract-3 child protocol. macOS uses the same exact epoch microseconds;
+//! Linux and Android use raw field-22 start ticks, without reading boot time or
+//! clock frequency. A native birth is not an age timestamp or authority proof.
 
 use std::io;
 
-use crate::claim::ChildProcess;
+use crate::claim::{ChildProcess, NativeChild};
 
 /// The kernel start time of process `pid`, in microseconds since the Unix
 /// epoch, computed as aterm computes it for a `child=` check (module
@@ -54,6 +59,56 @@ impl ChildProcess {
         })
     }
 }
+
+impl NativeChild {
+    /// Read a child's exact native C3 identifier. No process is started or
+    /// supervised, and no claim is sent. A later host check must establish
+    /// current identity, executable and custody independently.
+    ///
+    /// # Errors
+    /// The pid is outside `2..=i32::MAX`, the process cannot be read, the native
+    /// birth is zero or malformed, or this platform has no native reader.
+    pub fn of(pid: u32) -> io::Result<Self> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 1)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "native child pid out of range")
+            })?;
+        platform_native_child(pid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_native_child(pid: i32) -> io::Result<NativeChild> {
+    // The existing macOS epoch reader is also the exact native birth reader.
+    NativeChild::from_native(pid as u32, platform_start_us(pid)?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "native child birth is zero"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn platform_native_child(pid: i32) -> io::Result<NativeChild> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    native_child_from_stat(pid as u32, &stat)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid native child starttime"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+fn platform_native_child(_pid: i32) -> io::Result<NativeChild> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no native child reader on this platform",
+    ))
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn native_child_from_stat(pid: u32, stat: &str) -> Option<NativeChild> {
+    NativeChild::from_native(pid, start_ticks(stat)?)
+}
+
+#[cfg(test)]
+#[path = "native_kernel_tests.rs"]
+mod native_tests;
 
 #[cfg(target_os = "macos")]
 fn platform_start_us(pid: i32) -> io::Result<u64> {

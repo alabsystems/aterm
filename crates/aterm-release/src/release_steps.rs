@@ -11796,6 +11796,13 @@ enum PrefreezeEvent {
     ObservationFailed {
         why: String,
     },
+    /// Every authenticated main read failed for [`PREFREEZE_OBSERVATION_PATIENCE`]: the
+    /// supervisor ends, naming the last failure and how many there were in a row.
+    Ended {
+        why: String,
+        failures: u32,
+        failing_s: f64,
+    },
     YieldRequested {
         target: String,
         pid: u32,
@@ -11892,9 +11899,67 @@ fn settle_prefreeze<R: PrefreezeSupervisorRuntime>(
     });
 }
 
+/// The authenticated main reads that failed in a row, since the last one that answered.
+#[cfg(unix)]
+struct FailedReads {
+    since: std::time::Instant,
+    count: u32,
+    last: String,
+}
+
+/// Record one failed main read (its `prefreeze-observation-failed` event, then the run of
+/// failures it extends) and say whether the run now spans [`PREFREEZE_OBSERVATION_PATIENCE`].
+#[cfg(unix)]
+fn main_read_failed<R: PrefreezeSupervisorRuntime>(
+    runtime: &mut R,
+    failed: &mut Option<FailedReads>,
+    why: String,
+) -> bool {
+    runtime.event(PrefreezeEvent::ObservationFailed { why: why.clone() });
+    let now = runtime.now();
+    let run = failed.get_or_insert_with(|| FailedReads {
+        since: now,
+        count: 0,
+        last: String::new(),
+    });
+    run.count += 1;
+    run.last = why;
+    now.saturating_duration_since(run.since) >= PREFREEZE_OBSERVATION_PATIENCE
+}
+
+/// End a supervisor whose main reads kept failing: settle any worker and observation, say so
+/// in a terminal `prefreeze-ended` event, and return the error its exit status carries.
+#[cfg(unix)]
+fn end_prefreeze_unread<R: PrefreezeSupervisorRuntime>(
+    runtime: &mut R,
+    active: &mut Option<ActivePrefreeze<R::Worker>>,
+    observation: &mut Option<R::Observation>,
+    failed: FailedReads,
+) -> Result<(), String> {
+    settle_prefreeze(runtime, active, "main reads keep failing");
+    settle_main_observation(runtime, observation);
+    let failing_s = runtime
+        .now()
+        .saturating_duration_since(failed.since)
+        .as_secs_f64();
+    runtime.event(PrefreezeEvent::Ended {
+        why: failed.last.clone(),
+        failures: failed.count,
+        failing_s,
+    });
+    Err(format!(
+        "pre-freeze ended: {} authenticated main reads in a row failed over {failing_s:.0}s; \
+         the last: {}",
+        failed.count, failed.last
+    ))
+}
+
 /// Follow authenticated main observations, starting at most one preparation for each observed
 /// head. A completed, failed, killed or yielded attempt remains the stated outcome for that head;
 /// only a different main object can create another worker and therefore another run directory.
+/// A supervisor whose reads answer keeps following between cuts, so the next cut starts with a
+/// warm cutter; one whose every read fails for [`PREFREEZE_OBSERVATION_PATIENCE`] ends
+/// ([`end_prefreeze_unread`]), and a read that answers starts the count again.
 #[cfg(unix)]
 fn supervise_prefreeze_loop<R: PrefreezeSupervisorRuntime>(
     line: &str,
@@ -11903,6 +11968,7 @@ fn supervise_prefreeze_loop<R: PrefreezeSupervisorRuntime>(
     let mut active: Option<ActivePrefreeze<R::Worker>> = None;
     let mut observation: Option<R::Observation> = None;
     let mut attempted = None;
+    let mut failed: Option<FailedReads> = None;
     let mut next = runtime.now();
     loop {
         if runtime.interrupted() {
@@ -11950,12 +12016,16 @@ fn supervise_prefreeze_loop<R: PrefreezeSupervisorRuntime>(
             match runtime.poll_observation(refresh) {
                 Ok(Some(target)) => {
                     observation.take();
+                    failed = None;
                     observed = Some(target);
                 }
                 Ok(None) => {}
                 Err(why) => {
                     observation.take();
-                    runtime.event(PrefreezeEvent::ObservationFailed { why });
+                    if main_read_failed(runtime, &mut failed, why) {
+                        let run = failed.take().ok_or("the failed main reads were lost")?;
+                        return end_prefreeze_unread(runtime, &mut active, &mut observation, run);
+                    }
                     next = runtime.now() + PREFREEZE_REFRESH;
                 }
             }
@@ -12021,7 +12091,15 @@ fn supervise_prefreeze_loop<R: PrefreezeSupervisorRuntime>(
                 match runtime.start_observation() {
                     Ok(refresh) => observation = Some(refresh),
                     Err(why) => {
-                        runtime.event(PrefreezeEvent::ObservationFailed { why });
+                        if main_read_failed(runtime, &mut failed, why) {
+                            let run = failed.take().ok_or("the failed main reads were lost")?;
+                            return end_prefreeze_unread(
+                                runtime,
+                                &mut active,
+                                &mut observation,
+                                run,
+                            );
+                        }
                         next = runtime.now() + PREFREEZE_REFRESH;
                     }
                 }
@@ -12263,6 +12341,14 @@ impl PrefreezeSupervisorRuntime for LivePrefreezeSupervisor<'_> {
             PrefreezeEvent::ObservationFailed { why } => aterm_json::json!({
                 "schema":1,"event":"prefreeze-observation-failed","why":why,
             }),
+            PrefreezeEvent::Ended {
+                why,
+                failures,
+                failing_s,
+            } => aterm_json::json!({
+                "schema":1,"event":"prefreeze-ended","why":why,
+                "failures":failures,"failing_s":failing_s,
+            }),
             PrefreezeEvent::YieldRequested {
                 target,
                 pid,
@@ -12290,6 +12376,14 @@ impl PrefreezeSupervisorRuntime for LivePrefreezeSupervisor<'_> {
 
 #[cfg(unix)]
 const PREFREEZE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a background pre-freeze keeps following main while every authenticated read of it
+/// fails, about 20 reads at [`PREFREEZE_REFRESH`]. Past it the supervisor ends with the last
+/// failure named rather than polling with no bound, so a Mac whose read never answers (run 9's
+/// grant the 0.201.0 agh sweep removed) holds no supervisor after its release. The next cut
+/// builds its own cutter; the cut that started this one is unaffected.
+#[cfg(unix)]
+const PREFREEZE_OBSERVATION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 #[cfg(unix)]
 fn prefreeze_due(now: std::time::Instant, next: std::time::Instant) -> bool {

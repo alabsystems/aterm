@@ -2375,7 +2375,7 @@ impl HeldAt {
             let s = made_us
                 .checked_add_signed(at * 1_000_000)
                 .expect("in range");
-            DaemonNow::Running(aterm_uds::program_check::Daemon {
+            DaemonNow::Running(aterm_process_facts::program_check::Daemon {
                 pid: Self::DAEMON,
                 start_s: s / 1_000_000,
                 start_us: u32::try_from(s % 1_000_000).expect("under a second"),
@@ -2526,7 +2526,7 @@ impl Host for HeldAt {
         self.daemon
     }
 
-    fn backlog(&self, _: aterm_uds::program_check::Daemon, _: u64) -> Backlog {
+    fn backlog(&self, _: aterm_process_facts::program_check::Daemon, _: u64) -> Backlog {
         self.ask(Asked::Backlog);
         self.backlog
     }

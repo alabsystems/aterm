@@ -44,14 +44,15 @@ const STATE_DOMAIN: &[u8] = b"aterm/att/checkpoint-state/1\0";
 /// SHA-256 of the typed table's state at `cut` (a causally closed set of `log`'s records).
 ///
 /// # Errors
-/// A cell candidate has no header here, or a value does not encode.
+/// The view's resolution refuses (as [`super::Resolved::read`]), a cell candidate has no header
+/// here, or a value does not encode.
 pub(crate) fn state(
     table: &'static Table,
     session: &crate::table::Session<'_>,
     log: &Log,
     cut: &BTreeSet<Digest>,
 ) -> Result<Digest> {
-    let view = View::read(table, session, &log.as_of_cut(cut));
+    let view = View::read(table, session, &log.as_of_cut(cut))?;
     let index = log.causal_index();
     let cells = checkpoint::cells_digest(&view.cells, |id| {
         index.get(id).map(|header| (header.actor, header.sequence))

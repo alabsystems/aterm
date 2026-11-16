@@ -431,10 +431,15 @@ impl EntrySnapshot {
 /// A busy, unsigned, revoked, partial or mismatched state, or an anchor chain that does not
 /// resolve in the view, returns no entry. The value is the recipient's decrypted signed entry,
 /// read in place: no file under the home is opened, so neither a file nor the manifest can
-/// supply or block it. This creates no state, fetches no source and grants no application
-/// authority.
+/// supply or block it. This fetches no source and grants no application authority, and writes
+/// no state but one: before this Mac's first retained-history receipt, a read its membership
+/// records refuse makes the exclusive take a vault pass would, if the lock is free at that
+/// moment, and reads once more (`client::read_enrolling`), so a Mac with no pass running does
+/// not stay unread for records that only grew.
 /// # Errors
-/// The name is invalid/reserved, local state is unreadable or decryption fails.
+/// The name is invalid/reserved, local state is unreadable, decryption fails, or this Mac's
+/// membership records are not shown to hold the log it applied
+/// ([`crate::ErrorKind::MembershipHistoryUnavailable`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -533,7 +538,9 @@ pub fn read_verified_entry(
 
 /// [`read_verified_entry`], waiting until `deadline` while a writer holds this Mac's vault state.
 /// A store still busy then is an error, never an absent entry, so a caller does not take a sync
-/// in progress for a missing value.
+/// in progress for a missing value. The enrolling take of a read refused before this Mac's
+/// first receipt (`client::read_enrolling`) waits out another reader's observation within the
+/// same `deadline`.
 ///
 /// # Errors
 /// As [`read_verified_entry`], or the vault state stayed busy until `deadline`.
@@ -547,32 +554,40 @@ pub fn read_verified_entry_until(
     if expected.signer.is_none() {
         return Ok(None);
     }
-    match StateLock::observe_classified_until(paths, deadline)? {
-        StateObservation::Held(observation) => Ok(read_entry_with_version_held(
-            paths,
-            expected,
-            name,
-            Reading::Ordinary,
-            &mut None,
-            &observation,
-        )?
-        .map(|(entry, _)| entry)),
-        StateObservation::Absent => Ok(None),
-        StateObservation::Busy => Err(Error::new(
-            "this Mac's vault state stayed busy; run the command again",
-        )),
-    }
+    super::read_enrolling(
+        paths,
+        deadline,
+        || match StateLock::observe_classified_until(paths, deadline)? {
+            StateObservation::Held(observation) => Ok(read_entry_with_version_held(
+                paths,
+                expected,
+                name,
+                Reading::Ordinary,
+                &mut None,
+                &observation,
+            )?
+            .map(|(entry, _)| entry)),
+            StateObservation::Absent => Ok(None),
+            StateObservation::Busy => Err(Error::new(
+                "this Mac's vault state stayed busy; run the command again",
+            )),
+        },
+    )
 }
 
 /// Read every entry of `names` from one verified view, in place, or none of them: an entry set
 /// that only works together (the release identity, a Developer ID pair) is never read across two
 /// versions (DESIGN-secrets §4, "Read together"). `None` where any name is absent, an anchored
 /// member's chain does not resolve in that view, or the reads saw different versions. A writer
-/// holding this Mac's vault state is waited for, with a minute hang detector.
+/// holding this Mac's vault state is waited for, with a minute hang detector. Before this Mac's
+/// first retained-history receipt, a read its records refuse makes the take a vault pass would
+/// and reads the set once more (`client::read_enrolling`).
 ///
 /// # Errors
-/// A name is invalid or reserved, local state cannot be read, or the vault state stayed busy
-/// past that wait: a sync in progress is never taken for an absent set.
+/// A name is invalid or reserved, local state cannot be read, the vault state stayed busy
+/// past that wait (a sync in progress is never taken for an absent set), or this Mac's
+/// membership records are not shown to hold the log it applied
+/// ([`crate::ErrorKind::MembershipHistoryUnavailable`]).
 pub fn read_verified_set(
     paths: &Paths,
     expected: &Config,
@@ -584,8 +599,9 @@ pub fn read_verified_set(
     if expected.signer.is_none() {
         return Ok(None);
     }
-    let observation =
-        match StateLock::observe_classified_until(paths, Instant::now() + PUBLIC_ROSTER_WAIT)? {
+    let deadline = Instant::now() + PUBLIC_ROSTER_WAIT;
+    super::read_enrolling(paths, deadline, || {
+        let observation = match StateLock::observe_classified_until(paths, deadline)? {
             StateObservation::Held(observation) => observation,
             StateObservation::Absent => return Ok(None),
             StateObservation::Busy => {
@@ -594,33 +610,34 @@ pub fn read_verified_set(
                 ));
             }
         };
-    let mut first: Option<EntryVersion> = None;
-    let mut read = Vec::with_capacity(names.len());
-    for name in names {
-        let mut version = None;
-        let Some((entry, _)) = read_entry_with_version_held(
-            paths,
-            expected,
-            name,
-            Reading::Ordinary,
-            &mut version,
-            &observation,
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(version) = version else {
-            return Ok(None);
-        };
-        if let Some(first) = &first
-            && first.vault != version.vault
-        {
-            return Ok(None);
+        let mut first: Option<EntryVersion> = None;
+        let mut read = Vec::with_capacity(names.len());
+        for name in names {
+            let mut version = None;
+            let Some((entry, _)) = read_entry_with_version_held(
+                paths,
+                expected,
+                name,
+                Reading::Ordinary,
+                &mut version,
+                &observation,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(version) = version else {
+                return Ok(None);
+            };
+            if let Some(first) = &first
+                && first.vault != version.vault
+            {
+                return Ok(None);
+            }
+            first.get_or_insert(version);
+            read.push(entry);
         }
-        first.get_or_insert(version);
-        read.push(entry);
-    }
-    Ok(Some(read))
+        Ok(Some(read))
+    })
 }
 
 /// Read the authenticated vault version even if the named entry is absent or
@@ -875,10 +892,14 @@ fn read_entry_with_version(
     if expected.signer.is_none() {
         return Ok(None);
     }
-    let Some(_observation) = StateLock::observe(paths)? else {
-        return Ok(None);
-    };
-    read_entry_with_version_held(paths, expected, name, reading, version, &_observation)
+    // This read waits for no writer, so its enrolling take is tried once and waits for none.
+    super::read_enrolling(paths, Instant::now(), || {
+        *version = None;
+        let Some(observation) = StateLock::observe(paths)? else {
+            return Ok(None);
+        };
+        read_entry_with_version_held(paths, expected, name, reading, version, &observation)
+    })
 }
 
 /// Whether `name` is set apart (DESIGN-secrets §4): an AI CLI's login file, a home path aterm does

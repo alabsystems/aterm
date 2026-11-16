@@ -22,6 +22,9 @@ mod alias_admission_tests;
 #[path = "accounts_provider_commit_tests.rs"]
 mod provider_commit_tests;
 
+#[path = "accounts_sync_upkeep_counts_tests.rs"]
+mod upkeep_counts_tests;
+
 #[cfg(all(test, unix))]
 #[path = "accounts_source_presence_tests.rs"]
 mod source_presence;
@@ -1796,7 +1799,7 @@ fn with_logged_effects<R>(
     run(&fx)
 }
 
-/// `[harness] accounts = "off"` over a home whose `~/.secrets` holds Claude Code's fleet and
+/// `[harness] accounts = "off"` over a home whose test vault holds Claude Code's fleet and
 /// Kimi's, and which keeps a roster of Kimi's; with `off` false, the same home without it.
 #[cfg(unix)]
 fn accounts_bed(tag: &str, off: bool) -> Bed {
@@ -3491,9 +3494,15 @@ fn renewal_by(
 ) -> super::super::cli::Renewal {
     let roster_path = bed.roster(cli);
     let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
-    let candidates =
-        read_renewal_candidates(cli, &store, (&bed.home, &bed.state), &roster_path, now)
-            .expect("the records");
+    let candidates = read_renewal_candidates(
+        cli,
+        &store,
+        (&bed.home, &bed.state),
+        &roster_path,
+        now,
+        &crate::harness::login_adoption::Pass::default(),
+    )
+    .expect("the records");
     let (_, row) = candidates
         .tiered
         .into_iter()
@@ -5833,9 +5842,15 @@ fn renewal_of_a_used_gone_row(
             Ok(events)
         })
         .unwrap();
-    let candidates =
-        read_renewal_candidates(cli, &store, (&bed.home, &bed.state), &bed.roster(cli), NOW)
-            .unwrap();
+    let candidates = read_renewal_candidates(
+        cli,
+        &store,
+        (&bed.home, &bed.state),
+        &bed.roster(cli),
+        NOW,
+        &crate::harness::login_adoption::Pass::default(),
+    )
+    .unwrap();
     let records = &candidates.records;
     let ranked = candidates
         .tiered

@@ -3482,6 +3482,99 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A SELF-UPDATE VERB THE HARNESS THAT LEADS A WORD HANDS TO `__selfupdate` IS ANSWERED AS A ROW'S
+/// WAS: kimi-alab's `run` hands over `kimi upgrade` and `kimi update` (HX-09b) though kimi's row
+/// names no verb, and the bare verb is the managed check (or the disabled line), anything after
+/// it a shape aterm declines, and `--help` the vendor's own help after one note, through
+/// `bin/kimi`. CONTROL: muse, whose row names no verb and whose word no harness leads, passes
+/// the same words through to `bin/muse` silently.
+#[test]
+fn a_verb_the_leading_harness_hands_over_is_answered_though_its_row_names_none() {
+    use crate::selfupdate::{self, Decline};
+    let layout = temp_layout("selfupdate-led");
+    let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let kimi = crate::store::ToolName::new("kimi").unwrap();
+    let row = selfupdate::row_for("kimi").unwrap();
+    assert!(
+        selfupdate::verbs_of("kimi").is_empty(),
+        "PRECONDITION: kimi's row names no verb (HX-09b)"
+    );
+    assert!(
+        crate::harness::twin_harness(&layout, "kimi").is_some(),
+        "PRECONDITION: kimi-alab leads kimi"
+    );
+    for verb in ["upgrade", "update"] {
+        match selfupdate_plan(&layout, &kimi, &args(&[verb]), Some(&layout), true) {
+            SelfUpdatePlan::Check { row: r } => assert_eq!(r.program, "kimi", "{verb}"),
+            other => panic!("{verb}: {other:?}"),
+        }
+        match selfupdate_plan(&layout, &kimi, &args(&[verb]), Some(&layout), false) {
+            SelfUpdatePlan::Disabled(line) => {
+                assert_eq!(line, selfupdate::disabled_line(row, None), "{verb}");
+            }
+            other => panic!("{verb} disabled: {other:?}"),
+        }
+    }
+    for typed in [
+        &["upgrade", "-y"][..],
+        &["update", "--force"],
+        &["upgrade", "latest"],
+    ] {
+        let rest = args(&typed[1..]);
+        match selfupdate_plan(&layout, &kimi, &args(typed), Some(&layout), true) {
+            SelfUpdatePlan::Refuse(line) => assert_eq!(
+                line,
+                selfupdate::declined_line(
+                    row,
+                    &Decline::Shape {
+                        verb: typed[0],
+                        rest: &rest
+                    }
+                ),
+                "{typed:?}"
+            ),
+            other => panic!("{typed:?}: {other:?}"),
+        }
+    }
+    match selfupdate_plan(
+        &layout,
+        &kimi,
+        &args(&["upgrade", "--help"]),
+        Some(&layout),
+        true,
+    ) {
+        SelfUpdatePlan::Forward { command, note } => {
+            assert_eq!(note, Some(selfupdate::help_line(row)));
+            assert_eq!(command.get_program(), layout.shim(&kimi).as_os_str());
+        }
+        other => panic!("upgrade --help: {other:?}"),
+    }
+    // Only a plain word is a verb: a flag handed over is the vendor's.
+    for typed in [&["-p"][..], &["--continue"], &[]] {
+        match selfupdate_plan(&layout, &kimi, &args(typed), Some(&layout), true) {
+            SelfUpdatePlan::Forward { note: None, .. } => {}
+            other => panic!("{typed:?}: {other:?}"),
+        }
+    }
+    let muse = crate::store::ToolName::new("muse").unwrap();
+    assert!(
+        crate::harness::twin_harness(&layout, "muse").is_none(),
+        "PRECONDITION: no harness leads muse"
+    );
+    for typed in [&["update"][..], &["upgrade"]] {
+        match selfupdate_plan(&layout, &muse, &args(typed), Some(&layout), true) {
+            SelfUpdatePlan::Forward {
+                command,
+                note: None,
+            } => {
+                assert_eq!(command.get_program(), layout.shim(&muse).as_os_str());
+            }
+            other => panic!("CONTROL muse {typed:?}: {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
 #[test]
 fn the_hand_over_predicate_reads_the_sh_block_and_never_the_cmd_twin_or_bin() {
     use std::path::Path;
@@ -9336,11 +9429,13 @@ fn a_command_stub_reports_and_waits_for_its_program() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// ONCE A PENDING grok LANDS, ITS LAUNCH IS HANDED TO ITS bin/ SHIM, NEVER cmd_run: `led_shim`
-/// names `bin/grok`, the shim the stub stood in for, whose harness hand-off runs the launch
-/// under grok-alab (`the_grok_twin_hands_its_session_to_grok_alab_once_installed`), which gates
-/// a signed-out launch since HX-10d; kimi, which kimi-alab leads, goes the same way. CONTROL: a
-/// word no harness leads (claude) keeps `cmd_run`'s path.
+/// ONCE A PENDING grok LANDS, ITS LAUNCH IS HANDED TO ITS bin/ SHIM, NEVER ITS STORE BUILD:
+/// `cmd_run`, which the stub's wait ends in, execs what `led_shim` names, `bin/grok`, the shim
+/// the stub stood in for, whose harness hand-off runs the launch under grok-alab
+/// (`the_grok_twin_hands_its_session_to_grok_alab_once_installed`), which gates a signed-out
+/// launch since HX-10d; kimi, which kimi-alab leads, goes the same way
+/// (`run_hands_a_word_a_harness_leads_to_that_harness`). CONTROL: a word no harness leads
+/// (claude) runs its store build.
 #[cfg(unix)]
 #[test]
 fn a_landed_grok_runs_through_its_led_shim_after_a_pending_wait() {

@@ -36,6 +36,12 @@ pub(super) trait LaneService: Send + Sync {
         reader: &mut LaneReader<'_>,
         out: &mut Outbox,
     ) -> Option<ServeDisposition>;
+    /// The request `line` from a connection of `scope` reads as: the control server spells a
+    /// typed tab ID prefix as the whole ID here.
+    fn request(&self, line: String, scope: Scope) -> Request {
+        let _ = scope;
+        Request::parse(line)
+    }
     fn frame_header(&self, request: &Request, scope: Scope, out: &mut Outbox) -> bool {
         let _ = (request, scope, out);
         true
@@ -2171,7 +2177,7 @@ impl Lanes {
                 Some(request) => request,
                 None if parking => {
                     match next_request(&mut reader, mode, scope, header_done, reply, &*service) {
-                        Next::Line(line) => Request::parse(line),
+                        Next::Line(line) => service.request(line, scope),
                         Next::Park => return Here::Idle,
                         Next::Refused => {
                             reply.then_close = true;
@@ -2185,7 +2191,7 @@ impl Lanes {
                         return Here::Closed;
                     }
                     match read_next_line(&mut reader, reply) {
-                        Next::Line(line) => Request::parse(line),
+                        Next::Line(line) => service.request(line, scope),
                         Next::Refused => {
                             reply.then_close = true;
                             continue;
@@ -2614,8 +2620,10 @@ fn next_request(
                 return read_next_line(reader, reply);
             }
             Held::Header(end) if !*header_done => {
-                let header =
-                    Request::parse(request_line_text(&reader.buffer()[..end]).into_owned());
+                let header = service.request(
+                    request_line_text(&reader.buffer()[..end]).into_owned(),
+                    scope,
+                );
                 if !service.frame_header(&header, scope, reply) {
                     return Next::Refused;
                 }

@@ -548,6 +548,22 @@ impl SessionMeta {
             .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
     }
 
+    /// Whether the live scoped claim's own record stream, opened in `epoch`, has applied a
+    /// record of `kind` (its wire word): the stream feeds that kind, and its built-in reader
+    /// stands down for it. The stream's state outlives its claim, so the claim is read too: a
+    /// released or lapsed claim, and another claimant's, feed nothing.
+    #[must_use]
+    pub(crate) fn stream_applied(&self, kind: &str, epoch: &str, now_us: u64) -> bool {
+        match (self.live_scoped(now_us), &self.stream) {
+            (Some(scoped), Some(stream)) => {
+                stream.proven == scoped.proven
+                    && stream.epoch == epoch
+                    && stream.applied.contains(kind)
+            }
+            _ => false,
+        }
+    }
+
     /// The live claim's proven scoped claim at `now_us` ([`SupervisorClaim::scoped`]): a
     /// registered harness's contract 3 or 4 claim, with the versions it announced and the child
     /// aterm kept for it.
@@ -1473,6 +1489,9 @@ impl AttentionOwners {
     }
 }
 
+/// The `state` record's kind, by its wire word, as [`StreamState::applied`] names it.
+pub(crate) const STATE_KIND: &str = "state";
+
 /// A claimant's record stream (`stream @<sid> v=1`, `control_stream.rs`), kept on the session
 /// beside its claim and keyed on the claimant's proof. It names no wire type: every platform
 /// builds this file, and the wire library is Unix only.
@@ -1499,6 +1518,10 @@ pub(crate) struct StreamState {
     pub(crate) titles: u64,
     /// When the last `beat` arrived, on the awake clock ([`aterm_uds::process::awake_ms`]);
     /// HX-15e's watchdog reads it.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "kept by the unix-only `control_stream::judge`")
+    )]
     pub(crate) last_beat_ms: Option<u64>,
 }
 
@@ -4184,7 +4207,72 @@ pub(crate) fn path_columns(
     }
 }
 
-/// The server-published identity and agent verdict of one session.
+/// What the agent is doing, as a `state` record says it (the harness contract's six words).
+/// Every platform builds this file and the wire library is Unix only, so the record's word is
+/// kept here under its own type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamedState {
+    Starting,
+    Idle,
+    Working,
+    Asking,
+    Walled,
+    Ended,
+}
+
+impl StreamedState {
+    /// The agent word and detail this state reads as (`docs/HARNESS-CONTRACT.md`, "The `state`
+    /// record"), beside what the screen reader reads now. `asking` and `walled` name no kind:
+    /// until `ask` and `wall` records are applied the kind is the screen's (its `prompt` with
+    /// the box, its `question`, its `wall:<kind>`), else `prompt` and a bare `wall`, never a
+    /// kind nothing showed.
+    fn reads(
+        self,
+        screen_word: &'static str,
+        screen_detail: Option<&String>,
+    ) -> (&'static str, Option<String>) {
+        match self {
+            Self::Starting => ("busy", Some("starting".to_string())),
+            Self::Working => ("busy", None),
+            Self::Idle => ("idle", None),
+            Self::Ended => ("-", None),
+            Self::Asking if matches!(screen_word, "prompt" | "question") => {
+                (screen_word, screen_detail.cloned())
+            }
+            Self::Asking => ("prompt", None),
+            Self::Walled if screen_word.starts_with("wall:") => {
+                (screen_word, screen_detail.cloned())
+            }
+            Self::Walled => ("wall", None),
+        }
+    }
+}
+
+/// The `state` record a claim's stream last applied: while the publication holds one, the
+/// stream and not the screen reader decides the agent word and the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamFed {
+    pub(crate) state: StreamedState,
+    /// What the record says the input box holds; a record that names none reads `-`.
+    pub(crate) composer: aterm_messages::presence::ComposerState,
+    /// The aterm instance whose stream applied it.
+    pub(crate) epoch: String,
+    /// The record's `seq`.
+    pub(crate) hseq: u64,
+    /// The claim's holder, stamped on every row the record writes.
+    pub(crate) holder: String,
+    /// The tab's own session, the rows' author.
+    pub(crate) by: aterm_slog::Actor,
+    /// The agent the claim's registry row names, for a tab no agent run is open in.
+    pub(crate) agent: aterm_phase::Program,
+    /// The record's line as the wire codec writes it, kept as text outside the log's retention.
+    pub(crate) line: String,
+}
+
+/// THE CURRENT-STATE RECORD of one session, per kind: its program's identity, the agent state
+/// (`word`, `detail`, `rev`, since when, and its source: a built-in reader, or with `stream` set
+/// the claim's stream, by its epoch and the record's `hseq`, with the record's line kept as
+/// text), and the composer. `status` and `await agent` read it whichever source fed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentPublication {
     pub(crate) program: Option<String>,
@@ -4206,6 +4294,14 @@ pub(crate) struct AgentPublication {
     pub(crate) text_moves: u64,
     pub(crate) grid: Option<GridRead>,
     pub(crate) screen_moves: u64,
+    /// What the input box holds (`composer=`): the stream's word while its `state` stands,
+    /// else the screen reader's.
+    pub(crate) composer: aterm_messages::presence::ComposerState,
+    /// The screen reader's own reading of the input box, kept while the stream decides.
+    pub(crate) screen_composer: aterm_messages::presence::ComposerState,
+    /// The latest `state` record the claim's stream applied, `None` while the screen reader
+    /// feeds the state.
+    pub(crate) stream: Option<StreamFed>,
 }
 
 /// What the program in front last said about itself ([`SessionTimeline::note_program_state`]).
@@ -4318,6 +4414,9 @@ impl Default for AgentPublication {
             text_moves: 0,
             grid: None,
             screen_moves: 0,
+            composer: aterm_messages::presence::ComposerState::Unknown,
+            screen_composer: aterm_messages::presence::ComposerState::Unknown,
+            stream: None,
         }
     }
 }
@@ -4339,13 +4438,22 @@ impl AgentPublication {
         }
     }
 
-    fn effective(&self) -> (&'static str, Option<String>) {
-        match &self.input {
-            Some(stall) if self.reader.is_some() => (
+    /// The word and detail to publish, and whether the stream's `state` decided them. aterm's
+    /// own input-stall watch comes first, then the stream's state, then the screen.
+    fn effective(&self) -> (&'static str, Option<String>, bool) {
+        match (&self.input, &self.stream) {
+            (Some(stall), _) if self.reader.is_some() => (
                 "wall:unresponsive",
                 stall.stopped.then(|| "stopped".to_string()),
+                false,
             ),
-            _ => (self.screen_word, self.screen_detail.clone()),
+            (_, Some(fed)) => {
+                let (word, detail) = fed
+                    .state
+                    .reads(self.screen_word, self.screen_detail.as_ref());
+                (word, detail, true)
+            }
+            _ => (self.screen_word, self.screen_detail.clone(), false),
         }
     }
 
@@ -4659,6 +4767,14 @@ impl SessionTimeline {
         );
         let at = self.slog.now();
         self.slog.observe_meta(change, escalated, at);
+        // The stream's state stands only under its own live claim: a claim that was released,
+        // lapsed or taken by another claimant hands the state and the composer back to the
+        // screen reader. A claim kept through a grace keeps the reader down.
+        if self.agent.stream.as_ref().is_some_and(|fed| {
+            !meta.stream_applied(STATE_KIND, &fed.epoch, crate::metrics::now_us())
+        }) {
+            self.end_stream_state();
+        }
         self.ring();
     }
 
@@ -5445,7 +5561,53 @@ impl SessionTimeline {
         }
     }
 
-    /// Publish an agent verdict read from the screen `stamp` names.
+    /// THE STREAM'S ARM of the state: a `state` record the claim's stream applied. From here
+    /// until the claim ends ([`Self::record_meta_change`]) the record decides the agent word and
+    /// the composer, and the screen reader's reading only supplies the kind `asking` and
+    /// `walled` do not name. Returns whether the published word or detail moved.
+    pub(crate) fn publish_stream_state(&mut self, fed: StreamFed) -> bool {
+        let old_word = self.agent.word;
+        self.agent.stream = Some(fed);
+        self.settle_composer();
+        let changed = self.settle_agent_word(false);
+        // No screen was read: an exit a screen read would confirm stays pending.
+        let task_changed = self.reconcile_task_agent(false);
+        if self.agent.word != old_word {
+            crate::harness_host::ring_phase();
+        }
+        changed || task_changed
+    }
+
+    /// The stream's state no longer stands: the screen reader feeds the state and the composer
+    /// again, from what it reads now.
+    fn end_stream_state(&mut self) {
+        let old_word = self.agent.word;
+        self.agent.stream = None;
+        self.settle_composer();
+        self.settle_agent_word(false);
+        if self.agent.word != old_word {
+            crate::harness_host::ring_phase();
+        }
+    }
+
+    /// THE READER'S ARM of the composer: what the screen reader reads in the input box. It is
+    /// kept, and published unless the stream's state stands.
+    pub(crate) fn set_composer(&mut self, composer: aterm_messages::presence::ComposerState) {
+        self.agent.screen_composer = composer;
+        self.settle_composer();
+    }
+
+    fn settle_composer(&mut self) {
+        self.agent.composer = self
+            .agent
+            .stream
+            .as_ref()
+            .map_or(self.agent.screen_composer, |fed| fed.composer);
+    }
+
+    /// THE READER'S ARM of the state: an agent verdict read from the screen `stamp` names.
+    /// While the stream's state stands the reading is kept (it names the kind `asking` and
+    /// `walled` do not) and the published word is the stream's.
     pub(crate) fn publish_agent(
         &mut self,
         word: &'static str,
@@ -5504,7 +5666,7 @@ impl SessionTimeline {
     }
 
     fn settle_agent_word(&mut self, regrid: bool) -> bool {
-        let (word, detail) = self.agent.effective();
+        let (word, detail, streamed) = self.agent.effective();
         if self.agent.word == word && self.agent.detail == detail {
             return false;
         }
@@ -5524,6 +5686,14 @@ impl SessionTimeline {
             stamp: self.agent.stamp,
             reader: self.agent.reader,
             pgid: self.agent.program_pgid,
+            stream: self.agent.stream.as_ref().filter(|_| streamed).map(|fed| {
+                crate::session_log::StreamMove {
+                    hseq: fed.hseq,
+                    holder: &fed.holder,
+                    by: fed.by,
+                    agent: fed.agent,
+                }
+            }),
         };
         let _ = self.slog.agent_moved(moved, at);
         // A box the verdict closed with no answer and opened again keeps the supervisor's

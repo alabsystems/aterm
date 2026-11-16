@@ -13,7 +13,59 @@ fn applied() -> SyncOutcome {
     SyncOutcome::Applied {
         seq: 3,
         report: Report::default(),
+        moved: true,
     }
+}
+
+/// A version that carried only other Macs' news: applied, and nothing a runner reads moved.
+fn applied_quiet() -> SyncOutcome {
+    SyncOutcome::Applied {
+        seq: 4,
+        report: Report::default(),
+        moved: false,
+    }
+}
+
+/// A version that moved nothing a runner reads starts none, with the source reachable or not: a
+/// fleet's Macs publish all day, and each such version once cost every other Mac a whole pass.
+/// The return from failure still starts one, and so does a version that moved something. Every
+/// minute here is inside the recheck the first start set ([`RECHECK_MS`]), so no start is the
+/// recheck's.
+/// NEGATIVE CONTROL: an `after_pass` that starts for any applied version (`Applied { .. }`) starts
+/// one at minute 1; one that never starts for an applied version fails the last assertions; one
+/// that drops the return from failure starts none at minute 20 (run 2026-11-14).
+#[test]
+fn a_version_that_moved_nothing_here_starts_no_runner() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    for minute in 1..15 {
+        assert!(
+            !due.after_pass(&applied_quiet(), minute * MINUTE, HOME, Last::Ended),
+            "minute {minute}"
+        );
+    }
+    for minute in 15..20 {
+        assert!(
+            !due.after_unreachable_pass(&applied_quiet(), minute * MINUTE, HOME, Last::Ended),
+            "unreachable, minute {minute}"
+        );
+    }
+    // The unreachable passes left a return owed, and a quiet version is still a healthy pass
+    // that pays it, once.
+    const { assert!(20 * MINUTE < RECHECK_MS) };
+    assert!(due.after_pass(&applied_quiet(), 20 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::RECOVERED);
+    assert!(!due.after_pass(&applied_quiet(), 21 * MINUTE, HOME, Last::Ended));
+    assert!(
+        due.after_pass(&applied(), 22 * MINUTE, HOME, Last::Ended),
+        "a version that moved something starts one"
+    );
+    assert_eq!(caused(&due), Causes::APPLIED);
+    assert!(
+        due.after_unreachable_pass(&applied(), 23 * MINUTE, HOME, Last::Ended),
+        "and so does one applied from what this Mac holds while the source is away"
+    );
+    assert_eq!(caused(&due), Causes::APPLIED);
 }
 
 fn unchanged() -> SyncOutcome {

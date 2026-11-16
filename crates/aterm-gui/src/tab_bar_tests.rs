@@ -710,7 +710,6 @@ fn canonical_metadata_preserves_segment_and_hit_geometry() {
             conn: Some(TabConnRole::Both),
             closable: false,
             team: TabTeam::NONE,
-            load: 0,
         },
     ];
     let canonical = layout_segments_with_metadata(80, metadata.len(), &metadata, 0, false);
@@ -964,7 +963,6 @@ fn memoized_strip_glyphs_match_a_fresh_raster_for_every_key() {
                 conn: None,
                 team: TabTeam::NONE,
                 closable: true,
-                load: 0,
             };
             let mut images = Vec::new();
             append_status_image(&mut images, 0, metadata, color);
@@ -1138,31 +1136,6 @@ fn native_point_layout_keeps_close_and_tab_targets_while_reserving_app_icon_only
         [app.close[0], app.label[0], app.label[2]],
         "a vertical re-centre never disturbs horizontal geometry"
     );
-}
-
-#[test]
-fn a_chip_load_meter_shows_a_tenth_of_a_core_in_whole_points() {
-    assert_eq!(chip_load_step(0.05, 10.0), 0, "quiet earns no meter");
-    assert_eq!(chip_load_step(0.1, 512.0), 1, "a tenth of a core shows");
-    assert_eq!(chip_load_step(5.0, 10.0), 128);
-    assert_eq!(chip_load_step(40.0, 10.0), 255, "the machine is the end");
-    assert_eq!(chip_load_step(1.0, 0.0), 0, "no capacity, no meter");
-    assert_eq!(chip_load_step(f32::NAN, 10.0), 0);
-    assert_eq!(chip_load_len_pt(120.0, 0), None);
-    assert_eq!(chip_load_len_pt(120.0, 1), Some(1.0));
-    assert_eq!(chip_load_len_pt(120.0, 128), Some(50.0));
-    assert_eq!(chip_load_len_pt(120.0, 255), Some(100.0));
-    assert_eq!(
-        chip_load_len_pt(22.0, 255),
-        None,
-        "no room between the insets"
-    );
-    let loaded = TabStripMetadata {
-        load: 200,
-        ..PLAIN_TAB
-    };
-    assert!(!loaded.has_status());
-    assert_eq!(loaded.status_count(), 0);
 }
 
 #[test]

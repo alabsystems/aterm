@@ -284,6 +284,74 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
     );
 }
 
+/// A WRITE TO A STDIN NOBODY READS ENDS AT ITS CANCELLATION (Windows): std's end of a child's
+/// stdin is overlapped, so the write waits in slices and is cancelled at the look that says
+/// stop, where a blocking write would hold the capture's thread until a reader came. More than
+/// the pipe holds goes to a child that reads nothing, and the third look says stop: the write
+/// answers that cancellation and the capture's watch ends the child. The child, this binary,
+/// reads nothing and exits once the test releases it, which it does only where the capture
+/// held: its exit breaks the pipe under a write that held and ends the run of a watch never
+/// asked.
+#[cfg(windows)]
+#[test]
+fn a_write_to_a_stdin_nobody_reads_ends_at_its_cancellation() {
+    const RELEASE: &str = "ATERM_TEST_ALIGN_UNREAD_INPUT_RELEASE";
+    if let Some(release) = std::env::var_os(RELEASE) {
+        let release = std::path::PathBuf::from(release);
+        while !release.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::process::exit(0);
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let release = tmp.path().join("release");
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test binary"));
+    cmd.args([
+        "--exact",
+        "harness::align::tests::a_write_to_a_stdin_nobody_reads_ends_at_its_cancellation",
+        "--quiet",
+        "--test-threads=1",
+    ])
+    .env(RELEASE, &release);
+    let (done, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let looks = std::cell::Cell::new(0_usize);
+        let mut wrote = None;
+        let ended = capture_bounded_owned_watching(cmd, Duration::from_secs(3600), 1024, |input| {
+            let more_than_the_pipe_holds = vec![b'x'; 1 << 20];
+            wrote = Some(input.write_all(&more_than_the_pipe_holds, || {
+                looks.set(looks.get() + 1);
+                looks.get() > 2
+            }));
+            true
+        });
+        let _ = done.send((ended, wrote, looks.get()));
+    });
+    let answer = result.recv_timeout(HANG_DETECTOR);
+    let returned = answer.is_ok();
+    if !returned {
+        std::fs::write(&release, b"").unwrap();
+    }
+    let (ended, wrote, looks) = answer.unwrap_or_else(|_| {
+        result
+            .recv_timeout(HANG_DETECTOR)
+            .expect("the released child exited")
+    });
+    worker.join().unwrap();
+    assert!(
+        returned,
+        "a write to a stdin nobody reads held its capture: {wrote:?} after {looks} looks"
+    );
+    let wrote = wrote.expect("the watch ran");
+    assert_eq!(
+        wrote.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::Interrupted),
+        "the write answers its cancellation"
+    );
+    assert_eq!(looks, 3);
+    assert_eq!(ended, Ok(Ended::Stopped));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_slow_spawn_spends_the_budget() {

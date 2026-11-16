@@ -3,8 +3,11 @@
 
 use super::*;
 
+#[path = "model_reported_cpu_tests.rs"]
+mod reported_cpu;
+
 #[test]
-fn service_cpu_is_an_observed_floor_and_unknown_uid_work_stays_unassigned() {
+fn reported_cpu_service_and_unknown_owner_growth_are_independent_reports() {
     let reading = |second: u64| {
         let mut service = proc(900, 1, second * 200, 1, "service");
         service.uid = Some(0);
@@ -22,17 +25,13 @@ fn service_cpu_is_an_observed_floor_and_unknown_uid_work_stays_unassigned() {
         .expect("unknown ownership must not discard known CPU");
     assert!((split.services - 0.2).abs() < 0.000_001, "{split:?}");
     assert!(
-        (split.global - split.aterm - split.others - split.services - split.unaccounted).abs()
-            < 0.000_001
-    );
-    assert!(
-        split.unaccounted > 0.4,
-        "unobserved and unknown-owner work remains unassigned: {split:?}"
+        (split.unknown_owner_reported - 0.4).abs() < 0.000_001,
+        "{split:?}"
     );
 }
 
 #[test]
-fn resource_cpu_rows_keep_child_charges_separate_from_actual_cpu_without_coalitions() {
+fn reported_cpu_rows_keep_child_charges_separate_from_own_counter_growth() {
     let reading = |second: u64, children_ms: u64| {
         let mut shell = proc(200, 100, second * 10, 1, "shell");
         shell.uid = Some(501);
@@ -57,7 +56,7 @@ fn resource_cpu_rows_keep_child_charges_separate_from_actual_cpu_without_coaliti
     );
     assert!(
         cpu.tab.unread > 0,
-        "unseen descendant charges cannot prove actual CPU"
+        "unseen descendant charges retain their coverage uncertainty"
     );
     assert!(
         (snapshot.tabs[0].scope.cores.raw - 0.01).abs() < 0.001,
@@ -159,27 +158,30 @@ fn final_native_own_cpu_reaches_resource_rows_when_the_coalition_lane_is_off() {
     let snapshot = vitals.absorb(&end);
     let cpu = snapshot.resource(Resource::Cpu, &[7]);
     assert!((cpu.tab.now.unwrap() - 0.21).abs() < 0.001, "{cpu:?}");
-    assert!((snapshot.scoped_cpu.unwrap().all_actual() - 0.21).abs() < 0.001);
+    assert!((snapshot.scoped_cpu.unwrap().process_reported() - 0.21).abs() < 0.001);
 }
 
 #[test]
-fn current_app_coalition_cpu_reaches_the_resource_bar_while_tab_charge_stays_separate() {
+fn reported_cpu_coalition_channel_does_not_replace_process_scope_history() {
     let mut scene = crate::explain::fixtures::claude_reaped_1032();
     scene.unanswered = 0;
     let mut vitals = Vitals::new();
     vitals.absorb(&scene.reading(0, true));
     let snapshot = vitals.absorb(&scene.reading(1_000, true));
     let measured = snapshot.scoped_cpu.as_ref().unwrap();
-    assert_eq!(measured.app_measured, Some(3.4));
+    assert_eq!(measured.coalition_reported, Some(3.4));
     assert!(
-        !measured.app_incomplete,
+        !measured.coalition_incomplete,
         "tab attribution ambiguity does not erase proved app ownership: {measured:?}"
     );
     let cpu = snapshot.resource(Resource::Cpu, &[1]);
-    assert!((cpu.aterm.now.unwrap() - 3.4).abs() < 0.001, "{cpu:?}");
-    assert_eq!(
-        cpu.aterm.unread, 0,
-        "the coalition measured all app CPU despite the unknown tab split"
+    assert!(
+        (cpu.aterm.now.unwrap() - measured.process_reported()).abs() < 0.001,
+        "{cpu:?}"
+    );
+    assert!(
+        cpu.aterm.unread > 0,
+        "coalition coverage cannot erase process accounting gaps"
     );
     assert!(
         (cpu.tab.now.unwrap() - 0.2).abs() < 0.001,
@@ -194,10 +196,13 @@ fn current_app_coalition_cpu_reaches_the_resource_bar_while_tab_charge_stays_sep
     let later = vitals.absorb(&scene.reading(2_000, false));
     let current = later.scoped_cpu.as_ref().unwrap();
     assert_eq!(
-        current.app_measured, None,
+        current.coalition_reported, None,
         "carried explanation facts cannot masquerade as a new app measurement"
     );
-    assert!((current.all_actual() - 0.4).abs() < 0.001, "{current:?}");
+    assert!(
+        (current.process_reported() - 0.4).abs() < 0.001,
+        "{current:?}"
+    );
 }
 
 #[test]
@@ -212,10 +217,13 @@ fn app_measurements_must_match_the_resource_rows_whole_window() {
     let current = snapshot.scoped_cpu.as_ref().unwrap();
     assert_eq!(current.window_ns, 1_000_000_000);
     assert_eq!(
-        current.app_measured, None,
+        current.coalition_reported, None,
         "a five-second coalition average cannot replace a one-second bar reading"
     );
-    assert!((current.all_actual() - 0.4).abs() < 0.001, "{current:?}");
+    assert!(
+        (current.process_reported() - 0.4).abs() < 0.001,
+        "{current:?}"
+    );
 }
 
 #[test]
@@ -432,10 +440,10 @@ fn a_closed_panes_orphan_stays_in_its_logical_tab_without_becoming_another_panes
     vitals.absorb(&reading(11));
     let snapshot = vitals.absorb(&reading(12));
     let cpu = snapshot.scoped_cpu.as_ref().unwrap();
-    assert!((cpu.tabs[0].actual() - 0.2).abs() < 0.001, "{cpu:?}");
+    assert!((cpu.tabs[0].reported - 0.2).abs() < 0.001, "{cpu:?}");
     assert_eq!(cpu.panes.len(), 1);
     assert_eq!(
-        cpu.panes[0].floor, 0.0,
+        cpu.panes[0].reported, 0.0,
         "the surviving pane did none of that work"
     );
     assert!(
@@ -452,11 +460,12 @@ fn a_closed_panes_orphan_stays_in_its_logical_tab_without_becoming_another_panes
 }
 
 #[test]
-fn a_prior_tail_without_scope_coverage_cannot_restore_an_exact_reading() {
+fn reported_cpu_legacy_tail_discards_cpu_but_preserves_memory_coverage() {
     let mut saved = SavedStrip::default();
     let mut sample = Agg::default();
     sample.add(0.4, 1000, false);
     assert!(saved.replay(StripLine {
+        scope_cpu_accounting: None,
         k: 10,
         wall_ms: 100_000,
         caps: [None; 7],
@@ -467,9 +476,10 @@ fn a_prior_tail_without_scope_coverage_cannot_restore_an_exact_reading() {
         spans: Vec::new(),
         usual: Vec::new(),
     }));
-    assert_eq!(saved.aterm[0].buckets[0].1.mean, 0.4);
+    assert!(saved.aterm[0].is_empty());
+    assert_eq!(saved.aterm[Resource::Memory.index()].buckets[0].1.mean, 0.4);
     assert_eq!(saved.aterm_unread[0].buckets[0].1.mean, 1.0);
-    assert_eq!(saved.aterm_unread[1].buckets[0].1.mean, 1.0);
+    assert!(saved.aterm_unread[1].is_empty());
     assert!(saved.aterm_cpu_charge.is_empty());
 }
 
@@ -1683,7 +1693,6 @@ fn scheduling_zero_total_is_held_drawing_data_not_current_utilization() {
         assert_eq!(cpu.core_history[2].last(), Some(&None));
         assert_eq!(cpu.history.last(), Some(&None));
         assert!(held.split.is_none());
-        assert!(crate::scheduling::idle_performance(&held).is_none());
 
         let recovered = v.absorb(&sample(13, &[0, 0, prior_busy, prior_busy], Vec::new()));
         assert_eq!(recovered.cpu.as_ref().unwrap().current_busy(), Some(0.0));
@@ -1691,7 +1700,7 @@ fn scheduling_zero_total_is_held_drawing_data_not_current_utilization() {
 }
 
 #[test]
-fn scheduling_wait_requires_matching_sweep_windows() {
+fn reported_cpu_wait_counter_difference_keeps_its_own_read_span() {
     let reading = |t_s: u64, busy: &[u64], cpu_ms, run_ns| {
         let mut s = sample(
             t_s,
@@ -1720,12 +1729,16 @@ fn scheduling_wait_requires_matching_sweep_windows() {
     assert_eq!(resumed.global.wait, Some(2.0));
     assert_eq!(resumed.cpu.as_ref().unwrap().cores[2].load.raw, 0.0);
     assert_eq!(resumed.cpu.as_ref().unwrap().cores[3].load.raw, 0.0);
-    assert!(crate::scheduling::idle_performance(&resumed).is_none());
 
     let aligned = v.absorb(&reading(13, &[0, 0, 100, 100], 2000, 8_000_000_000));
     assert_eq!(aligned.procs_window_ns, aligned.cores_window_ns);
     assert_eq!(aligned.global.wait, Some(2.0));
-    assert!(crate::scheduling::idle_performance(&aligned).is_some());
+    let published_late = v.absorb(&reading(14, &[0, 0, 100, 100], 6000, 9_000_000_000));
+    assert_eq!(
+        published_late.global.wait,
+        Some(-3.0),
+        "a signed counter difference is not physical waiting"
+    );
 }
 
 #[test]
@@ -5020,7 +5033,6 @@ fn bar_shares_nest_tab_inside_aterm_inside_global_across_all_five_resources() {
     assert_eq!(net.state, NetState::Online);
     assert_eq!(net.srtt_ms, Some(14.5));
     for res in [
-        Resource::Cpu,
         Resource::Memory,
         Resource::Disk,
         Resource::Network,
@@ -5034,6 +5046,7 @@ fn bar_shares_nest_tab_inside_aterm_inside_global_across_all_five_resources() {
             "{res:?}: expected 0 < t <= a <= g <= 1, got [{g}, {a}, {t}]"
         );
     }
+    assert_eq!(snap.bar_shares(Resource::Cpu, &[1]), None);
 }
 
 #[test]

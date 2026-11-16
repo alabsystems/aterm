@@ -185,16 +185,21 @@ fn two_dispatches_waiting_behind_a_held_claim() {
                             }
                             permit
                         },
-                        &mut |b, resources| {
-                            trace.waits(
-                                b.index,
-                                test_waits::Wait::For(test_waits::Reason::local(b, resources)),
-                            );
-                        },
-                        &|look| {
-                            pass.lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .again(look)
+                        LookHooks {
+                            rejected:
+                                &mut |b: &Planned, resources: test_plan::DispatchResources| {
+                                    trace.waits(
+                                        b.index,
+                                        test_waits::Wait::For(test_waits::Reason::local(
+                                            b, resources,
+                                        )),
+                                    );
+                                },
+                            again: &|look| {
+                                pass.lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .again(look)
+                            },
                         },
                     );
                     assert!(next.is_none(), "nothing starts behind the held claim");

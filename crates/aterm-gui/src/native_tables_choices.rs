@@ -21,12 +21,18 @@
 //!   the sheet has more room there, and shows as many words as that room holds.
 //!
 //! The words come from the compiled column ([`aterm_db::typed::Ty::Enum`]): the page keeps no
-//! list of them.
+//! list of them. A reference's cell opens on the same list, of the rows of its target, each read
+//! by its words and staged by its key ([`crate::native_tables::rows::choice`], docs/PLAN.md
+//! LT-30). The list is a list box (`ListBox`) of options (`ListBoxOption`), each spoken by its
+//! words, the marked one selected.
 
 use aterm_db::typed::{Column, Ty};
 
-use crate::native_tables::{Group, SheetColumn, fitted, group, press, styled};
-use crate::native_ui::{Insets, Layout, Length, SemanticRole, StyleRef, UiNode};
+use crate::native_tables::{Group, SheetColumn, fitted, group, styled};
+use crate::native_ui::{
+    ActionId, ButtonSpec, Control, ControlState, GroupSpec, Insets, Layout, Length, SemanticRole,
+    StyleRef, UiContent, UiNode,
+};
 use crate::native_workers::text_width;
 
 /// The key of the word `n` of the open cell's list.
@@ -45,7 +51,7 @@ pub(crate) fn type_words(
         (None, Some(other)) if column.group == Group::Linked => {
             format!("count \u{b7} {}", named(other))
         }
-        // The row's own key, or the Mac that states a row of its own.
+        // The row's own key, or the machine that states a row of its own.
         (None, Some(to)) => format!("\u{2192} {}", named(to)),
         (None, None) => String::new(),
     };
@@ -73,7 +79,7 @@ fn ty_words(ty: &Ty, named: &dyn Fn(&str) -> String) -> String {
         Ty::Enum(words) => format!("one of {}", words.len()),
         Ty::Time => "time".into(),
         Ty::Day => "date".into(),
-        Ty::Label => "Mac label".into(),
+        Ty::Label => "machine label".into(),
         Ty::Hex(n) => format!("{n} hex digits"),
         Ty::Digits(n) => format!("{n} digits"),
         Ty::Email => "address".into(),
@@ -94,7 +100,7 @@ fn ty_words(ty: &Ty, named: &dyn Fn(&str) -> String) -> String {
     }
 }
 
-/// A set's or a list's words: `set of Mac labels`, `list of whole numbers`; where its values
+/// A set's or a list's words: `set of machine labels`, `list of whole numbers`; where its values
 /// have no one noun, what each is (`list, each one of 4`).
 fn several(kind: &str, inner: &Ty, named: &dyn Fn(&str) -> String) -> String {
     match plural(inner) {
@@ -118,7 +124,7 @@ fn plural(ty: &Ty) -> Option<&'static str> {
         Ty::Evidence => "evidence",
         Ty::Time => "times",
         Ty::Day => "dates",
-        Ty::Label => "Mac labels",
+        Ty::Label => "machine labels",
         Ty::Email => "addresses",
         Ty::Phone => "phone numbers",
         Ty::Url => "URLs",
@@ -142,7 +148,7 @@ fn plural(ty: &Ty) -> Option<&'static str> {
 pub(crate) enum Opens {
     /// A text field, as any cell.
     Field,
-    /// A list of the column's words ([`Choice`]).
+    /// A list of the column's words, or of the rows a reference names ([`Choice`]).
     List,
     /// The other value of a bool, staged at once.
     Toggle,
@@ -151,20 +157,28 @@ pub(crate) enum Opens {
 /// What opening a cell of `column` does.
 pub(crate) fn opens(column: &SheetColumn) -> Opens {
     match column.compiled.map(|c| c.ty) {
-        Some(Ty::Enum(_) | Ty::Set(Ty::Enum(_))) => Opens::List,
+        Some(Ty::Enum(_) | Ty::Set(Ty::Enum(_)) | Ty::Ref(_)) => Opens::List,
         Some(Ty::Bool) => Opens::Toggle,
         _ => Opens::Field,
     }
 }
 
-/// An open cell's list of words: an enum's, or a set of enums' with each member marked.
+/// An open cell's list of words: an enum's, a set of enums' with each member marked, or the rows
+/// a reference may name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Choice {
-    /// The column's words, in its order; for an enum that may be empty, `""` last, which reads
-    /// `empty`.
-    pub(crate) words: Vec<&'static str>,
+    /// What each choice stages: the column's words, in its order, or a reference's row keys;
+    /// for a column that may be empty, `""` last, which reads `empty`.
+    pub(crate) words: Vec<String>,
+    /// How each choice reads, in the list and in the open field once marked: an enum's word
+    /// itself; a row by the words it is known by, never its key alone.
+    pub(crate) said: Vec<String>,
     /// Several of the words at once: a set.
     pub(crate) many: bool,
+    /// Whether only a choice typed whole is marked: a reference's rows, where the first row
+    /// whose words start with what was typed (one of two rows under one label) is no row the
+    /// person named.
+    pub(crate) whole: bool,
     /// The word the keys have marked.
     pub(crate) at: Option<usize>,
     /// What a set's list last wrote into the field (what it opened with, at first): while the
@@ -181,18 +195,20 @@ impl Choice {
             Ty::Set(Ty::Enum(words)) => (words, true),
             _ => return None,
         };
-        let mut words = words.to_vec();
+        let mut words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
         if !many && column.null {
-            words.push("");
+            words.push(String::new());
         }
         let at = if many {
             Some(0)
         } else {
-            words.iter().position(|word| *word == text.trim())
+            words.iter().position(|word| word == text.trim())
         };
         Some(Self {
+            said: words.clone(),
             words,
             many,
+            whole: false,
             at,
             wrote: text.to_owned(),
         })
@@ -214,9 +230,10 @@ impl Choice {
         self.at = usize::try_from(next).ok();
     }
 
-    /// Mark the word that was typed, else the first that starts with it; else, in an enum's
-    /// list, none. In a set's list the word typed is the one after its last comma, and a mark
-    /// no word matches stays where it was.
+    /// Mark the word that was typed, else (except in a list of rows, [`Self::whole`]) the first
+    /// that starts with it; else, in an enum's list, none. A choice is matched by how it reads,
+    /// and a row's key typed whole marks that row. In a set's list the word typed is the one
+    /// after its last comma, and a mark no word matches stays where it was.
     pub(crate) fn follow(&mut self, typed: &str) {
         let typed = if self.many {
             typed.rsplit(',').next().unwrap_or_default()
@@ -226,10 +243,16 @@ impl Choice {
         let typed = typed.trim().to_lowercase();
         let found = (!typed.is_empty())
             .then(|| {
-                let words = || self.words.iter().map(|w| w.to_lowercase());
-                words()
-                    .position(|w| w == typed)
-                    .or_else(|| words().position(|w| w.starts_with(&typed)))
+                let said = || self.said.iter().map(|w| w.to_lowercase());
+                self.words
+                    .iter()
+                    .position(|w| w.to_lowercase() == typed)
+                    .or_else(|| said().position(|w| w == typed))
+                    .or_else(|| {
+                        (!self.whole)
+                            .then(|| said().position(|w| w.starts_with(&typed)))
+                            .flatten()
+                    })
             })
             .flatten();
         if !self.many || found.is_some() {
@@ -237,11 +260,20 @@ impl Choice {
         }
     }
 
-    /// The word an enum's list stages as its cell closes: the marked one.
-    pub(crate) fn marked(&self) -> Option<&'static str> {
+    /// The word an enum's list stages as its cell closes: the marked one (a row's key).
+    pub(crate) fn marked(&self) -> Option<&str> {
         self.at
             .filter(|_| !self.many)
-            .and_then(|at| self.words.get(at).copied())
+            .and_then(|at| self.words.get(at))
+            .map(String::as_str)
+    }
+
+    /// How the marked choice reads: what the open field shows once it is marked.
+    pub(crate) fn marked_said(&self) -> Option<&str> {
+        self.at
+            .filter(|_| !self.many)
+            .and_then(|at| self.said.get(at))
+            .map(String::as_str)
     }
 
     /// Whether Space in the field is the list's, not typed: a set's list whose field holds what
@@ -251,7 +283,7 @@ impl Choice {
     }
 
     /// The members a set's text holds, in the column's order.
-    pub(crate) fn members(&self, text: &str) -> Vec<&'static str> {
+    pub(crate) fn members(&self, text: &str) -> Vec<&str> {
         let held: Vec<&str> = text
             .split(',')
             .map(str::trim)
@@ -259,7 +291,7 @@ impl Choice {
             .collect();
         self.words
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|w| held.contains(w))
             .collect()
     }
@@ -267,7 +299,7 @@ impl Choice {
     /// A set's text with word `n` put in, or taken out where it is in: its members in the
     /// column's order, as the grid shows a set (`a, b`).
     pub(crate) fn toggled(&self, text: &str, n: usize) -> String {
-        let Some(word) = self.words.get(n).copied() else {
+        let Some(word) = self.words.get(n).map(String::as_str) else {
             return text.to_owned();
         };
         let mut members = self.members(text);
@@ -278,7 +310,7 @@ impl Choice {
         }
         self.words
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|w| members.contains(w))
             .collect::<Vec<_>>()
             .join(", ")
@@ -302,9 +334,11 @@ const SHOWN: usize = 12;
 /// `line` a word, the marked word ringed and, in a set's list, each member ticked. Where it fits
 /// on neither side it takes the side with more room and shows as many words as that holds,
 /// those round the mark, so every word it shows is on the sheet. `typed` is what the open cell
-/// holds: a set's members.
+/// holds: a set's members. The list is a list box named `label`, each choice an option spoken by
+/// how it reads, the marked one selected.
 pub(crate) fn list(
     choice: &Choice,
+    label: &str,
     typed: &str,
     (x, top, w): (f32, f32, f32),
     (foot, line): (f32, f32),
@@ -339,7 +373,7 @@ pub(crate) fn list(
         .min(choice.words.len().saturating_sub(n));
     let mark_w = text_width("\u{2713} ", SemanticRole::Text, StyleRef::Primary);
     let widest = choice
-        .words
+        .said
         .iter()
         .map(|word| text_width(said_word(word), SemanticRole::Text, StyleRef::Primary))
         .fold(0.0_f32, f32::max);
@@ -347,11 +381,18 @@ pub(crate) fn list(
     let height = n as f32 * line;
     let y = if above { top - height } else { below };
     let mut items = Vec::with_capacity(n);
-    for (at, word) in choice.words.iter().enumerate().skip(first).take(n) {
+    for (at, (word, says)) in choice
+        .words
+        .iter()
+        .zip(&choice.said)
+        .enumerate()
+        .skip(first)
+        .take(n)
+    {
         let key = format!("{CHOICE}{at}");
         let marked = choice.at == Some(at);
-        let member = members.contains(word);
-        let mut spoken = said_word(word).to_owned();
+        let member = members.contains(&word.as_str());
+        let mut spoken = said_word(says).to_owned();
         if choice.many {
             spoken.push_str(if member {
                 ", in the set"
@@ -378,12 +419,12 @@ pub(crate) fn list(
         }
         face.push(fitted(
             format!("{key}/word"),
-            said_word(word),
+            said_word(says),
             style,
             (width - 20.0 - if choice.many { mark_w } else { 0.0 }).max(1.0),
         ));
         let mut seat = vec![
-            press(&key, spoken),
+            option(&key, spoken, marked),
             group(format!("{key}/face"))
                 .layout(Layout::row().padding(Insets::symmetric(10.0, 0.0)))
                 .children(face)
@@ -412,11 +453,38 @@ pub(crate) fn list(
                 .children(vec![
                     group("tables/choices/before")
                         .layout(Layout::default().width(Length::Fixed(x.max(0.0)))),
-                    group("tables/choices/list")
-                        .layout(Layout::column().width(Length::Fixed(width)))
-                        .children(items),
+                    UiNode::new(
+                        "tables/choices/list",
+                        UiContent::Group(GroupSpec {
+                            role: SemanticRole::ListBox,
+                            ..GroupSpec::new(label)
+                        }),
+                    )
+                    .layout(Layout::column().width(Length::Fixed(width)))
+                    .children(items),
                 ]),
         ])
+}
+
+/// One choice of the list: a press the size of its seat, under its painted words, spoken as
+/// `spoken`; an option of the list box, selected where it is marked.
+fn option(key: &str, spoken: String, marked: bool) -> UiNode {
+    UiNode::new(
+        key.to_owned(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(spoken).visual_label(String::new()),
+                ActionId::new(key.to_owned()),
+            )
+            .state(ControlState {
+                enabled: true,
+                selected: marked,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Navigation)
+            .role(SemanticRole::ListBoxOption),
+        ),
+    )
 }
 
 /// How a word of a list reads: an empty one as `empty`.

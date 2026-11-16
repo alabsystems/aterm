@@ -350,6 +350,35 @@ fn push_batch(rows: &[(&str, &str, &str)]) -> agh::github::refs::AtomicRefBatch 
 
 const ABSENT: &str = "0000000000000000000000000000000000000000";
 
+/// A real atomic receive goes through the resource's durable journal, retaining the
+/// fixture's routing and native timing choices. Dry/preflight runs use `run_git`.
+fn journaled_push(gh: &Github, run: &GitRun) -> agh::Result<()> {
+    use agh::git::GitOp;
+    use agh::policy::{RouteRequest, RouteTarget};
+    let GitOp::PushRefs {
+        dir,
+        batch,
+        dry_run: false,
+    } = &run.op
+    else {
+        panic!("the fixture must name a mutable atomic push");
+    };
+    let request =
+        RouteRequest::write(RouteTarget::Repo(run.slug.clone())).with_named(run.named.clone());
+    let permit = gh
+        .router()
+        .permit(&request, &|profile| gh.presence(profile))?;
+    let journal = gh.journal(&run.slug)?;
+    let refs = gh.refs(&run.slug);
+    let outcome = match run.progress_window {
+        Some(window) => {
+            refs.push_atomic_with_progress_window(&permit, dir, batch, &journal, window)
+        }
+        None => refs.push_atomic_with_budget(&permit, dir, batch, &journal, run.budget),
+    }?;
+    outcome.into_result().map(|_| ())
+}
+
 #[test]
 fn native_writes_keep_the_credential_that_the_parent_journaled() {
     use agh::git::{ControlRefChange, ControlRefTransaction, RELEASE_LEASE_REF};
@@ -441,7 +470,7 @@ fn native_writes_keep_the_credential_that_the_parent_journaled() {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(fingerprints.len(), 2);
+        assert_eq!(fingerprints.len(), if rotated { 0 } else { 2 });
         let expected = agh::identity::fingerprint(agh_fake::token("dev").as_bytes());
         assert!(fingerprints.iter().all(|fp| *fp == expected.as_str()));
     }
@@ -670,12 +699,15 @@ fn native_push_checks_fast_forward_immutable_tags_stale_leases_and_missing_objec
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
     let slug = common::slug("fixture-dev/app");
-    gh.run_git(&GitRun::push_refs(
-        &slug,
-        &source,
-        push_batch(&[("refs/heads/main", &before, &after)]),
-        false,
-    ))
+    journaled_push(
+        &gh,
+        &GitRun::push_refs(
+            &slug,
+            &source,
+            push_batch(&[("refs/heads/main", &before, &after)]),
+            false,
+        ),
+    )
     .expect("fast-forward");
     host_git(&remote, &["tag", "v1", &before]);
     host_git(
@@ -720,9 +752,11 @@ fn native_push_checks_fast_forward_immutable_tags_stale_leases_and_missing_objec
         ),
         (vec![("refs/heads/main", &*after, &*after)], Kind::Usage),
     ] {
-        let error = gh
-            .run_git(&GitRun::push_refs(&slug, &source, push_batch(&rows), false))
-            .expect_err("refused");
+        let error = journaled_push(
+            &gh,
+            &GitRun::push_refs(&slug, &source, push_batch(&rows), false),
+        )
+        .expect_err("refused");
         assert_eq!(error.kind, kind, "{}", error.why);
         assert_eq!(error.side_effect, SideEffect::None);
         assert_eq!(host_git(&remote, &["rev-parse", "main"]), after);
@@ -732,14 +766,16 @@ fn native_push_checks_fast_forward_immutable_tags_stale_leases_and_missing_objec
         &source,
         &["config", "hook.pre-push.command", "touch must-not-run"],
     );
-    let error = gh
-        .run_git(&GitRun::push_refs(
+    let error = journaled_push(
+        &gh,
+        &GitRun::push_refs(
             &slug,
             &source,
             push_batch(&[("refs/tags/new", ABSENT, &after)]),
             false,
-        ))
-        .expect_err("config hook");
+        ),
+    )
+    .expect_err("config hook");
     assert_eq!(error.kind, Kind::Refused);
     assert!(matches!(error.sub, Sub::GitConfig { .. }));
 }
@@ -938,7 +974,7 @@ fn native_cut_push_measurement() {
         *previous_cpu.lock().unwrap() = cpu.child_cpu_ns;
         let start = std::time::Instant::now();
         if let Some(run) = run {
-            gh.run_git(&run).unwrap();
+            journaled_push(&gh, &run).unwrap();
         } else {
             gh.refs(&slug)
                 .check_control(&permit, &source, &unlock, agh::git::GIT_BUDGET)
@@ -990,12 +1026,15 @@ fn native_push_tags_pack_only_what_the_observed_remote_lacks() {
             .client(git_env())
             .git_remote_for_tests("fixture-dev/app", &remote)
             .build();
-        gh.run_git(&GitRun::push_refs(
-            &common::slug("fixture-dev/app"),
-            &source,
-            push_batch(&[("refs/tags/release", ABSENT, &tag)]),
-            false,
-        ))
+        journaled_push(
+            &gh,
+            &GitRun::push_refs(
+                &common::slug("fixture-dev/app"),
+                &source,
+                push_batch(&[("refs/tags/release", ABSENT, &tag)]),
+                false,
+            ),
+        )
         .unwrap();
         let packs: Vec<_> = std::fs::read_dir(remote.join("objects/pack"))
             .unwrap()
@@ -1052,14 +1091,16 @@ fn native_push_remote_owned_tags_refuse_corrupt_witnesses_and_tags() {
             .client(git_env())
             .git_remote_for_tests("fixture-dev/app", &remote)
             .build();
-        let error = gh
-            .run_git(&GitRun::push_refs(
+        let error = journaled_push(
+            &gh,
+            &GitRun::push_refs(
                 &common::slug("fixture-dev/app"),
                 &source,
                 push_batch(&[("refs/tags/release", ABSENT, &tag)]),
                 false,
-            ))
-            .unwrap_err();
+            ),
+        )
+        .unwrap_err();
         assert_eq!(error.side_effect, SideEffect::None);
         assert!(
             !gh.fx()
@@ -1098,12 +1139,15 @@ fn native_push_cold_history_is_not_limited_by_the_incremental_inventory() {
         .client(git_env())
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
-    gh.run_git(&GitRun::push_refs(
-        &common::slug("fixture-dev/app"),
-        &source,
-        push_batch(&[("refs/heads/cold", ABSENT, &head)]),
-        false,
-    ))
+    journaled_push(
+        &gh,
+        &GitRun::push_refs(
+            &common::slug("fixture-dev/app"),
+            &source,
+            push_batch(&[("refs/heads/cold", ABSENT, &head)]),
+            false,
+        ),
+    )
     .unwrap();
     assert_eq!(host_git(&remote, &["rev-parse", "cold"]), head);
     assert_eq!(host_git(&remote, &["show", "cold:file"]), "blob 9999");
@@ -1696,14 +1740,16 @@ fn native_push_incremental_refuses_corrupt_metadata_new_blobs_and_missing_closur
             .client(git_env())
             .git_remote_for_tests("fixture-dev/app", &remote)
             .build();
-        let error = gh
-            .run_git(&GitRun::push_refs(
+        let error = journaled_push(
+            &gh,
+            &GitRun::push_refs(
                 &common::slug("fixture-dev/app"),
                 &source,
                 push_batch(&[("refs/heads/main", &before, &after)]),
                 false,
-            ))
-            .expect_err("broken source cannot write");
+            ),
+        )
+        .expect_err("broken source cannot write");
         assert_eq!(
             error.side_effect,
             SideEffect::None,
@@ -1736,12 +1782,15 @@ fn native_push_incremental_borrows_only_authenticated_old_blob_authority() {
         .client(git_env())
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
-    gh.run_git(&GitRun::push_refs(
-        &common::slug("fixture-dev/app"),
-        &source,
-        push_batch(&[("refs/heads/main", &before, &after)]),
-        false,
-    ))
+    journaled_push(
+        &gh,
+        &GitRun::push_refs(
+            &common::slug("fixture-dev/app"),
+            &source,
+            push_batch(&[("refs/heads/main", &before, &after)]),
+            false,
+        ),
+    )
     .expect("remote already owns the exact BEFORE blob");
     assert_eq!(
         host_git(&remote, &["show", "main:old"]),
@@ -1833,12 +1882,15 @@ fn native_push_incremental_inventory_past_one_capture_is_admitted_whole() {
         .client(git_env())
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
-    gh.run_git(&GitRun::push_refs(
-        &common::slug("fixture-dev/app"),
-        &source,
-        push_batch(&[("refs/heads/main", &before, &after)]),
-        false,
-    ))
+    journaled_push(
+        &gh,
+        &GitRun::push_refs(
+            &common::slug("fixture-dev/app"),
+            &source,
+            push_batch(&[("refs/heads/main", &before, &after)]),
+            false,
+        ),
+    )
     .expect("a wide incremental push is admitted whole");
     assert_eq!(host_git(&remote, &["rev-parse", "main"]), after);
     assert_eq!(
@@ -1894,15 +1946,18 @@ fn native_push_incremental_preserves_raw_signed_objects_and_ignores_source_graft
         .client(git_env())
         .git_remote_for_tests("fixture-dev/app", &remote)
         .build();
-    gh.run_git(&GitRun::push_refs(
-        &common::slug("fixture-dev/app"),
-        &source,
-        push_batch(&[
-            ("refs/heads/main", &before, &signed),
-            ("refs/tags/v1", ABSENT, &tag),
-        ]),
-        false,
-    ))
+    journaled_push(
+        &gh,
+        &GitRun::push_refs(
+            &common::slug("fixture-dev/app"),
+            &source,
+            push_batch(&[
+                ("refs/heads/main", &before, &signed),
+                ("refs/tags/v1", ABSENT, &tag),
+            ]),
+            false,
+        ),
+    )
     .expect("raw graph ignores graft");
     assert_eq!(
         host_git(&remote, &["cat-file", "commit", &signed]),
@@ -2380,17 +2435,17 @@ fn native_push_cli_reports_dry_run_and_journaled_success_and_validates_before_ro
         &["init", "--quiet", "--bare", &remote.to_string_lossy()],
     );
     let input = world.path().join("push.json");
-    let write_input = |before: &str, after: &str| {
+    let write_input = |reference: &str, before: &str, after: &str| {
         std::fs::write(
             &input,
             aterm_json::json!([
-                { "ref": "refs/heads/main", "before": before, "after": after }
+                { "ref": reference, "before": before, "after": after }
             ])
             .to_string(),
         )
         .expect("input")
     };
-    let run = |dry: bool| {
+    let run = |dry: bool, timeout: Option<&str>| {
         let (ctx, captured) = common::ctx(world.path(), &world.fake, git_env());
         let mut ctx = ctx
             .with_git_helper(common::helper())
@@ -2407,27 +2462,59 @@ fn native_push_cli_reports_dry_run_and_journaled_success_and_validates_before_ro
         if dry {
             args.push("--dry-run");
         }
+        if let Some(timeout) = timeout {
+            args.extend(["--timeout", timeout]);
+        }
         let exit = common::run_cli(&mut ctx, &args);
-        (exit, captured)
+        (exit, captured, ctx.fx.children_run())
     };
-    write_input(ABSENT, &sha);
-    let (exit, captured) = run(true);
+    write_input("refs/heads/main", ABSENT, &sha);
+    let (exit, captured, _) = run(true, None);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     assert_eq!(
         common::stdout_json(&captured)["outcome"],
         aterm_json::Value::from("would_send")
     );
     assert!(!world.dirs.journal().exists());
-    let (exit, captured) = run(false);
+    let (exit, captured, children) = run(false, None);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     let report = common::stdout_json(&captured);
     assert_eq!(report["outcome"], aterm_json::Value::from("created"));
     assert!(report["intent"].as_str().is_some());
     assert_eq!(host_git(&remote, &["rev-parse", "main"]), sha);
+    assert!(
+        children
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "push"))
+    );
+    assert!(children.iter().all(|child| {
+        child
+            .progress
+            .as_ref()
+            .is_some_and(|bound| bound.window == aterm_uds::deadline::ECHO_HANG)
+    }));
+    write_input("refs/heads/explicit-timeout", ABSENT, &sha);
+    let (exit, captured, children) = run(false, Some("37s"));
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert!(common::stdout_json(&captured)["intent"].as_str().is_some());
+    assert_eq!(
+        host_git(&remote, &["rev-parse", "refs/heads/explicit-timeout"]),
+        sha
+    );
+    assert!(
+        children
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "push"))
+    );
+    assert!(
+        children
+            .iter()
+            .all(|child| child.progress.is_none() && child.budget == Duration::from_secs(37))
+    );
     for (before, after) in [(&*sha, &*sha), (&*sha, ABSENT)] {
-        write_input(before, after);
+        write_input("refs/heads/main", before, after);
         world.fake.clear_seen();
-        let (exit, captured) = run(false);
+        let (exit, captured, _) = run(false, None);
         assert_eq!(exit, 2, "{}", captured.stderr_text());
         assert!(
             world.fake.seen().is_empty(),
@@ -5511,8 +5598,9 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
             .count()
     };
     let posts_before = posts();
-    let stale = gh
-        .run_git(&GitRun::push_refs(
+    let stale = journaled_push(
+        &gh,
+        &GitRun::push_refs(
             &slug,
             &source,
             push_batch(&[
@@ -5520,8 +5608,9 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
                 ("refs/attest/unwanted", ABSENT, &after),
             ]),
             false,
-        ))
-        .expect_err("stale lease");
+        ),
+    )
+    .expect_err("stale lease");
     assert_eq!(stale.kind, Kind::Conflict);
     assert_eq!(posts(), posts_before);
     assert_eq!(
@@ -5888,4 +5977,5 @@ fn a_vault_login_held_past_the_wait_refuses_the_run() {
     assert!(!dirs.grants().exists(), "a refused run wrote a grant");
 }
 
+mod late_admission_tests;
 pub(crate) mod source_cache_tests;

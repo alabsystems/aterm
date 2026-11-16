@@ -153,6 +153,11 @@ fn slept(asleep: (Instant, SystemTime), woke: (Instant, SystemTime)) -> Option<D
     Some(wall.saturating_sub(mono))
 }
 
+/// Whether this system's step announcement also announces a resume from suspend: Linux's timer
+/// is cancelled at every resume as at every set; macOS's `clock_set` is posted by a set of the
+/// clock alone, which a wake need not make.
+const STEPS_TELL_A_RESUME: bool = cfg!(target_os = "linux");
+
 /// A live watch of the wall clock's moves; dropping it ends every registration.
 #[derive(Debug)]
 pub struct WallWatch {
@@ -162,27 +167,43 @@ pub struct WallWatch {
     steps: Option<imp::Steps>,
     /// The sleep and wake listener; it hears until dropped.
     _power: Option<imp::Listening>,
+    /// Whether a sleep's wake reaches this watch ([`Self::hears_sleep`]).
+    hears_sleep: bool,
 }
 
 impl WallWatch {
     /// Watch this system's announcements: `None` where it announces neither a step nor a wake
-    /// (or none could be registered), so the owner keeps its own look.
+    /// (or none could be registered), so the owner keeps its own look. `Some` once either half
+    /// registered, so a watch whose power half was refused hears steps only
+    /// ([`Self::hears_sleep`]).
     #[must_use]
     pub fn start() -> Option<Self> {
         let heard = Arc::new(Heard::new().ok()?);
         let steps = imp::Steps::start();
         let power = imp::power(&heard);
+        Self::of(heard, steps, power)
+    }
+
+    /// The watch the registered halves make, `None` where neither registered.
+    fn of(
+        heard: Arc<Heard>,
+        steps: Option<imp::Steps>,
+        power: Option<imp::Listening>,
+    ) -> Option<Self> {
         if steps.is_none() && power.is_none() {
             return None;
         }
+        let hears_sleep = power.is_some() || (STEPS_TELL_A_RESUME && steps.is_some());
         Some(Self {
             heard,
             steps,
             _power: power,
+            hears_sleep,
         })
     }
 
-    /// A watch the system never tells, for a test that tells it by hand ([`Self::tell`]).
+    /// A watch the system never tells, for a test that tells it by hand ([`Self::tell`]). It
+    /// counts as hearing a sleep: the test tells it each one.
     ///
     /// # Errors
     /// Its doorbell's pipe could not be made.
@@ -192,7 +213,25 @@ impl WallWatch {
             heard: Arc::new(Heard::new()?),
             steps: None,
             _power: None,
+            hears_sleep: true,
         })
+    }
+
+    /// A watch of the system's step announcement alone, as [`Self::start`] makes one where the
+    /// power half was refused: `None` where steps are not announced ([`STEPS_ANNOUNCED`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn steps_only() -> Option<Self> {
+        Self::of(Arc::new(Heard::new().ok()?), imp::Steps::start(), None)
+    }
+
+    /// Whether this watch hears a sleep's wake: its power half registered (macOS, Windows), or
+    /// its step announcement also announces a resume (Linux's timer). A watch that hears steps
+    /// alone (macOS with the power half refused) says nothing of a sleep the clock was not set
+    /// across, so an owner that waits for a sleep keeps reading its own clocks.
+    #[must_use]
+    pub const fn hears_sleep(&self) -> bool {
+        self.hears_sleep
     }
 
     /// Announce `moved` as the system would: the next poll of [`Self::fds`] reads ready.

@@ -1490,8 +1490,8 @@ impl App {
                 }
                 if let Some(rows) = laid_in(&self.upgrade_view.rows, row.clone(), now_s()) {
                     self.apply_agent_upgrades_owned(rows, None, &[]);
-                    if let Some(local) =
-                        self.local_session_of(&aterm_session::SessionId::new(&row.tab))
+                    if let Some(local) = aterm_session::SessionId::parse(&row.tab)
+                        .and_then(|id| self.local_session_of(&id))
                         && let Some(handle) = self.pool.get(local)
                     {
                         handle
@@ -1516,8 +1516,8 @@ impl App {
                     self.upgrade_view.pressed_off.remove(&ask.tab);
                 }
                 if ask.word == UpgradeWord::Now
-                    && let Some(local) =
-                        self.local_session_of(&aterm_session::SessionId::new(&ask.tab))
+                    && let Some(local) = aterm_session::SessionId::parse(&ask.tab)
+                        .and_then(|id| self.local_session_of(&id))
                 {
                     self.show_upgrade_refusal(
                         local,

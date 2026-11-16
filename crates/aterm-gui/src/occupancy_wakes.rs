@@ -2041,8 +2041,8 @@ fn forget_closed() {
     let gone: Vec<String> = sids
         .into_iter()
         .filter(|sid| {
-            store
-                .by_sid(&aterm_session::SessionId::new(sid.clone()))
+            aterm_session::SessionId::parse(sid)
+                .and_then(|sid| store.by_sid(&sid))
                 .is_none_or(|h| h.state == crate::session_store::SessionState::Exited)
         })
         .collect();

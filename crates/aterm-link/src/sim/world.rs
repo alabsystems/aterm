@@ -46,7 +46,7 @@ use std::time::Duration;
 use super::bus::{self, ArmMutant, Escalation, Stop, Tier};
 use super::conform;
 use super::device::Device;
-use super::endpoint::{Endpoint, EpRules, EpState};
+use super::endpoint::{Endpoint, EpRules, EpState, FetchRead, Row};
 use super::{lock, Core, Process, Rng, SimKill};
 use crate::body::Body;
 use crate::bridge::{Bridge, Config};
@@ -300,6 +300,10 @@ pub(crate) enum Mutant {
     DeliverPastAStandingEntry,
     /// A fetch (`inbox get @<off>`) hands a session an own record whose in-flight entry stands (`Bridge::fetch_record`).
     FetchPastAStandingEntry,
+    /// A fetch hands a session a record of its lane past one a delivery would hold back: held in
+    /// hand behind an own record, an own post whose ack is owed, or an own record whose in-flight
+    /// entry stands (`Bridge::holds_back_below`).
+    FetchPastAStandingEntryBelow,
     /// A fetch hands an answer, or this node's `expired`, leaving the deadline it settles standing (`Bridge::fetch_record`).
     FetchLeavesTheDeadline,
     /// An own record whose in-flight entry stands for aterm's drain drops the broker link, as
@@ -308,6 +312,11 @@ pub(crate) enum Mutant {
     DropTheLinkAtAHeldOwnRecord,
     /// The inbox commit passes a held own record (`Bridge::inbox_commit_floor`).
     CommitPastAHeldOwnRecord,
+    /// A held own record a session's refill read ahead of the inbox group's live tail is
+    /// accounted against the inbox commit once delivered, as every build before
+    /// ATERM-KI-1116-4504 accounted it (`Bridge::deliver_held`): the commit passes the node's
+    /// other mail the tail has yet to take.
+    HeldRefillAccounted,
     /// The mirror's floor is trusted as it reads.
     TrustTheFloorThatReads,
     /// An attach that could not write the state dir's witness of the log goes on and delivers on it.
@@ -340,6 +349,15 @@ pub(crate) enum Mutant {
     /// A post or receipt retried at a pin an earlier attempt took is published again without
     /// reading its record back first (`Bridge::landed_at_its_pin`).
     RetryWithoutReadingBack,
+    /// A retry at a pin, and the attach's replay, take no landing the bridge holds unhanded for
+    /// its standing entry, held in hand or queued in the mailbox (`Bridge::unhanded_landing`
+    /// answers `None`): past a cut that gave that copy up on the bus they read back, find none
+    /// and publish again, and the reader is handed both, as every build before
+    /// ATERM-KI-1115-149 did. Its witness is a real broker's
+    /// (`bridge::tests::a_retry_settles_at_the_landing_the_bridge_holds_unhanded`): no seed of the
+    /// asking, asking-with-write-errors, asking-with-fetches or keyed lossy worlds reaches it on
+    /// this build.
+    RetryPastAnUnhandedLanding,
     /// A read back before a republish goes on at the floor (`transport::fetch_kept`), never
     /// told: a record retention still holds below its subject's oldest is missed.
     ReadBackWithoutTheHeld,
@@ -685,17 +703,35 @@ pub(crate) enum Mutant {
     /// of it reads its attempt back, so past a cut that carried that attempt unread and dropped
     /// its dedup key, the retry at the pin lands a second copy of its key.
     OwnersPinFromItsKeyHeadless,
-    /// A read back on a log that continues none starts at 0, its start, as ATERM-KI-1111-4's
-    /// rule took every such log under another id (`Bridge::read_back_from`, and a pin's head in
-    /// `StateDir::publication_offset_resets`), not at the head this node read when it met that
-    /// log (`LogWitness::met`): on a log astream gave another id keeping its records (a fresh one
-    /// where its identity sidecar does not read, one derived from its records where the sidecar
-    /// is gone), the read back meets the sender's earlier post of the same words, settles the
-    /// post on it and never publishes it (critic review F1, 2026-11-13). Every sim world's posts
-    /// carry words of their own, so no world meets it, and its control is a bridge unit test on
-    /// a real broker whose identity sidecar rots or goes
+    /// A read back on a log that continues none (`state::Head::Anywhere`) takes a row of the
+    /// post's words wherever it stands, without its origin (`Bridge::found_anywhere`), as
+    /// ATERM-KI-1111-4's rule read every such log from 0: on a log astream gave another id
+    /// keeping its records (a fresh one where its identity sidecar does not read, one derived
+    /// from its records where the sidecar is gone), the read back meets the sender's earlier
+    /// post of the same words, settles the post on it and never publishes it (critic review
+    /// F1, 2026-11-13). Every sim world's posts carry words of their own, so no world meets it,
+    /// and its control is a bridge unit test on a real broker whose identity sidecar rots or
+    /// goes
     /// (`a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_the_same_words`).
-    ReadBackFromTheLogsStart,
+    ReadBackAnywhereByWords,
+    /// A read back on a log that continues none starts at the head this node read when it met
+    /// that log (`LogWitness::met`, and a pin's head at the head the attach read in
+    /// `StateDir::publication_offset_resets`), as every build from critic review F1 to
+    /// ATERM-KI-1114-1414 started it, not anywhere: an attempt whose record a carried cut kept
+    /// below that head, its dedup key dropped, on a log astream reminted keeping its records,
+    /// goes unread, and the retry or the replay lands a second copy.
+    ReadBackFromTheAttachHead,
+    /// A read back on a log that continues none that cannot say whether a row of the post's
+    /// words is its own (no origin the broker stamps, no told read below a floor, a page that
+    /// does not advance) answers that none landed, and the post is published again at its pin,
+    /// not held (`Bridge::found_anywhere`'s case 6 of `Bridge::unverified_publication`).
+    AnywhereUntoldPublishes,
+    /// A read back from anywhere passes a row of the post's words at its sequence under a
+    /// producer of no node it knows while the mesh's hand-off, which names the nodes this Mac
+    /// retired, does not read (`Bridge::own_producers`): an attempt an older node key of this
+    /// Mac's published is taken for another writer's, and the post is published again beside
+    /// it.
+    AnywherePassesAnUnplacedProducer,
     /// A re-base's witness is written as any other witness is, not on the media
     /// (`Bridge::save_log_witness`, `StateDir::rebase_log_witness`), as every build before critic
     /// review F1: a power cut may bring back the witness of the log before it, and the next attach
@@ -1217,10 +1253,10 @@ pub(crate) struct Stats {
     /// RESERVATIONS PUBLISHED AT THEIR PINS that asked for a verdict (critic item F23,
     /// [`crate::fx::ReservationTap`]): a dedup answer the read back verified, one another
     /// writer's record answered, and the answers of each of `Bridge::unverified_publication`'s
-    /// five cases (index 0 is case 1).
+    /// six cases (index 0 is case 1).
     pub(crate) reservations_verified: u64,
     pub(crate) reservation_collisions: u64,
-    pub(crate) unverifiable: [u64; 5],
+    pub(crate) unverifiable: [u64; 6],
     /// KEYED RE-POSTS ([`Opts::keys`]): posts under an earlier note's key; of them, the ones
     /// aterm was told landed as their key's earlier record (`dup=1`) and the ones that landed a
     /// copy of their own (their key's earlier records given up); and the cuts that landed
@@ -1478,8 +1514,13 @@ struct World {
     ask_rng: Rng,
     /// Every ask with a deadline, by its marker.
     asks: BTreeMap<String, Ask>,
-    /// The offsets of the `expired` records judged ([`World::judge_expiries`]).
+    /// The offsets of the `expired` records judged ([`World::judge_expiries`]), of the log the
+    /// broker holds: a restart that gave up the records at and past an offset
+    /// ([`World::book_restart`]) drops those, for the records landing there next are others.
     expiries_judged: BTreeSet<u64>,
+    /// Every whole record a session read by a fetch, with the own records of its lane below it
+    /// then ([`World::fetch_read_past`]); a restart lowers each one's head to what it kept.
+    reads_past: Vec<(String, super::endpoint::ReadPast)>,
     /// `expired` records that followed an answer retention gave up before the sweep read it:
     /// `(asker, the answer's offset, the expiry's)`, honest once aterm was told a range of the
     /// asker's lane holding the answer ([`World::check_settled`]).
@@ -1753,6 +1794,7 @@ impl World {
             ask_rng: Rng::new(seed ^ 0x0dea_d11e_0a5c_00f4),
             asks: BTreeMap::new(),
             expiries_judged: BTreeSet::new(),
+            reads_past: Vec::new(),
             expired_over_given_up: Vec::new(),
             verdicts_lost: BTreeSet::new(),
             say_rng: Rng::new(seed ^ 0x05a7_7091_c5f4_0b0b),
@@ -2338,6 +2380,35 @@ impl World {
         }
     }
 
+    /// NO FETCH READS PAST WHAT A DELIVERY WOULD HOLD BACK (ATERM-KI-1115-41): once a session
+    /// read a record of its lane by a fetch, no copy of an own record of the lane below it lands
+    /// after the read (at or past the log's head then, as each restart since lowered it). The
+    /// replay lands such a copy only of a record whose in-flight entry stood as the session read
+    /// past it, a cut or a power loss having given its first copy up: the session then holds the
+    /// later record before the earlier one, an `expired` after the answer it read. A copy is
+    /// known by its subject and body, as the replay publishes the journaled entry again. The
+    /// reads end with their sessions ([`World::sessions_end`]: a power cut of the machine, a
+    /// quit), and a copy that lands after (a clear a power cut undid on the media) reaches none.
+    fn fetch_read_past(&mut self) -> Vec<String> {
+        self.reads_past.extend(self.ep.take_read_past());
+        if self.reads_past.is_empty() {
+            return Vec::new();
+        }
+        let records = self.core.broker.records();
+        let mut bad = Vec::new();
+        for (sid, read) in &self.reads_past {
+            for (q, subject, body, _) in &records {
+                if *q >= read.head && read.below.iter().any(|(s, b)| s == subject && b == body) {
+                    bad.push(format!(
+                        "fetch past: {sid} read @{} past an own record whose copy landed @{q}",
+                        read.off
+                    ));
+                }
+            }
+        }
+        bad
+    }
+
     /// EVERY FETCH IS ANSWERED AS THE BROKER HOLDS ITS RECORD (finding F3), judged against
     /// what the broker held of the session's lane at that offset the moment the bridge
     /// answered (the endpoint reads it then, [`super::endpoint::Fetched`]): a record is
@@ -2496,40 +2567,65 @@ impl World {
             }
             let every_log = self.opts.mutants.contains(&Mutant::FetchReadOnEveryLog);
             let s = lock(&self.ep.state);
-            // A row of the log the endpoint was last told (an offset of a log since replaced
-            // names another record), or an answer the asker read by a fetch, which leaves none
-            // (ATERM-KI-1115-9210), while the ask it names stands: below the `expired`, or read
-            // before a fork took its own offset. A row keeps its own offset's reading: its
-            // `on_log` is the inbox floor's too.
-            let handed = s
-                .sessions
-                .values()
-                .chain(s.gone.iter())
-                .filter(|x| x.sid == asker)
-                .find_map(|x| {
-                    let answers = |kind: &str| ANSWER_KINDS.contains(&kind);
-                    x.rows
-                        .iter()
-                        .find(|row| {
-                            row.re == Some(re) && row.on_log && row.off < e && answers(&row.kind)
-                        })
-                        .map(|row| row.off)
-                        .or_else(|| {
-                            x.read_by_fetch
-                                .iter()
-                                .find(|read| {
-                                    read.re == re
-                                        && (read.ask_on_log || every_log)
-                                        && (read.off_replaced || read.off < e)
-                                        && answers(&read.kind)
-                                })
-                                .map(|read| read.off)
-                        })
-                });
+            let mine = || {
+                s.sessions
+                    .values()
+                    .chain(s.gone.iter())
+                    .filter(|x| x.sid == asker)
+            };
+            // A row, or an answer the asker read by a fetch, which leaves none
+            // (ATERM-KI-1115-9210), while the ask it names stands on the log the endpoint was
+            // last told (an offset of a log since replaced names another record): below the
+            // `expired`, or handed before a fork took its own offset (ATERM-KI-1115-2409).
+            let row_stands = |row: &Row| row.re_on_log && (!row.on_log || row.off < e);
+            let read_stands = |read: &FetchRead| {
+                (read.ask_on_log || every_log) && (read.off_replaced || read.off < e)
+            };
+            let answers = |kind: &str| ANSWER_KINDS.contains(&kind);
+            let handed = mine().find_map(|x| {
+                x.rows
+                    .iter()
+                    .find(|row| row.re == Some(re) && answers(&row.kind) && row_stands(row))
+                    .map(|row| row.off)
+                    .or_else(|| {
+                        x.read_by_fetch
+                            .iter()
+                            .find(|read| read.re == re && answers(&read.kind) && read_stands(read))
+                            .map(|read| read.off)
+                    })
+            });
+            // NOR A SECOND `expired` OF THE ASK (ATERM-KI-1115-2409): one the asker was handed
+            // whose record a log change gave up, the ask kept. [`World::expired_once`] counts
+            // the copies the broker still holds.
+            let again = mine().find_map(|x| {
+                x.rows
+                    .iter()
+                    .find(|row| {
+                        row.kind == "expired" && row.re == Some(re) && row.re_on_log && !row.on_log
+                    })
+                    .map(|row| row.off)
+                    .or_else(|| {
+                        x.read_by_fetch
+                            .iter()
+                            .find(|read| {
+                                read.kind == "expired"
+                                    && read.re == re
+                                    && read.ask_on_log
+                                    && read.off_replaced
+                            })
+                            .map(|read| read.off)
+                    })
+            });
             drop(s);
             if let Some(a) = handed {
                 bad.push(format!(
                     "deadline: @{e} expired @{re} ({marker}), whose answer @{a} {asker} was handed"
+                ));
+            }
+            if let Some(a) = again {
+                bad.push(format!(
+                    "deadline: @{e} expired @{re} ({marker}) again, {asker} handed its `expired` \
+                     @{a} on a log since replaced"
                 ));
             }
         }
@@ -3053,6 +3149,14 @@ impl World {
         if r.kept < r.before.len() as u64 {
             self.lost_floor = Some(self.lost_floor.map_or(r.kept, |f| f.min(r.kept)));
         }
+        // AN OFFSET A RESTART GAVE UP NAMES ANOTHER RECORD NEXT (ATERM-KI-1115-2409): the
+        // `expired` that lands there is judged as its own.
+        self.expiries_judged.retain(|&off| off < r.kept);
+        // The reads the endpoint took this step, before the restart, are lowered with the rest.
+        self.reads_past.extend(self.ep.take_read_past());
+        for (_, read) in &mut self.reads_past {
+            read.head = read.head.min(r.kept);
+        }
         // THE VERDICTS THE STOP TOOK (item F4): an answer or an `expired` acked past what the
         // stop kept is gone with it (what a weak tier lets a power loss take, P3), and nothing
         // publishes it again, as nothing does a retired post past `lost_floor`.
@@ -3152,6 +3256,15 @@ impl World {
         }
     }
 
+    /// Every session of this aterm ends ([`Endpoint::power_cut`]), and with it every read past
+    /// ([`World::fetch_read_past`]): no reader of the order is left, and a copy a power cut lands
+    /// (a clear it undid on the media) reaches none of them.
+    fn sessions_end(&mut self) {
+        drop(self.ep.take_read_past());
+        self.reads_past.clear();
+        self.ep.power_cut();
+    }
+
     /// A POWER CUT of the whole machine: the bridge dies, the broker loses
     /// what the law lets it, the state dir keeps what the device lets it,
     /// aterm and its sessions are gone, and the next boot begins.
@@ -3169,7 +3282,7 @@ impl World {
             }
             self.note(n);
         }
-        self.ep.power_cut();
+        self.sessions_end();
         self.boot = self.boot.wrapping_add(1).max(1);
         self.mark = boot_mark(std::path::Path::new(&self.cfg.state_dir), self.boot);
         self.epoch += 1;
@@ -3240,7 +3353,7 @@ impl World {
         if matches!(run, Ok(Some(run)) if run.clean) {
             self.stats.clean_stops += 1;
         }
-        self.ep.power_cut();
+        self.sessions_end();
         self.epoch += 1;
         self.open_sessions();
     }
@@ -4130,6 +4243,7 @@ impl World {
         }
         if self.opts.fetches {
             bad.extend(self.fetch_answers());
+            bad.extend(self.fetch_read_past());
         }
         if self.opts.deadlines {
             bad.extend(self.expired_once());
@@ -4824,12 +4938,13 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
             crate::fx::ReservationTap::Collision => w.stats.reservation_collisions += n,
             crate::fx::ReservationTap::ReplayedAtTheWinner => w.stats.replayed_at_the_winner += n,
             crate::fx::ReservationTap::Unverifiable(case) => {
-                if let Some(slot) = usize::from(case)
+                let slot = usize::from(case)
                     .checked_sub(1)
                     .and_then(|i| w.stats.unverifiable.get_mut(i))
-                {
-                    *slot += n;
-                }
+                    .unwrap_or_else(|| {
+                        panic!("an unverifiable case {case} the stats keep no slot for")
+                    });
+                *slot += n;
             }
         }
     }

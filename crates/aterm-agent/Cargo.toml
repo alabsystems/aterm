@@ -28,6 +28,7 @@ workspace = true
 dev-seams = []
 
 [dependencies]
+aterm-path = { workspace = true }
 # The readers of an agent's reply words and the texts the turn-end policy types (needs, Land's
 # check, the go-ahead, Cruise's carry, press guards, the read-only command classifier).
 alab-policy = { workspace = true }
@@ -279,17 +280,3 @@ path = "tests/transcript_allocations.rs"
 [[test]]
 name = "profile_sentinels"
 path = "tests/profile_sentinels.rs"
-
-# What the session log's step tap costs the footer thread (Phase 3B plan §9
-# M1), run by hand (`targo --unverified bench -p aterm-agent --bench
-# step_tap_cost`), never a gate.
-[[bench]]
-name = "step_tap_cost"
-harness = false
-
-# Authenticated receipt replay and per-prefix capacity checks, on synthetic histories.
-# Run by hand with `targo --unverified bench --profile opt-test -p aterm-agent
-# --bench native_receipts_replay`; no latency threshold or user journal is involved.
-[[bench]]
-name = "native_receipts_replay"
-harness = false

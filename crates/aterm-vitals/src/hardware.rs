@@ -7,6 +7,8 @@ use crate::model::{Snapshot, Thermal, Ticks};
 
 /// Minimum busy fraction of every E core in a recorded underuse episode.
 pub const EFFICIENCY_BUSY_MIN: f32 = 0.9;
+/// Maximum mean busy fraction of P cores in a recorded core-tick observation.
+pub const PERFORMANCE_BUSY_MAX: f32 = 0.25;
 /// Required continuous observation before an episode is retained.
 pub const SUSTAIN_NS: u64 = 30_000_000_000;
 
@@ -168,7 +170,7 @@ pub struct Frame {
     pub hardware: Option<Sample>,
     /// Public thermal state and low-power setting; nominal is not a no-limit proof.
     pub thermal: Option<Thermal>,
-    /// Current runnable wait in cores.
+    /// Reported runnable-minus-CPU counter-growth difference, in cores.
     pub wait: Option<f32>,
     /// Worker identity, policy and CPU counters read with this frame.
     pub workers: Vec<Worker>,
@@ -197,11 +199,7 @@ pub(crate) struct Recorder {
 }
 
 fn all_e_busy_p_idle(s: &Snapshot) -> Option<bool> {
-    if s.machine_only
-        || s.procs_window_ns.is_none()
-        || s.procs_window_ns != s.cores_window_ns
-        || !s.global.wait.is_some_and(f32::is_finite)
-    {
+    if s.machine_only || s.procs_window_ns.is_none() || s.procs_window_ns != s.cores_window_ns {
         return None;
     }
     let cpu = s.cpu.as_ref()?;
@@ -217,14 +215,27 @@ fn all_e_busy_p_idle(s: &Snapshot) -> Option<bool> {
     if e.is_empty() || !cpu.clusters.iter().any(|c| c.short == "P") {
         return None;
     }
+    let p: Vec<_> = cpu
+        .clusters
+        .iter()
+        .filter(|c| c.short == "P")
+        .flat_map(|c| &c.cores)
+        .collect();
+    let p_busy = p.iter().try_fold(0.0f32, |sum, &&i| {
+        let busy = cpu.cores.get(i)?.current()?;
+        (busy.is_finite() && (0.0..=1.0).contains(&busy)).then_some(sum + busy)
+    })?;
+    let e_busy: Vec<f32> = e
+        .iter()
+        .map(|&&i| {
+            let busy = cpu.cores.get(i)?.current()?;
+            (busy.is_finite() && (0.0..=1.0).contains(&busy)).then_some(busy)
+        })
+        .collect::<Option<_>>()?;
     Some(
-        crate::scheduling::idle_performance(s).is_some()
-            && e.into_iter().all(|i| {
-                cpu.cores
-                    .get(*i)
-                    .and_then(|c| c.current())
-                    .is_some_and(|v| v >= EFFICIENCY_BUSY_MIN)
-            }),
+        !p.is_empty()
+            && p_busy <= p.len() as f32 * PERFORMANCE_BUSY_MAX
+            && e_busy.into_iter().all(|busy| busy >= EFFICIENCY_BUSY_MIN),
     )
 }
 

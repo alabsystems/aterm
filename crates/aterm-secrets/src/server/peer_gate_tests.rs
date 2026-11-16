@@ -25,6 +25,14 @@ fn txt(seq: u64, rec: Option<[u8; 32]>) -> VaultTxt {
     }
 }
 
+/// The instance at `host` as a browse hands it to a pass, with `txt`: what [`pull_due`] judges.
+fn named(host: &str, txt: Option<&VaultTxt>) -> crate::discover::DiscoveredVault {
+    crate::discover::DiscoveredVault {
+        url: format!("http://{host}:7484/v1/team"),
+        txt: txt.cloned(),
+    }
+}
+
 /// What a gated pass pulls of a vault a TXT names: its envelope where the TXT names a higher seq
 /// than the one held (or none is held and the vault is taken), its records where the TXT names a
 /// `rec` other than the one held and every proven one, and at every visit where it names no
@@ -45,7 +53,8 @@ fn a_txt_makes_due_only_what_it_names_past_what_is_held() {
         follows: [0; 32],
     };
     let proven = |rec: &[u8; 32]| *rec == [2; 32];
-    let due = |txt: Option<&VaultTxt>, own: &Own| pull_due(txt, own, proven);
+    let due =
+        |txt: Option<&VaultTxt>, own: &Own| pull_due(&named("m9.local", txt), false, own, proven);
     let (envelope, records) = (
         Due {
             envelope: true,
@@ -111,6 +120,62 @@ fn a_txt_makes_due_only_what_it_names_past_what_is_held() {
     };
     assert_eq!(due(Some(&txt(9, Some([9; 32]))), &stranger), Due::NONE);
     assert_eq!(due(Some(&txt(9, None)), &stranger), Due::NONE);
+}
+
+/// A TXT naming no `rec` is excused from records only on an `alab-secrets` instance where the
+/// instance its label names, resolving to its endpoints, named a `rec` for the vault
+/// (`named_elsewhere`), whatever label `pull_due` is handed with it: which instance that is, and
+/// that a TXT naming no label never has one, is how a round finds `named_elsewhere`
+/// ([`PullGate::names_rec`], bound by
+/// `a_named_rec_stands_for_its_label_at_exactly_the_endpoints_it_resolved_to_until_a_catch_up`
+/// and `another_servers_rec_at_the_same_endpoints_excuses_no_alab_secrets_records`). On
+/// `alab-secrets` with none beside it, labelled or not, and on any other instance, beside one
+/// or not, its records are due at every visit. A TXT naming a `rec` is judged by it wherever it
+/// is.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with the label taken as the proof
+/// (`None => txt.label.is_none() || !PullGate::alab_instance(&peer.url)`), "alab-secrets alone,
+/// label Some("m9")" fails; with no exception (`None => true`), "alab-secrets beside a rec,
+/// label Some("m9")"; with no look at the instance (`None => !named_elsewhere`), "own-label,
+/// beside true, label Some("m9")"; with the label required beside the group's `rec`
+/// (`None => txt.label.is_none() || !(named_elsewhere && …)`), "alab-secrets beside a rec,
+/// label None".
+#[test]
+fn a_rec_less_txt_is_excused_only_on_alab_secrets_beside_a_named_rec() {
+    let own = Own {
+        seq: Some(5),
+        rec: [1; 32],
+        takes_envelope: true,
+        takes_records: true,
+        follows: [0; 32],
+    };
+    let records = |host: &str, label: Option<&str>, rec: Option<[u8; 32]>, beside: bool| {
+        let advertised = VaultTxt {
+            label: label.map(str::to_owned),
+            ..txt(5, rec)
+        };
+        pull_due(&named(host, Some(&advertised)), beside, &own, |_| false).records
+    };
+    for label in [Some("m9"), None] {
+        assert!(
+            !records("alab-secrets.local", label, None, true),
+            "alab-secrets beside a rec, label {label:?}"
+        );
+        assert!(
+            records("alab-secrets.local", label, None, false),
+            "alab-secrets alone, label {label:?}"
+        );
+        for beside in [false, true] {
+            assert!(
+                records("m9.local", label, None, beside),
+                "own-label, beside {beside}, label {label:?}"
+            );
+            assert!(
+                !records("alab-secrets.local", label, Some([1; 32]), beside),
+                "alab-secrets naming the held rec, beside {beside}"
+            );
+        }
+    }
 }
 
 /// A server on loopback pinning vault `team` to [`OLD`], holding its envelope at `seq`, with
@@ -681,15 +746,16 @@ fn first_reads_hold_no_slot_and_a_version_stored_is_read_whole_once() {
     }
 }
 
-/// A holder's `alab-secrets` instance is gated as any instance is, its TXT naming no `rec` by
-/// design: a newer version it names is pulled alone, and a TXT naming what is held costs it no
-/// request; this server's own `alab-secrets` instance (resolving to it) is not pulled. The
+/// A holder's `alab-secrets` instance is gated as any instance is where its server's own-label
+/// instance, resolving to the same endpoints, names a `rec` for the vault: its TXT names that
+/// label (`m9`, from [`txt`]) and no `rec`, by design, so the records are due as `m9`'s TXT
+/// says; a newer version the `alab-secrets` TXT names is pulled alone, and a TXT naming what is
+/// held costs it no request; this server's own instances (resolving to it) are not pulled. The
 /// holder is swept as every server is ([`PullGate::sweep_due`]).
 ///
-/// NEGATIVE CONTROLS (2026-11-15): with the rec-less `alab-secrets` TXT read as an older
-/// build's (no `PullGate::alab_instance` exception in `group_wants`), the equal TXT costs a
-/// records GET (`left: (0, 1)`, `right: (0, 0)`); with step 6's holder edge (a group holding an
-/// `alab-secrets` instance pulled whatever its TXT says), it costs both (`left: (1, 1)`).
+/// NEGATIVE CONTROLS (2026-11-15): with no `alab-secrets` exception in `pull_due`
+/// (`None => true`), and with no instance taken as naming a `rec` (`PullGate::names_rec`
+/// answering false), the equal TXT costs a records GET (`left: (0, 1)`, `right: (0, 0)`).
 #[test]
 fn an_alab_secrets_instance_is_gated_and_names_no_records() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -707,13 +773,18 @@ fn an_alab_secrets_instance_is_gated_and_names_no_records() {
     let pass = |at: &Running, seq, when| {
         pull_pass(
             &own.shared,
-            &[browsed("alab-secrets.local", at, txt(seq, None))],
+            &[
+                browsed("alab-secrets.local", at, txt(seq, None)),
+                // Its server's own-label instance: the version held, and the records it holds.
+                browsed("m9.local", at, txt(5, digest(at))),
+            ],
             own_port,
             Some("m1"),
             &[],
             Pass::Gated(when),
         );
     };
+    assert_eq!(digest(&holder), digest(&own));
     pass(&holder, 5, t0);
     assert_eq!(asked(&holder), (0, 0), "a TXT naming what is held");
     publish(&holder, 6);
@@ -721,7 +792,346 @@ fn an_alab_secrets_instance_is_gated_and_names_no_records() {
     assert_eq!(asked(&holder), (1, 0), "a newer version, alone");
     assert_eq!(own.held_seq("team"), Some(6));
     pass(&own, 9, t0 + PULL_SPACING * 2);
-    assert_eq!(asked(&own), (0, 0), "the instance this server holds");
+    assert_eq!(asked(&own), (0, 0), "the instances this server holds");
+    own.stop();
+    holder.stop();
+}
+
+/// A holder's `alab-secrets` instance naming its server's label has its records pulled at every
+/// round where the instance that label names, resolving to its endpoints, named no `rec` for its
+/// vault, in it or a round within [`NAMED_FOR`] before it ([`PullGate::names_rec`]): beside its
+/// own-label instance naming another vault (`family`, which this server takes nothing of; a
+/// round's resolve leaves such an instance out, and a pass handed one notes it for that vault
+/// alone), and in the next round, whose batch leaves that instance out, each round asks the
+/// holder for its records and nothing else, and the second takes a record posted to it between
+/// them, well before the holder's next sweep. A label shows no instance named the records.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with the label taken as the proof
+/// (`None => txt.label.is_none() || !PullGate::alab_instance(&peer.url)`), with
+/// `PullGate::names_rec` reading a `rec` for any vault, and with every rec-less `alab-secrets`
+/// TXT excused (`None => !PullGate::alab_instance(&peer.url)`), the first round asks the holder
+/// nothing (`left: (0, 0)`, `right: (0, 1)`).
+#[test]
+fn a_labelled_alab_secrets_instance_with_no_rec_named_beside_it_is_pulled_every_round() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = serving(&root.path().join("own"), 5, |_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    });
+    let holder = peer(&root.path().join("holder"), 5);
+    let mut founded = Founded::new();
+    for server in [&own, &holder] {
+        post(server, &[founded.log.genesis()]);
+    }
+    let own_port = own.addr.port();
+    let t0 = Instant::now();
+    swept(&own, &[&[holder.addr]], t0);
+    let alab = browsed("alab-secrets.local", &holder, txt(5, None));
+    // Its server's own-label instance, carrying the TXT of another vault it advertises there.
+    let family = crate::discover::DiscoveredVault {
+        url: format!("http://m9.local:{}/v1/family", holder.addr.port()),
+        txt: Some(VaultTxt {
+            vault: "family".to_owned(),
+            ..txt(5, Some([0xfa; 32]))
+        }),
+    };
+    let pass = |peers: &[crate::discover::DiscoveredVault], when| {
+        pull_pass(
+            &own.shared,
+            peers,
+            own_port,
+            Some("m1"),
+            &[],
+            Pass::Gated(when),
+        );
+    };
+    pass(&[alab.clone(), family], t0);
+    assert_eq!(
+        asked(&holder),
+        (0, 1),
+        "beside an own-label instance naming another vault: its records alone"
+    );
+    let first = founded.grow();
+    post(&holder, &[&first]);
+    assert_ne!(digest(&own), digest(&holder));
+    pass(&[alab], t0 + PULL_SPACING);
+    assert_eq!(
+        asked(&holder),
+        (0, 2),
+        "with that instance left out of the round: asked again"
+    );
+    assert_eq!(digest(&own), digest(&holder), "and takes what was posted");
+    own.stop();
+    holder.stop();
+}
+
+/// A holder whose only registration is `alab-secrets` (its TXT names no label, and no other
+/// instance resolves to its endpoints) has its records pulled at every visit, as an older
+/// build's rec-less TXT has: browsed as `alab-secrets.local` alone, its TXT naming the version
+/// held, each round past the spacing asks it for its records and nothing else, and takes a
+/// record posted to it between two rounds, well before the holder's next sweep.
+///
+/// NEGATIVE CONTROL (2026-11-15): with `pull_due` making records due by none for every rec-less
+/// `alab-secrets` TXT, whatever its group holds (`None => !PullGate::alab_instance(&peer.url)`,
+/// the exception's first form), the first round asks the holder nothing (`left: (0, 0)`,
+/// `right: (0, 1)`).
+#[test]
+fn an_alab_secrets_instance_naming_no_label_has_its_records_pulled_at_every_visit() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = serving(&root.path().join("own"), 5, |_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    });
+    let holder = peer(&root.path().join("holder"), 5);
+    let mut founded = Founded::new();
+    for server in [&own, &holder] {
+        post(server, &[founded.log.genesis()]);
+    }
+    let own_port = own.addr.port();
+    let t0 = Instant::now();
+    swept(&own, &[&[holder.addr]], t0);
+    let only = VaultTxt {
+        label: None,
+        ..txt(5, None)
+    };
+    let pass = |when| {
+        pull_pass(
+            &own.shared,
+            &[browsed("alab-secrets.local", &holder, only.clone())],
+            own_port,
+            Some("m1"),
+            &[],
+            Pass::Gated(when),
+        );
+    };
+    pass(t0);
+    assert_eq!(
+        asked(&holder),
+        (0, 1),
+        "the version held: its records alone"
+    );
+    let first = founded.grow();
+    post(&holder, &[&first]);
+    assert_ne!(digest(&own), digest(&holder));
+    pass(t0 + PULL_SPACING);
+    assert_eq!(asked(&holder), (0, 2), "the next round asks again");
+    assert_eq!(digest(&own), digest(&holder), "and takes what was posted");
+    own.stop();
+    holder.stop();
+}
+
+/// Two `alab-secrets` instances resolving to the same endpoints (as two holders' do after a
+/// heal, both at `alab-secrets.local:7484` and told apart by their TXT's label), neither TXT
+/// naming a `rec` and nothing else resolving there: neither stands for the other's records
+/// (neither names a `rec`, and neither is on the host the other's label names), so each round
+/// past the spacing asks the server there for its records and nothing else.
+///
+/// NEGATIVE CONTROL (2026-11-15): with [`PullGate::note_named`] noting an instance whose TXT
+/// names no `rec` (no `txt.rec.is_some()` filter) and [`PullGate::names_rec`] taking an
+/// instance on any host (no look at the label), each is taken as naming the records beside the
+/// other and the first round asks nothing (`left: (0, 0)`, `right: (0, 1)`); either alone
+/// leaves this test passing, since both rules hold the case.
+#[test]
+fn two_alab_secrets_instances_naming_no_rec_have_their_records_pulled_every_round() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = serving(&root.path().join("own"), 5, |_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    });
+    let holder = peer(&root.path().join("holder"), 5);
+    let founded = Founded::new();
+    for server in [&own, &holder] {
+        post(server, &[founded.log.genesis()]);
+    }
+    let own_port = own.addr.port();
+    let t0 = Instant::now();
+    swept(&own, &[&[holder.addr]], t0);
+    let healed = |label: &str| {
+        browsed(
+            "alab-secrets.local",
+            &holder,
+            VaultTxt {
+                label: Some(label.to_owned()),
+                ..txt(5, None)
+            },
+        )
+    };
+    let pass = |when| {
+        pull_pass(
+            &own.shared,
+            &[healed("m7"), healed("m9")],
+            own_port,
+            Some("m1"),
+            &[],
+            Pass::Gated(when),
+        );
+    };
+    pass(t0);
+    assert_eq!(asked(&holder), (0, 1), "two rec-less TXTs: the records");
+    pass(t0 + PULL_SPACING);
+    assert_eq!(asked(&holder), (0, 2), "and again the next round");
+    own.stop();
+    holder.stop();
+}
+
+/// Where the gate takes a `rec` as named for an `alab-secrets` TXT ([`PullGate::note_named`],
+/// [`PullGate::names_rec`]): by the instance on the host its `label` names (`m9.local` for
+/// `m9`, from [`txt`]) alone, for the vault that instance's TXT named, at exactly the endpoints
+/// it resolved to, until a round resolves that instance at other endpoints or any catch-up
+/// comes, an address change's as well as a wake's. Another instance noted at the same endpoints
+/// (`m7.local`) stands for nothing, nor does any for a TXT naming no label.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with `names_rec` taking a list that shares an endpoint
+/// (`endpoints.iter().any(|at| named.endpoints.contains(at))`), "a list sharing an endpoint"
+/// fails; with `names_rec` matching by endpoints and vault alone (no look at the host), "another
+/// instance at the same endpoints" fails; with a TXT naming no label taken as naming any
+/// (`txt.label.as_deref().is_none_or(…)` in place of the `let … else`), "a TXT naming no label"
+/// fails; with `catch_up` forgetting the noted instances only after a wake (`if woke`), "a
+/// catch-up for new addresses" fails.
+#[test]
+fn a_named_rec_stands_for_its_label_at_exactly_the_endpoints_it_resolved_to_until_a_catch_up() {
+    let at = |n: u8| SocketAddr::from(([127, 0, 0, n], 7484));
+    let endpoints =
+        |n: u8| -> Vec<(SocketAddr, String)> { vec![(at(n), format!("http://{}/v1/team", at(n)))] };
+    let m9 = named("m9.local", Some(&txt(5, Some(NEW))));
+    let m7 = named("m7.local", Some(&txt(5, Some(NEW))));
+    let alab = txt(5, None);
+    let unlabelled = VaultTxt {
+        label: None,
+        ..txt(5, None)
+    };
+    let family = VaultTxt {
+        vault: "family".to_owned(),
+        ..txt(5, None)
+    };
+    let (one, two) = (endpoints(1), endpoints(2));
+    let mut gate = PullGate::default();
+    let t0 = Instant::now();
+    gate.note_named([(&m7, one.as_slice())], t0);
+    assert!(
+        !gate.names_rec(&[at(1)], &alab),
+        "another instance at the same endpoints"
+    );
+    gate.note_named([(&m9, one.as_slice())], t0);
+    assert!(gate.names_rec(&[at(1)], &alab), "where it resolved");
+    assert!(!gate.names_rec(&[at(1)], &family), "another vault");
+    assert!(
+        !gate.names_rec(&[at(1)], &unlabelled),
+        "a TXT naming no label"
+    );
+    assert!(
+        !gate.names_rec(&[at(1), at(2)], &alab),
+        "a list sharing an endpoint"
+    );
+    gate.note_named([(&m9, two.as_slice())], t0 + PULL_SPACING);
+    assert!(
+        !gate.names_rec(&[at(1)], &alab),
+        "once a round resolved it elsewhere"
+    );
+    assert!(gate.names_rec(&[at(2)], &alab), "where it resolves now");
+    gate.catch_up(false);
+    assert!(
+        !gate.names_rec(&[at(2)], &alab),
+        "a catch-up for new addresses"
+    );
+    gate.note_named([(&m9, two.as_slice())], t0 + PULL_SPACING * 2);
+    assert!(gate.names_rec(&[at(2)], &alab), "noted again");
+    gate.catch_up(true);
+    assert!(!gate.names_rec(&[at(2)], &alab), "after a wake");
+}
+
+/// What a round's resolve of an instance whose host resolved to no endpoint (a lookup that timed
+/// out or failed) does to what an earlier round noted of it ([`PullGate::note_named`]): it
+/// stands, as for an instance the round left out, while the TXT the round resolved still names
+/// a `rec` for the vault, and goes once that TXT names none.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with every instance the round resolved forgotten, whatever
+/// its endpoints (`seen == instance` alone), "its host resolving to no endpoint" fails; with an
+/// instance whose host resolved to none never forgotten (`seen == instance &&
+/// !endpoints.is_empty()`), "its TXT naming no rec, at no endpoint" fails.
+#[test]
+fn an_instance_resolving_to_no_endpoint_leaves_what_was_noted_of_it_unless_it_names_no_rec() {
+    let at = SocketAddr::from(([127, 0, 0, 1], 7484));
+    let one = vec![(at, format!("http://{at}/v1/team"))];
+    let none: Vec<(SocketAddr, String)> = Vec::new();
+    let alab = txt(5, None);
+    let mut gate = PullGate::default();
+    let t0 = Instant::now();
+    let naming = named("m9.local", Some(&txt(5, Some(NEW))));
+    gate.note_named([(&naming, one.as_slice())], t0);
+    gate.note_named([(&naming, none.as_slice())], t0 + PULL_SPACING);
+    assert!(
+        gate.names_rec(&[at], &alab),
+        "its host resolving to no endpoint"
+    );
+    let rec_less = named("m9.local", Some(&txt(5, None)));
+    gate.note_named([(&rec_less, none.as_slice())], t0 + PULL_SPACING * 2);
+    assert!(
+        !gate.names_rec(&[at], &alab),
+        "its TXT naming no rec, at no endpoint"
+    );
+}
+
+/// A server that answers where another server was noted naming the records (a DHCP lease handed
+/// on, or this Mac moving between two labs on one subnet without a catch-up): through the
+/// production pull on loopback, after a round resolves `m7.local` naming the records this server
+/// holds at the holder's endpoint, the next round's `alab-secrets` TXT there, labelled `m9`,
+/// has its records pulled, since `m7` is not the instance it names; once a round resolves
+/// `m9.local` naming them, the next round's `alab-secrets` TXT alone asks nothing; and one
+/// naming no label is pulled beside that note too.
+///
+/// NEGATIVE CONTROLS (2026-11-15), each the holder's (envelope, records) GETs: with
+/// `names_rec` matching by endpoints and vault alone (no look at the host), the round after
+/// `m7`'s asks nothing (`left: (0, 0)`, `right: (0, 1)`); with `names_rec` answering false,
+/// the round beside `m9` naming the records asks them (`left: (0, 2)`, `right: (0, 1)`); with a
+/// TXT naming no label taken as naming any (`is_none_or`), the unlabelled round asks nothing
+/// (`left: (0, 1)`, `right: (0, 2)`).
+#[test]
+fn another_servers_rec_at_the_same_endpoints_excuses_no_alab_secrets_records() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = serving(&root.path().join("own"), 5, |_, _| {
+        Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+    });
+    let holder = peer(&root.path().join("holder"), 5);
+    let founded = Founded::new();
+    for server in [&own, &holder] {
+        post(server, &[founded.log.genesis()]);
+    }
+    let own_port = own.addr.port();
+    let t0 = Instant::now();
+    swept(&own, &[&[holder.addr]], t0);
+    let held = digest(&holder);
+    assert_eq!(held, digest(&own));
+    let alab = |label: Option<&str>| {
+        browsed(
+            "alab-secrets.local",
+            &holder,
+            VaultTxt {
+                label: label.map(str::to_owned),
+                ..txt(5, None)
+            },
+        )
+    };
+    let pass = |peers: &[crate::discover::DiscoveredVault], when| {
+        pull_pass(
+            &own.shared,
+            peers,
+            own_port,
+            Some("m1"),
+            &[],
+            Pass::Gated(when),
+        );
+    };
+    pass(&[browsed("m7.local", &holder, txt(5, held))], t0);
+    assert_eq!(asked(&holder), (0, 0), "m7 naming the records held");
+    pass(&[alab(Some("m9"))], t0 + PULL_SPACING);
+    assert_eq!(asked(&holder), (0, 1), "m9's alab-secrets after m7's note");
+    pass(
+        &[alab(Some("m9")), browsed("m9.local", &holder, txt(5, held))],
+        t0 + PULL_SPACING * 2,
+    );
+    assert_eq!(asked(&holder), (0, 1), "beside m9 naming the records held");
+    pass(&[alab(Some("m9"))], t0 + PULL_SPACING * 3);
+    assert_eq!(asked(&holder), (0, 1), "the round after m9's note");
+    pass(&[alab(None)], t0 + PULL_SPACING * 4);
+    assert_eq!(asked(&holder), (0, 2), "a TXT naming no label");
     own.stop();
     holder.stop();
 }
@@ -939,9 +1349,16 @@ fn alab_secrets_rings_the_browse_unless_this_server_holds_it() {
 }
 
 /// What the real gate does from a state of [`aterm_models_swarm::peer_gate_model`]: the
-/// environment's moves as the model makes them, and `Gate` as [`pull_due`] decides it, over a
-/// server holding `seq` 5 (when `held`) and records digest `[1; 32]`, of a TXT naming `seq`
-/// 4, 5 or 6 (`adv`) and `rec` none, `[1; 32]`, `[2; 32]` (proven) or `[3; 32]`.
+/// environment's moves as the model makes them, and `Gate` as [`pull_due`] decides it given
+/// `named_elsewhere`, over a server holding `seq` 5 (when `held`) and records digest `[1; 32]`,
+/// of a TXT naming `seq` 4, 5 or 6 (`adv`) and `rec` none, `[1; 32]`, `[2; 32]` (proven) or
+/// `[3; 32]`, on `m9.local` with `named_elsewhere` either way, on `alab-secrets.local` with it
+/// false, or on `alab-secrets.local` with it true (`inst`). Each is decided with the TXT naming
+/// label `m9` and naming none, and every way of a state must agree: neither a label nor
+/// `named_elsewhere` on an instance other than `alab-secrets` moves a pull. `named_elsewhere` is
+/// an input here: how a round finds it ([`PullGate::note_named`], [`PullGate::names_rec`],
+/// which answers it only for the instance the TXT's label names, so never for a TXT naming
+/// none) is not modelled.
 fn gate_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_spec::interp::State {
     let mut next = state.clone();
     let mut set = |var: &'static str, value: i64| {
@@ -958,6 +1375,8 @@ fn gate_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_spe
         "NoRec" => set("rec", 0),
         "ProvenRec" => set("rec", 2),
         "OtherRec" => set("rec", 3),
+        "AlabAlone" => set("inst", 1),
+        "AlabNamedElsewhere" => set("inst", 2),
         "Gate" => {
             let takes = state["takes"] == 1;
             let own = Own {
@@ -971,8 +1390,34 @@ fn gate_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_spe
                 0 => None,
                 n => Some([u8::try_from(n).expect("small"); 32]),
             };
-            let named = txt(4 + u64::try_from(state["adv"]).expect("small"), rec);
-            let due = pull_due(Some(&named), &own, |rec| *rec == [2; 32]);
+            let ways: &[(&str, bool)] = match state["inst"] {
+                0 => &[("m9.local", false), ("m9.local", true)],
+                1 => &[("alab-secrets.local", false)],
+                _ => &[("alab-secrets.local", true)],
+            };
+            let seq = 4 + u64::try_from(state["adv"]).expect("small");
+            let dues: Vec<Due> = ways
+                .iter()
+                .flat_map(|&(host, named_elsewhere)| {
+                    [Some("m9"), None].map(|label| {
+                        let advertised = VaultTxt {
+                            label: label.map(str::to_owned),
+                            ..txt(seq, rec)
+                        };
+                        pull_due(
+                            &named(host, Some(&advertised)),
+                            named_elsewhere,
+                            &own,
+                            |rec| *rec == [2; 32],
+                        )
+                    })
+                })
+                .collect();
+            assert!(
+                dues.windows(2).all(|pair| pair[0] == pair[1]),
+                "every way of {state:?} decides alike: {dues:?}"
+            );
+            let due = dues[0];
             set("phase", 1);
             set("env", i64::from(due.envelope));
             set("recs", i64::from(due.records));
@@ -982,15 +1427,34 @@ fn gate_transition(state: &aterm_spec::interp::State, action: &str) -> aterm_spe
     next
 }
 
-/// Every move the gate's model reaches is one the real gate makes ([`pull_due`]): a newer or
-/// first envelope is pulled, records a TXT names that this server neither holds nor proved, a
-/// `rec`-less TXT's records at every visit, and nothing a TXT shows held or proven, nor of a
-/// vault this server takes nothing of. That the model holds its laws and each mutant breaks one
-/// is `crates/aterm-models/tests/non_vacuity.rs`'s, which sweeps every registered model.
+/// Every move the gate's model reaches is one [`pull_due`] (all a round asks of a peer's TXT)
+/// makes given `named_elsewhere`: a newer or first envelope is pulled, records a TXT names that
+/// this server neither holds nor proved, a `rec`-less TXT's records at every visit unless it is
+/// an `alab-secrets` instance's and `named_elsewhere` holds, and nothing a TXT shows held or
+/// proven, nor of a vault this server takes nothing of. It binds `pull_due` alone: which
+/// instances make `named_elsewhere` hold for a round, those it resolved and those the gate
+/// remembers ([`PullGate::note_named`], [`PullGate::names_rec`]), is bound by the round tests
+/// (`an_alab_secrets_instance_is_gated_and_names_no_records`,
+/// `a_labelled_alab_secrets_instance_with_no_rec_named_beside_it_is_pulled_every_round`,
+/// `two_alab_secrets_instances_naming_no_rec_have_their_records_pulled_every_round`,
+/// `a_named_rec_stands_for_its_label_at_exactly_the_endpoints_it_resolved_to_until_a_catch_up`,
+/// `an_instance_resolving_to_no_endpoint_leaves_what_was_noted_of_it_unless_it_names_no_rec`,
+/// `another_servers_rec_at_the_same_endpoints_excuses_no_alab_secrets_records` and
+/// `round_counts_tests::a_holders_own_label_instance_out_of_the_batch_gates_its_records_for_a_sweep_period`).
+/// That the model holds its laws and each mutant breaks one is
+/// `crates/aterm-models/tests/non_vacuity.rs`'s, which sweeps every registered model.
 ///
-/// NEGATIVE CONTROL (2026-11-15): with `pull_due`'s rec-less arm back to step 6's
-/// `None => envelope`, the model rejects a real `Gate` (the loop's assertion fails), from a state
-/// whose TXT names no `rec` and no newer version.
+/// NEGATIVE CONTROLS (2026-11-15): with `pull_due`'s rec-less arm back to step 6's
+/// `None => envelope`, the model rejects a real `Gate` (the loop's assertion fails) from a state
+/// whose TXT names no `rec` and no newer version (`inst: 0`, `recs: 0` where the model has 1);
+/// with every rec-less `alab-secrets` TXT excused (`None => !PullGate::alab_instance(…)`), from
+/// the state whose TXT is on `alab-secrets` with `named_elsewhere` false (`inst: 1`, `recs: 0`
+/// where the model has 1); with no `alab-secrets` exception (`None => true`), from the state
+/// with it true (`inst: 2`, `recs: 1` where the model has 0). The ways of one state disagree
+/// ("every way of … decides alike" fails) with the label taken as the proof (`inst: 1`, the
+/// labelled TXT pulling no records), with no look at the instance (`None => !named_elsewhere`,
+/// `inst: 0` with `named_elsewhere` pulling none) and with the label required where
+/// `named_elsewhere` holds (`inst: 2`, the TXT naming no label pulling them).
 #[test]
 fn the_gate_conforms_to_its_model() {
     let model = aterm_models_swarm::peer_gate_model();
@@ -1009,10 +1473,15 @@ fn the_gate_conforms_to_its_model() {
         }
     }
     assert!(gated > 8, "{gated} gates");
-    let mut state = model.init_state();
-    state.insert("rec", 0);
-    let mut bad = gate_transition(&state, "Gate");
-    bad.insert("recs", 0);
-    assert!(!model.successors("Gate", &state).contains(&bad));
-    assert!(!model.check_invariant("RecLessProgress", &bad));
+    // A rec-less TXT on an own-label instance, and on an `alab-secrets` one with
+    // `named_elsewhere` false.
+    for inst in [0, 1] {
+        let mut state = model.init_state();
+        state.insert("rec", 0);
+        state.insert("inst", inst);
+        let mut bad = gate_transition(&state, "Gate");
+        bad.insert("recs", 0);
+        assert!(!model.successors("Gate", &state).contains(&bad), "{inst}");
+        assert!(!model.check_invariant("RecLessProgress", &bad), "{inst}");
+    }
 }

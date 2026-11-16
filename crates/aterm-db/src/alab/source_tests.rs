@@ -494,3 +494,112 @@ fn native_projection_refuses_control_drift_and_holds_control_during_persistence(
         .unwrap();
     drop(PrivateLock::take(&control, "control.lock", Duration::ZERO, "released").unwrap());
 }
+
+/// The retained registry records an admission's log read decodes and their payload bytes, read
+/// from the store itself: each record that carries a payload and is no removal cutoff.
+fn retained_payloads(paths: &client::Paths, config: &Path) -> (u64, u64) {
+    application::with_retained_store(
+        paths,
+        paths,
+        crate::admission::deadline(),
+        |session, catalog| projection_descriptor(config, session, catalog),
+        |session, store, _, _, _, _, _| {
+            let (metadata, _) = store.metadata_with_append_bound(session)?;
+            Ok(metadata
+                .iter()
+                .filter(|evidence| !evidence.cutoff)
+                .filter_map(|evidence| evidence.record.as_ref())
+                .fold((0, 0), |(records, bytes), record| {
+                    (records + 1, bytes + record.payload().len() as u64)
+                }))
+        },
+    )
+    .unwrap()
+}
+
+/// A STRICT READ OF THE REGISTRY IS COUNTED BY WHAT IT READ ([`admission_counts`]): an
+/// admission as one read once it holds both replicas, each retained record it hands the decoder
+/// once, and that record's payload bytes; an observation that is no admission
+/// ([`Registry::observe_projection`]) as one observation. Over one Writer's registry each
+/// admission moves `[reads, records, bytes, observations]` by `[1, r, b, 0]`, `r` and `b` the
+/// store's own (`retained_payloads`): of the opened registry, after seeding (more records than
+/// before it) and after a roll; the run that recorded the controls below read `[1, 0, 0, 0]`,
+/// `[1, 3, 38829, 0]` and `[1, 4, 49774, 0]`. An observation moves `[0, 0, 0, 1]`, and an
+/// admission refused before it reads (its injected unavailability) moves none. The process's
+/// own counts, which `metrics` prints, move by at least as much as this thread's each time:
+/// every read counts in both, and other threads only add.
+///
+/// NEGATIVE CONTROLS (2026-11-13), each applied alone:
+/// - `admitted_decode`'s record count removed: the admission after seeding fails, left
+///   `[1, 0, 38829, 0]`, right `[1, 3, 38829, 0]`;
+/// - `observe_projection`'s count removed: `an observation that is no admission` fails, left
+///   `[0, 0, 0, 0]`, right `[0, 0, 0, 1]`;
+/// - `count_admission`'s add to the process's counts removed: the first admission fails, `the
+///   opened registry's admission: the process's counts moved by [0, 0, 0, 0], this thread's by
+///   [1, 0, 0, 0]`.
+#[test]
+fn a_strict_read_counts_what_it_read() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    let config = paths.home.join("config.toml");
+    let vault = client::config(paths).unwrap().unwrap();
+    let list = |c: AdmissionCounts| [c.reads, c.records, c.bytes, c.observations];
+    let moved = |what: &str, run: &dyn Fn()| {
+        let (before, process_before) = (list(admission_counts_here()), list(admission_counts()));
+        run();
+        let (after, process_after) = (list(admission_counts_here()), list(admission_counts()));
+        let moved: [u64; 4] = std::array::from_fn(|i| after[i] - before[i]);
+        let process: [u64; 4] = std::array::from_fn(|i| process_after[i] - process_before[i]);
+        eprintln!("{what}: {moved:?}");
+        assert!(
+            (0..4).all(|i| process[i] >= moved[i]),
+            "{what}: the process's counts moved by {process:?}, this thread's by {moved:?}"
+        );
+        moved
+    };
+    let admit = || {
+        registry
+            .with_admitted_projection(&config, paths, &vault, None, |_, _| Ok(()))
+            .unwrap();
+    };
+    let (r0, b0) = retained_payloads(paths, &config);
+    assert_eq!(
+        moved("the opened registry's admission", &admit),
+        [1, r0, b0, 0]
+    );
+    registry.seed().unwrap();
+    registry.publish_schema().unwrap();
+    let (r1, b1) = retained_payloads(paths, &config);
+    assert!(r1 > r0 && b1 > b0, "seeding appends records: {r0} to {r1}");
+    assert_eq!(
+        moved("the seeded registry's admission", &admit),
+        [1, r1, b1, 0]
+    );
+    assert_eq!(
+        moved("an observation that is no admission", &|| {
+            registry.observe_projection(&config).unwrap();
+        }),
+        [0, 0, 0, 1]
+    );
+    assert_eq!(
+        moved("an admission refused before it reads", &|| {
+            PROJECTION_MUTANT.set(3);
+            let refused =
+                registry.with_admitted_projection(&config, paths, &vault, None, |_, _| Ok(()));
+            PROJECTION_MUTANT.set(0);
+            assert!(refused.is_err());
+        }),
+        [0, 0, 0, 0]
+    );
+    let rolled = registry
+        .roll(true, aterm_time::unix_millis().unwrap())
+        .unwrap();
+    assert!(rolled.sealed, "{rolled:?}");
+    let (r2, b2) = retained_payloads(paths, &config);
+    assert_eq!(
+        moved("the rolled registry's admission", &admit),
+        [1, r2, b2, 0]
+    );
+}

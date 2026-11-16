@@ -454,7 +454,10 @@ fn led_tables_leave_the_scan_its_place_and_its_turns() {
 }
 
 /// A lead names at most a round's list of tables ([`MAX_TABLES`]): one past that is not kept,
-/// and the scan reaches its table at its turn. A table led already is led once.
+/// and the scan reaches its table at its turn. A table led already is led once. The tables a
+/// round leads because the lists newly share them count against a bound of their own, so a full
+/// list of them still leaves the scheduler's lead its place, first.
+/// MUTANT (`LEADS_UNRANKED`): the scheduler's lead does not go first.
 ///
 /// The merge of 2026-11-13 ported this law from main's announce, which asked for witnesses past
 /// the bound; a lead past it is refused instead, and the walk's dial still settles its seat.
@@ -468,29 +471,376 @@ fn a_lead_past_a_lists_bound_is_not_kept() {
     assert!(repair.lead(table(3)), "a table led already");
     assert!(!repair.lead(table(200)), "one past the bound is not kept");
     assert!(repair.pending());
+
+    // The tables a round leads because the lists newly share them have a bound of their own,
+    // which leaves the scheduler's whole: a write here is led however many there are.
+    for mutant in [false, true] {
+        let mut repair = Repair::default();
+        for n in 0..MAX_TABLES {
+            repair.take_up(table(n as u8));
+        }
+        repair.take_up(table(201));
+        assert!(
+            repair.lead(table(200)),
+            "a full list of newly shared tables refuses no lead the scheduler names"
+        );
+        let common: BTreeSet<Digest> = (0..MAX_TABLES)
+            .map(|n| table(n as u8))
+            .chain([table(200), table(201)])
+            .collect();
+        LEADS_UNRANKED.with(|flag| flag.set(mutant));
+        let led = repair.led(&common);
+        LEADS_UNRANKED.with(|flag| flag.set(false));
+        assert_eq!(
+            led == Some(table(200)),
+            !mutant,
+            "the scheduler's lead goes first (MUTANT {mutant})"
+        );
+        assert!(
+            !repair.lead.contains_key(&table(201)),
+            "one past the newly shared bound is not kept"
+        );
+    }
 }
 
-/// A round that trades table lists leaves, on both sides, which tables both listed
-/// ([`PeerRepair::lists`]): a table one side holds and the other does not list is left out, and
-/// a peer no round traded lists with tells nothing. The dial scheduler's walk passes a seat over
-/// for a table its last lists left out (`crate::runtime::discovery`).
-/// NEGATIVE CONTROL (2026-11-13, by an inverse edit then undone): with the table exchange
-/// keeping no listing, `the initiator` read none for each table.
+/// A round that trades table lists leaves, on each side, what they showed of both sides' tables
+/// ([`crate::replica::Listing::takes`]), which the dial scheduler's walk reads
+/// (`crate::runtime::discovery`): a table both listed may go to the peer; one this side listed
+/// and the peer did not may not, for the peer holds none of it or cannot take it. A table this
+/// side did not list may go only where this side's store of it is younger than the round (as a
+/// Mac's store of a table its peer created, enrolled after their last lists), whose lists could
+/// say nothing of it; one this side held then and did not list (its policy excludes it) may not,
+/// however often it is written. A peer no round traded lists with may be offered anything.
+/// MUTANT (`TAKES_ANY_UNLISTED`): the responder may give the initiator the third table, which the
+/// responder held before the round and did not list.
+/// MUTANT (`TAKES_ONLY_LISTED`): it may not, even once its store is younger than the round.
 #[test]
-fn a_round_leaves_which_tables_both_sides_listed() {
+fn a_round_leaves_what_the_peer_may_take_of_each_table() {
     let lab = Lab::new(&[Role::Writer; 2]);
     let tables = tables(&lab, 3);
     let digest = |table: usize| tables[table].0.digest();
+    // Whether `repair`'s lists let a round led to `table` give the peer some of it, this side
+    // holding a store of it since `held`; anything, before a round traded lists.
+    let takes = |repair: &PeerRepair, table: usize, held: Option<Instant>| {
+        repair
+            .listed()
+            .is_none_or(|lists| lists.takes(&digest(table), held))
+    };
     // Mac 1 lists only the first two.
     let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables[..2], 1)];
     let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+    let before = Instant::now();
     assert!(ours.listed().is_none(), "no round has traded lists");
     exchange_round(&endpoints[0], &endpoints[1], &mut ours, &mut theirs);
+    let after = Instant::now();
     for (side, repair) in [("initiator", &ours), ("responder", &theirs)] {
+        assert!(repair.listed().is_some(), "the {side}'s round traded lists");
         assert_eq!(
-            [0, 1, 2].map(|table| repair.listed().map(|lists| lists.contains(&digest(table)))),
-            [Some(true), Some(true), Some(false)],
-            "the {side}"
+            [0, 1, 2].map(|table| takes(repair, table, Some(before))),
+            [true, true, false],
+            "the {side}, its stores held before the round"
+        );
+    }
+    assert!(
+        !takes(&ours, 2, Some(after)),
+        "the initiator listed the third table and the responder did not, however young its store"
+    );
+    for (mutant, cell) in [
+        (None, None),
+        (Some("TAKES_ANY_UNLISTED"), Some(&TAKES_ANY_UNLISTED)),
+        (Some("TAKES_ONLY_LISTED"), Some(&TAKES_ONLY_LISTED)),
+    ] {
+        let read = |held| {
+            if let Some(cell) = cell {
+                cell.with(|flag| flag.set(true));
+            }
+            let takes = takes(&theirs, 2, held);
+            if let Some(cell) = cell {
+                cell.with(|flag| flag.set(false));
+            }
+            takes
+        };
+        let expected = match mutant {
+            None => [false, true, false],
+            Some("TAKES_ANY_UNLISTED") => [true, true, true],
+            _ => [false, false, false],
+        };
+        assert_eq!(
+            [read(Some(before)), read(Some(after)), read(None)],
+            expected,
+            "the responder, which did not list the third table: its store held before the \
+             round, taken up after it, unknown (MUTANT {mutant:?})"
+        );
+    }
+}
+
+/// A table both sides list that their last round to trade lists did not find both listing is the
+/// next round's before the scan's turn, whichever side begins it: the side that took it up since
+/// may hold none of it. Mac 0 holds a record of its fourth table, which Mac 1 does not list in their
+/// first round and lists in their second, as a Mac lists a table it enrolled once a round brought
+/// the declaration. Begun by Mac 0, whose first lists found Mac 1 leaving the table out, or by
+/// Mac 1, whose first lists did not hold it, the second round takes the table, and Mac 1 holds
+/// the record. Each round after it is the scan's.
+///
+/// The recipient of `process_sync_tests`' later table takes it up so, in whichever round with the
+/// source comes after the one that brought the declaration; before this, that round's regular
+/// turn reached the table only where the scan's place happened to fall before it.
+/// MUTANT (`TAKEN_UP_UNLED`): the second round takes the scan's next table, and Mac 1 holds
+/// nothing.
+#[test]
+fn a_table_the_lists_newly_share_is_the_next_rounds_before_the_scans_turn() {
+    let late = 3;
+    for mac1_begins in [false, true] {
+        for mutant in [false, true] {
+            let lab = Lab::new(&[Role::Writer; 2]);
+            let tables = tables(&lab, 4);
+            write(&lab, &tables, late, 0);
+            let full = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+            // Mac 1 before it takes the fourth table up.
+            let before = endpoint(&lab, &tables[..late], 1);
+            let (mut zero, mut one) = (PeerRepair::default(), PeerRepair::default());
+            // One round begun by Mac 1, or by Mac 0, as Mac 1's endpoint is `mac1`; the table it
+            // took, from its beginner's state.
+            let mut round = |mac1: &Endpoint| {
+                let beginner = if mac1_begins {
+                    exchange_round(mac1, &full[0], &mut one, &mut zero);
+                    &one
+                } else {
+                    exchange_round(&full[0], mac1, &mut zero, &mut one);
+                    &zero
+                };
+                selected(beginner, &tables)
+            };
+            let first = round(&before);
+            assert_ne!(first, late, "Mac 1 does not list the fourth table");
+            TAKEN_UP_UNLED.with(|flag| flag.set(mutant));
+            let second = round(&full[1]);
+            TAKEN_UP_UNLED.with(|flag| flag.set(false));
+            let case = format!("begun by Mac {}, MUTANT {mutant}", u8::from(mac1_begins));
+            if mutant {
+                assert_ne!(second, late, "the scan's next table ({case})");
+                assert_eq!(held(&lab, &tables, late, 1), 0, "{case}");
+                continue;
+            }
+            assert_eq!(second, late, "the table the lists newly share ({case})");
+            assert_eq!(
+                held(&lab, &tables, late, 1),
+                1,
+                "Mac 1 holds the record ({case})"
+            );
+            assert_ne!(round(&full[1]), late, "the scan goes on ({case})");
+        }
+    }
+}
+
+/// A led table stays led through a round that breaks off before its exchange of the table ends,
+/// so the next round takes it before the scan's turn. Mac 0 holds a record of its fourth table,
+/// which Mac 1 does not list in their first round and lists in their second, as in
+/// [`a_table_the_lists_newly_share_is_the_next_rounds_before_the_scans_turn`]; Mac 0 begins each
+/// round. The second leads the table, and Mac 1's receive of Mac 0's batch breaks off
+/// ([`crate::replica::BEFORE_INGEST`]), so Mac 1 holds none of it. That round's lists already
+/// showed the table shared, so the third finds nothing newly shared: it takes the table by the
+/// lead the second left, and Mac 1 holds the record.
+///
+/// This is the newly shared table of `auto_enrollment_tests` where the round that leads it breaks
+/// off (an I/O timeout or a busy admission under load): between two Macs at rest, the record then
+/// waited for an audit or a scan turn that happened to fall on the table.
+/// MUTANT (`LEAD_SPENT_ON_SELECTION`, as before 2026-11-14): the broken round spends the lead,
+/// and the third round is the scan's turn.
+#[test]
+fn a_lead_outlives_a_round_that_breaks_off_before_its_table_is_exchanged() {
+    let late = 3;
+    for mutant in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 4);
+        let digest = tables[late].0.digest();
+        write(&lab, &tables, late, 0);
+        let full = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+        // Mac 1 before it takes the fourth table up.
+        let before = endpoint(&lab, &tables[..late], 1);
+        let (mut zero, mut one) = (PeerRepair::default(), PeerRepair::default());
+        exchange_round(&full[0], &before, &mut zero, &mut one);
+        assert_ne!(
+            selected(&zero, &tables),
+            late,
+            "Mac 1 does not list the fourth table"
+        );
+
+        let hook: crate::replica::IngestHook =
+            Box::new(|_| Err(Error::new("the round broke off before the ingest")));
+        crate::replica::BEFORE_INGEST
+            .lock()
+            .unwrap()
+            .push((digest, hook));
+        LEAD_SPENT_ON_SELECTION.with(|flag| flag.set(mutant));
+        exchange_round(&full[0], &full[1], &mut zero, &mut one);
+        LEAD_SPENT_ON_SELECTION.with(|flag| flag.set(false));
+        let broken = zero
+            .application_interrupted()
+            .expect("the led round broke off");
+        assert_eq!(
+            (broken.table, broken.sent),
+            (Some(digest), 0),
+            "the round led the table and delivered none of it (MUTANT {mutant})"
+        );
+        assert_eq!(held(&lab, &tables, late, 1), 0, "MUTANT {mutant}");
+
+        exchange_round(&full[0], &full[1], &mut zero, &mut one);
+        let took = zero.application().unwrap();
+        if mutant {
+            assert!(took.regular, "MUTANT: the scan's turn");
+            continue;
+        }
+        assert_eq!(
+            (took.table, took.regular, took.sent),
+            (Some(digest), false, 1),
+            "the table the broken round led"
+        );
+        assert_eq!(held(&lab, &tables, late, 1), 1, "Mac 1 holds the record");
+    }
+}
+
+/// A led table whose exchange breaks off in every round is spent by the second round that takes
+/// it, so the pair is left nothing pending ([`PeerRepair::pending`]) and the dial scheduler rests
+/// it until its audit. As in
+/// [`a_lead_outlives_a_round_that_breaks_off_before_its_table_is_exchanged`], Mac 0 holds a
+/// record of a table Mac 1 lists from their second round on, which that round leads; here Mac
+/// 1's receive of every batch of it breaks off ([`crate::replica::BEFORE_INGEST`]), as for a
+/// table whose exchange fails each time (a store the peer cannot enroll). The second round and
+/// the third take the table and break off; the fourth takes the scan's turn on another table and
+/// completes, and nothing is pending after it.
+///
+/// On 9f0e991ea2e the lead outlived every such round: each fifth round, the scan's, completed
+/// with the lead still pending, so the scheduler followed the pair up at the follow-up delay and
+/// the next four rounds broke off, without end. Main spent the lead as the first round selected
+/// the table.
+/// MUTANT (`LEAD_OUTLIVES_EVERY_BREAK`): four rounds take the table and break off, and the first
+/// to complete, the scan's, leaves the lead pending.
+#[test]
+fn a_lead_whose_exchange_breaks_off_each_time_is_spent_by_the_second_round_that_takes_it() {
+    let late = 2;
+    for mutant in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 3);
+        let digest = tables[late].0.digest();
+        write(&lab, &tables, late, 0);
+        let full = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+        // Mac 1 before it takes the third table up.
+        let before = endpoint(&lab, &tables[..late], 1);
+        let (mut zero, mut one) = (PeerRepair::default(), PeerRepair::default());
+        exchange_round(&full[0], &before, &mut zero, &mut one);
+        assert_eq!(selected(&zero, &tables), 0, "the scan's first table");
+
+        // Each round that sends Mac 1 a batch of the table breaks off there.
+        let arm = || {
+            let mut hooks = crate::replica::BEFORE_INGEST.lock().unwrap();
+            if !hooks.iter().any(|(table, _)| *table == digest) {
+                let hook: crate::replica::IngestHook =
+                    Box::new(|_| Err(Error::new("the table's exchange fails each time")));
+                hooks.push((digest, hook));
+            }
+        };
+        // Each round's table, whether it broke off, and whether it left work pending, up to the
+        // first that completes.
+        let mut rounds = Vec::new();
+        loop {
+            arm();
+            LEAD_OUTLIVES_EVERY_BREAK.with(|flag| flag.set(mutant));
+            exchange_round(&full[0], &full[1], &mut zero, &mut one);
+            LEAD_OUTLIVES_EVERY_BREAK.with(|flag| flag.set(false));
+            let (report, broke) = match zero.application() {
+                Some(report) => (report, false),
+                None => (
+                    zero.application_interrupted()
+                        .expect("the round reached its table"),
+                    true,
+                ),
+            };
+            let table = tables
+                .iter()
+                .position(|(scope, _)| Some(scope.digest()) == report.table)
+                .expect("a provisioned table was selected");
+            rounds.push((table, broke, zero.pending()));
+            if !broke {
+                break;
+            }
+            assert!(rounds.len() < 8, "a round completes: {rounds:?}");
+        }
+        crate::replica::BEFORE_INGEST
+            .lock()
+            .unwrap()
+            .retain(|(table, _)| *table != digest);
+        assert_eq!(held(&lab, &tables, late, 1), 0, "MUTANT {mutant}");
+        if mutant {
+            assert_eq!(
+                rounds,
+                [
+                    (late, true, false),
+                    (late, true, false),
+                    (late, true, false),
+                    (late, true, false),
+                    (1, false, true)
+                ],
+                "MUTANT: the lead outlives every break, and the scan's round leaves it pending"
+            );
+            continue;
+        }
+        assert_eq!(
+            rounds,
+            [(late, true, false), (late, true, false), (1, false, false)],
+            "two rounds take the table and break off, and the scan's round leaves nothing pending"
+        );
+    }
+}
+
+/// A table this side's scheduler named (a write here, which a walk hands its dial to lead with)
+/// goes before the tables a round leads only because the lists newly share them, however their
+/// digests sort. Mac 1 lists the first and the last of Mac 0's five tables in their first round,
+/// and all five in their second, which so finds three tables newly shared. Between the two
+/// rounds Mac 0 writes the last table and leads it: the second round takes it and carries the
+/// record, and the three newly shared tables follow in turn.
+///
+/// On 9f0e991ea2e the leads were one queue in digest order, so a written table waited behind
+/// each newly shared one that sorted before it, each up to `TABLE_BURST` rounds where it moved
+/// full batches, while the walk's dial that led it settled its seat for it.
+/// MUTANT (`LEADS_UNRANKED`): the newly shared tables go first, and the written table's record
+/// waits for the fourth round after.
+#[test]
+fn a_table_the_scheduler_named_goes_before_the_tables_the_lists_newly_share() {
+    let written = 4;
+    for mutant in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 5);
+        let full = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+        let first: Vec<_> = [0, written].map(|table| tables[table].clone()).into();
+        let before = endpoint(&lab, &first, 1);
+        let (mut zero, mut one) = (PeerRepair::default(), PeerRepair::default());
+        exchange_round(&full[0], &before, &mut zero, &mut one);
+        assert_eq!(selected(&zero, &tables), 0, "the scan's first table");
+
+        write(&lab, &tables, written, 0);
+        assert!(zero.lead(tables[written].0.digest()));
+        let mut order = Vec::new();
+        let mut carried = Vec::new();
+        for _ in 0..4 {
+            LEADS_UNRANKED.with(|flag| flag.set(mutant));
+            exchange_round(&full[0], &full[1], &mut zero, &mut one);
+            LEADS_UNRANKED.with(|flag| flag.set(false));
+            order.push(selected(&zero, &tables));
+            carried.push(held(&lab, &tables, written, 1));
+        }
+        if mutant {
+            assert_eq!(
+                (order, carried),
+                (vec![1, 2, 3, written], vec![0, 0, 0, 1]),
+                "MUTANT: the written table waits behind the newly shared ones"
+            );
+            continue;
+        }
+        assert_eq!(
+            (order, carried),
+            (vec![written, 1, 2, 3], vec![1, 1, 1, 1]),
+            "the written table first, then the newly shared ones in turn"
         );
     }
 }

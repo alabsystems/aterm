@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `login-notice [<code> [<label>]|disk [<cause>]|end|back]`.
+//! `login-notice [<code> [<label>]|end|back]`.
 
 use aterm_agent::supervise::limit::reset_clock;
 use aterm_agent::supervise::policy::exception::Exception;
@@ -9,13 +9,12 @@ use aterm_agent::supervise::policy::notice::{self, NoticeText};
 use aterm_phase::Program;
 
 use crate::harness_host::{AccountsSaid, HostNote};
-use crate::message_reporters::DiskFullCause;
 
 /// Whether this build injects ([`cmd`]): a development build only.
 const INJECTION_ENABLED: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
 /// The usage line every junk form answers with.
-const USAGE: &str = "usage: login-notice [<code> [<label>]|disk [spent|inodes|off]|end|back]";
+const USAGE: &str = "usage: login-notice [<code> [<label>]|end|back]";
 
 /// The roster label a notice names when the verb names none.
 const LABEL: &str = "main";
@@ -25,7 +24,7 @@ const LABEL: &str = "main";
 /// verb shows the words the loop would.
 const SAMPLE_RESET: &str = "Oct 23 at 9am (America/Los_Angeles)";
 
-/// What the verb asks: the list, a notice to raise, the disk-full alert, the raised ones' end, or the tab's login back.
+/// What the verb asks: the list, a notice to raise, the raised ones' end, or the tab's login back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Asked {
     List,
@@ -33,7 +32,6 @@ pub(crate) enum Asked {
         text: &'static NoticeText,
         label: String,
     },
-    Disk(DiskFullCause),
     End,
     Back,
 }
@@ -45,13 +43,6 @@ pub(crate) fn parse(rest: &str, injection: bool) -> Result<Asked, String> {
         [] => return Ok(Asked::List),
         ["end"] => Asked::End,
         ["back"] => Asked::Back,
-        ["disk"] => Asked::Disk(DiskFullCause::Spent),
-        ["disk", cause] => Asked::Disk(match *cause {
-            "spent" => DiskFullCause::Spent,
-            "inodes" => DiskFullCause::Inodes,
-            "off" => DiskFullCause::CleanupOff { fault: false },
-            _ => return Err(format!("{USAGE} (no disk cause `{cause}`)")),
-        }),
         [code] | [code, _] => {
             let text = notice::ALL
                 .iter()
@@ -70,7 +61,7 @@ pub(crate) fn parse(rest: &str, injection: bool) -> Result<Asked, String> {
     };
     if !injection {
         return Err(
-            "login-notice <code>|disk|end|back needs a development build (dev-seams)".to_string(),
+            "login-notice <code>|end|back needs a development build (dev-seams)".to_string(),
         );
     }
     Ok(asked)
@@ -126,19 +117,7 @@ pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
     };
     match asked {
         Asked::List => Vec::new(),
-        Asked::End => vec![
-            resume(None),
-            HostNote::Accounts(AccountsSaid::Nothing),
-            HostNote::DiskFullOver,
-        ],
-        Asked::Disk(cause) => vec![HostNote::DiskFull {
-            free: Some(1 << 20),
-            freed: 31 << 30,
-            hogs: Vec::new(),
-            cause: *cause,
-            thresholds: aterm_agent::harness::disk::Config::default().thresholds(None),
-            asked: None,
-        }],
+        Asked::End => vec![resume(None), HostNote::Accounts(AccountsSaid::Nothing)],
         Asked::Back => vec![HostNote::LoginBack {
             sid: sid.to_string(),
         }],
@@ -176,7 +155,6 @@ impl crate::App {
         }
         let word = match asked {
             Asked::Raise { text, .. } => text.id,
-            Asked::Disk(_) => "disk-full",
             Asked::Back => "back",
             Asked::End | Asked::List => "end",
         };

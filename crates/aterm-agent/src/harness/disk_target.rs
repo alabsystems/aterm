@@ -35,6 +35,30 @@ pub const CLOCK_DIRS: &[&str] = &[".fingerprint", "deps", "build", "examples"];
 /// A profile's directories cargo writes and rebuilds.
 pub const PROFILE_OUTPUTS: &[&str] = &[".fingerprint", "build", "deps", "incremental", "examples"];
 
+/// The base of the names a disk pass gives its stages (`.aterm-removing`, `.aterm-removing-1`, …:
+/// [`atpkg::build_cache::stage_name`]): the folder it makes inside the folder holding what it
+/// takes, on that folder's volume, moves what it takes into under cargo's locks, and deletes once
+/// it let them go; what that delete leaves goes back where it was. A leading dot: no name cargo
+/// writes is one, and the build-directory search never enters it; another base than atpkg's
+/// own, so neither pass takes the other's stage.
+pub const STAGE: &str = ".aterm-removing";
+
+/// The file a disk pass makes in each stage of its own ([`STAGE`]) and holds the lock of while
+/// the stage lives: what proves a folder of that name is a stage, and what keeps every other pass
+/// off one whose pass still deletes it. It goes last, once nothing else of the stage is left.
+pub const STAGE_TAG: &str = ".aterm-stage";
+
+/// Is `name` one a disk pass gives a stage ([`STAGE`])?
+fn is_stage_name(name: &std::ffi::OsStr) -> bool {
+    atpkg::build_cache::is_stage(name, std::ffi::OsStr::new(STAGE))
+}
+
+/// Is the last component of `path` one a disk pass gives a stage ([`STAGE`])?
+#[must_use]
+pub fn is_stage_path(path: &Path) -> bool {
+    path.file_name().is_some_and(is_stage_name)
+}
+
 /// Is the `deps/` entry `dep` the hashed twin of `name`, the artifact cargo uplifts into the profile.
 #[must_use]
 pub fn uplift_twin(name: &str, dep: &str) -> bool {
@@ -87,10 +111,66 @@ pub const PROFILE_WALK_WALL: Duration = Duration::from_secs(10);
 pub const PRESSURE_MIN_IDLE_S: i64 = 10 * 60;
 
 /// The least idle time a profile's incremental cache needs under a projection that is not also a
-/// measured short (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2): an hour, the span of the
-/// projection's own hour rate, so a session paused between builds keeps its cache and its rebuild
-/// never reads as a fill aterm made.
+/// measured short: an hour, the span of the projection's own hour rate, so a session paused
+/// between builds keeps its cache and its rebuild never reads as a fill aterm made. Below the
+/// floor it is [`PRESSURE_MIN_IDLE_S`].
 pub const PROJECTED_MIN_IDLE_S: i64 = 60 * 60;
+
+/// A profile `deps/` holding this many entries or more is over the entry bound: WindowServer's
+/// TCC preflight of a binary laid in a directory that size outruns its watchdog. It is the disk
+/// walker's warning count (`aterm_diskwalk::HUGE_WARN`).
+pub const ENTRY_BOUND: u32 = 100_000;
+
+/// A build directory once over [`ENTRY_BOUND`] stays over it until its `deps/` falls under this
+/// count, the disk walker's note count (`aterm_diskwalk::HUGE_NOTE`).
+pub const ENTRY_BOUND_CLEAR: u32 = 75_000;
+
+/// The entry bound in force: [`ENTRY_BOUND`], [`ENTRY_BOUND_CLEAR`], and the step, a tenth of
+/// the bound: how far a count must move from the one its last row stated before the row of a
+/// directory that stays is written again.
+#[must_use]
+pub fn entry_bound() -> (u32, u32, u32) {
+    match pretended_entry_bound() {
+        Some(bound) => (bound, bound.saturating_mul(3) / 4, (bound / 10).max(1)),
+        None => (ENTRY_BOUND, ENTRY_BOUND_CLEAR, ENTRY_BOUND / 10),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PRETEND_ENTRY_BOUND: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// A test's entry bound on this thread (its clear count three quarters of it, its step a tenth,
+/// at least one), or the shipped one with `None`.
+#[cfg(all(test, unix))]
+pub(crate) fn pretend_entry_bound(bound: Option<u32>) {
+    PRETEND_ENTRY_BOUND.with(|b| b.set(bound));
+}
+
+#[cfg(test)]
+fn pretended_entry_bound() -> Option<u32> {
+    PRETEND_ENTRY_BOUND.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn pretended_entry_bound() -> Option<u32> {
+    None
+}
+
+/// The profile folders cargo lays at a build directory's root by default: where an entry-bound
+/// look reads a `deps/` the profile walk did not reach ([`TargetDir::deps_unwalked`]).
+const USUAL_PROFILES: [&str; 2] = ["debug", "release"];
+
+/// How many entries the directory at `deps` holds, reached from its volume's root without
+/// following a link: one attribute read on macOS, a listing elsewhere.
+///
+/// # Errors
+/// It could not be opened or read: [`io::ErrorKind::NotFound`] where it, or a folder above it,
+/// is not there.
+pub fn deps_entries_of(deps: &Path) -> io::Result<u32> {
+    fd::entry_count(deps)
+}
 
 #[cfg(any(unix, windows))]
 const MAX_DELETE_DEPTH: usize = 256;
@@ -131,6 +211,9 @@ pub struct Profile {
     pub bytes: u64,
     /// `true` when that walk stopped at its bound: the figure is a floor.
     pub bytes_partial: bool,
+    /// How many entries its `deps/` holds, once an entry-bound look counted it
+    /// ([`TargetDir::count_deps`]); no other survey reads it.
+    pub deps_entries: Option<u32>,
     /// What a build that died left in it ([`died_output`]), read only under pressure.
     pub died: Died,
 }
@@ -404,6 +487,28 @@ pub(crate) fn died_output(profile: &Path, dev: u64, now: i64) -> Died {
     died
 }
 
+/// A stage an earlier disk pass left in a build directory ([`STAGE`]): what it took and moved
+/// aside, which the next removal there deletes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftStage {
+    /// Its path.
+    pub path: PathBuf,
+    /// File allocation in it whose last name would be removed, on the build directory's device.
+    pub bytes: u64,
+    /// `true` when that walk stopped at its bound: the figure is a floor.
+    pub bytes_partial: bool,
+}
+
+/// What one walk of a build directory found ([`fd::walk`]).
+struct Walked {
+    /// Every cargo profile in it, at any depth.
+    profiles: Vec<PathBuf>,
+    /// Every stage an earlier disk pass left in it ([`LeftStage`]), never entered.
+    stages: Vec<PathBuf>,
+    /// Why the walk did not read all of it, when it did not.
+    cut: Option<String>,
+}
+
 /// One build directory, with the facts that decide it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDir {
@@ -417,6 +522,8 @@ pub struct TargetDir {
     pub walk_cut_short: Option<String>,
     /// Every cargo profile in it, at any depth.
     pub profiles: Vec<Profile>,
+    /// Stages an earlier disk pass left in it ([`STAGE`]), found by its walk and never entered.
+    pub stages: Vec<LeftStage>,
     /// The device it lives on ([`dev_of`]), when that could be read.
     pub device: Option<u64>,
     /// Why its volume is not one a reclaim may touch, when it is not.
@@ -433,6 +540,11 @@ pub struct TargetDir {
     pub foreign: Option<String>,
     /// Tier 3's verdict on it ([`super::idle::assess`]): its facts as a whole idle build directory, or why it is kept whole.
     pub idle: Option<Result<super::idle::IdleFacts, String>>,
+    /// Where the profile walk was cut short ([`Self::walk_cut_short`]), the fullest `deps/` of
+    /// the usual profile folders at its root (`debug`, `release`) that the walk did not reach,
+    /// with its count, once an entry-bound look counted it ([`Self::count_deps`]): such a
+    /// directory is kept, and its `entry-bound` row needs the count no profile carries.
+    pub deps_unwalked: Option<(PathBuf, u32)>,
 }
 
 impl TargetDir {
@@ -442,15 +554,18 @@ impl TargetDir {
         self.candidate_profiles(now, threshold_days).collect()
     }
 
-    /// Counted file allocation in the candidates' `incremental/` caches, and whether it is a floor.
+    /// Counted file allocation in the candidates' `incremental/` caches and in the stages an
+    /// earlier pass left, and whether it is a floor.
     #[must_use]
     pub fn reclaimable(&self, now: i64, threshold_days: i64) -> (u64, bool) {
         self.candidate_profiles(now, threshold_days)
-            .fold((0u64, false), |(b, partial), p| {
-                let (bytes, overflow) = b.overflowing_add(p.bytes);
+            .map(|p| (p.bytes, p.bytes_partial))
+            .chain(self.stages.iter().map(|s| (s.bytes, s.bytes_partial)))
+            .fold((0u64, false), |(b, partial), (more, floor)| {
+                let (bytes, overflow) = b.overflowing_add(more);
                 (
                     if overflow { u64::MAX } else { bytes },
-                    partial || p.bytes_partial || overflow,
+                    partial || floor || overflow,
                 )
             })
     }
@@ -523,6 +638,52 @@ impl TargetDir {
         }
         Ok(marker)
     }
+
+    /// Count the entries of each profile's `deps/` ([`Profile::deps_entries`]): what an
+    /// entry-bound look reads, one attribute read a profile on macOS. Where the profile walk was
+    /// cut short, the usual profile folders it did not reach are counted as well
+    /// ([`Self::deps_unwalked`]): a walk that ran out in `doc/` before it listed `debug/` found
+    /// no profile, and the directory would read as holding no `deps/` at all.
+    pub fn count_deps(&mut self) {
+        for p in &mut self.profiles {
+            p.deps_entries = deps_entries_of(&p.path.join("deps")).ok();
+        }
+        self.deps_unwalked = None;
+        if self.walk_cut_short.is_some() {
+            self.deps_unwalked = USUAL_PROFILES
+                .iter()
+                .map(|name| self.path.join(name))
+                .filter(|profile| !self.profiles.iter().any(|p| p.path == *profile))
+                .filter_map(|profile| {
+                    let deps = profile.join("deps");
+                    deps_entries_of(&deps).ok().map(|n| (deps, n))
+                })
+                .max_by_key(|(_, n)| *n);
+        }
+    }
+
+    /// The `deps/` that holds the most entries, a profile's or one the cut walk did not reach
+    /// ([`Self::deps_unwalked`]), with its count, once [`Self::count_deps`] ran.
+    #[must_use]
+    pub fn deps_peak(&self) -> Option<(PathBuf, u32)> {
+        self.profiles
+            .iter()
+            .filter_map(|p| p.deps_entries.map(|n| (p.path.join("deps"), n)))
+            .chain(self.deps_unwalked.clone())
+            .max_by_key(|(_, n)| *n)
+    }
+
+    /// Is it a build cache's to retire: found as one, or under a registered cache's policy?
+    /// Ordinary cleanup never takes such a directory; its cache's own sweep does.
+    #[must_use]
+    pub fn cache_custody(&self) -> bool {
+        matches!(self.origin, Origin::BuildCache { .. })
+            || self
+                .path
+                .ancestors()
+                .take(MAX_CUSTODY_DEPTH)
+                .any(managed_cache)
+    }
 }
 
 /// A span of seconds a person can read: minutes under an hour, hours under a day, whole days after.
@@ -551,6 +712,24 @@ pub(super) fn target_witness(
     threshold_days: i64,
 ) -> Result<Witness, String> {
     let marker = t.fences()?;
+    if !t.stages.is_empty() {
+        // What an earlier pass already took goes whatever its profiles say; the idle ones go
+        // too. With no idle profile the witness counts none and dates none idle.
+        let candidates = t.candidates(now, threshold_days);
+        let idle_days = candidates
+            .iter()
+            .filter_map(|p| p.last_used)
+            .map(|m| age_days(now, m))
+            .min()
+            .unwrap_or(0);
+        return Ok(Witness::StaleBuildDir {
+            marker,
+            profiles: candidates.len(),
+            idle_days,
+            threshold_days,
+            leaves: Vec::new(),
+        });
+    }
     if t.profiles.is_empty() {
         return Err(
             "no recognized Cargo/Targo profile (a build lock beside deps/, .fingerprint/, or build/ with incremental/)"
@@ -630,6 +809,9 @@ pub fn assess_under(
                 p.bytes = bytes;
                 p.bytes_partial = partial;
             }
+        }
+        for s in &mut td.stages {
+            (s.bytes, s.bytes_partial) = cache_bytes(&s.path, td.device);
         }
     }
     Some(td)
@@ -946,8 +1128,9 @@ fn facts(path: &Path, budget: WalkBudget) -> Option<TargetDir> {
         return None;
     }
     let (marker, holds_source) = root_facts(path);
-    let (found, cut) = fd::find(path, budget);
-    let profiles = found
+    let walked = fd::walk(path, budget);
+    let profiles = walked
+        .profiles
         .into_iter()
         .map(|p| Profile {
             last_used: profile_clock(&p),
@@ -956,15 +1139,26 @@ fn facts(path: &Path, budget: WalkBudget) -> Option<TargetDir> {
             in_use: None,
             bytes: 0,
             bytes_partial: false,
+            deps_entries: None,
             died: Died::default(),
+        })
+        .collect();
+    let stages = walked
+        .stages
+        .into_iter()
+        .map(|path| LeftStage {
+            path,
+            bytes: 0,
+            bytes_partial: false,
         })
         .collect();
     Some(TargetDir {
         path: path.to_path_buf(),
         marker,
         holds_source,
-        walk_cut_short: cut,
+        walk_cut_short: walked.cut,
         profiles,
+        stages,
         device: dev_of(path),
         volume: volume_refusal(path),
         probed_recent: false,
@@ -973,6 +1167,7 @@ fn facts(path: &Path, budget: WalkBudget) -> Option<TargetDir> {
         total: None,
         foreign: None,
         idle: None,
+        deps_unwalked: None,
     })
 }
 
@@ -1081,6 +1276,13 @@ mod held {
                 Err(std::fs::TryLockError::Error(e)) => Err(e),
             }
         }
+
+        /// The file whose lock this is, for a read of what it is (a stage's tag is proved one
+        /// link, the one its name names, only once its lock is held).
+        #[cfg(unix)]
+        pub(super) fn file(&self) -> &std::fs::File {
+            &self.0
+        }
     }
 
     impl Drop for HeldLock {
@@ -1164,14 +1366,108 @@ fn lock_held(path: &Path, hook: &mut dyn FnMut(&Path)) -> Option<String> {
 /// Bytes deleting the tree at `dir` would release.
 #[must_use]
 pub fn cache_bytes(dir: &Path, dev: Option<u64>) -> (u64, bool) {
+    let used = cache_use(dir, dev, None);
+    (used.bytes, used.partial)
+}
+
+/// What deleting a tree would release, and when it was last used ([`cache_use`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheUse {
+    /// Bytes deleting it would release ([`cache_bytes`]).
+    pub bytes: u64,
+    /// The walk stopped short or could not read an entry: `bytes` is a floor, and `newest` is
+    /// only of what was read.
+    pub partial: bool,
+    /// Unix seconds of the newest write or change the walk saw, the tree's own folder included
+    /// ([`written`]), or of the newest read of a file in it where the volume records one: a
+    /// cache a tool reads every day and never writes is in use. `None` where no time was read (on
+    /// Windows, where the walk dates nothing). A folder's read time is not counted: the walk's
+    /// own listing of it may set it.
+    pub newest: Option<i64>,
+}
+
+/// When the entry `meta` describes was last written or changed, in unix seconds: the newer of
+/// its modification and its status-change time. A tree copied or unpacked with its old times
+/// kept (`cp -a`, `rsync -a`, `tar`) carries old modification times, and only the change time
+/// says it arrived today.
+#[cfg(not(windows))]
+pub(crate) fn written(meta: &std::fs::Metadata) -> Option<i64> {
+    let modified = meta.modified().ok().map(|at| {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    });
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(meta.ctime())
+    };
+    #[cfg(not(unix))]
+    let changed: Option<i64> = None;
+    modified.into_iter().chain(changed).max()
+}
+
+/// [`cache_bytes`] in one walk with the newest write or change under `dir` ([`CacheUse`]),
+/// stopping, cut short, once `until` passes.
+#[must_use]
+pub fn cache_use(dir: &Path, dev: Option<u64>, until: Option<std::time::Instant>) -> CacheUse {
     #[cfg(windows)]
     {
-        let t = fd::tally(dir, &fd::Walk::sizes(fd::Count::Released, dev));
-        (t.bytes, t.partial)
+        let wall = until.map(|at| at.saturating_duration_since(std::time::Instant::now()));
+        if wall.is_some_and(|left| left.is_zero()) {
+            return CacheUse {
+                bytes: 0,
+                partial: true,
+                newest: None,
+            };
+        }
+        let t = fd::tally(
+            dir,
+            &fd::Walk {
+                wall,
+                ..fd::Walk::sizes(fd::Count::Released, dev)
+            },
+        );
+        CacheUse {
+            bytes: t.bytes,
+            partial: t.partial,
+            newest: None,
+        }
     }
     #[cfg(not(windows))]
     {
-        walk_bytes(dir, |meta| same_dev(meta, dev), released)
+        let newest = std::cell::Cell::new(
+            std::fs::symlink_metadata(dir)
+                .ok()
+                .and_then(|meta| written(&meta)),
+        );
+        let seen = |meta: &std::fs::Metadata| newest.set(newest.get().max(written(meta)));
+        let read = |meta: &std::fs::Metadata| {
+            let at = meta.accessed().ok().map(|at| {
+                at.duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            });
+            newest.set(newest.get().max(at));
+        };
+        let (bytes, partial) = walk_bytes_until(
+            dir,
+            |meta| {
+                seen(meta);
+                same_dev(meta, dev)
+            },
+            |meta| {
+                seen(meta);
+                if meta.is_file() {
+                    read(meta);
+                }
+                released(meta)
+            },
+            until,
+        );
+        CacheUse {
+            bytes,
+            partial,
+            newest: newest.get(),
+        }
     }
 }
 
@@ -1238,9 +1534,19 @@ pub struct Judge {
 /// Where a reclaim of one profile stands, for a test's hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// Every cargo lock of the profile (tier 1: of every profile) is held.
     Locked,
-    Deleting,
+    /// Every check under the locks passed; custody is read next, then what is taken leaves.
+    Staging,
+    /// What is taken sits in a stage of its own, the locks still held; custody is read again
+    /// next (unix only).
+    Staged,
+    /// The locks are let go.
     Released,
+    /// A delete starts. Of a stage, once the locks are let go: the hook's path is the stage's.
+    /// In place, under the locks, of what was not staged: the path is the folder's that holds
+    /// it, as every other stage's is.
+    Deleting,
     #[cfg(test)]
     Removing,
 }
@@ -1476,11 +1782,14 @@ mod fd {
     use super::{
         CACHE_DIRS, CARGO_LOCKS, CLOCK_DIRS, DIED_METADATA_MIN_AGE_S, DIED_SESSION_MIN_AGE_S,
         HeldLock, INCREMENTAL, Judge, MAX_CUSTODY_DEPTH, MAX_DELETE_DEPTH, Path, PathBuf, Removed,
-        Select, Stage, TargetDir, WalkBudget, io, root_facts,
+        Select, Stage, TargetDir, WalkBudget, Walked, io, root_facts,
     };
+    #[cfg(unix)]
+    use aterm_dirfd::RenameFlags;
     use aterm_dirfd::{self as dirfd, AtFlags, Dir, Errno, Mode, OFlags, OwnedFd};
     #[cfg(windows)]
     use aterm_dirfd::{FileId, FileType};
+    use aterm_sysprobe::volumes::Table;
     use std::ffi::{OsStr, OsString};
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt as _;
@@ -1495,8 +1804,26 @@ mod fd {
         /// A link refused by `O_NOFOLLOW`.
         pub(super) const LOOP: i32 = libc::ELOOP;
         /// A full disk.
-        #[cfg(test)]
         pub(super) const NOSPC: i32 = libc::ENOSPC;
+        /// A rename its filesystem will not make between two names of one folder on one device
+        /// (an overlayfs lower directory): no volume is crossed, and the entry goes in place.
+        pub(super) const XDEV: i32 = libc::EXDEV;
+        /// A rename of a name in use as a mount point.
+        pub(super) const BUSY: i32 = libc::EBUSY;
+        /// What `rmdir` says of a directory that holds something.
+        pub(super) const NOTEMPTY_OR_EXIST: &[i32] = &[libc::ENOTEMPTY, libc::EEXIST];
+        /// What says nothing can be staged here at all: a full disk or quota, or a filesystem or
+        /// kernel with no rename that never replaces (NFS, some FUSE and older ZFS say `EINVAL`, a
+        /// kernel before Linux 3.15 or a BSD `ENOSYS`, SMB, FAT and exFAT `ENOTSUP`). Slices,
+        /// not match arms: Linux's `ENOTSUP` is its `EOPNOTSUPP`.
+        pub(super) const CANNOT_STAGE: &[i32] = &[
+            NOSPC,
+            libc::EDQUOT,
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+        ];
     }
 
     #[cfg(windows)]
@@ -1723,6 +2050,40 @@ mod fd {
         Ok(children(fd)?.into_iter().map(|c| c.name).collect())
     }
 
+    /// How many entries the directory at the absolute `path` holds ([`pin`]: no link is
+    /// followed).
+    pub(super) fn entry_count(path: &Path) -> io::Result<u32> {
+        count(&pin(path)?)
+    }
+
+    /// One attribute read: the directory is never listed.
+    #[cfg(target_vendor = "apple")]
+    fn count(dir: &OwnedFd) -> io::Result<u32> {
+        Ok(dirfd::dir_entry_count(dir)?)
+    }
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn count(dir: &OwnedFd) -> io::Result<u32> {
+        let mut n = 0u32;
+        for entry in Dir::read_from(dir)? {
+            if !matches!(entry?.file_name().to_bytes(), b"." | b"..") {
+                n = n.saturating_add(1);
+            }
+        }
+        Ok(n)
+    }
+
+    /// A Windows listing names neither `.` nor `..`.
+    #[cfg(windows)]
+    fn count(dir: &OwnedFd) -> io::Result<u32> {
+        let mut n = 0u32;
+        for entry in Dir::read_from(dir)? {
+            entry?;
+            n = n.saturating_add(1);
+        }
+        Ok(n)
+    }
+
     struct Child {
         name: OsString,
         #[cfg(windows)]
@@ -1829,6 +2190,7 @@ mod fd {
         dev: u64,
         cut: Option<String>,
         found: Vec<PathBuf>,
+        stages: Vec<PathBuf>,
     }
 
     impl Walker {
@@ -1880,6 +2242,14 @@ mod fd {
                 if dev(&child).ok() != Some(self.dev) {
                     continue;
                 }
+                // A stage an earlier pass left is never entered: it counts as the one entry its
+                // folder listed. One named so that is neither tagged nor empty is walked as any
+                // other folder, so no profile in it goes unlocked.
+                #[cfg(unix)]
+                if super::is_stage_name(name) && left_stage(&child) {
+                    self.stages.push(path.join(name));
+                    continue;
+                }
                 if depth + 1 > self.budget.depth {
                     self.cut = Some(format!("it nests deeper than {} levels", self.budget.depth));
                     return;
@@ -1892,18 +2262,33 @@ mod fd {
         }
     }
 
-    /// Walk the build directory at the canonical `path` for its profiles.
-    pub(super) fn find(path: &Path, budget: WalkBudget) -> (Vec<PathBuf>, Option<String>) {
-        let root = match pin(path) {
-            Ok(fd) => fd,
-            Err(e) => return (Vec::new(), Some(format!("it could not be opened: {e}"))),
-        };
-        find_at(&root, path, budget)
+    /// Is the directory `stage`, named as a stage ([`super::STAGE`]), one a disk pass left: it
+    /// holds its tag as a plain file, or nothing (made, and killed before its tag was)?
+    #[cfg(unix)]
+    fn left_stage(stage: &OwnedFd) -> bool {
+        open_file(stage, OsStr::new(super::STAGE_TAG)).is_some()
+            || names(stage).is_ok_and(|n| n.is_empty())
     }
 
-    fn find_at(root: &OwnedFd, path: &Path, budget: WalkBudget) -> (Vec<PathBuf>, Option<String>) {
+    /// Walk the build directory at the canonical `path` for its profiles and left stages.
+    pub(super) fn walk(path: &Path, budget: WalkBudget) -> Walked {
+        match pin(path) {
+            Ok(root) => walk_at(&root, path, budget),
+            Err(e) => Walked {
+                profiles: Vec::new(),
+                stages: Vec::new(),
+                cut: Some(format!("it could not be opened: {e}")),
+            },
+        }
+    }
+
+    fn walk_at(root: &OwnedFd, path: &Path, budget: WalkBudget) -> Walked {
         let Ok(root_dev) = dev(root) else {
-            return (Vec::new(), Some("its device could not be read".to_owned()));
+            return Walked {
+                profiles: Vec::new(),
+                stages: Vec::new(),
+                cut: Some("its device could not be read".to_owned()),
+            };
         };
         let mut w = Walker {
             budget,
@@ -1912,9 +2297,38 @@ mod fd {
             dev: root_dev,
             cut: None,
             found: Vec::new(),
+            stages: Vec::new(),
         };
         w.visit(root, path, 0);
-        (w.found, w.cut)
+        Walked {
+            profiles: w.found,
+            stages: w.stages,
+            cut: w.cut,
+        }
+    }
+
+    /// The fences of the build directory at `path` on device `dev` whose walk was `cut` (or not):
+    /// [`TargetDir::fences`] read again by a remover, its marker when they pass.
+    fn fences_at(path: &Path, cut: Option<String>, dev: u64) -> Result<String, String> {
+        let (marker, holds_source) = root_facts(path);
+        TargetDir {
+            path: path.to_path_buf(),
+            marker,
+            holds_source,
+            walk_cut_short: cut,
+            profiles: Vec::new(),
+            stages: Vec::new(),
+            device: Some(dev),
+            volume: None,
+            probed_recent: false,
+            origin: super::Origin::Named,
+            owned: super::Owned::NotOwned,
+            total: None,
+            foreign: None,
+            idle: None,
+            deps_unwalked: None,
+        }
+        .fences()
     }
 
     fn reopen(root: &OwnedFd, root_path: &Path, path: &Path, on: u64) -> io::Result<OwnedFd> {
@@ -2492,6 +2906,9 @@ mod fd {
         started: Instant,
         entries: usize,
         on: u64,
+        /// Pass over a profile's `incremental/` (a folder so named beside a cargo lock), which
+        /// rustc alone writes: a scan of what a pass would stage ([`unmanaged_below`]).
+        caches_unread: bool,
     }
 
     impl CustodyWalk {
@@ -2535,6 +2952,14 @@ mod fd {
                             path.join(name).display()
                         ));
                     }
+                }
+                if self.caches_unread
+                    && name == INCREMENTAL
+                    && CARGO_LOCKS
+                        .iter()
+                        .any(|l| open_file(fd, OsStr::new(l)).is_some())
+                {
+                    continue;
                 }
                 let child = match dirfd::openat(fd, name, dir_flags(), Mode::empty()) {
                     Ok(child) => child,
@@ -2588,6 +3013,7 @@ mod fd {
             started,
             entries: 0,
             on: stat.st_dev,
+            caches_unread: false,
         };
         if kind.is_dir() {
             ordinary_custody_at(&root, path)?;
@@ -2722,6 +3148,890 @@ mod fd {
         }
     }
 
+    /// Delete the stage `name` of `folder` (at `folder_path`), open as `stage`, under `pass`:
+    /// every entry but its tag first, then, only once nothing of it was kept and `pass` still
+    /// permits, its tag and the stage itself. A stage cut short keeps its tag, so a later pass
+    /// knows it for a stage and finishes it. Whether the stage is gone.
+    #[cfg(unix)]
+    fn delete_stage(
+        folder: &OwnedFd,
+        folder_path: &Path,
+        name: &OsStr,
+        stage: &OwnedFd,
+        depth: usize,
+        out: &mut Deleted,
+        pass: &mut Removal<'_>,
+    ) -> bool {
+        let here = folder_path.join(name);
+        if !pass.permit((stage, &here), &here, out) {
+            return false;
+        }
+        let kept = out.kept.len();
+        match children(stage) {
+            Ok(mut children) => {
+                children.retain(|c| c.name != super::STAGE_TAG);
+                // In the order a delete in place keeps (fingerprints before the outputs they
+                // vouch for), the locks last: a delete cut short leaves no fingerprint whose
+                // output is gone.
+                children.sort_by_key(|c| {
+                    (
+                        CARGO_LOCKS.iter().any(|l| c.name == *l),
+                        content_rank(&c.name),
+                    )
+                });
+                for child in children {
+                    remove_tree_at(stage, &child, &here, depth + 1, out, pass);
+                    if pass.revoked {
+                        return false;
+                    }
+                }
+            }
+            Err(e) => {
+                out.kept.push(format!("{}: {e}", here.display()));
+                return false;
+            }
+        }
+        if out.kept.len() > kept || !pass.permit((folder, folder_path), &here, out) {
+            return false;
+        }
+        match dirfd::unlinkat(stage, super::STAGE_TAG, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(e) => {
+                out.kept.push(format!(
+                    "{}: {}",
+                    here.join(super::STAGE_TAG).display(),
+                    io::Error::from(e)
+                ));
+                return false;
+            }
+        }
+        match rmdir_named(folder, name, stage) {
+            Ok(()) | Err(Errno::NOENT) => true,
+            Err(e) => {
+                out.kept
+                    .push(format!("{}: {}", here.display(), io::Error::from(e)));
+                false
+            }
+        }
+    }
+
+    /// Finish the stage an earlier pass left at `stage` in the build directory `root` (at
+    /// `path`) on device `on`: while its custody allows and no pass holds its tag, every entry of
+    /// it goes and then the stage ([`delete_stage`]); one holding nothing (its pass stopped
+    /// before it made its tag) is only removed, and one named so that holds no tag but something
+    /// else is left alone. What the delete leaves goes back where it was ([`settle_stage`]),
+    /// unless custody was revoked during it.
+    #[cfg(unix)]
+    fn finish_stage(
+        root: &OwnedFd,
+        path: &Path,
+        stage: &Path,
+        on: u64,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> Removed {
+        let mut done = Removed::default();
+        let (Some(folder_path), Some(name)) = (stage.parent(), stage.file_name()) else {
+            return done;
+        };
+        let skip = |done: &mut Removed, why: String| done.skipped.push((stage.to_path_buf(), why));
+        let folder = match reopen(root, path, folder_path, on) {
+            Ok(fd) => fd,
+            Err(e) => {
+                skip(&mut done, format!("its folder could not be opened: {e}"));
+                return done;
+            }
+        };
+        let fd = match open_dir(&folder, name) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => return done,
+            Err(e) => {
+                skip(&mut done, format!("it could not be opened: {e}"));
+                return done;
+            }
+        };
+        if dev(&fd).ok() != Some(on) {
+            skip(&mut done, "it is on another device".to_owned());
+            return done;
+        }
+        if let Err(why) = ordinary_custody_at(&fd, stage) {
+            skip(&mut done, why);
+            return done;
+        }
+        let _tag = match take_lock(&fd, super::STAGE_TAG, false) {
+            Ok(Some(tag)) => tag,
+            Ok(None) => {
+                skip(&mut done, "its pass is still deleting it".to_owned());
+                return done;
+            }
+            Err(e) if e.raw_os_error() == Some(code::NOENT) => {
+                if names(&fd).is_ok_and(|n| n.is_empty()) {
+                    match rmdir_named(&folder, name, &fd) {
+                        Ok(()) | Err(Errno::NOENT) => done.units.push(stage.to_path_buf()),
+                        Err(e) => done.trouble.push(format!(
+                            "{}: {}",
+                            stage.display(),
+                            io::Error::from(e)
+                        )),
+                    }
+                } else {
+                    skip(
+                        &mut done,
+                        "named like a disk pass's stage but holds no tag of one: left alone"
+                            .to_owned(),
+                    );
+                }
+                return done;
+            }
+            Err(e) => {
+                skip(&mut done, format!("its tag could not be taken: {e}"));
+                return done;
+            }
+        };
+        let mut deleted = Deleted::default();
+        let mut pass = Removal {
+            on,
+            custody: Some((root, path)),
+            revoked: false,
+            _hook: hook,
+            permit: None,
+        };
+        let depth = stage
+            .strip_prefix(path)
+            .map_or(0, |rel| rel.components().count());
+        if delete_stage(
+            &folder,
+            folder_path,
+            name,
+            &fd,
+            depth,
+            &mut deleted,
+            &mut pass,
+        ) {
+            done.units.push(stage.to_path_buf());
+        } else if !pass.revoked {
+            // Where custody was revoked mid-delete nothing more is moved: the stage stays as
+            // its delete left it, tagged, for the custody that took it.
+            settle_stage((&folder, folder_path), (name, &fd), &mut deleted.kept);
+        }
+        done.bytes = deleted.bytes;
+        done.trouble.extend(deleted.kept);
+        done
+    }
+
+    /// What a stage's finish left (`name` of the folder `folder`, open as `stage`, its tag's
+    /// lock held) goes back into that folder under its own names, under the folder's cargo
+    /// locks ([`quiet_locks`]; a build directory's root holds none, and there a move back that
+    /// never replaces an entry is all that keeps a build that started meanwhile whole), and
+    /// the stage, then empty, goes. While a build holds the folder it all stays staged, for a
+    /// later pass. Where a name it would go back to is taken (a build laid its own there),
+    /// what holds it stays in the stage, which loses its tag: no pass counts or finishes it
+    /// again, and it is walked as any other folder. So nothing a delete cannot remove stays
+    /// out of the path its owner knows, nor makes a row every pass for good. `kept` says how.
+    #[cfg(unix)]
+    fn settle_stage(
+        (folder, folder_path): (&OwnedFd, &Path),
+        (name, stage): (&OsStr, &OwnedFd),
+        kept: &mut Vec<String>,
+    ) {
+        let here = folder_path.join(name);
+        let left: Vec<OsString> = match names(stage) {
+            Ok(mut left) => {
+                left.retain(|n| n != super::STAGE_TAG);
+                left
+            }
+            Err(e) => {
+                kept.push(format!("{}: {e}; it stays staged", here.display()));
+                return;
+            }
+        };
+        let _quiet = match quiet_locks(folder, folder_path) {
+            Ok(held) => held,
+            Err(why) => {
+                kept.push(format!(
+                    "{}: what its delete left stays staged while {why}; a later pass finishes it",
+                    here.display()
+                ));
+                return;
+            }
+        };
+        let back = put_back(folder, (stage, &here), &left, "the delete left it", kept);
+        let stuck: Vec<&OsString> = left.iter().filter(|n| !back.contains(n)).collect();
+        if stuck.is_empty() {
+            let _ = dirfd::unlinkat(stage, super::STAGE_TAG, AtFlags::empty());
+            if let Err(e) = rmdir_named(folder, name, stage)
+                && e != Errno::NOENT
+            {
+                kept.push(format!("{}: {}", here.display(), io::Error::from(e)));
+            }
+            return;
+        }
+        let taken = |n: &OsString| dirfd::fstatat(folder, n, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+        if stuck.iter().all(|n| taken(n))
+            && dirfd::unlinkat(stage, super::STAGE_TAG, AtFlags::empty()).is_ok()
+        {
+            kept.push(format!(
+                "{}: what could not go back (a build laid its own in its place) stays in it, \
+                 no longer a stage any pass finishes",
+                here.display()
+            ));
+        }
+    }
+
+    /// Add what `more` removed to `done`.
+    #[cfg(unix)]
+    fn add(done: &mut Removed, more: Removed) {
+        done.bytes = done.bytes.saturating_add(more.bytes);
+        done.units.extend(more.units);
+        done.skipped.extend(more.skipped);
+        done.trouble.extend(more.trouble);
+    }
+
+    /// Finish every stage an earlier pass left in the build directory at `path` (open as
+    /// `root`, on device `on`) that its walk found (`stages`) and that lies under none of
+    /// `leave` (a build directory named inside it, which decides its own): [`finish_stage`].
+    ///
+    /// Only the idle row finishes a stage this way, with no cargo lock: it is the row the
+    /// survey makes for every build directory that holds one, its bytes count the stage, and
+    /// the pass (`DiskReclaimPass`) lets its tier remove under the journal row alone. A whole
+    /// removal answers only for what it took under every lock ([`whole_out`] finishes a stage
+    /// after that), and a pressure row or a tier-3 row leaves a stage to the directory's idle
+    /// row, which runs before it.
+    #[cfg(unix)]
+    fn finish_left(
+        (root, path, on): (&OwnedFd, &Path, u64),
+        stages: &[PathBuf],
+        leave: &[PathBuf],
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> Removed {
+        let mut done = Removed::default();
+        for stage in stages {
+            // One inside a build directory named inside this one is that directory's (one
+            // that cannot be placed is left too).
+            if leave
+                .iter()
+                .any(|l| aterm_path::is_under(stage, l) != Some(false))
+            {
+                continue;
+            }
+            let finished = finish_stage(root, path, stage, on, hook);
+            add(&mut done, finished);
+        }
+        done
+    }
+
+    #[cfg(all(test, unix))]
+    thread_local! {
+        static STAGE_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+        static MOVE_FAULT: std::cell::Cell<Option<(usize, i32)>> = const { std::cell::Cell::new(None) };
+        static MOUNTED: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+        static TABLE: std::cell::RefCell<Option<Table>> = const { std::cell::RefCell::new(None) };
+        static SCAN_BUDGET: std::cell::Cell<Option<WalkBudget>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// On this thread, every stage a pass would make fails with `errno` (`None`: none does).
+    #[cfg(all(test, unix))]
+    pub(super) fn inject_stage_fault(errno: Option<i32>) {
+        STAGE_FAULT.with(|f| f.set(errno));
+    }
+
+    /// On this thread, every move into a stage after the first `after` of them fails with
+    /// `errno` (`None`: none does).
+    #[cfg(all(test, unix))]
+    pub(super) fn inject_move_fault(fault: Option<(usize, i32)>) {
+        MOVE_FAULT.with(|f| f.set(fault));
+    }
+
+    /// On this thread, read a volume as mounted at `at` whatever the mount table says (`None`:
+    /// the table alone decides).
+    #[cfg(all(test, unix))]
+    pub(super) fn pretend_mounted(at: Option<PathBuf>) {
+        MOUNTED.with(|m| *m.borrow_mut() = at);
+    }
+
+    /// On this thread, a pass reads `table` as the mount table (`None`: one read whole that
+    /// holds no mount, as `mount_table` gives a test).
+    #[cfg(all(test, unix))]
+    pub(super) fn pretend_table(table: Option<Table>) {
+        TABLE.with(|t| *t.borrow_mut() = table);
+    }
+
+    /// The mount table a pass reads just before it takes the locks. A unit test reads the one
+    /// it was given (`pretend_table`), else one read whole that holds no mount: whether a
+    /// test's pass stages never turns on what is mounted on the machine that runs it.
+    #[cfg(unix)]
+    fn mount_table() -> Table {
+        #[cfg(test)]
+        {
+            TABLE.with(|t| t.borrow().clone()).unwrap_or_else(|| Table {
+                mounts: Vec::new(),
+                complete: true,
+                firmlinks: Vec::new(),
+            })
+        }
+        #[cfg(not(test))]
+        {
+            aterm_sysprobe::volumes::table()
+        }
+    }
+
+    /// On this thread, the scan a pass makes of what it would stage runs within `budget`
+    /// (`None`: within [`STAGE_SCAN`]).
+    #[cfg(all(test, unix))]
+    pub(super) fn inject_scan_budget(budget: Option<WalkBudget>) {
+        SCAN_BUDGET.with(|b| b.set(budget));
+    }
+
+    /// Is a volume mounted at or under `dir`, or is that not ruled out: the mount table read
+    /// just before the locks were taken ([`super::super::mounts_clear`]).
+    #[cfg(unix)]
+    fn mounted_under(dir: &Path, table: Option<&Table>) -> bool {
+        #[cfg(test)]
+        if MOUNTED.with(|m| m.borrow().as_deref().is_some_and(|at| at.starts_with(dir))) {
+            return true;
+        }
+        super::super::mounts_clear(dir, table).is_err()
+    }
+
+    /// The bounds of the scan a pass makes of what it would stage ([`unmanaged_below`]): every
+    /// entry, as deep as custody is read, within the profile walk's wall clock.
+    #[cfg(unix)]
+    const STAGE_SCAN: WalkBudget = WalkBudget {
+        entries: usize::MAX,
+        depth: MAX_CUSTODY_DEPTH,
+        wall: super::PROFILE_WALK_WALL,
+    };
+
+    /// Was the directory `fd` (at `path`, on device `on`) read whole within [`STAGE_SCAN`] and
+    /// found to hold nothing a move must not carry: no custody marker at or below it, no
+    /// directory on another device, no special entry, none that could not be opened. A removal
+    /// that takes more than a profile's `incremental/` (tier 1: everything of a build
+    /// directory; tier 3: every cargo output of a profile) reads this just before it takes the
+    /// locks, as it reads the mount table, and stages nothing where it is not so: a rename
+    /// would carry a managed directory out of the path its owner knows, where the delete in
+    /// place stops at it. Tier 1, which takes whatever a build directory's root holds, reads it
+    /// again at the stage, under the locks, where no path reaches what it carried. What only
+    /// rustc writes (a profile's `incremental/`) is staged unread, by tier 2 and by these
+    /// scans alike, so the largest caches neither run a scan into its bound nor are read
+    /// under the locks. Whatever a scan did not see is the stage delete's to find: it stops
+    /// there, and what it left goes back where it was ([`left_back`], [`finish_stage`]).
+    #[cfg(unix)]
+    fn unmanaged_below(fd: &OwnedFd, path: &Path, on: u64) -> bool {
+        #[cfg(test)]
+        let budget = SCAN_BUDGET.with(std::cell::Cell::get).unwrap_or(STAGE_SCAN);
+        #[cfg(not(test))]
+        let budget = STAGE_SCAN;
+        let mut walk = CustodyWalk {
+            budget,
+            started: Instant::now(),
+            entries: 0,
+            on,
+            caches_unread: true,
+        };
+        walk.visit(fd, path, 0).is_ok()
+    }
+
+    /// A stage this pass made ([`super::STAGE`]): the folder inside the folder holding what it
+    /// takes, open, with its tag's lock held for as long as it lives.
+    #[cfg(unix)]
+    struct Aside {
+        fd: OwnedFd,
+        name: OsString,
+        path: PathBuf,
+        _tag: HeldLock,
+    }
+
+    /// Make a stage in `folder` (at `folder_path`) on device `on`: the lowest free stage name,
+    /// made by `mkdirat` (which never replaces an entry), and in it a tag made new and locked.
+    /// The tag is read again once its lock is held, one link and still the file its name names,
+    /// so no file swapped in between its make and its lock passes for this pass's. `None` when
+    /// none can be made, and a stage made but not proved is removed again.
+    #[cfg(unix)]
+    fn make_aside(folder: &OwnedFd, folder_path: &Path, on: u64) -> Option<Aside> {
+        #[cfg(test)]
+        if STAGE_FAULT.with(std::cell::Cell::get).is_some() {
+            return None;
+        }
+        let name = atpkg::build_cache::take_stage(OsStr::new(super::STAGE), &mut |n| {
+            dirfd::mkdirat(folder, n, Mode::RWXU).map_err(io::Error::from)
+        })
+        .ok()?;
+        let fd = match open_dir(folder, &name) {
+            Ok(Some(fd)) if dev(&fd).ok() == Some(on) => fd,
+            _ => {
+                let _ = dirfd::unlinkat(folder, &name, AtFlags::REMOVEDIR);
+                return None;
+            }
+        };
+        let flags =
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let made = dirfd::openat(&fd, super::STAGE_TAG, flags, Mode::RUSR | Mode::WUSR);
+        let made_tag = made.is_ok();
+        let tag = made.ok().and_then(|tag| {
+            let lock = HeldLock::try_take(std::fs::File::from(tag))
+                .ok()
+                .flatten()?;
+            let held = dirfd::fstat(lock.file()).ok()?;
+            let named = dirfd::fstatat(&fd, super::STAGE_TAG, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+            (held.st_nlink == 1 && (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
+                .then_some(lock)
+        });
+        let Some(tag) = tag else {
+            if made_tag {
+                let _ = dirfd::unlinkat(&fd, super::STAGE_TAG, AtFlags::empty());
+            }
+            let _ = rmdir_named(folder, &name, &fd);
+            return None;
+        };
+        Some(Aside {
+            fd,
+            path: folder_path.join(&name),
+            name,
+            _tag: tag,
+        })
+    }
+
+    /// What became of one entry a pass would move into its stage ([`move_aside`]).
+    #[cfg(unix)]
+    enum Moved {
+        /// It sits in the stage.
+        Yes,
+        /// It was gone already.
+        Gone,
+        /// It stays where it was, for the reason given: it is on another volume or is a mount
+        /// point, or the rename refused it for a reason of its own.
+        Stays(String),
+        /// Nothing renames into a stage here: what is left goes in place, under the locks.
+        CannotStage,
+    }
+
+    /// Move the entry `name` of `folder` (at `folder_path`) into `aside`, under the same name:
+    /// never one on another device than `on`, never by a rename that could replace anything.
+    #[cfg(unix)]
+    fn move_aside(
+        folder: &OwnedFd,
+        folder_path: &Path,
+        name: &OsStr,
+        aside: &Aside,
+        on: u64,
+    ) -> Moved {
+        let here = folder_path.join(name);
+        let stays =
+            |why: String| Moved::Stays(format!("{}: {why}; it stays where it was", here.display()));
+        match dirfd::fstatat(folder, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if st.st_dev == on => {}
+            Ok(_) => return stays("it is on another volume".to_owned()),
+            Err(Errno::NOENT) => return Moved::Gone,
+            Err(e) => return stays(io::Error::from(e).to_string()),
+        }
+        match rename_aside(folder, name, aside) {
+            Ok(()) => Moved::Yes,
+            Err(Errno::NOENT) => match dirfd::fstatat(folder, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => Moved::Gone,
+                _ => Moved::CannotStage,
+            },
+            Err(e) if e.0 == code::BUSY => {
+                stays("moving it would cross a volume (it is a mount point)".to_owned())
+            }
+            // Both names are in `folder`, on the device read above: `EXDEV` is the
+            // filesystem's refusal (an overlayfs lower directory), not a volume crossed.
+            Err(e) if e.0 == code::XDEV || code::CANNOT_STAGE.contains(&e.0) => Moved::CannotStage,
+            Err(e) => stays(io::Error::from(e).to_string()),
+        }
+    }
+
+    /// The rename [`move_aside`] makes: `name` of `folder` to the same name in `aside`, never
+    /// replacing an entry there.
+    #[cfg(unix)]
+    fn rename_aside(folder: &OwnedFd, name: &OsStr, aside: &Aside) -> Result<(), Errno> {
+        #[cfg(test)]
+        if let Some((after, errno)) = MOVE_FAULT.with(std::cell::Cell::get) {
+            if after == 0 {
+                return Err(Errno(errno));
+            }
+            MOVE_FAULT.with(|f| f.set(Some((after - 1, errno))));
+        }
+        dirfd::renameat_with(folder, name, &aside.fd, name, RenameFlags::NOREPLACE)
+    }
+
+    /// Remove `aside` from `folder` when it holds only its tag: a stage nothing sits in.
+    /// Whether it is gone.
+    #[cfg(unix)]
+    fn drop_empty_aside(folder: &OwnedFd, aside: &Aside) -> bool {
+        if !names(&aside.fd).is_ok_and(|n| n.len() == 1 && n[0] == super::STAGE_TAG) {
+            return false;
+        }
+        let _ = dirfd::unlinkat(&aside.fd, super::STAGE_TAG, AtFlags::empty());
+        matches!(
+            rmdir_named(folder, &aside.name, &aside.fd),
+            Ok(()) | Err(Errno::NOENT)
+        )
+    }
+
+    /// Move each of `names` that sits in the stage `stage` (open, at `stage_path`) back into
+    /// `folder` under its own name, last moved first, never over an entry there: one that
+    /// cannot go back stays staged, said in `kept` after `why`. The names that went back.
+    #[cfg(unix)]
+    fn put_back(
+        folder: &OwnedFd,
+        (stage, stage_path): (&OwnedFd, &Path),
+        names: &[OsString],
+        why: &str,
+        kept: &mut Vec<String>,
+    ) -> Vec<OsString> {
+        let mut back = Vec::new();
+        for name in names.iter().rev() {
+            match dirfd::renameat_with(stage, name, folder, name, RenameFlags::NOREPLACE) {
+                Ok(()) => back.push(name.clone()),
+                Err(Errno::NOENT) => {}
+                Err(e) => kept.push(format!(
+                    "{}: {why} and it could not move back ({}); it stays staged",
+                    stage_path.join(name).display(),
+                    io::Error::from(e)
+                )),
+            }
+        }
+        back
+    }
+
+    /// Every cargo lock the folder `folder` (at `path`) holds, taken without waiting and never
+    /// made: why not, while a build holds one or one cannot be taken. A folder that holds none
+    /// (a build directory's root) gives none to take. A pass probes a profile with it before
+    /// it scans what it would stage, so it reads nothing of a build that holds the profile.
+    #[cfg(unix)]
+    fn quiet_locks(folder: &OwnedFd, path: &Path) -> Result<Vec<HeldLock>, String> {
+        let mut held = Vec::new();
+        for lock in CARGO_LOCKS {
+            match take_lock(folder, lock, false) {
+                Ok(Some(lock)) => held.push(lock),
+                Err(e) if e.raw_os_error() == Some(code::NOENT) => {}
+                Ok(None) => return Err(format!("a build holds {}", path.join(lock).display())),
+                Err(e) => {
+                    return Err(format!(
+                        "{} could not be taken: {e}",
+                        path.join(lock).display()
+                    ));
+                }
+            }
+        }
+        Ok(held)
+    }
+
+    /// What the delete of the stage `aside` left goes back where it was: each of `moved` that
+    /// still sits in it moves back into `t.folder` under its own name ([`put_back`]), never
+    /// over what a build laid there meanwhile. A profile's is moved under its cargo locks
+    /// taken again, so never beside a build that started there; a build directory's root
+    /// holds no cargo lock, so there the move back that never replaces an entry is all that
+    /// keeps a build that started meanwhile whole. So an entry the delete could not remove, a
+    /// directory on another device it never entered and a managed directory it stopped at are
+    /// where they were before the pass, as a delete in place leaves them. Each line of `kept`
+    /// that named what went back names it where it is again. Whether the stage is gone: one
+    /// that still holds something keeps its tag, for a later pass to finish ([`finish_stage`],
+    /// which moves back what its own delete leaves).
+    #[cfg(unix)]
+    fn left_back(
+        t: &Taking<'_>,
+        aside: &Aside,
+        moved: &[OsString],
+        kept: &mut Vec<String>,
+    ) -> bool {
+        let Ok(_quiet) = quiet_locks(t.folder, t.folder_path) else {
+            return false;
+        };
+        let back = put_back(
+            t.folder,
+            (&aside.fd, &aside.path),
+            moved,
+            "the delete left it",
+            kept,
+        );
+        for name in &back {
+            let staged = aside.path.join(name).display().to_string();
+            let placed = t.folder_path.join(name).display().to_string();
+            for line in kept.iter_mut() {
+                if let Some(rest) = line.strip_prefix(&staged)
+                    && rest.starts_with(['/', ':', ' '])
+                {
+                    *line = format!("{placed}{rest}");
+                }
+            }
+        }
+        drop_empty_aside(t.folder, aside)
+    }
+
+    /// Where a pass takes from ([`take_out`]): the folder holding what it takes (a profile, or
+    /// the build directory itself) at `folder_path`, which its hook and lines name; the depth of
+    /// that folder's entries in the delete; the device it never leaves; the build directory's
+    /// custody; and, on unix, whether what it takes may be staged at all (`stageable`: by the
+    /// scan made just before the locks were taken, where one is made), whether it is read
+    /// again once it sits in the stage (`reread`; [`unmanaged_below`]), and the profiles whose
+    /// locks are held, when what it takes may hold profiles (tier 1: `locked`; the stage is
+    /// walked for a profile not among them, [`unlocked_profile`]).
+    struct Taking<'a> {
+        folder: &'a OwnedFd,
+        folder_path: &'a Path,
+        depth: usize,
+        on: u64,
+        custody: (&'a OwnedFd, &'a Path),
+        #[cfg(unix)]
+        stageable: bool,
+        #[cfg(unix)]
+        reread: bool,
+        #[cfg(unix)]
+        locked: Option<&'a [PathBuf]>,
+    }
+
+    /// Does the stage `aside`, holding what was taken from the folder at `folder_path`, hold a
+    /// cargo profile not among `locked`, or could that not be ruled out (its walk was cut
+    /// short): why. A build that started a profile after the walk made under the locks takes
+    /// its own lock there, which no pass holds; once the profile sits in the stage no build
+    /// can name it, so this walk, unlike one of the build directory, has no race to lose.
+    #[cfg(unix)]
+    fn unlocked_profile(aside: &Aside, folder_path: &Path, locked: &[PathBuf]) -> Option<String> {
+        let walked = walk_at(&aside.fd, &aside.path, WalkBudget::SHIPPED);
+        if let Some(cut) = walked.cut {
+            return Some(format!("what it took could not be walked whole ({cut})"));
+        }
+        walked.profiles.iter().find_map(|p| {
+            let placed = folder_path.join(p.strip_prefix(&aside.path).ok()?);
+            (!locked.iter().any(|l| same_path(l, &placed))).then(|| {
+                format!(
+                    "{} is a profile it did not lock (a build started it since the locks were taken)",
+                    placed.display()
+                )
+            })
+        })
+    }
+
+    /// What [`take_out`] did.
+    struct Taken {
+        bytes: u64,
+        kept: Vec<String>,
+        revoked: bool,
+        /// Whether what was taken was staged, and then whether it went whole: everything taken
+        /// staged and the stage gone. `None` when nothing was staged.
+        staged_whole: Option<bool>,
+    }
+
+    /// Take `entries` of `t.folder` under the cargo locks `held`, and let the locks go before
+    /// the delete. Unix: each entry is moved into a stage of the pass's own made in that folder
+    /// ([`make_aside`]); custody is read again at the stage; the locks are let go; then the
+    /// stage is deleted ([`delete_stage`]), and what that delete leaves goes back where it was
+    /// ([`left_back`]). An entry on another volume, or that is a mount point, stays where it
+    /// was. Where custody refuses once all is staged, everything moves back. Where no stage
+    /// can be made, or a rename says none can be made here, or a volume is mounted inside an
+    /// entry by the mount table read before the locks, or a scan (before the locks, or of the
+    /// stage: `t.stageable`, `t.reread`) did not find all of it free to move, what is left is
+    /// deleted in place under the locks ([`in_place`]), everything moved back first where the
+    /// scan of the stage said so.
+    #[cfg(unix)]
+    fn take_out(
+        t: &Taking<'_>,
+        entries: Vec<Child>,
+        held: Vec<HeldLock>,
+        table: Option<&Table>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> Taken {
+        let stageable = t.stageable
+            && !entries.is_empty()
+            && entries
+                .iter()
+                .all(|c| !mounted_under(&t.folder_path.join(&c.name), table));
+        let aside = if stageable {
+            make_aside(t.folder, t.folder_path, t.on)
+        } else {
+            None
+        };
+        let Some(aside) = aside else {
+            return in_place(t, entries, held, hook);
+        };
+        let mut kept = Vec::new();
+        let mut moved: Vec<OsString> = Vec::new();
+        let mut rest: Vec<Child> = Vec::new();
+        let mut entries = entries.into_iter();
+        for entry in entries.by_ref() {
+            match move_aside(t.folder, t.folder_path, &entry.name, &aside, t.on) {
+                Moved::Yes => moved.push(entry.name),
+                Moved::Gone => {}
+                Moved::Stays(why) => kept.push(why),
+                Moved::CannotStage => {
+                    rest.push(entry);
+                    break;
+                }
+            }
+        }
+        rest.extend(entries);
+        if moved.is_empty() {
+            drop_empty_aside(t.folder, &aside);
+            drop(aside);
+            let mut taken = in_place(t, rest, held, hook);
+            kept.append(&mut taken.kept);
+            taken.kept = kept;
+            return taken;
+        }
+        hook(Stage::Staged, t.folder_path);
+        let refused = ordinary_custody_at(&aside.fd, &aside.path)
+            .err()
+            .map(|why| (why, "custody refused it after it was staged"))
+            .or_else(|| {
+                t.locked
+                    .and_then(|locked| unlocked_profile(&aside, t.folder_path, locked))
+                    .map(|why| (why, "it holds a profile no lock of the pass covers"))
+            });
+        let carried =
+            refused.is_none() && t.reread && !unmanaged_below(&aside.fd, &aside.path, t.on);
+        if refused.is_some() || carried {
+            let why = match &refused {
+                Some((_, why)) => why,
+                None => "it holds what a move must not carry",
+            };
+            put_back(t.folder, (&aside.fd, &aside.path), &moved, why, &mut kept);
+            drop_empty_aside(t.folder, &aside);
+        }
+        if let Some((why, _)) = refused {
+            kept.push(format!("{}: {why}", t.folder_path.display()));
+            drop(aside);
+            drop(held);
+            hook(Stage::Released, t.folder_path);
+            return Taken {
+                bytes: 0,
+                kept,
+                revoked: true,
+                staged_whole: Some(false),
+            };
+        }
+        if carried {
+            // Back where it was, all of it goes as it went before stages: in place, under the
+            // locks, a delete that stops at what the move must not have carried.
+            drop(aside);
+            let mut all: Vec<Child> = moved.into_iter().map(|name| Child { name }).collect();
+            all.append(&mut rest);
+            let mut taken = in_place(t, all, held, hook);
+            kept.append(&mut taken.kept);
+            taken.kept = kept;
+            return taken;
+        }
+        let mut deleted = Deleted::default();
+        let mut revoked = false;
+        if !rest.is_empty() {
+            hook(Stage::Deleting, t.folder_path);
+            let mut pass = Removal {
+                on: t.on,
+                custody: Some(t.custody),
+                revoked: false,
+                _hook: &mut *hook,
+                permit: None,
+            };
+            for entry in &rest {
+                remove_tree_at(
+                    t.folder,
+                    entry,
+                    t.folder_path,
+                    t.depth,
+                    &mut deleted,
+                    &mut pass,
+                );
+                if pass.revoked {
+                    break;
+                }
+            }
+            revoked = pass.revoked;
+        }
+        drop(held);
+        hook(Stage::Released, t.folder_path);
+        let mut gone = false;
+        if !revoked {
+            hook(Stage::Deleting, &aside.path);
+            let mut pass = Removal {
+                on: t.on,
+                custody: Some(t.custody),
+                revoked: false,
+                _hook: &mut *hook,
+                permit: None,
+            };
+            gone = delete_stage(
+                t.folder,
+                t.folder_path,
+                &aside.name,
+                &aside.fd,
+                t.depth,
+                &mut deleted,
+                &mut pass,
+            );
+            revoked = pass.revoked;
+        }
+        kept.append(&mut deleted.kept);
+        let staged_whole = Some(gone && kept.is_empty());
+        if !gone && !left_back(t, &aside, &moved, &mut kept) {
+            kept.push(format!(
+                "{}: stays staged; a later pass finishes it",
+                aside.path.display()
+            ));
+        }
+        Taken {
+            bytes: deleted.bytes,
+            kept,
+            revoked,
+            staged_whole,
+        }
+    }
+
+    /// Windows makes no stage (`aterm-dirfd` has no handle-relative rename there): what is taken
+    /// is deleted in place under the locks ([`in_place`]).
+    #[cfg(windows)]
+    fn take_out(
+        t: &Taking<'_>,
+        entries: Vec<Child>,
+        held: Vec<HeldLock>,
+        _table: Option<&Table>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> Taken {
+        in_place(t, entries, held, hook)
+    }
+
+    /// Delete `entries` of `t.folder` where they are, under the cargo locks `held`, and let the
+    /// locks go after.
+    fn in_place(
+        t: &Taking<'_>,
+        entries: Vec<Child>,
+        held: Vec<HeldLock>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> Taken {
+        let mut deleted = Deleted::default();
+        let mut revoked = false;
+        if !entries.is_empty() {
+            hook(Stage::Deleting, t.folder_path);
+            let mut pass = Removal {
+                on: t.on,
+                custody: Some(t.custody),
+                revoked: false,
+                _hook: &mut *hook,
+                permit: None,
+            };
+            for entry in &entries {
+                remove_tree_at(
+                    t.folder,
+                    entry,
+                    t.folder_path,
+                    t.depth,
+                    &mut deleted,
+                    &mut pass,
+                );
+                if pass.revoked {
+                    break;
+                }
+            }
+            revoked = pass.revoked;
+        }
+        drop(held);
+        hook(Stage::Released, t.folder_path);
+        Taken {
+            bytes: deleted.bytes,
+            kept: deleted.kept,
+            revoked,
+            staged_whole: None,
+        }
+    }
+
     struct Profiled {
         bytes: u64,
         gone: bool,
@@ -2734,8 +4044,8 @@ mod fd {
         custody: (&OwnedFd, &Path),
         path: &Path,
         on: u64,
-        judge: &Judge,
-        select: Select<'_>,
+        (judge, select): (&Judge, Select<'_>),
+        mounts: Option<&Table>,
         hook: &mut dyn FnMut(Stage, &Path),
     ) -> Result<Profiled, String> {
         let held = take_all(profile, path)?;
@@ -2760,7 +4070,7 @@ mod fd {
             Ok(None) => return Err("it no longer holds a real incremental/".to_owned()),
             Err(e) => return Err(format!("its incremental/ could not be opened: {e}")),
         };
-        hook(Stage::Deleting, path);
+        hook(Stage::Staging, path);
         if let Err(why) = ordinary_custody_at(custody.0, custody.1) {
             drop(held);
             hook(Stage::Released, path);
@@ -2771,30 +4081,37 @@ mod fd {
                 revoked: true,
             });
         }
-        let mut deleted = Deleted::default();
-        let revoked = {
-            let mut pass = Removal {
-                on,
-                custody: Some(custody),
-                revoked: false,
-                _hook: hook,
-                permit: None,
-            };
-            remove_tree_at(profile, &target, path, 0, &mut deleted, &mut pass);
-            pass.revoked
+        // `incremental/` holds what rustc alone writes, on the profile's device (read above):
+        // it is staged unread, however large, and what its delete would not take goes back.
+        let taking = Taking {
+            folder: profile,
+            folder_path: path,
+            depth: 0,
+            on,
+            custody,
+            #[cfg(unix)]
+            stageable: true,
+            #[cfg(unix)]
+            reread: false,
+            #[cfg(unix)]
+            locked: None,
         };
-        let gone = matches!(open_dir(profile, inc), Ok(None));
-        drop(held);
-        hook(Stage::Released, path);
+        let taken = take_out(&taking, vec![target], held, mounts, hook);
+        let gone = taken
+            .staged_whole
+            .unwrap_or_else(|| matches!(open_dir(profile, inc), Ok(None)));
         Ok(Profiled {
-            bytes: deleted.bytes,
+            bytes: taken.bytes,
             gone,
-            kept: deleted.kept,
-            revoked,
+            kept: taken.kept,
+            revoked: taken.revoked,
         })
     }
 
-    /// Remove the build directory at `path` whole ([`super::reclaim_whole`]).
+    /// Remove the build directory at `path` whole ([`super::reclaim_whole`]). What an earlier
+    /// pass left staged at its root goes only with a removal that went: after every lock was
+    /// taken, every check passed and what this one takes left under them (`whole_out`). One
+    /// that refuses finishes nothing, so its answer is the refusal alone.
     pub(super) fn reclaim_whole(
         path: &Path,
         judge: &Judge,
@@ -2820,25 +4137,8 @@ mod fd {
         };
         let root_dev = on_measured_volume(&root, judge)?;
         let refuse = |why: String| io::Error::other(format!("no longer a candidate: {why}"));
-        let (marker, holds_source) = root_facts(path);
-        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
-        let marker = TargetDir {
-            path: path.to_path_buf(),
-            marker,
-            holds_source,
-            walk_cut_short: cut,
-            profiles: Vec::new(),
-            device: Some(root_dev),
-            volume: None,
-            probed_recent: false,
-            origin: super::Origin::Named,
-            owned: super::Owned::NotOwned,
-            total: None,
-            foreign: None,
-            idle: None,
-        }
-        .fences()
-        .map_err(refuse)?;
+        let Walked { profiles, cut, .. } = walk_at(&root, path, WalkBudget::SHIPPED);
+        let marker = fences_at(path, cut, root_dev).map_err(refuse)?;
         if marker != "CACHEDIR.TAG" {
             return Err(refuse(format!(
                 "only a signed CACHEDIR.TAG lets a whole build directory go, and it carries {marker}"
@@ -2847,6 +4147,16 @@ mod fd {
         if profiles.is_empty() {
             return Err(refuse("it holds no cargo profile".to_owned()));
         }
+        #[cfg(unix)]
+        let mounts = mount_table();
+        // Nothing of a profile a build holds is read: its locks are probed before the scan.
+        #[cfg(unix)]
+        for profile in &profiles {
+            let fd = reopen(&root, path, profile, root_dev).map_err(|e| refuse(e.to_string()))?;
+            quiet_locks(&fd, profile).map(drop).map_err(refuse)?;
+        }
+        #[cfg(unix)]
+        let stageable = unmanaged_below(&root, path, root_dev);
         let mut held = Vec::new();
         for profile in &profiles {
             let fd = reopen(&root, path, profile, root_dev).map_err(|e| refuse(e.to_string()))?;
@@ -2873,7 +4183,11 @@ mod fd {
             }
         }
         hook(Stage::Locked, path);
-        let (mut again, cut) = find_at(&root, path, WalkBudget::SHIPPED);
+        let Walked {
+            profiles: mut again,
+            cut,
+            stages: left,
+        } = walk_at(&root, path, WalkBudget::SHIPPED);
         let mut before = profiles.clone();
         again.sort();
         before.sort();
@@ -2884,64 +4198,68 @@ mod fd {
             ));
         }
         check().map_err(refuse)?;
-        let same = |fd: &OwnedFd| dirfd::fstat(fd).map(|st| (st.st_dev, st.st_ino));
-        let named = |parent: &OwnedFd| -> io::Result<bool> {
-            Ok(match open_dir(parent, name)? {
-                Some(fd) => same(&fd)? == same(&root)?,
-                None => false,
-            })
+        let whole = Whole {
+            parent: &parent_fd,
+            name,
+            root: &root,
+            path,
+            on: root_dev,
         };
-        if !named(&parent_fd)? {
+        if !names_root(&whole)? {
             return Err(refuse("its name now names another directory".to_owned()));
         }
-        hook(Stage::Deleting, path);
+        hook(Stage::Staging, path);
         ordinary_custody_at(&root, path).map_err(refuse)?;
-        let mut deleted = Deleted::default();
-        let mut pass = Removal {
-            on: root_dev,
-            custody: Some((&root, path)),
-            revoked: false,
-            _hook: hook,
-            permit: None,
-        };
-        match children(&root) {
-            Ok(mut children) => {
-                children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c.name == *l));
-                for child in children {
-                    remove_tree_at(&root, &child, path, 1, &mut deleted, &mut pass);
-                    if pass.revoked {
-                        break;
-                    }
-                }
-            }
-            Err(e) => deleted.kept.push(format!("{}: {e}", path.display())),
+        #[cfg(unix)]
+        {
+            whole_out(
+                &whole,
+                (held, &profiles),
+                (Some(&mounts), stageable),
+                &left,
+                hook,
+            )
         }
-        let mut gone = false;
-        if deleted.kept.is_empty() && pass.permit((&root, path), path, &mut deleted) {
-            match named(&parent_fd) {
-                Ok(true) => match rmdir_named(&parent_fd, name, &root) {
-                    Ok(()) => gone = true,
-                    Err(e) => {
-                        deleted
-                            .kept
-                            .push(format!("{}: {}", path.display(), io::Error::from(e)))
-                    }
-                },
-                Ok(false) => deleted.kept.push(format!(
-                    "{}: its name now names another directory, which is left",
-                    path.display()
-                )),
-                Err(e) => deleted.kept.push(format!(
-                    "{}: its final name could not be inspected: {e}",
-                    path.display()
-                )),
-            }
+        #[cfg(windows)]
+        {
+            let _ = left;
+            whole_in_place(&whole, held, hook)
         }
+    }
 
-        drop(held);
-        hook(Stage::Released, path);
-        if !gone && deleted.bytes == 0 {
-            let mut why = deleted.kept;
+    /// A build directory a tier-1 removal takes whole: `name` in `parent`, open as `root`, at
+    /// `path` on device `on`.
+    struct Whole<'a> {
+        parent: &'a OwnedFd,
+        name: &'a OsStr,
+        root: &'a OwnedFd,
+        path: &'a Path,
+        on: u64,
+    }
+
+    /// Does `w.name` in `w.parent` still name the directory `w.root`?
+    fn names_root(w: &Whole<'_>) -> io::Result<bool> {
+        let same = |fd: &OwnedFd| dirfd::fstat(fd).map(|st| (st.st_dev, st.st_ino));
+        Ok(match open_dir(w.parent, w.name)? {
+            Some(fd) => same(&fd)? == same(w.root)?,
+            None => false,
+        })
+    }
+
+    /// The answer of a tier-1 removal that freed `bytes`, took the directory itself or not
+    /// (`gone`), and left what `skipped` and `trouble` say: an error when it took nothing.
+    fn whole_removed(
+        path: &Path,
+        (bytes, gone): (u64, bool),
+        skipped: Vec<(PathBuf, String)>,
+        trouble: Vec<String>,
+    ) -> io::Result<Removed> {
+        if !gone && bytes == 0 {
+            let mut why: Vec<String> = skipped
+                .iter()
+                .map(|(p, why)| format!("{}: {why}", p.display()))
+                .chain(trouble)
+                .collect();
             if why.is_empty() {
                 why.push("nothing could be removed".to_owned());
             }
@@ -2951,15 +4269,254 @@ mod fd {
             )));
         }
         Ok(Removed {
-            bytes: deleted.bytes,
+            bytes,
             units: if gone {
                 vec![path.to_path_buf()]
             } else {
                 Vec::new()
             },
-            skipped: Vec::new(),
-            trouble: deleted.kept,
+            skipped,
+            trouble,
         })
+    }
+
+    /// Tier 1 on unix: every entry of the build directory but its `CACHEDIR.TAG` (and a folder
+    /// named as a stage) is taken out under the locks `held` of the profiles `locked`
+    /// ([`take_out`]), staged only where the mount table and the scan read before the locks
+    /// allow (`mounts`, `stageable`), read again at the stage, and walked there for a profile
+    /// a build started since the locks were taken, which puts all of it back and takes nothing
+    /// ([`unlocked_profile`]). Then, the locks let go, each stage an earlier pass left at the
+    /// directory's root is finished (`left`, by the walk made under the locks;
+    /// [`finish_stage`]): one deeper went with the entry that held it. Once nothing of the
+    /// directory stays, it goes too ([`tidy_root`]).
+    #[cfg(unix)]
+    fn whole_out(
+        w: &Whole<'_>,
+        (held, locked): (Vec<HeldLock>, &[PathBuf]),
+        (mounts, stageable): (Option<&Table>, bool),
+        left: &[PathBuf],
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        let mut trouble = Vec::new();
+        let entries = match children(w.root) {
+            Ok(mut entries) => {
+                entries.retain(|c| c.name != "CACHEDIR.TAG" && !super::is_stage_name(&c.name));
+                entries.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c.name == *l));
+                entries
+            }
+            Err(e) => {
+                trouble.push(format!("{}: {e}", w.path.display()));
+                Vec::new()
+            }
+        };
+        let taking = Taking {
+            folder: w.root,
+            folder_path: w.path,
+            depth: 1,
+            on: w.on,
+            custody: (w.root, w.path),
+            stageable,
+            reread: true,
+            locked: Some(locked),
+        };
+        let taken = take_out(&taking, entries, held, mounts, hook);
+        let mut bytes = taken.bytes;
+        trouble.extend(taken.kept);
+        let mut skipped = Vec::new();
+        let mut finished = Vec::new();
+        if !taken.revoked {
+            for stage in left.iter().filter(|s| s.parent() == Some(w.path)) {
+                let done = finish_stage(w.root, w.path, stage, w.on, hook);
+                bytes = bytes.saturating_add(done.bytes);
+                finished.extend(done.units);
+                skipped.extend(done.skipped);
+                trouble.extend(done.trouble);
+            }
+        }
+        let mut gone = false;
+        if trouble.is_empty() && !taken.revoked {
+            match tidy_root(w, hook) {
+                Tidy::Gone(freed) => {
+                    gone = true;
+                    bytes = bytes.saturating_add(freed);
+                }
+                Tidy::Stays(why) => skipped.push((w.path.to_path_buf(), why)),
+                Tidy::Trouble(line) => trouble.push(line),
+            }
+        }
+        let mut removed = whole_removed(w.path, (bytes, gone), skipped, trouble)?;
+        removed.units.extend(finished);
+        Ok(removed)
+    }
+
+    /// What became of a tier-1 build directory once all else of it went ([`tidy_root`]).
+    #[cfg(unix)]
+    enum Tidy {
+        /// It went, with the bytes its `CACHEDIR.TAG` held.
+        Gone(u64),
+        /// It stays, for the reason given: a build started in it.
+        Stays(String),
+        /// It stays, for the error given.
+        Trouble(String),
+    }
+
+    /// The most bytes of a `CACHEDIR.TAG` a removal reads, to write it back if a build starts in
+    /// the directory while it goes.
+    #[cfg(unix)]
+    const TAG_MAX: u64 = 64 * 1024;
+
+    /// Remove the tier-1 build directory `w` once it holds only its `CACHEDIR.TAG`: while
+    /// custody allows and its name still names it, the tag goes, then the directory. A build
+    /// that started in it meanwhile keeps it: the directory holds more than its tag, or its
+    /// removal finds it no longer empty and the tag is written back.
+    #[cfg(unix)]
+    fn tidy_root(w: &Whole<'_>, hook: &mut dyn FnMut(Stage, &Path)) -> Tidy {
+        use std::io::Read as _;
+        let tag = OsStr::new("CACHEDIR.TAG");
+        let lone = names(w.root).is_ok_and(|n| n.len() == 1 && n[0] == "CACHEDIR.TAG")
+            && open_file(w.root, tag).is_some();
+        if !lone {
+            return Tidy::Stays(
+                "it holds more than its CACHEDIR.TAG now (a build started in it, or an earlier stage stays); it stays"
+                    .to_owned(),
+            );
+        }
+        let mut deleted = Deleted::default();
+        let mut pass = Removal {
+            on: w.on,
+            custody: Some((w.root, w.path)),
+            revoked: false,
+            _hook: hook,
+            permit: None,
+        };
+        if !pass.permit((w.root, w.path), w.path, &mut deleted) {
+            return Tidy::Trouble(deleted.kept.join("; "));
+        }
+        match names_root(w) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Tidy::Trouble(format!(
+                    "{}: its name now names another directory, which is left",
+                    w.path.display()
+                ));
+            }
+            Err(e) => {
+                return Tidy::Trouble(format!(
+                    "{}: its final name could not be inspected: {e}",
+                    w.path.display()
+                ));
+            }
+        }
+        let Some(file) = open_file(w.root, tag) else {
+            return Tidy::Stays("its CACHEDIR.TAG is no longer a plain file; it stays".to_owned());
+        };
+        let mut text = Vec::new();
+        let read = (&file).take(TAG_MAX + 1).read_to_end(&mut text);
+        let whole = u64::try_from(text.len()).is_ok_and(|n| n <= TAG_MAX);
+        if read.is_err() || !whole {
+            return Tidy::Stays(
+                "its CACHEDIR.TAG could not be read whole to write back; it stays".to_owned(),
+            );
+        }
+        let freed = dirfd::fstat(&file).map_or(0, |st| {
+            if st.st_nlink == 1 {
+                st.st_blocks.saturating_mul(512)
+            } else {
+                0
+            }
+        });
+        if let Err(e) = dirfd::unlinkat(w.root, tag, AtFlags::empty()) {
+            return Tidy::Trouble(format!(
+                "{}: {}",
+                w.path.join(tag).display(),
+                io::Error::from(e)
+            ));
+        }
+        match rmdir_named(w.parent, w.name, w.root) {
+            Ok(()) => Tidy::Gone(freed),
+            Err(e) if code::NOTEMPTY_OR_EXIST.contains(&e.0) => Tidy::Stays(format!(
+                "a build started in it while it was removed; its CACHEDIR.TAG {} and it stays",
+                write_back(w.root, &text)
+            )),
+            Err(e) => Tidy::Trouble(format!(
+                "{}: {}; its CACHEDIR.TAG {}",
+                w.path.display(),
+                io::Error::from(e),
+                write_back(w.root, &text)
+            )),
+        }
+    }
+
+    /// Write `text` back as the `CACHEDIR.TAG` of `root`, never over one there: how it went.
+    #[cfg(unix)]
+    fn write_back(root: &OwnedFd, text: &[u8]) -> String {
+        use std::io::Write as _;
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH;
+        match dirfd::openat(root, "CACHEDIR.TAG", flags, mode) {
+            Ok(fd) => match std::fs::File::from(fd).write_all(text) {
+                Ok(()) => "is written back".to_owned(),
+                Err(e) => format!("could not be written back whole ({e})"),
+            },
+            Err(e) if e.0 == libc::EEXIST => "was made again meanwhile".to_owned(),
+            Err(e) => format!("could not be written back ({})", io::Error::from(e)),
+        }
+    }
+
+    /// Tier 1 on Windows: everything of the build directory is deleted in place under the
+    /// locks, the directory itself last.
+    #[cfg(windows)]
+    fn whole_in_place(
+        w: &Whole<'_>,
+        held: Vec<HeldLock>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        hook(Stage::Deleting, w.path);
+        let mut deleted = Deleted::default();
+        let mut pass = Removal {
+            on: w.on,
+            custody: Some((w.root, w.path)),
+            revoked: false,
+            _hook: &mut *hook,
+            permit: None,
+        };
+        match children(w.root) {
+            Ok(mut children) => {
+                children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c.name == *l));
+                for child in children {
+                    remove_tree_at(w.root, &child, w.path, 1, &mut deleted, &mut pass);
+                    if pass.revoked {
+                        break;
+                    }
+                }
+            }
+            Err(e) => deleted.kept.push(format!("{}: {e}", w.path.display())),
+        }
+        let mut gone = false;
+        if deleted.kept.is_empty() && pass.permit((w.root, w.path), w.path, &mut deleted) {
+            match names_root(w) {
+                Ok(true) => match rmdir_named(w.parent, w.name, w.root) {
+                    Ok(()) => gone = true,
+                    Err(e) => {
+                        deleted
+                            .kept
+                            .push(format!("{}: {}", w.path.display(), io::Error::from(e)))
+                    }
+                },
+                Ok(false) => deleted.kept.push(format!(
+                    "{}: its name now names another directory, which is left",
+                    w.path.display()
+                )),
+                Err(e) => deleted.kept.push(format!(
+                    "{}: its final name could not be inspected: {e}",
+                    w.path.display()
+                )),
+            }
+        }
+        drop(held);
+        hook(Stage::Released, w.path);
+        whole_removed(w.path, (deleted.bytes, gone), Vec::new(), deleted.kept)
     }
 
     /// What `parts`, a path inside a profile, names by the compiler's rules: `Some(Some(lock))`
@@ -3066,13 +4623,14 @@ mod fd {
         let root = pin(path).map_err(gone_since)?;
         let root_dev = on_measured_volume(&root, judge)?;
         let (marker, holds_source) = root_facts(path);
-        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
+        let Walked { profiles, cut, .. } = walk_at(&root, path, WalkBudget::SHIPPED);
         TargetDir {
             path: path.to_path_buf(),
             marker,
             holds_source,
             walk_cut_short: cut,
             profiles: Vec::new(),
+            stages: Vec::new(),
             device: Some(root_dev),
             volume: None,
             probed_recent: false,
@@ -3081,6 +4639,7 @@ mod fd {
             total: None,
             foreign: None,
             idle: None,
+            deps_unwalked: None,
         }
         .fences()
         .map_err(refuse)?;
@@ -3390,7 +4949,9 @@ mod fd {
         }
     }
 
-    /// Empty the profiles of the build directory at `path` ([`super::reclaim_profiles`]).
+    /// Empty the profiles of the build directory at `path` ([`super::reclaim_profiles`]): only
+    /// what it takes under each profile's locks. A stage an earlier pass left there is the
+    /// directory's idle row's to finish ([`finish_left`]), which the pass runs first.
     pub(super) fn reclaim_profiles(
         path: &Path,
         judge: &Judge,
@@ -3403,25 +4964,8 @@ mod fd {
         let root = pin(path).map_err(gone_since)?;
         let root_dev = on_measured_volume(&root, judge)?;
         let refuse = |why: String| io::Error::other(format!("no longer a candidate: {why}"));
-        let (marker, holds_source) = root_facts(path);
-        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
-        let marker = TargetDir {
-            path: path.to_path_buf(),
-            marker,
-            holds_source,
-            walk_cut_short: cut,
-            profiles: Vec::new(),
-            device: Some(root_dev),
-            volume: None,
-            probed_recent: false,
-            origin: super::Origin::Named,
-            owned: super::Owned::NotOwned,
-            total: None,
-            foreign: None,
-            idle: None,
-        }
-        .fences()
-        .map_err(refuse)?;
+        let Walked { profiles, cut, .. } = walk_at(&root, path, WalkBudget::SHIPPED);
+        let marker = fences_at(path, cut, root_dev).map_err(refuse)?;
         if marker != "CACHEDIR.TAG" {
             return Err(refuse(format!(
                 "only a signed CACHEDIR.TAG lets a whole build directory go, and it carries {marker}"
@@ -3440,6 +4984,18 @@ mod fd {
                     break;
                 }
             };
+            #[cfg(unix)]
+            let table = Some(mount_table());
+            #[cfg(windows)]
+            let table: Option<Table> = None;
+            // Nothing of a profile a build holds is read: its locks are probed before the scan.
+            #[cfg(unix)]
+            if let Err(why) = quiet_locks(&fd, profile).map(drop) {
+                stop = Some((i, why));
+                break;
+            }
+            #[cfg(unix)]
+            let stageable = unmanaged_below(&fd, profile, root_dev);
             let held = match take_all(&fd, profile) {
                 Ok(held) => held,
                 Err(why) => {
@@ -3474,7 +5030,7 @@ mod fd {
                 stop = Some((i, why));
                 break;
             }
-            hook(Stage::Deleting, profile);
+            hook(Stage::Staging, profile);
             if let Err(why) = ordinary_custody_at(&root, path) {
                 stop = Some((i, why));
                 break;
@@ -3487,7 +5043,10 @@ mod fd {
             let mut order: Vec<Child> = Vec::new();
             for entry in entries {
                 aterm_uds::progress::tick();
-                if CARGO_LOCKS.iter().any(|l| entry.name == *l) {
+                // A stage an earlier pass left is not this row's: the directory's idle row
+                // finishes it, or a pass that still holds its tag deletes it.
+                if CARGO_LOCKS.iter().any(|l| entry.name == *l) || super::is_stage_name(&entry.name)
+                {
                     continue;
                 }
                 if cargo_output(&fd, &entry, &deps) {
@@ -3502,31 +5061,26 @@ mod fd {
                 }
             }
             order.sort_by_key(|c| content_rank(&c.name));
-            let mut deleted = Deleted::default();
-            let revoked = {
-                let mut pass = Removal {
-                    on: root_dev,
-                    custody: Some((&root, path)),
-                    revoked: false,
-                    _hook: hook,
-                    permit: None,
-                };
-                for entry in order {
-                    remove_tree_at(&fd, &entry, profile, 1, &mut deleted, &mut pass);
-                    if pass.revoked {
-                        break;
-                    }
-                }
-                pass.revoked
+            let taking = Taking {
+                folder: &fd,
+                folder_path: profile,
+                depth: 1,
+                on: root_dev,
+                custody: (&root, path),
+                #[cfg(unix)]
+                stageable,
+                #[cfg(unix)]
+                reread: false,
+                #[cfg(unix)]
+                locked: None,
             };
-            drop(held);
-            hook(Stage::Released, profile);
-            done.bytes = done.bytes.saturating_add(deleted.bytes);
-            if deleted.kept.is_empty() {
+            let taken = take_out(&taking, order, held, table.as_ref(), hook);
+            done.bytes = done.bytes.saturating_add(taken.bytes);
+            if taken.kept.is_empty() {
                 done.units.push(profile.clone());
             }
-            done.trouble.extend(deleted.kept);
-            if revoked {
+            done.trouble.extend(taken.kept);
+            if taken.revoked {
                 stop = Some((
                     i + 1,
                     "cleanup stopped because build-cache custody could no longer be established"
@@ -3562,12 +5116,16 @@ mod fd {
         }
         #[cfg(windows)]
         {
-            use aterm_sysprobe::paths::windows_key;
+            use aterm_path::windows_key;
             windows_key(a).is_some_and(|k| windows_key(b).is_some_and(|l| k == l))
         }
     }
 
-    /// Reclaim the build directory at `path`: the profiles `select` names.
+    /// Reclaim the build directory at `path`: the profiles `select` names. The idle reclaim
+    /// first finishes what earlier passes left staged in the build directory, less the ones
+    /// named inside it, by the one walk that finds its profiles ([`finish_left`]): what that
+    /// freed answers for the row where every profile refuses. A pressure row takes its one
+    /// profile's cache and leaves a stage to that idle row.
     pub(super) fn reclaim(
         path: &Path,
         judge: &Judge,
@@ -3577,25 +5135,13 @@ mod fd {
         fixed_volume(path)?;
         let root = pin(path).map_err(gone_since)?;
         let root_dev = on_measured_volume(&root, judge)?;
-        let (marker, holds_source) = root_facts(path);
-        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
-        TargetDir {
-            path: path.to_path_buf(),
-            marker,
-            holds_source,
-            walk_cut_short: cut,
-            profiles: Vec::new(),
-            device: Some(root_dev),
-            volume: None,
-            probed_recent: false,
-            origin: super::Origin::Named,
-            owned: super::Owned::NotOwned,
-            total: None,
-            foreign: None,
-            idle: None,
-        }
-        .fences()
-        .map_err(|why| io::Error::other(format!("no longer a candidate: {why}")))?;
+        let Walked {
+            profiles,
+            cut,
+            stages,
+        } = walk_at(&root, path, WalkBudget::SHIPPED);
+        fences_at(path, cut, root_dev)
+            .map_err(|why| io::Error::other(format!("no longer a candidate: {why}")))?;
         let (wanted, leave) = match select {
             Select::Idle { leave } => (None, leave),
             Select::Lru { profile, .. } => (Some(profile), &[][..]),
@@ -3605,7 +5151,17 @@ mod fd {
                 "no longer a candidate: not one of this build directory's cargo profiles",
             ));
         }
-        let mut done = Removed::default();
+        #[cfg(unix)]
+        let mut done = match select {
+            Select::Idle { leave } => finish_left((&root, path, root_dev), &stages, leave, hook),
+            Select::Lru { .. } => Removed::default(),
+        };
+        #[cfg(windows)]
+        let mut done = {
+            // Windows makes no stage (`aterm-dirfd` has no handle-relative rename there).
+            let _ = stages;
+            Removed::default()
+        };
         for profile in &profiles {
             // Not the one asked for, or a profile of a build directory named
             // inside this one, which decides its own (one that cannot be
@@ -3613,7 +5169,7 @@ mod fd {
             if wanted.is_some_and(|w| !same_path(profile, w))
                 || leave
                     .iter()
-                    .any(|l| aterm_sysprobe::paths::is_under(profile, l) != Some(false))
+                    .any(|l| aterm_path::is_under(profile, l) != Some(false))
             {
                 continue;
             }
@@ -3635,7 +5191,19 @@ mod fd {
                 }
                 continue;
             }
-            match reclaim_profile(&fd, (&root, path), profile, root_dev, judge, select, hook) {
+            #[cfg(unix)]
+            let mounts = Some(mount_table());
+            #[cfg(windows)]
+            let mounts: Option<Table> = None;
+            match reclaim_profile(
+                &fd,
+                (&root, path),
+                profile,
+                root_dev,
+                (judge, select),
+                mounts.as_ref(),
+                hook,
+            ) {
                 Ok(p) => {
                     done.bytes = done.bytes.saturating_add(p.bytes);
                     if p.gone {
@@ -3960,7 +5528,7 @@ pub(crate) use fd::{mark_cloned, mark_theirs, only_owners_pass};
 
 #[cfg(not(any(unix, windows)))]
 mod fd {
-    use super::{Judge, Path, PathBuf, Removed, Select, Stage, WalkBudget, io};
+    use super::{Judge, Path, Removed, Select, Stage, WalkBudget, Walked, io};
     pub(super) fn unmanaged_custody(_path: &Path, _budget: WalkBudget) -> Result<(), String> {
         Err("reading cache custody needs unix or Windows".into())
     }
@@ -3974,11 +5542,17 @@ mod fd {
     pub(super) fn clock(_path: &Path, _budget: WalkBudget) -> Option<i64> {
         None
     }
-    pub(super) fn find(_path: &Path, _budget: WalkBudget) -> (Vec<PathBuf>, Option<String>) {
-        (
-            Vec::new(),
-            Some("reclaiming build caches needs unix or Windows".to_owned()),
-        )
+    pub(super) fn entry_count(_path: &Path) -> io::Result<u32> {
+        Err(io::Error::other(
+            "counting a folder's entries needs unix or Windows",
+        ))
+    }
+    pub(super) fn walk(_path: &Path, _budget: WalkBudget) -> Walked {
+        Walked {
+            profiles: Vec::new(),
+            stages: Vec::new(),
+            cut: Some("reclaiming build caches needs unix or Windows".to_owned()),
+        }
     }
     pub(super) fn reclaim(
         _path: &Path,

@@ -136,6 +136,8 @@ impl Bar {
 pub(crate) enum HitKind {
     /// One stable machine or service cell in the network rows.
     Network(crate::network_deck::Target),
+    /// One part of the Disk Custody band, or the band as a whole: the Disk lens.
+    DiskCustody(crate::stats_lens::disk_band::Part),
     /// A row, or one of its scope cells.
     Row(Instrument, Bar),
     /// The cores block, or the Cores row: the lens on CPU, cores well.
@@ -184,6 +186,7 @@ impl Hit {
             HitKind::Cores => Instrument::Cpu,
             HitKind::Header => Instrument::HowToRead,
             HitKind::Network(_) => Instrument::NetworkState,
+            HitKind::DiskCustody(_) => Instrument::Disk,
         }
     }
 
@@ -191,7 +194,9 @@ impl Hit {
     pub(crate) const fn bar(self) -> Bar {
         match self.kind {
             HitKind::Row(_, bar) => bar,
-            HitKind::Cores | HitKind::Header | HitKind::Network(_) => Bar::Global,
+            HitKind::Cores | HitKind::Header | HitKind::Network(_) | HitKind::DiskCustody(_) => {
+                Bar::Global
+            }
         }
     }
 }

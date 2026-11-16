@@ -79,6 +79,7 @@ fn parked_record(attempt_id: u64, mode: ApplyMode) -> crate::PendingUpdateHandof
         teardown: crate::DeferredHandoffTeardown::None,
         commit_drain_started: None,
         commit_flush: None,
+        table_flush: None,
         held_commit: None,
         revoked_by_activity: false,
     }

@@ -338,6 +338,9 @@ impl Read<'_> {
         Ok(format)
     }
 
+    /// The objects `store`'s refs name (with `reflogs`, its root refs', pseudorefs' and
+    /// reflogs' too), leaving out each ref whose name starts with `except`: a pass's own pins,
+    /// which hold nothing for it.
     fn roots(
         &self,
         store: &Path,
@@ -345,6 +348,7 @@ impl Read<'_> {
         width: usize,
         reflogs: bool,
         objects: Option<&Path>,
+        except: Option<&str>,
     ) -> Result<BTreeSet<String>, String> {
         let listed = self.refs(store, snapshot, objects)?;
         let mut roots = BTreeSet::new();
@@ -358,6 +362,9 @@ impl Read<'_> {
                 return Err("private Git reference inventory is unproven".to_owned());
             }
             head |= name == "HEAD";
+            if except.is_some_and(|prefix| name.starts_with(prefix)) {
+                continue;
+            }
             if !reflogs && name != "HEAD" && !name.starts_with("refs/") {
                 continue;
             }
@@ -483,7 +490,7 @@ fn completed(answer: super::Answer) -> Result<String, String> {
 /// measured): its name only capitals, `-` and `_`; `HEAD`, a name ending in `_HEAD`, or one of
 /// the irregular root refs; never the pseudorefs `FETCH_HEAD` and `MERGE_HEAD`, which can hold
 /// several objects.
-fn root_ref(name: &str) -> bool {
+pub(in crate::build_cache) fn root_ref(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -509,13 +516,17 @@ fn oid_valid(oid: &str, width: usize) -> bool {
         && !oid.bytes().all(|byte| byte == b'0')
 }
 
+/// Where `path` is, its folder resolved. A tree whose folder went with it (a worktree removed by
+/// hand with what held it, DC-13b) is where its nearest standing folder puts it: nothing can
+/// stand inside it.
 fn location(path: &Path) -> Result<PathBuf, String> {
-    let parent = path
-        .parent()
-        .ok_or("private Git cut has no parent")?
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    Ok(parent.join(path.file_name().ok_or("private Git cut has no name")?))
+    let parent = path.parent().ok_or("private Git cut has no parent")?;
+    let name = path.file_name().ok_or("private Git cut has no name")?;
+    match parent.canonicalize() {
+        Ok(parent) => Ok(parent.join(name)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(location(parent)?.join(name)),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn witness_path(
@@ -639,8 +650,16 @@ fn check(git: &dyn Git, checkout: &Path, wt: &Path, admin: Option<&Path>) -> Res
         // Ref enumeration need not read the private store's possibly broken alternates.
         // Use only the witness's bound local objects; its complete rooted closure is
         // proved below before any private store can be admitted.
-        let roots = read.roots(&directory.path, &snapshot, width, true, Some(&objects))?;
-        let witness_roots = read.roots(&witness.path, &witness_snapshot, width, false, None)?;
+        let roots = read.roots(
+            &directory.path,
+            &snapshot,
+            width,
+            true,
+            Some(&objects),
+            None,
+        )?;
+        let witness_roots =
+            read.roots(&witness.path, &witness_snapshot, width, false, None, None)?;
         let input = witness_roots
             .iter()
             .map(|root| format!("{root}\n"))
@@ -705,12 +724,14 @@ fn check(git: &dyn Git, checkout: &Path, wt: &Path, admin: Option<&Path>) -> Res
                 proof.width,
                 true,
                 Some(&proof.witness.path.join("objects")),
+                None,
             )? != proof.private_roots
             || read.roots(
                 &proof.witness.path,
                 &witness_snapshot,
                 proof.width,
                 false,
+                None,
                 None,
             )? != proof.witness_roots
             || outside(&proof.candidate, &cuts, &private)? != proof.witness.path
@@ -754,14 +775,23 @@ pub struct Unrooted {
     pub roots: Vec<String>,
 }
 
+/// More roots of one private store than its refs and reflogs name (a gone registration's
+/// sequencer state and staged index, DC-13b): each a commit the store holds.
+pub(in crate::build_cache) type Extra<'a> = &'a mut dyn FnMut(&Path) -> Result<Vec<String>, String>;
+
 /// The private module stores of `wt`, the linked worktree of `checkout` whose entry is `admin`,
 /// that hold a root their canonical witness does not ([`check`]'s first read, which no store
-/// may fail): the roots a pin must copy into each witness before the worktree can go.
-pub(super) fn unrooted(
+/// may fail): the roots a pin must copy into each witness before the worktree can go. `wt` may
+/// be gone: a registration whose folder is gone is pinned through it too (DC-13b). `extra`
+/// names more roots of a store; a witness ref whose name starts with `own` (the caller's own
+/// pins, which a pass that stopped before their pushes were recorded left) holds nothing.
+pub(in crate::build_cache) fn unrooted(
     git: &dyn Git,
     checkout: &Path,
     wt: &Path,
     admin: &Path,
+    own: Option<&str>,
+    extra: Extra<'_>,
 ) -> Result<Vec<Unrooted>, String> {
     let private = registry::clear(wt, Some(admin))?;
     let mut budget = Budget::new();
@@ -787,8 +817,17 @@ pub(super) fn unrooted(
             return Err("canonical Git witness uses another object format".to_owned());
         }
         let objects = witness.path.join("objects");
-        let roots = read.roots(&directory.path, &snapshot, width, true, Some(&objects))?;
-        let witness_roots = read.roots(&witness.path, &witness_snapshot, width, false, None)?;
+        let mut roots = read.roots(
+            &directory.path,
+            &snapshot,
+            width,
+            true,
+            Some(&objects),
+            None,
+        )?;
+        roots.extend(extra(&directory.path)?);
+        let witness_roots =
+            read.roots(&witness.path, &witness_snapshot, width, false, None, own)?;
         let input = witness_roots
             .iter()
             .map(|root| format!("{root}\n"))
@@ -823,7 +862,7 @@ pub(super) fn unrooted(
 }
 
 /// Recheck registry custody and all private history before either retiring tree is removed.
-pub(super) fn clear(
+pub(in crate::build_cache) fn clear(
     git: &dyn Git,
     checkout: &Path,
     wt: &Path,

@@ -59,6 +59,45 @@ fn a_lock_file_has_one_holder() {
     );
 }
 
+/// Shared holders hold a lock file together, two in one process as two processes' would, and
+/// none beside an exclusive holder: `try_take` finds a shared holder at once and says `None`,
+/// waiting for nothing, and takes it once every shared holder let go; while it holds it, a
+/// share waits until its deadline and says `busy`. A missing file is made 0600, and a folder is
+/// no lock file to either.
+/// NEGATIVE CONTROL, observed: with `share` taking the exclusive lock (`Hold::Exclusive`), the
+/// second share is refused: `` called `Result::unwrap()` on an `Err` value: Custom { kind:
+/// WouldBlock, error: "busy" } ``.
+#[test]
+fn shared_holders_hold_a_lock_file_together_and_never_beside_an_exclusive_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("name.looking");
+    let first = LockFile::share(&path, Instant::now(), "busy").unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let second = LockFile::share(&path, Instant::now(), "busy").unwrap();
+    assert!(LockFile::try_take(&path).unwrap().is_none());
+    drop(first);
+    assert!(
+        LockFile::try_take(&path).unwrap().is_none(),
+        "one shared holder is left"
+    );
+    drop(second);
+    let alone = LockFile::try_take(&path)
+        .unwrap()
+        .expect("no holder is left");
+    let refused = LockFile::share(&path, Instant::now(), "busy").unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(refused.to_string(), "busy");
+    assert!(LockFile::try_take(&path).unwrap().is_none());
+    drop(alone);
+    drop(LockFile::share(&path, Instant::now(), "busy").unwrap());
+    assert!(LockFile::share(dir.path(), Instant::now(), "busy").is_err());
+    assert!(LockFile::try_take(dir.path()).is_err());
+}
+
 /// A link at the path is never followed (`O_NOFOLLOW`): a take through a link to a regular
 /// file there fails with `ELOOP`, and that file is never locked through it, so a take of the
 /// file itself, while the take through the link is held, gets it at once.
@@ -131,4 +170,39 @@ fn a_thread_that_takes_nothing_is_refused_each_take_and_each_try_counts() {
         here,
         "another thread's tries are its own"
     );
+}
+
+/// The shared lease and the take that never waits are takes too: inside [`takes_nothing`] a
+/// [`LockFile::share`] and a [`LockFile::try_take`] are each refused before the lock is tried
+/// and each counts as a try, so no holder, shared or exclusive, is left behind them. Outside the
+/// rule the same share gets the lock, and the same try_take, once the share let go, gets it.
+/// NEGATIVE CONTROLS, observed: with `try_take` not asking `refused_here`, the try_take inside
+/// the rule takes the lock: `` left: Ok(true) right: Err(PermissionDenied) ``; with the refusal
+/// asked by `lock_exclusive_with_clock` alone and not by `lock_with_clock`, the share inside it
+/// does: `` left: Ok(()) right: Err(PermissionDenied) ``.
+#[test]
+fn a_thread_that_takes_nothing_is_refused_a_share_and_a_try_take() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("name.looking");
+    std::thread::spawn(move || {
+        let refused = takes_nothing(|| LockFile::share(&path, Instant::now(), "busy").map(drop));
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(takes_tried_here(), 1, "a refused share is a try");
+        let refused = takes_nothing(|| LockFile::try_take(&path).map(|held| held.is_some()));
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(io::ErrorKind::PermissionDenied),
+            "a try_take inside the rule"
+        );
+        assert_eq!(takes_tried_here(), 2, "a refused try_take is a try");
+        drop(LockFile::share(&path, Instant::now(), "busy").expect("a share outside the rule"));
+        let alone = LockFile::try_take(&path).expect("a try_take outside the rule");
+        assert!(alone.is_some(), "nothing the refused takes tried holds it");
+        assert_eq!(takes_tried_here(), 4);
+    })
+    .join()
+    .unwrap();
 }

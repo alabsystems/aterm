@@ -175,6 +175,8 @@ pub struct SetupStatus {
     /// Install… opens the tab. Filled by the window (`App::developer_tools_install_step`), never
     /// by the worker.
     pub developer_tools: Option<ToolsInstall>,
+    /// The Mac Setup password episode, independent of whether the compiler is installed.
+    pub mac_setup: Option<ToolsInstall>,
     /// The GitHub repositories row waits on Apple's Command Line Tools: the window's shim reads
     /// them missing on this Mac ([`crate::clt_shim::Shim::tools_missing`]), or they were found
     /// installed only since that row's last reading, which the window keeps calm until the next
@@ -1965,6 +1967,25 @@ fn row_view_as(
     review: bool,
 ) -> RowView {
     let mut row = row_view_current(subject, status, selection, vault_url, review, None);
+    if row.managed
+        && row.standing == Some(Standing::NeedsYou)
+        && matches!(
+            subject,
+            Subject::Access(Access::NameRule | Access::SpotlightScope | Access::NetworkHelper)
+        )
+        && matches!(
+            status.mac_setup,
+            Some(ToolsInstall::Password | ToolsInstall::Recovered)
+        )
+    {
+        let reason = row.note.take().unwrap_or_default();
+        let step = if status.mac_setup == Some(ToolsInstall::Password) {
+            "Waiting for your Mac password in the Mac Setup tab."
+        } else {
+            "Continue the unfinished work in the Mac Setup tab."
+        };
+        row.note = Some(format!("{step} {reason}"));
+    }
     // History is a display value only: Off/hold/not-needed rules above it stay
     // current, and no old reading supplies a button or settled standing below.
     if !row.managed || matches!(row.value, RowValue::Muted(_)) || status.newer() {
@@ -2568,6 +2589,8 @@ pub(crate) const TOOLS_NOT_ADMIN_NOTE: &str =
 
 /// The GitHub repositories row's button while Apple's Command Line Tools are missing and nothing
 /// installs them: it opens their terminal tab, whose one password prompt installs them.
+pub(crate) const FINISH_MAC_SETUP: &str = "system-state/finish-mac-setup";
+
 pub(crate) const INSTALL_TOOLS: &str = "system-state/row/repositories/install";
 
 /// Where the GitHub repositories row stands on Apple's Command Line Tools, which every clone
@@ -2953,6 +2976,12 @@ impl Headline {
 
 /// THE HEADLINE RULE (§3.2, pure).
 pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Plan>) -> Headline {
+    match status.mac_setup {
+        Some(ToolsInstall::Password) => return Headline::tools_tab(TOOLS_PASSWORD_HEADLINE),
+        Some(ToolsInstall::Recovered) => return Headline::tools_tab(TOOLS_RECOVERED_HEADLINE),
+        _ => {}
+    }
+
     // The Mac Setup tab needs the person (§3.3): at its known password prompt, or
     // continuing its restored session without claiming which prompt it has reached.
     let repositories = Subject::Setting(Setting::Repositories);
@@ -4964,6 +4993,26 @@ impl SystemStateApp {
                     });
                 }
             }
+            FINISH_MAC_SETUP
+                if self.plan_known
+                    && self.reviewed_rows().iter().any(|row| {
+                        row.managed
+                            && row.standing == Some(Standing::NeedsYou)
+                            && matches!(
+                                row.subject,
+                                Subject::Access(
+                                    Access::NameRule
+                                        | Access::SpotlightScope
+                                        | Access::NetworkHelper
+                                )
+                            )
+                    }) =>
+            {
+                self.actions
+                    .push_back(SystemStateAction::InstallDeveloperTools {
+                        by_person: self.by_person,
+                    });
+            }
             INSTALL_TOOLS => {
                 if self.plan_known && self.reviewed_rows().iter().any(|row| row.install_tools) {
                     self.actions
@@ -5025,6 +5074,10 @@ impl SystemStateApp {
                     }
                     _ => {}
                 }
+            }
+            "system-state/row/network-auth/open" if self.can_open_access(Access::NetworkAuth) => {
+                view.open_line = Some(lines::Line::Secrets);
+                self.vault_open = Some(true);
             }
             _ => {
                 if let Some(access) = key
@@ -5192,6 +5245,8 @@ pub(crate) const GITHUB_OTHER_ACCOUNT: &str = "GitHub account setting differs fr
 /// Debug and dev-seam builds only.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) const FIXTURES: &[&str] = &[
+    "required-access",
+    "required-password",
     "repository-progress@developer",
     "repository-waiting@developer",
     "repository-outcomes@developer",
@@ -5689,6 +5744,44 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 status: "error".into(),
                 detail: RETRIES_NOTE.into(),
             }];
+        }
+        "required-access" | "required-password" => {
+            status.observed = in_place();
+            for (access, why) in [
+                (
+                    Access::LocalNetwork,
+                    "Allow aterm in macOS Local Network settings.",
+                ),
+                (
+                    Access::NetworkAuth,
+                    "Approve this Mac on an authorized ALab Mac.",
+                ),
+                (
+                    Access::NameRule,
+                    "Your Mac password installs the naming permission.",
+                ),
+                (
+                    Access::NetworkHelper,
+                    "Your Mac password installs the local-network helper.",
+                ),
+                (
+                    Access::SpotlightScope,
+                    "Your Mac password excludes new home folders from Spotlight.",
+                ),
+            ] {
+                let mut row = read(Subject::Access(access), NeedsYou, Some("Incomplete"));
+                row.note = Some(why.into());
+                if let Some(slot) = status
+                    .observed
+                    .iter_mut()
+                    .find(|seen| seen.subject == row.subject)
+                {
+                    *slot = row;
+                }
+            }
+            if name == "required-password" {
+                status.mac_setup = Some(ToolsInstall::Password);
+            }
         }
         "set-up" => {
             // Trackpad scrolling, set in this login session, is in full use from the next. The

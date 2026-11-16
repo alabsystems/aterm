@@ -189,7 +189,18 @@ pub struct GitExecution {
 /// [`installed_git`], without starting a program or granting execution authority.
 #[must_use]
 pub fn installed_git_execution(sys: &dyn System) -> Option<GitExecution> {
-    installed_git_reading(sys, None).map(GitInstallation::execution)
+    installed_git_execution_for(sys, None)
+}
+
+/// [`installed_git_execution`] for `user_home`'s store when given, otherwise this process's
+/// account. A named account never borrows another account's managed build; native Git is the
+/// fallback. The program and managed entry come from the same ordinary admission reading.
+#[must_use]
+pub fn installed_git_execution_for(
+    sys: &dyn System,
+    user_home: Option<&Path>,
+) -> Option<GitExecution> {
+    installed_git_reading(sys, user_home).map(GitInstallation::execution)
 }
 
 enum GitInstallation {

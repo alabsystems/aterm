@@ -57,7 +57,7 @@ use aterm_json::Value;
 
 use super::arena::{self, Halt};
 use super::bench_build::bench_profile::Profile;
-use super::bench_build::{self, Built, Entry, Targo, another_build, load_average};
+use super::bench_build::{self, Entry, PreparedBench, Targo, another_build, load_average};
 use super::fabric::{self, bench_spec};
 use super::{LaneRun, Status};
 
@@ -750,12 +750,15 @@ fn measure() -> Result<Vec<Count>, Halt> {
     let driver = crate::perf::driver::cargo_driver()?;
     let worlds = worlds();
     let build_args = worlds[0].args.build_args();
-    let (targo, built, load_before) = bench_build::prepare(driver, Profile::Dev, &build_args)?;
+    let (prepared, load_before) = bench_build::prepare(driver, Profile::Dev, &build_args)?;
+    for world in &worlds {
+        prepared.require_request(Profile::Dev, &world.args.build_args())?;
+    }
     eprintln!("  load (1, 5, 15 min) before the build: {load_before}");
     let mut found: Vec<Count> = Vec::new();
     for world in &worlds {
         let before = load_average();
-        let report = run_world(&targo, &world.args, &built)?;
+        let report = run_world(&prepared, &world.args)?;
         eprintln!(
             "  {}: load {before} before the world, {} after",
             world.name,
@@ -782,8 +785,8 @@ fn measure() -> Result<Vec<Count>, Halt> {
     Ok(found)
 }
 
-/// Run `args`'s world once on the build `built`, answering its report.
-fn run_world(targo: &Targo<'_>, args: &fabric::Args, built: &Built) -> Result<Value, Halt> {
+/// Run one world on the preparation shared by every world, answering its report.
+fn run_world(prepared: &PreparedBench<Targo<'_>>, args: &fabric::Args) -> Result<Value, Halt> {
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-fabric-counts-")
         .suffix(".noindex")
@@ -792,14 +795,13 @@ fn run_world(targo: &Targo<'_>, args: &fabric::Args, built: &Built) -> Result<Va
     let arm = args.plan()[0];
     let words = args.bench_words(arm);
     bench_build::run_bench(
-        targo,
-        &args.build_args(),
+        prepared,
         (bench_spec::ENV, &words),
         (bench_spec::OUT_ENV, scratch.path()),
         "fabric bench:",
-        built,
         Entry::Counted,
     )?;
+    let built = prepared.built();
     let path = scratch.path().join("fabric.json");
     let text = crate::read_regular_text(&path)
         .map_err(|e| format!("the bench wrote no {}: {e}", path.display()))?;

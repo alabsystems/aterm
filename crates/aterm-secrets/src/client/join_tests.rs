@@ -4189,7 +4189,11 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
     projection.poll();
     assert_eq!(requests.lock().unwrap().len(), 2);
     pending.store(true, Ordering::SeqCst);
-    projection.after_pass(&SyncOutcome::Unchanged { seq: 1 }, SourceSaid::AtOnce);
+    projection.after_pass(
+        &SyncOutcome::Unchanged { seq: 1 },
+        false,
+        SourceSaid::AtOnce,
+    );
     assert_eq!(
         requests.lock().unwrap().len(),
         3,

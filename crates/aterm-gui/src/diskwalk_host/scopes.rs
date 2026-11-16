@@ -17,7 +17,9 @@ use super::{Claim, DiskScope, Pace, RootRecord, RootState};
 pub(crate) const PROMOTE_AFTER: u32 = 2;
 /// Discoveries in a row that must miss a member before it leaves its pane.
 pub(crate) const LEAVE_AFTER: u32 = 2;
-/// A pane not discovered for this long starts again: its next discovery is its first.
+/// On a walker that looks every [`super::DISCOVER_EVERY`], a pane not discovered for this long
+/// starts again: its next discovery is its first. A walker that may rest allows its own longer
+/// gap (`PANE_STALE_AT_REST`).
 pub(crate) const PANE_STALE_AFTER: Duration = Duration::from_secs(15);
 /// The window over which glance walks are metered.
 pub(crate) const GLANCE_WINDOW: Duration = Duration::from_secs(600);
@@ -151,19 +153,25 @@ pub(crate) struct Membership {
 }
 
 impl Membership {
-    /// Whether the pane's next discovery continues this one: it was seen within
-    /// [`PANE_STALE_AFTER`].
-    pub(crate) fn fresh(&self, now: Instant) -> bool {
+    /// Whether the pane's next discovery continues this one: it was seen within `within`
+    /// ([`PANE_STALE_AFTER`] on a walker that looks every [`super::DISCOVER_EVERY`]).
+    pub(crate) fn fresh(&self, now: Instant, within: Duration) -> bool {
         self.seen
-            .is_some_and(|(_, at)| now.saturating_duration_since(at) < PANE_STALE_AFTER)
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) < within)
     }
 
     /// Fold in discovery `round` at `now`, which named `named`: the first discovery (none
-    /// before, one gone stale, or one that did not immediately precede it) joins what it
-    /// names; a later one applies the hysteresis.
-    pub(crate) fn observe(&mut self, named: &BTreeSet<PathBuf>, round: u64, now: Instant) {
+    /// before, one not seen within `within`, or one that did not immediately precede it) joins
+    /// what it names; a later one applies the hysteresis.
+    pub(crate) fn observe(
+        &mut self,
+        named: &BTreeSet<PathBuf>,
+        round: u64,
+        now: Instant,
+        within: Duration,
+    ) {
         let continues =
-            self.seen.is_some_and(|(r, _)| r.saturating_add(1) >= round) && self.fresh(now);
+            self.seen.is_some_and(|(r, _)| r.saturating_add(1) >= round) && self.fresh(now, within);
         if !continues {
             self.members = named.iter().map(|p| (p.clone(), 0)).collect();
             self.pending.clear();

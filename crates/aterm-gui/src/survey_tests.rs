@@ -1352,6 +1352,7 @@ fn a_rows_usage_takes_the_screen_then_the_tap_then_the_rollout() {
         ctx_left: Some(64),
         dur_us: 0,
         row: None,
+        route: None,
     };
     let codex = codex_survey().facts;
     let usage = |screen, tapped: Option<&Reading>, codex| Usage::of(screen, tapped, codex);

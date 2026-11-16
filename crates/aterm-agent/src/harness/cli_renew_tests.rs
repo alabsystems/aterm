@@ -3141,6 +3141,230 @@ fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
     }
 }
 
+/// What a stand-in run of this test binary plays ([`an_openers_failing_exit_ends_its_renewal_and_a_succeeding_one_does_not`]).
+const STAND_IN_ROLE: &str = "ATERM_TEST_RENEWAL_STAND_IN";
+/// The opener role the stand-in provider starts.
+const STAND_IN_OPENER: &str = "ATERM_TEST_RENEWAL_STAND_IN_OPENER";
+/// The file whose appearance lets a stand-in provider that its capture did not end exit by itself.
+const STAND_IN_RELEASE: &str = "ATERM_TEST_RENEWAL_STAND_IN_RELEASE";
+/// A hosted callback's code and state, as Claude's paste prompt takes them.
+const STAND_IN_CODE: &str = "stand-in-code#stand-in-state";
+
+/// The file a stand-in provider writes beside its `release` once its opener has ended.
+fn opened_mark(release: &Path) -> PathBuf {
+    release.with_extension("opened")
+}
+
+/// This test binary, run as the stand-in `role`.
+fn renewal_stand_in(role: &str) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("this test binary"));
+    cmd.args([
+        "--exact",
+        "harness::cli::tests::renew::an_openers_failing_exit_ends_its_renewal_and_a_succeeding_one_does_not",
+        "--quiet",
+        "--test-threads=1",
+    ])
+    .env(STAND_IN_ROLE, role);
+    cmd
+}
+
+/// A stand-in's run: the provider does what `claude auth login` does with no terminal, starts
+/// its opener (`BROWSER`) and then waits at its paste prompt for a code on stdin; each opener is
+/// aterm's own, ending as the real one ends. It exits; it never returns.
+fn play_renewal_stand_in(role: &str) -> ! {
+    use crate::harness::open_url::{self, Met, MetWord};
+    use std::io::Write as _;
+    let outcome = || PathBuf::from(std::env::var_os(open_url::OUTCOME_ENV).expect("an outcome"));
+    let opener_exit = |code: std::process::ExitCode| -> ! {
+        std::process::exit(i32::from(code != std::process::ExitCode::SUCCESS))
+    };
+    match role {
+        // The opener with no URL refuses it ("takes one URL") having met nothing, and its
+        // failing exit publishes the terminal record (`open_url::publish_failed_exit`).
+        "opener-fails" => opener_exit(open_url::main_entry(Vec::new())),
+        // An opener that recorded what it met before its failing exit.
+        "opener-fails-at-a-bot-check" => {
+            open_url::write_outcome(&outcome(), &Met::new(MetWord::BotCheck, Some("claude.ai")));
+            opener_exit(open_url::main_entry(Vec::new()))
+        }
+        // An opener whose hosted callback came: it hands the code to the renewal and succeeds.
+        "opener-hands-over" => {
+            let (code, state) = STAND_IN_CODE.split_once('#').expect("a code and a state");
+            let handed = open_url::hand_over_hosted(&format!(
+                "https://platform.claude.com/oauth/code/callback?code={code}&state={state}"
+            ));
+            std::process::exit(i32::from(handed.is_err()))
+        }
+        "provider" => {
+            let opener = std::env::var(STAND_IN_OPENER).expect("the provider names its opener");
+            let opened = renewal_stand_in(&opener)
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            let release = PathBuf::from(std::env::var_os(STAND_IN_RELEASE).expect("a release"));
+            std::fs::write(opened_mark(&release), b"").expect("the opener's end, marked");
+            let (pasted, answer) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let _ = pasted.send(line);
+            });
+            let line = loop {
+                match answer.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Ok(line) => break line,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !release.exists() => {}
+                    Err(_) => std::process::exit(9),
+                }
+            };
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(
+                out,
+                "opener {} pasted {}",
+                if opened { "succeeded" } else { "failed" },
+                line.trim_end()
+            );
+            let _ = out.flush();
+            std::process::exit(0)
+        }
+        "status-waits" => {
+            let release = PathBuf::from(std::env::var_os(STAND_IN_RELEASE).expect("a release"));
+            std::fs::write(release.with_extension("ready"), b"").expect("ready");
+            while !release.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::process::exit(0)
+        }
+        other => panic!("no stand-in role {other}"),
+    }
+}
+
+/// CANCELLING THE FOLLOW-ON STATUS CAPTURE ENDS IT, ON EVERY PLATFORM: a status check running
+/// under a work scope (here this binary standing in, waiting until it is released) is ended once
+/// the scope is paused, the capture answering an error, not when its hour's budget ends or the
+/// check exits by itself. MUTANT: the Windows capture that watched no scope (the bounded capture
+/// alone) holds the scope until the stand-in is released.
+#[test]
+fn cancelling_a_status_capture_ends_it_on_every_platform() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let release = tmp.path().join("status");
+    let mut cmd = renewal_stand_in("status-waits");
+    cmd.env(STAND_IN_RELEASE, &release);
+    let lifetime = crate::harness::account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let borrowed = scope.clone();
+    let (done, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(scope.wrap(move || {
+        let answer = capture_status_scoped(cmd, std::time::Duration::from_secs(3600), &borrowed);
+        let _ = done.send(answer);
+    }));
+    aterm_spec::wait::until_while_descendants_work("the status stand-in is ready", || {
+        release.with_extension("ready").exists().then_some(())
+    });
+    let pause = lifetime.pause().unwrap();
+    // What is left is the capture's own: it reads the pause and ends its child.
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let returned = answer.is_ok();
+    std::fs::write(&release, b"").unwrap();
+    let answer =
+        answer.unwrap_or_else(|_| result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap());
+    worker.join().unwrap();
+    assert!(
+        returned,
+        "a cancelled status capture held the scope until its child exited"
+    );
+    assert_eq!(
+        answer.map(|ran| ran.code),
+        Err(RenewalFailure::cancelled().to_string())
+    );
+    assert!(pause.try_wait().unwrap().resume().is_ok());
+}
+
+/// AN OPENER'S FAILING EXIT ENDS ITS RENEWAL, ON EVERY PLATFORM (ATERM-KI-1105-14): the provider
+/// still waits at its paste prompt, and the renewal's capture ends it once the opener's terminal
+/// record appears, answering the opener's stop with what it met (nothing, or the check), not the
+/// budget's end; the budget here is an hour, so only the record can end the run before the
+/// one-minute hang detector. CONTROL: an opener that succeeds, by handing over a hosted code,
+/// ends nothing: the code is typed at the paste prompt and the provider's own exit is the
+/// answer. Every opener is aterm's own (`open_url`); the provider and openers are this binary.
+/// The wait is in two steps: the provider's and its opener's starts and runs, a minute without
+/// their progress (a loaded machine stretches a start without bound), until the provider marks
+/// its opener's end or the renewal answers; then the minute of the wall for what is left, the
+/// capture's own reading of the record and its ending of the provider (or its typing of the code
+/// and the provider's one line and exit), since the provider then polls its release and so
+/// shows progress whether or not its capture ends it.
+#[test]
+fn an_openers_failing_exit_ends_its_renewal_and_a_succeeding_one_does_not() {
+    use crate::harness::open_url::{Met, MetWord};
+    if let Ok(role) = std::env::var(STAND_IN_ROLE) {
+        play_renewal_stand_in(&role);
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    for (opener, met) in [
+        ("opener-fails", None),
+        (
+            "opener-fails-at-a-bot-check",
+            Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
+        ),
+        ("opener-hands-over", None),
+    ] {
+        let release = tmp.path().join(opener);
+        let mut cmd = renewal_stand_in("provider");
+        cmd.env(STAND_IN_OPENER, opener)
+            .env(STAND_IN_RELEASE, &release);
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let answer = capture_unattended_renewal(cmd, std::time::Duration::from_secs(3600));
+            let _ = done.send(answer);
+        });
+        let early = aterm_spec::wait::until_while_descendants_work(
+            "the provider marks its opener's end, or the renewal answers",
+            || match result.try_recv() {
+                Ok(answer) => Some(Some(answer)),
+                Err(_) => opened_mark(&release).exists().then_some(None),
+            },
+        );
+        let answer = match early {
+            Some(answer) => Ok(answer),
+            None => result.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        };
+        let returned = answer.is_ok();
+        if !returned {
+            // A run its capture did not end exits once released, so the worker returns.
+            std::fs::write(&release, b"").unwrap();
+        }
+        let answer = answer.unwrap_or_else(|_| {
+            result
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the released provider exits")
+        });
+        worker.join().unwrap();
+        assert!(
+            returned,
+            "{opener}: the renewal held its provider past the hang detector: {answer:?}"
+        );
+        if opener == "opener-hands-over" {
+            let (ran, recorded) = answer.expect("the provider exits by itself");
+            assert_eq!(ran.code, Some(0), "{opener}");
+            let said = String::from_utf8_lossy(&ran.stdout);
+            assert!(
+                said.ends_with(&format!("opener succeeded pasted {STAND_IN_CODE}\n")),
+                "{opener}: {said:?}"
+            );
+            assert_eq!(recorded, None, "{opener}");
+        } else {
+            let failure = answer.expect_err("the opener's stop is no provider exit");
+            let mut said = String::from(OPENER_STOPPED);
+            if let Some(met) = &met {
+                said = format!("{said}; {}", met.words());
+            }
+            assert_eq!(failure.to_string(), said, "{opener}");
+            assert_eq!(failure.met, met, "{opener}");
+        }
+    }
+}
+
 /// A RENEWAL RUN BY HAND THAT FAILS IS THE ROW'S LAST SIGN-IN AND ONE LEDGER ROW (it wrote
 /// none): the provider's own failing exit is recorded as the upkeep's ladder records its
 /// attempts, under the `hand` word, with no binding moved and no check run; the same failure

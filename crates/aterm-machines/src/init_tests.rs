@@ -3987,6 +3987,21 @@ fn an_agent_tab_joins_the_open_alab_vault() {
 /// broker (the run exits 0). NEGATIVE CONTROL: the person's own run searches for them.
 #[test]
 fn a_run_aterm_decided_raises_no_question_of_macos() {
+    // The fake Mac has read its grants; the absent broker still leaves network setup pending.
+    fn known_grants(_: bool) -> Vec<(Access, Grant)> {
+        Access::ALL
+            .into_iter()
+            .map(|access| {
+                let reading = match access {
+                    Access::NetworkAuth | Access::NetworkHelper => {
+                        Grant::NeedsYou("network setup is not finished".into())
+                    }
+                    _ => Grant::On,
+                };
+                (access, reading)
+            })
+            .collect()
+    }
     const MDFIND: &str =
         "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"CACHEDIR.TAG\"'";
     for (decided, asks) in [(Decider::Aterm, false), (Decider::Person, true)] {
@@ -4014,7 +4029,7 @@ fn a_run_aterm_decided_raises_no_question_of_macos() {
             None,
             &reading(&[]),
             &standing,
-            no_grants,
+            known_grants,
             move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
         )
         .unwrap()
@@ -4045,6 +4060,14 @@ fn a_run_aterm_decided_raises_no_question_of_macos() {
         );
         assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
         assert!(crate::init_secrets::finishes_by_itself(row), "{row:?}");
+        for access in [Access::NetworkAuth, Access::NetworkHelper] {
+            let pending = rows
+                .iter()
+                .find(|row| row.id == format!("{PERMISSION}{}", access.word()))
+                .expect("the known pending requirement");
+            assert_eq!(pending.outcome, Outcome::Person);
+            assert!(!verified_row(pending));
+        }
         assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
     }
 }
@@ -4759,6 +4782,110 @@ fn on_linux_init_runs_the_base_the_vault_and_github_and_the_mac_rows_are_not_app
             "the distribution's git: {calls:?}"
         );
     }
+}
+
+/// The ordinary acquisition check keeps its displayed reason compact while its JSON report
+/// explains every destination it preserved, through the acquisition and init wrappers.
+#[test]
+fn repository_check_json_keeps_all_preserved_reasons() {
+    let names = ["kept-0", "kept-1", "kept-2", "kept-3", "kept-4"];
+    let (sys, alice) = crate::init_github::scripted::inventory(&names, &names);
+    sys.logged_in(&alice);
+    sys.stat_of(
+        "/dev/console",
+        Stat {
+            uid: alice.uid,
+            gid: 20,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: 0,
+        },
+    );
+    for name in names {
+        let path = Path::new(&alice.home).join(name);
+        let mut occupied = sys.stat(&path).unwrap();
+        occupied.dir = false;
+        sys.stat_of(path.to_str().unwrap(), occupied);
+    }
+    let mut picked = options(&[
+        "--check".into(),
+        "--json".into(),
+        "--only".into(),
+        "init.github.native".into(),
+    ])
+    .unwrap();
+    picked.station = picked.only.clone();
+    let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
+        prepare_groups_with(
+            sys,
+            ctx,
+            mode,
+            None,
+            reading,
+            &alab_standing(),
+            no_grants,
+            |_| panic!("repository check opens no Secrets stage"),
+        )
+    };
+    let mut laps = Laps::start();
+    let rows = converge(
+        &sys,
+        &picked,
+        &Front {
+            base: &|_| Base::none(),
+            groups: &groups,
+            full_disk_access: &|| panic!("repository check reads no workstation permission"),
+            targo: None,
+            cwd: None,
+            records: &NoRecords,
+            on_row: &|_| {},
+            present: &|| false,
+            on_held: &|_| {},
+        },
+        &mut NoJournal,
+        &mut laps,
+    )
+    .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.id == "init.github.native@alice")
+        .unwrap();
+    assert_eq!(row.outcome, Outcome::Person, "{rows:#?}");
+    let compact = row.why.as_deref().unwrap();
+    assert!(compact.contains("~/kept-3"), "{compact}");
+    assert!(!compact.contains("~/kept-4"), "{compact}");
+    let observation = crate::init_observe::observation(Setting::Repositories, &[row]);
+    assert!(
+        observation
+            .detail
+            .as_deref()
+            .is_some_and(|detail| !detail.contains("~/kept-4")),
+        "{observation:?}"
+    );
+    let report = report_json(Action::Check, complete(&rows, Action::Check), rows, &laps).unwrap();
+    let report: aterm_json::Value = aterm_json::from_str(&report).unwrap();
+    let row = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"].as_str() == Some("init.github.native@alice"))
+        .unwrap();
+    for name in names {
+        let path = format!("~/{name}");
+        for detail in [
+            row["explain"]["why"].as_str().unwrap(),
+            row["explain"]["remedy"]["person"]["how"].as_str().unwrap(),
+        ] {
+            assert!(detail.contains(&path), "{detail}");
+        }
+    }
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|call| crate::init_github::acquires_repository(call)),
+        "a read-only check acquires nothing"
+    );
 }
 
 /// The ordinary `init --only github` producer shares the existing alignment lease too: it
@@ -6274,6 +6401,11 @@ fn the_walk_takes_the_grants_the_permissions_phase_left_to_the_person() {
         report("init.permissions.full-disk-access", Outcome::Person),
         report("init.permissions.developer-tools", Outcome::Ok),
         report("init.permissions.debugger", Outcome::Person),
+        report("init.permissions.local-network", Outcome::Person),
+        report("init.permissions.name-rule", Outcome::Person),
+        report("init.permissions.spotlight-scope", Outcome::Person),
+        report("init.permissions.network-auth", Outcome::Person),
+        report("init.permissions.network-helper", Outcome::Person),
         report("init.permissions.accessibility", Outcome::Person),
         report("init.permissions.camera", Outcome::Person),
         report("init.secrets.vault", Outcome::Person),
@@ -6283,6 +6415,11 @@ fn the_walk_takes_the_grants_the_permissions_phase_left_to_the_person() {
         [
             Access::FullDiskAccess,
             Access::Debugger,
+            Access::LocalNetwork,
+            Access::NameRule,
+            Access::SpotlightScope,
+            Access::NetworkAuth,
+            Access::NetworkHelper,
             Access::Accessibility
         ]
     );
@@ -6290,7 +6427,7 @@ fn the_walk_takes_the_grants_the_permissions_phase_left_to_the_person() {
         rows.iter()
             .filter(|row| row.outcome == Outcome::Person)
             .count(),
-        5,
+        10,
         "the outcome alone takes rows that are no grant"
     );
 }
@@ -6914,7 +7051,8 @@ fn only_init_spotlight_runs_the_spotlight_rows_alone() {
 /// and says how to restart it now.
 #[test]
 fn only_init_fseventsd_restarts_it() {
-    use aterm_uds::services::{Look, Service};
+    use aterm_process_facts::services::Service;
+    use aterm_uds::services::Look;
     let alice = ctx(&[user("alice", 501)]);
     let mut sys = Fake::root();
     sys.euid = 501;
@@ -7126,8 +7264,8 @@ fn an_invalid_init_toml_leaves_one_unread_row_and_the_rest_run() {
 
 /// The Permissions phase: a row for each grant aterm needs, Accessibility only for a run
 /// that signs out; a grant only the person switches on names how, and an apply is done
-/// with it while `--check` is not. A grant this process cannot read (an aterm outside
-/// aterm.app reads none) fails nothing: the run exits 0.
+/// with it while `--check` is not. An optional grant this process cannot read fails nothing:
+/// the run exits 0 while the required grants are confirmed.
 #[test]
 fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
     fn read(sign_out: bool) -> Vec<(Access, Grant)> {
@@ -7142,6 +7280,11 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
                 Access::Debugger,
                 Grant::Unread("tccd did not answer".into()),
             ),
+            (Access::LocalNetwork, Grant::On),
+            (Access::NameRule, Grant::On),
+            (Access::SpotlightScope, Grant::On),
+            (Access::NetworkAuth, Grant::On),
+            (Access::NetworkHelper, Grant::On),
         ]
     }
     let rows = permissions(read, false);
@@ -7150,7 +7293,12 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
         [
             "init.permissions.full-disk-access",
             "init.permissions.developer-tools",
-            "init.permissions.debugger"
+            "init.permissions.debugger",
+            "init.permissions.local-network",
+            "init.permissions.name-rule",
+            "init.permissions.spotlight-scope",
+            "init.permissions.network-auth",
+            "init.permissions.network-helper"
         ]
     );
     let sys = Fake::root();
@@ -7164,7 +7312,10 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
         rows[2].probe(&sys, &alice),
         Probe::NotApplicable { why } if why.contains("tccd did not answer")
     ));
-    assert_eq!(permissions(no_grants, true).len(), 4);
+    for row in &rows[3..] {
+        assert!(matches!(row.probe(&sys, &alice), Probe::Ok { .. }));
+    }
+    assert_eq!(permissions(no_grants, true).len(), 9);
     let reported = run(
         &sys,
         &alice,
@@ -7191,6 +7342,71 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
         ..person.clone()
     });
     assert_eq!(status(&failed, Action::Check), 1, "{failed:?}");
+}
+
+#[test]
+fn unread_required_authorizations_are_never_verified_or_successful_init_checks() {
+    fn unread(_: bool) -> Vec<(Access, Grant)> {
+        Access::ALL
+            .into_iter()
+            .map(|access| {
+                (
+                    access,
+                    Grant::Unread("the observation did not finish".into()),
+                )
+            })
+            .collect()
+    }
+    fn ready(_: bool) -> Vec<(Access, Grant)> {
+        Access::ALL
+            .into_iter()
+            .map(|access| (access, Grant::On))
+            .collect()
+    }
+    let sys = Fake::root();
+    let alice = at_console(user("alice", 501));
+    for (read, confirmed) in [(unread as Grants, false), (no_grants, false), (ready, true)] {
+        let rows = run(
+            &sys,
+            &alice,
+            Base::none(),
+            &[(permissions(read, false), workstation_place(Class::Person))],
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        for access in [
+            Access::LocalNetwork,
+            Access::NameRule,
+            Access::SpotlightScope,
+            Access::NetworkAuth,
+            Access::NetworkHelper,
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| row.id == format!("{PERMISSION}{}", access.word()))
+                .expect("every required authorization has an init row");
+            assert_eq!(
+                row.outcome,
+                if confirmed {
+                    Outcome::Ok
+                } else {
+                    Outcome::Unknown
+                },
+                "{access:?}: {row:?}"
+            );
+            assert_eq!(verified_row(row), confirmed, "{access:?}");
+            for action in [Action::Plan, Action::Apply, Action::Check] {
+                assert_eq!(counts(row, action), confirmed, "{access:?} {action:?}");
+            }
+        }
+        assert_eq!(status(&rows, Action::Check) == 0, confirmed);
+        assert_eq!(status(&rows, Action::Apply) == 0, confirmed);
+    }
+    assert!(
+        sys.calls().is_empty(),
+        "an unread grant must not cause a prompt"
+    );
 }
 
 #[test]

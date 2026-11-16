@@ -75,7 +75,7 @@ fn supported_retention_revokes_ordinary_paths_and_keeps_unretained_siblings_elig
         let seen = assessed(&target, now).profiles[0].last_used.unwrap();
         let mut called = false;
         let mut retain = |stage, _: &Path| {
-            if stage == Stage::Deleting && !called {
+            if stage == Stage::Staging && !called {
                 called = true;
                 atpkg::build_cache::registered::retain(&home, &target).unwrap();
             }
@@ -104,8 +104,12 @@ fn supported_retention_revokes_ordinary_paths_and_keeps_unretained_siblings_elig
 
 #[test]
 fn a_late_registered_marker_revokes_each_ordinary_removal_path() {
+    #[cfg(unix)]
+    let whens = [Stage::Locked, Stage::Staging, Stage::Staged];
+    #[cfg(windows)]
+    let whens = [Stage::Locked, Stage::Staging];
     for method in 0..4 {
-        for when in [Stage::Locked, Stage::Deleting] {
+        for when in whens {
             let tmp = Tmp::new("late-managed-target");
             let target = synthetic_target(&tmp, "target");
             let now = now_after_write(STALE + 1);
@@ -155,13 +159,13 @@ fn custody_revoked_before_removal_stops_later_profiles_until_a_fresh_pass() {
         let before = snapshot(&target, &|_| false);
         let now = now_after_write(STALE + 1);
         let marker = target.join(custody_marker);
-        let mut deleting = 0;
+        let mut staging = 0;
         let mut released = 0;
         let mut removing = 0;
         let error = reclaim_with(&target, &judge(now), &mut |stage, _| match stage {
-            Stage::Deleting => {
-                deleting += 1;
-                if deleting == 1 {
+            Stage::Staging => {
+                staging += 1;
+                if staging == 1 {
                     std::fs::write(&marker, b"held").unwrap();
                 } else if marker.exists() {
                     std::fs::remove_file(&marker).unwrap();
@@ -175,11 +179,11 @@ fn custody_revoked_before_removal_stops_later_profiles_until_a_fresh_pass() {
                 }
             }
             Stage::Removing => removing += 1,
-            Stage::Locked => {}
+            Stage::Locked | Stage::Staged | Stage::Deleting => {}
         })
         .expect_err("a pre-removal custody refusal stops the whole pass");
         assert!(error.to_string().contains(MANAGED_CACHE), "{error}");
-        assert_eq!(deleting, 1, "the next profile never reaches deletion");
+        assert_eq!(staging, 1, "the next profile never reaches deletion");
         assert_eq!(released, 1, "the refused profile releases its locks");
         assert_eq!(removing, 0, "no removal boundary was entered");
         assert!(!marker.exists());
@@ -208,7 +212,7 @@ fn a_renamed_pinned_target_keeps_its_registered_custody() {
     let now = now_after_write(STALE + 1);
     let mut called = false;
     reclaim_with(&target, &judge(now), &mut |stage, _| {
-        if stage == Stage::Deleting {
+        if stage == Stage::Staging {
             called = true;
             std::fs::rename(&target, &moved).unwrap();
             std::fs::create_dir(&target).unwrap();
@@ -268,6 +272,14 @@ fn a_managed_ancestor_keeps_an_explicitly_named_nested_target() {
     }
 }
 
+/// A managed build directory inside what an ordinary removal takes is never removed, and it
+/// ends where it was. A removal that takes more than `incremental/` (the whole one, tier 3)
+/// finds its marker by the scan before the locks, stages nothing, and its delete in place stops
+/// at it; one that takes `incremental/` unread stops at it in its stage, and what that delete
+/// left goes back.
+///
+/// Negative control: a pass that staged it and left what its delete kept in the stage would
+/// leave `managed` there, where the last snapshot finds nothing at its path and a stage stands.
 #[test]
 fn an_ordinary_target_cannot_remove_a_managed_descendant() {
     for method in 0..4 {
@@ -286,6 +298,8 @@ fn an_ordinary_target_cannot_remove_a_managed_descendant() {
         };
         assert!(why.contains(MANAGED_CACHE), "method {method}: {why}");
         assert_eq!(snapshot(&nested, &|_| false), before, "method {method}");
+        #[cfg(unix)]
+        assert!(stages_in(&target).is_empty(), "method {method}: staged");
     }
 }
 
@@ -386,12 +400,18 @@ fn mid_walk_custody(ancestor: bool, rename: bool, custody_marker: &str) {
                 );
             }
         }
+        // Each file is known by its identity and length, not its path: a staged pass moves the
+        // payloads before it deletes them.
+        let payloads: Vec<_> = payloads
+            .iter()
+            .map(|rel| identity(&target.join(rel)))
+            .collect();
         let allocated: Vec<_> = snapshot(&target, &|_| false)
             .into_iter()
             .filter(|(_, kind, _)| kind == "file")
             .map(|(rel, _, _)| {
-                let bytes = blocks(&target.join(&rel));
-                (rel, bytes)
+                let file = target.join(&rel);
+                (identity(&file), blocks(&file))
             })
             .collect();
         let now = now_after_write(STALE + 1);
@@ -402,28 +422,23 @@ fn mid_walk_custody(ancestor: bool, rename: bool, custody_marker: &str) {
             .max()
             .unwrap();
         let mut injected = false;
+        let mut locked_after = 0;
         let mut remaining = Vec::new();
         let mut marker: Option<PathBuf> = None;
         let done = ordinary_method(method, &target, now, seen, &mut |stage, _| {
-            // Removing the policy after this profile returns must not let the same pass resume.
-            if stage == Stage::Released
-                && matches!(method, 0 | 3)
-                && let Some(policy) = &marker
-            {
-                std::fs::remove_file(policy).unwrap();
+            if injected && stage == Stage::Locked {
+                locked_after += 1;
             }
             if stage != Stage::Removing || injected {
                 return;
             }
-            let alive: Vec<_> = payloads
-                .iter()
-                .filter(|p| target.join(p).exists())
-                .collect();
+            let live = live_files(&target);
+            let alive: Vec<_> = payloads.iter().filter(|p| live.contains(p)).collect();
             if alive.len() != payloads.len() - 1 {
                 return;
             }
             injected = true;
-            remaining = alive.into_iter().cloned().collect();
+            remaining = alive.into_iter().copied().collect();
             #[cfg(unix)]
             if rename {
                 std::fs::rename(&target, &moved).unwrap();
@@ -445,13 +460,14 @@ fn mid_walk_custody(ancestor: bool, rename: bool, custody_marker: &str) {
             "method {method}: mutation must already have started"
         );
         let active = if rename { &moved } else { &target };
+        let live = live_files(active);
         assert!(
-            remaining.iter().all(|rel| active.join(rel).exists()),
+            remaining.iter().all(|p| live.contains(p)),
             "method {method}: remaining payloads"
         );
         let freed: u64 = allocated
             .iter()
-            .filter(|(rel, _)| !active.join(rel).exists())
+            .filter(|(p, _)| !live.contains(p))
             .map(|(_, bytes)| bytes)
             .sum();
         assert!(freed > 0, "method {method}: actual partial deletion");
@@ -463,8 +479,41 @@ fn mid_walk_custody(ancestor: bool, rename: bool, custody_marker: &str) {
             done.trouble.iter().any(|why| why.contains(MANAGED_CACHE)),
             "{done:?}"
         );
-        assert_eq!(marker.unwrap().exists(), !matches!(method, 0 | 3));
+        assert_eq!(
+            locked_after, 0,
+            "method {method}: no profile is locked once custody is revoked"
+        );
+        assert!(marker.unwrap().exists());
     }
+}
+
+/// The identity and length of the file at `path`: what it is wherever a pass moves it.
+fn identity(path: &Path) -> (aterm_sysprobe::volumes::FileId, u64) {
+    let id = aterm_sysprobe::volumes::file_id(path, false).expect("an identity");
+    (id, std::fs::symlink_metadata(path).expect("stat").len())
+}
+
+/// The [`identity`] of every file under `root`, a stage's included: read by metadata alone, so
+/// no file a remover holds open is read.
+fn live_files(root: &Path) -> Vec<(aterm_sysprobe::volumes::FileId, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read").flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file()
+                && let Some(id) = aterm_sysprobe::volumes::file_id(&path, false)
+            {
+                out.push((id, meta.len()));
+            }
+        }
+    }
+    out
 }
 
 #[test]
@@ -1052,6 +1101,7 @@ fn reclaimable_totals_use_only_the_same_eligible_profiles_as_the_candidate_list(
             in_use,
             bytes: u64::MAX,
             bytes_partial: true,
+            deps_entries: None,
             died: Died::default(),
         });
     }
@@ -1270,9 +1320,13 @@ fn a_build_holding_any_lock_keeps_its_profile() {
     }
 }
 
-/// Every lock is held from before the delete until after it, then released.
+/// Every lock is held from before anything is taken until what was taken is staged, and let go
+/// before the stage is deleted (Windows, which stages nothing: until after the delete).
+///
+/// Negative control: a pass that deleted in place on unix would show `incremental/` still in its
+/// place at `Deleting` with every lock held.
 #[test]
-fn every_lock_is_held_for_the_whole_delete_and_released_after() {
+fn every_lock_is_held_until_what_it_took_is_staged() {
     let tmp = Tmp::new("locks");
     let t = synthetic_target(&tmp, "target");
     let debug = t.join("debug");
@@ -1287,14 +1341,24 @@ fn every_lock_is_held_for_the_whole_delete_and_released_after() {
         seen.push((stage, all, inc));
     })
     .expect("reclaimed");
-    assert_eq!(
-        seen,
-        vec![
-            (Stage::Locked, true, true),
-            (Stage::Deleting, true, true),
-            (Stage::Released, false, false),
-        ]
-    );
+    #[cfg(unix)]
+    let expected = vec![
+        (Stage::Locked, true, true),
+        (Stage::Staging, true, true),
+        (Stage::Staged, true, false),
+        (Stage::Released, false, false),
+        (Stage::Deleting, false, false),
+    ];
+    #[cfg(windows)]
+    let expected = vec![
+        (Stage::Locked, true, true),
+        (Stage::Staging, true, true),
+        (Stage::Deleting, true, true),
+        (Stage::Released, false, false),
+    ];
+    assert_eq!(seen, expected, "(stage, locks held, in place)");
+    assert!(!debug.join(INCREMENTAL).exists());
+    assert!(!debug.join(STAGE).exists(), "no stage is left");
 }
 
 /// Reclaim locks are released via `LOCK_UN` even while a forked child has not yet exec'd.
@@ -1325,8 +1389,10 @@ fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
         seen,
         vec![
             (Stage::Locked, true, true),
-            (Stage::Deleting, true, true),
+            (Stage::Staging, true, true),
+            (Stage::Staged, true, true),
             (Stage::Released, false, true),
+            (Stage::Deleting, false, true),
         ],
         "(stage, every lock held, the child not yet exec'd)"
     );
@@ -1449,7 +1515,7 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert_eq!(only(&t), 1, "the report wrote no lock");
     let mut all_held = false;
     reclaim_with(&t, &judge(now), &mut |stage, _| {
-        if stage == Stage::Deleting {
+        if stage == Stage::Staging {
             all_held = CARGO_LOCKS.iter().all(|l| held(&t.join("debug").join(l)));
         }
     })
@@ -1566,7 +1632,9 @@ fn nothing_is_reached_through_a_symlink() {
     );
 }
 
-/// Deletion never crosses onto another device or volume.
+/// Deletion never crosses onto another device or volume, and a directory on another device
+/// ends where it was: the delete of the stage never enters it, and what that delete left goes
+/// back.
 #[test]
 fn the_delete_never_enters_another_device() {
     let tmp = Tmp::new("device");
@@ -1590,6 +1658,9 @@ fn the_delete_never_enters_another_device() {
         done.bytes, counted,
         "nothing on the other device is counted"
     );
+    // What the stage's delete left went back where it was: no stage stands.
+    #[cfg(unix)]
+    assert!(stages_in(&t).is_empty(), "nothing stays staged");
 
     let t = synthetic_target(&tmp, "volume");
     let dev = dev_of(&t).expect("dev");
@@ -1678,7 +1749,11 @@ fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     );
 }
 
-/// An undeletable entry is reported and uncounted while its siblings are still removed.
+/// An undeletable entry is reported and uncounted while its siblings are still removed, and it
+/// ends where it was: what the delete of a stage leaves goes back, and its line names it there.
+///
+/// Negative control (unix): without the move back the stuck folder would sit in the pass's
+/// stage, where `ro` names nothing and a stage stands.
 #[test]
 fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
     let tmp = Tmp::new("undeletable");
@@ -1708,6 +1783,15 @@ fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
         done.trouble.iter().any(|t| t.contains("stuck")),
         "the error is surfaced: {done:?}"
     );
+    #[cfg(unix)]
+    {
+        assert!(stages_in(&t).is_empty(), "no stage stands: {done:?}");
+        let said = ro.join("file").display().to_string();
+        assert!(
+            done.trouble.iter().any(|t| t.starts_with(&said)),
+            "its line names it where it is: {done:?}"
+        );
+    }
 }
 
 /// A directory holding `Cargo.toml` or `src/` at its root is never a reclaim candidate.
@@ -1724,41 +1808,54 @@ fn a_directory_holding_source_is_never_a_candidate() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// Partial deletion updating `incremental/`'s mtime leaves the profile idle for the next reclaim.
+/// Partial deletion updating `incremental/`'s mtime leaves the profile idle for the next
+/// reclaim, whether the pass staged what it took and moved back what its delete left, or (unix
+/// too: a full disk makes no stage) deleted it in place.
 #[test]
 fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
-    let tmp = Tmp::new("cut-short");
-    let t = synthetic_target(&tmp, "target");
-    let debug = t.join("debug");
-    let inc = debug.join(INCREMENTAL);
-    let stuck = inc.join("stuck");
-    let held = Stuck::at(&stuck);
-    let now = now_after_write(0);
-    let old = now - 30 * DAY;
-    for d in [
-        ".fingerprint",
-        "deps",
-        "build",
-        "incremental",
-        "incremental/lay-1x2y3z",
-    ] {
-        set_mtime(&at(&debug, d), old);
+    #[cfg(unix)]
+    let ways = [false, true];
+    #[cfg(windows)]
+    let ways = [false];
+    for in_place in ways {
+        let tmp = Tmp::new(["cut-short", "cut-short-in-place"][usize::from(in_place)]);
+        let t = synthetic_target(&tmp, "target");
+        let debug = t.join("debug");
+        let inc = debug.join(INCREMENTAL);
+        let stuck = inc.join("stuck");
+        let held = Stuck::at(&stuck);
+        let now = now_after_write(0);
+        let old = now - 30 * DAY;
+        for d in [
+            ".fingerprint",
+            "deps",
+            "build",
+            "incremental",
+            "incremental/lay-1x2y3z",
+        ] {
+            set_mtime(&at(&debug, d), old);
+        }
+        assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
+
+        #[cfg(unix)]
+        fd::inject_stage_fault(in_place.then_some(libc::ENOSPC));
+        let done = reclaim(&t, &judge(now));
+        #[cfg(unix)]
+        fd::inject_stage_fault(None);
+        let done = done.expect("partly reclaimed");
+        assert!(done.units.is_empty(), "{done:?}");
+        assert!(stuck.join("file").exists());
+        drop(held);
+
+        let again = assessed(&t, now);
+        assert!(
+            target_witness(&again, now, STALE).is_ok(),
+            "still idle after its own partial delete: {again:?}"
+        );
+        let done = reclaim(&t, &judge(now)).expect("the rest");
+        assert_eq!(done.units, vec![inc.clone()], "{done:?}");
+        assert!(!inc.exists());
     }
-    assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
-
-    let done = reclaim(&t, &judge(now)).expect("partly reclaimed");
-    assert!(done.units.is_empty(), "{done:?}");
-    assert!(stuck.join("file").exists());
-    drop(held);
-
-    let again = assessed(&t, now);
-    assert!(
-        target_witness(&again, now, STALE).is_ok(),
-        "still idle after its own partial delete: {again:?}"
-    );
-    let done = reclaim(&t, &judge(now)).expect("the rest");
-    assert_eq!(done.units, vec![inc.clone()], "{done:?}");
-    assert!(!inc.exists());
 }
 
 /// Created locks inherit the standard `OpenOptions` mode under the process umask.
@@ -1878,11 +1975,12 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
     let before = snapshot(&t, &|rel| rel.starts_with("debug/incremental"));
 
     let mut seen = Vec::new();
-    let done = reclaim_lru_with(&t, &debug, &judge(now), now - 3 * 3_600, &mut |stage, p| {
+    // The profile's own locks: a stage's delete names the stage, not the profile.
+    let done = reclaim_lru_with(&t, &debug, &judge(now), now - 3 * 3_600, &mut |stage, _| {
         if stage == Stage::Removing {
             return;
         }
-        let all = CARGO_LOCKS.iter().all(|l| held(&p.join(l)));
+        let all = CARGO_LOCKS.iter().all(|l| held(&debug.join(l)));
         seen.push((stage, all));
     })
     .expect("reclaimed");
@@ -1891,14 +1989,22 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
         done.skipped.is_empty() && done.trouble.is_empty(),
         "{done:?}"
     );
-    assert_eq!(
-        seen,
-        vec![
-            (Stage::Locked, true),
-            (Stage::Deleting, true),
-            (Stage::Released, false)
-        ]
-    );
+    #[cfg(unix)]
+    let expected = vec![
+        (Stage::Locked, true),
+        (Stage::Staging, true),
+        (Stage::Staged, true),
+        (Stage::Released, false),
+        (Stage::Deleting, false),
+    ];
+    #[cfg(windows)]
+    let expected = vec![
+        (Stage::Locked, true),
+        (Stage::Staging, true),
+        (Stage::Deleting, true),
+        (Stage::Released, false),
+    ];
+    assert_eq!(seen, expected);
     assert!(!debug.join(INCREMENTAL).exists());
     assert_eq!(
         snapshot(&t, &|rel| rel.starts_with("debug/incremental")),
@@ -1958,7 +2064,7 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
     let moved = tmp.path().join("target.moved");
     let mut swapped = None;
     let done = reclaim_whole_with(&t, &judge(now), now, DAY, ok, &mut |stage, _| {
-        if stage == Stage::Deleting {
+        if stage == Stage::Staging {
             let renamed = std::fs::rename(&t, &moved);
             if renamed.is_ok() {
                 std::fs::create_dir(&t).expect("swap in");
@@ -2046,7 +2152,7 @@ fn whole_reclaim_keeps_freed_bytes_when_its_final_name_cannot_be_inspected() {
         &mut || Ok(()),
         &mut |stage, at| {
             if stage == Stage::Removing && at == t {
-                assert!(std::fs::read_dir(&t).unwrap().next().is_none());
+                assert_eq!(names_in(&t), ["CACHEDIR.TAG"], "all else went first");
                 std::fs::rename(&t, &moved).expect("move the emptied directory");
                 std::fs::create_dir(&t).expect("replace its name with a directory");
                 std::fs::write(t.join("keep.txt"), replacement).expect("the replacement payload");
@@ -2074,7 +2180,23 @@ fn whole_reclaim_keeps_freed_bytes_when_its_final_name_cannot_be_inspected() {
     std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o700))
         .expect("restore the replacement for inspection and cleanup");
     assert_eq!(std::fs::read(t.join("keep.txt")).unwrap(), replacement);
-    assert!(std::fs::read_dir(&moved).unwrap().next().is_none());
+    assert_eq!(
+        names_in(&moved),
+        ["CACHEDIR.TAG"],
+        "the root that stays keeps its marker"
+    );
+}
+
+/// The names of the entries of the directory at `dir`, sorted.
+#[cfg(unix)]
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// [`unhashed_twin`] matches only the unhashed stem (`-` as `_`) with the same extension.
@@ -2113,6 +2235,947 @@ fn only_a_local_fixed_disk_passes_the_volume_fence() {
     ] {
         let err = fixed_verdict(volume).expect_err("refused");
         assert!(err.contains(why), "{volume:?}: {err}");
+    }
+}
+
+/// Lay a stage an earlier pass left at `folder/name` ([`STAGE`]): its tag and one 8 KiB file of
+/// what it took. The stage's path.
+#[cfg(unix)]
+fn lay_stage(folder: &Path, name: &str) -> PathBuf {
+    let stage = folder.join(name);
+    std::fs::create_dir_all(&stage).expect("stage");
+    std::fs::write(stage.join(STAGE_TAG), b"").expect("tag");
+    std::fs::write(stage.join("taken.bin"), vec![5u8; 8192]).expect("taken");
+    stage
+}
+
+/// A stage an earlier pass left goes only while its custody allows: a managed ancestor keeps it
+/// whole, and a marker that lands in the build directory once its delete began stops that delete.
+///
+/// Negative control: with no marker anywhere the same stage is gone after one reclaim, and
+/// without the custody read at the stage's own removal, phase 2's file would go.
+#[cfg(unix)]
+#[test]
+fn a_stage_is_finished_only_while_custody_allows() {
+    let now = now_after_write(STALE + 1);
+    let marker = atpkg::build_cache::registered::MARKER;
+    let tmp = Tmp::new("stage-custody-ancestor");
+    let t = synthetic_target(&tmp, "target");
+    let stage = lay_stage(&t.join("debug"), STAGE);
+    std::fs::write(t.parent().unwrap().join(marker), br#"{"schema":3}"#).unwrap();
+    reclaim(&t, &judge(now)).expect_err("a managed ancestor keeps the stage");
+    assert_eq!(std::fs::read(stage.join("taken.bin")).unwrap(), [5u8; 8192]);
+    assert!(stage.join(STAGE_TAG).exists());
+
+    let tmp = Tmp::new("stage-custody-late");
+    let t = synthetic_target(&tmp, "target");
+    let stage = lay_stage(&t.join("debug"), STAGE);
+    let mut landed = false;
+    let error = reclaim_with(&t, &judge(now), &mut |step, at| {
+        if step == Stage::Removing && at == stage.as_path() && !landed {
+            landed = true;
+            std::fs::write(t.join(marker), br#"{"schema":3}"#).unwrap();
+        }
+    })
+    .expect_err("custody read again at the stage stops its delete");
+    assert!(landed, "the stage's delete began");
+    assert!(error.to_string().contains(MANAGED_CACHE), "{error}");
+    assert_eq!(std::fs::read(stage.join("taken.bin")).unwrap(), [5u8; 8192]);
+
+    let tmp = Tmp::new("stage-custody-none");
+    let t = synthetic_target(&tmp, "target");
+    let stage = lay_stage(&t.join("debug"), STAGE);
+    let freed = blocks(&stage.join("taken.bin"));
+    let done = reclaim(&t, &judge(now)).expect("an ordinary stage goes");
+    assert!(!stage.exists(), "{done:?}");
+    assert!(done.units.contains(&stage), "{done:?}");
+    assert!(done.bytes >= freed, "{done:?}");
+}
+
+/// A stage an earlier pass left is never walked: a profile moved into it is no profile of the
+/// build directory's, and its entries count against no walk's bound.
+///
+/// Negative control: the same tree in a folder of another name is found as a profile and cuts a
+/// walk bounded at 20 entries.
+#[cfg(unix)]
+#[test]
+fn a_stage_is_never_walked_as_a_profile_nor_kept_by_a_bound() {
+    let now = now_after_write(STALE + 1);
+    let bounded = WalkBudget {
+        entries: 20,
+        ..WalkBudget::SHIPPED
+    };
+    for (name, staged) in [(STAGE, true), ("aside", false)] {
+        let tmp = Tmp::new("stage-walk");
+        let t = synthetic_target(&tmp, "target");
+        let folder = t.join(name);
+        lay_profile(&folder.join("debug"));
+        std::fs::write(folder.join(STAGE_TAG), b"").unwrap();
+        for n in 0..50 {
+            std::fs::write(folder.join(format!("taken-{n}")), b"x").unwrap();
+        }
+        let td = assessed(&t, now);
+        let mut profiles: Vec<PathBuf> = td.profiles.iter().map(|p| p.path.clone()).collect();
+        profiles.sort();
+        let stages: Vec<PathBuf> = td.stages.iter().map(|s| s.path.clone()).collect();
+        let cut = fd::walk(&t, bounded).cut;
+        if staged {
+            assert_eq!(profiles, vec![t.join("debug")]);
+            assert_eq!(stages, vec![folder.clone()]);
+            assert!(td.stages[0].bytes > 0, "{td:?}");
+            assert!(cut.is_none(), "{cut:?}");
+        } else {
+            assert_eq!(profiles, vec![at(&t, "aside/debug"), t.join("debug")]);
+            assert!(stages.is_empty(), "{td:?}");
+            assert!(cut.is_some(), "the control walk is bounded");
+        }
+    }
+}
+
+/// The hook order of a pass that stages: what it takes is staged under the locks and deleted
+/// once they are let go.
+#[cfg(unix)]
+const STAGED_ORDER: [Stage; 5] = [
+    Stage::Locked,
+    Stage::Staging,
+    Stage::Staged,
+    Stage::Released,
+    Stage::Deleting,
+];
+
+/// The hook order of a pass that deletes in place, under the locks.
+#[cfg(unix)]
+const IN_PLACE_ORDER: [Stage; 4] = [
+    Stage::Locked,
+    Stage::Staging,
+    Stage::Deleting,
+    Stage::Released,
+];
+
+/// Every folder under `root` named as a stage ([`STAGE`]): none where `root` itself is gone.
+#[cfg(unix)]
+fn stages_in(root: &Path) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    snapshot(root, &|_| false)
+        .into_iter()
+        .filter(|(rel, kind, _)| kind == "dir" && is_stage_path(rel))
+        .map(|(rel, _, _)| root.join(rel))
+        .collect()
+}
+
+/// The blocks of every file under `dir`.
+#[cfg(unix)]
+fn blocks_under(dir: &Path) -> u64 {
+    snapshot(dir, &|_| false)
+        .into_iter()
+        .filter(|(_, kind, _)| kind == "file")
+        .map(|(rel, _, _)| blocks(&dir.join(rel)))
+        .sum()
+}
+
+/// The blocks of the files of the synthetic target `t` that `method` ([`ordinary_method`])
+/// takes: `debug/incremental/` for the idle and the pressure reclaim, every file but the
+/// `CACHEDIR.TAG` for the whole removal, and the four cargo outputs for tier 3.
+#[cfg(unix)]
+fn taken_by(method: usize, t: &Path) -> u64 {
+    let outputs = [
+        "debug/.fingerprint",
+        "debug/build",
+        "debug/deps",
+        "debug/incremental",
+    ];
+    snapshot(t, &|_| false)
+        .into_iter()
+        .filter(|(rel, kind, _)| {
+            kind == "file"
+                && match method {
+                    0 | 1 => rel.starts_with("debug/incremental"),
+                    2 => rel != Path::new("CACHEDIR.TAG"),
+                    _ => outputs.iter().any(|o| rel.starts_with(o)),
+                }
+        })
+        .map(|(rel, _, _)| blocks(&t.join(rel)))
+        .sum()
+}
+
+/// Whether the lock at `lock` exists and is held.
+#[cfg(unix)]
+fn held_if_there(lock: &Path) -> bool {
+    lock.exists() && held(lock)
+}
+
+/// The exit test of DC-20: each of the four removers takes what it removes under cargo's
+/// locks, moves it into a stage of its own, lets the locks go, and only then deletes the stage,
+/// so a build that starts in that profile meanwhile takes its lock at once.
+///
+/// Negative controls: the probe at `Staged` finds the locks held, and the same probe at the
+/// first removal, which here finds the lock let go wherever the pass moved it, finds it held in
+/// `a_stage_that_cannot_be_made_deletes_in_place_under_the_locks`; a pass that deleted in place
+/// would come to its first removal with `debug/.cargo-lock` held, where `Build::holds` panics.
+#[cfg(unix)]
+#[test]
+fn a_disk_pass_lets_go_of_the_cargo_locks_before_it_deletes() {
+    for method in 0..4 {
+        let tmp = Tmp::new("lets-go");
+        let t = synthetic_target(&tmp, "target");
+        let debug = t.join("debug");
+        let now = now_after_write(STALE + 1);
+        let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+        let taken = taken_by(method, &t);
+        let probe = if method == 2 {
+            at(&t, ".aterm-removing/debug/.cargo-lock")
+        } else {
+            debug.join(".cargo-lock")
+        };
+        let mut order = Vec::new();
+        let mut held_when_staged = None;
+        let mut free_at_first_removal = None;
+        let mut build: Option<Build> = None;
+        let done = ordinary_method(method, &t, now, seen, &mut |stage, _| {
+            if stage != Stage::Removing {
+                if stage == Stage::Staged {
+                    held_when_staged = Some(held(&probe));
+                }
+                order.push(stage);
+                return;
+            }
+            if build.is_none() {
+                free_at_first_removal = Some(!held(&probe));
+                std::fs::create_dir_all(&debug).expect("a build's profile");
+                let lock = debug.join(".cargo-lock");
+                if !lock.exists() {
+                    std::fs::write(&lock, b"").expect("its lock");
+                }
+                build = Some(Build::holds(&lock));
+            }
+        })
+        .expect("reclaimed");
+        assert_eq!(order, STAGED_ORDER, "method {method}");
+        assert_eq!(held_when_staged, Some(true), "method {method}");
+        assert_eq!(free_at_first_removal, Some(true), "method {method}");
+        assert!(build.is_some(), "method {method}: a build took the lock");
+        assert_eq!(done.bytes, taken, "method {method}: {done:?}");
+        assert!(stages_in(&t).is_empty(), "method {method}: stage left");
+        if method == 2 {
+            assert!(t.join("CACHEDIR.TAG").exists());
+            assert!(debug.join(".cargo-lock").exists());
+            assert!(done.units.is_empty(), "{done:?}");
+            assert!(
+                done.skipped
+                    .iter()
+                    .any(|(_, why)| why.contains("a build started in it")),
+                "{done:?}"
+            );
+        }
+    }
+}
+
+/// A pass stopped once it staged and let go (killed; here a panic at its first removal) leaves
+/// its stage tagged and let go, and the next pass finishes it and counts what it held.
+///
+/// Negative control: the same pass without the panic leaves no stage.
+#[cfg(unix)]
+#[test]
+fn a_left_stage_is_finished_by_the_next_pass() {
+    for method in 0..4 {
+        for stop in [true, false] {
+            let tmp = Tmp::new("left-stage");
+            let t = synthetic_target(&tmp, "target");
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ordinary_method(method, &t, now, seen, &mut |stage, _| {
+                    assert!(
+                        !(stop && stage == Stage::Removing),
+                        "the pass stops at its first removal"
+                    );
+                })
+            }));
+            let stages = stages_in(&t);
+            if !stop {
+                first.expect("no stop").expect("reclaimed");
+                assert!(stages.is_empty(), "method {method}: {stages:?}");
+                continue;
+            }
+            assert!(first.is_err(), "method {method}: the pass stopped");
+            assert_eq!(stages.len(), 1, "method {method}: {stages:?}");
+            let stage = &stages[0];
+            assert!(stage.join(STAGE_TAG).exists(), "method {method}");
+            assert!(!held(&stage.join(STAGE_TAG)), "method {method}");
+            let td = assessed(&t, now);
+            assert_eq!(td.stages.len(), 1, "method {method}: {td:?}");
+            assert!(
+                matches!(
+                    target_witness(&td, now, STALE),
+                    Ok(Witness::StaleBuildDir { profiles: 0, .. })
+                ),
+                "method {method}: {td:?}"
+            );
+            let left = blocks_under(stage);
+            let done = reclaim(&t, &judge(now)).expect("the next pass finishes it");
+            assert_eq!(done.bytes, left, "method {method}: {done:?}");
+            assert!(done.units.contains(stage), "method {method}: {done:?}");
+            assert!(stages_in(&t).is_empty(), "method {method}");
+        }
+    }
+}
+
+/// Custody is read again once all that is taken sits in the stage: a marker that lands then
+/// sends everything back where it was, and nothing goes.
+///
+/// Negative control: a plain file that lands then (`note.txt`) changes nothing, and what was
+/// taken goes.
+#[cfg(unix)]
+#[test]
+fn custody_read_again_at_the_stage_moves_everything_back() {
+    let marker = atpkg::build_cache::registered::MARKER;
+    for method in 0..4 {
+        for (name, refuses) in [(marker, true), ("note.txt", false)] {
+            let tmp = Tmp::new("stage-custody-again");
+            let t = synthetic_target(&tmp, "target");
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+            let before = snapshot(&t, &|rel| rel == Path::new(name));
+            // Where the lock is once the locks are let go: back in its profile, or (the whole
+            // removal that goes on) in the stage with the profile it took.
+            let lock = if method == 2 && !refuses {
+                at(&t, ".aterm-removing/debug/.cargo-lock")
+            } else {
+                t.join("debug/.cargo-lock")
+            };
+            let mut landed = false;
+            let mut let_go = None;
+            let result = ordinary_method(method, &t, now, seen, &mut |stage, _| {
+                if stage == Stage::Staged {
+                    landed = true;
+                    std::fs::write(t.join(name), br#"{"schema":3}"#).unwrap();
+                }
+                if stage == Stage::Released && let_go.is_none() {
+                    let_go = Some(!held(&lock));
+                }
+            });
+            assert!(landed, "method {method}");
+            assert!(stages_in(&t).is_empty(), "method {method}: stage left");
+            assert_eq!(let_go, Some(true), "method {method}: the locks are let go");
+            if refuses {
+                let text = match &result {
+                    Ok(done) => done.trouble.join("; "),
+                    Err(error) => error.to_string(),
+                };
+                assert!(text.contains(MANAGED_CACHE), "method {method}: {text}");
+                assert_eq!(
+                    snapshot(&t, &|rel| rel == Path::new(name)),
+                    before,
+                    "method {method}: everything is back"
+                );
+            } else {
+                let done = result.expect("reclaimed");
+                assert!(done.bytes > 0, "method {method}: {done:?}");
+                assert!(!t.join("debug/incremental").exists(), "method {method}");
+            }
+        }
+    }
+}
+
+/// A move into the stage that a mount point refuses (`EBUSY`: it would cross a volume) leaves
+/// that entry where it was, deletes nothing of it in place, and the pass refuses.
+///
+/// Negative control: with the fault cleared the same pass reclaims.
+#[cfg(unix)]
+#[test]
+fn a_move_that_would_cross_a_volume_leaves_the_tree_and_refuses() {
+    for method in 0..4 {
+        for fault in [Some(libc::EBUSY), None] {
+            let tmp = Tmp::new("stage-xdev");
+            let t = synthetic_target(&tmp, "target");
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+            let before = snapshot(&t, &|_| false);
+            let case = format!("method {method}, {fault:?}");
+            fd::inject_move_fault(fault.map(|errno| (0, errno)));
+            let result = ordinary_method(method, &t, now, seen, &mut |_, _| {});
+            fd::inject_move_fault(None);
+            assert!(stages_in(&t).is_empty(), "{case}");
+            if fault.is_some() {
+                let error = result.expect_err("nothing is reclaimed");
+                assert!(
+                    error.to_string().contains("would cross a volume"),
+                    "{case}: {error}"
+                );
+                assert_eq!(snapshot(&t, &|_| false), before, "{case}");
+            } else {
+                assert!(result.expect("reclaimed").bytes > 0, "{case}");
+            }
+        }
+    }
+}
+
+/// Where no stage can be made (a full disk), a rename says none can be made here (`ENOSYS`, or
+/// `EXDEV` between two names of one folder: an overlayfs lower directory), or a removal that
+/// takes more than `incremental/` did not read what it would stage whole before the locks (its
+/// scan stops at a bound), what is taken is deleted in place under the locks, as before stages:
+/// the probe that finds the locks let go at a staged pass's first removal finds them held here.
+///
+/// Negative control: with no fault the order is the staged one and the locks are let go, as
+/// they are where the scan's bound meets a removal that makes no scan (`incremental/` alone).
+#[cfg(unix)]
+#[test]
+fn a_stage_that_cannot_be_made_deletes_in_place_under_the_locks() {
+    let unread = WalkBudget {
+        entries: 0,
+        ..WalkBudget::SHIPPED
+    };
+    let faults = [
+        (Some(libc::ENOSPC), None, None),
+        (None, Some(libc::ENOSYS), None),
+        (None, Some(libc::EXDEV), None),
+        (None, None, Some(unread)),
+        (None, None, None),
+    ];
+    for method in 0..4 {
+        for (stage_fault, move_fault, scan) in faults {
+            let tmp = Tmp::new("stage-cannot");
+            let t = synthetic_target(&tmp, "target");
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+            let mut taken = taken_by(method, &t);
+            if method == 2 {
+                taken += blocks(&t.join("CACHEDIR.TAG"));
+            }
+            let lock = t.join("debug/.cargo-lock");
+            let mut order = Vec::new();
+            let mut held_at_removal = None;
+            let mut staged_at_deleting = None;
+            fd::inject_stage_fault(stage_fault);
+            fd::inject_move_fault(move_fault.map(|errno| (0, errno)));
+            fd::inject_scan_budget(scan);
+            let result = ordinary_method(method, &t, now, seen, &mut |stage, _| {
+                if stage == Stage::Removing {
+                    if held_at_removal.is_none() {
+                        held_at_removal = Some(held_if_there(&lock));
+                    }
+                    return;
+                }
+                if stage == Stage::Deleting && staged_at_deleting.is_none() {
+                    staged_at_deleting = Some(!stages_in(&t).is_empty());
+                }
+                order.push(stage);
+            });
+            fd::inject_stage_fault(None);
+            fd::inject_move_fault(None);
+            fd::inject_scan_budget(None);
+            let done = result.expect("reclaimed");
+            let case = format!("method {method}, {stage_fault:?}, {move_fault:?}, {scan:?}");
+            let unread = scan.is_some() && method >= 2;
+            if stage_fault.is_none() && move_fault.is_none() && !unread {
+                assert_eq!(order, STAGED_ORDER, "{case}");
+                assert_eq!(held_at_removal, Some(false), "{case}");
+                continue;
+            }
+            assert_eq!(order, IN_PLACE_ORDER, "{case}");
+            assert_eq!(held_at_removal, Some(true), "{case}: held");
+            assert_eq!(staged_at_deleting, Some(false), "{case}: no stage stands");
+            assert_eq!(done.bytes, taken, "{case}: {done:?}");
+            assert!(stages_in(&t).is_empty(), "{case}");
+        }
+    }
+}
+
+/// A folder with a volume mounted at or below it, by the mount table read before the locks, is
+/// never moved: it is deleted in place under the locks, which never enters another device. So
+/// is one whose mount table was not read whole, which rules no mount out.
+///
+/// Negative control: with a table read whole that holds no mount there (what a test's pass
+/// reads unless it is given another) the same pass stages.
+#[cfg(unix)]
+#[test]
+fn a_folder_with_a_volume_mounted_below_it_is_deleted_in_place_never_moved() {
+    let cut = aterm_sysprobe::volumes::Table::default();
+    assert!(!cut.complete, "a table not read whole");
+    for (mounted, table) in [(true, None), (false, Some(cut)), (false, None)] {
+        let tmp = Tmp::new("stage-mounted");
+        let t = synthetic_target(&tmp, "target");
+        let now = now_after_write(STALE + 1);
+        let inc = t.join("debug").join(INCREMENTAL);
+        let in_place = mounted || table.is_some();
+        fd::pretend_mounted(mounted.then(|| inc.join("lay-1x2y3z")));
+        fd::pretend_table(table);
+        let mut order = Vec::new();
+        let mut made = false;
+        let result = reclaim_with(&t, &judge(now), &mut |stage, _| {
+            made |= !stages_in(&t).is_empty();
+            if stage != Stage::Removing {
+                order.push(stage);
+            }
+        });
+        fd::pretend_mounted(None);
+        fd::pretend_table(None);
+        result.expect("reclaimed");
+        if in_place {
+            assert_eq!(order, IN_PLACE_ORDER);
+            assert!(!made, "no stage was made");
+        } else {
+            assert_eq!(order, STAGED_ORDER);
+            assert!(made, "the control stages");
+        }
+        assert!(!inc.exists());
+    }
+}
+
+/// A folder named as a stage that holds no tag but something else is no stage: no pass removes
+/// it or what it holds, and a profile in it is walked (and so locked) as any other.
+///
+/// Negative control: an empty folder named as a stage (a pass killed before it made its tag)
+/// is gone after one reclaim.
+#[cfg(unix)]
+#[test]
+fn a_folder_named_as_a_stage_without_its_tag_is_never_removed() {
+    let now = now_after_write(STALE + 1);
+    let work = b"someone's work";
+    for method in 0..4 {
+        let tmp = Tmp::new("tagless-stage");
+        let t = synthetic_target(&tmp, "target");
+        let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+        let folder = if method == 2 {
+            t.join(STAGE)
+        } else {
+            t.join("debug").join(STAGE)
+        };
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("work.txt"), work).unwrap();
+        assert!(assessed(&t, now).stages.is_empty(), "method {method}");
+        let result = ordinary_method(method, &t, now, seen, &mut |_, _| {});
+        assert_eq!(
+            std::fs::read(folder.join("work.txt")).unwrap(),
+            work,
+            "method {method}"
+        );
+        assert!(assessed(&t, now).stages.is_empty(), "method {method}");
+        if method == 2 {
+            let done = result.expect("the rest went");
+            assert!(t.join("CACHEDIR.TAG").exists());
+            assert!(
+                done.skipped
+                    .iter()
+                    .any(|(p, why)| *p == t && why.contains("more than its CACHEDIR.TAG")),
+                "{done:?}"
+            );
+        } else {
+            let done = result.expect("the idle cache goes");
+            assert!(done.bytes > 0, "method {method}: {done:?}");
+        }
+    }
+
+    let tmp = Tmp::new("tagless-profile");
+    let t = synthetic_target(&tmp, "target");
+    lay_profile(&at(&t, ".aterm-removing/x"));
+    let found: Vec<PathBuf> = assessed(&t, now)
+        .profiles
+        .iter()
+        .map(|p| p.path.clone())
+        .collect();
+    assert!(found.contains(&at(&t, ".aterm-removing/x")), "{found:?}");
+
+    let tmp = Tmp::new("tagless-empty");
+    let t = synthetic_target(&tmp, "target");
+    let empty = at(&t, "debug/.aterm-removing-1");
+    std::fs::create_dir(&empty).unwrap();
+    assert_eq!(assessed(&t, now).stages.len(), 1);
+    let done = reclaim(&t, &judge(now)).expect("reclaimed");
+    assert!(!empty.exists());
+    assert!(done.units.contains(&empty), "{done:?}");
+}
+
+/// A stage whose tag another pass holds is that pass's: a pass leaves it, and stages what it
+/// takes beside it under the next free name.
+///
+/// Negative control: once the hold is let go, the next pass finishes the stage.
+#[cfg(unix)]
+#[test]
+fn a_stage_its_pass_still_holds_is_left_to_it() {
+    let tmp = Tmp::new("stage-held");
+    let t = synthetic_target(&tmp, "target");
+    let now = now_after_write(STALE + 1);
+    let stage = lay_stage(&t.join("debug"), STAGE);
+    let hold = take(&stage.join(STAGE_TAG));
+    let mut beside = Vec::new();
+    let done = reclaim_with(&t, &judge(now), &mut |step, _| {
+        if step == Stage::Staged {
+            beside = stages_in(&t);
+        }
+    })
+    .expect("the idle cache still goes");
+    assert_eq!(std::fs::read(stage.join("taken.bin")).unwrap(), [5u8; 8192]);
+    assert!(
+        done.skipped
+            .iter()
+            .any(|(p, why)| *p == stage && why.contains("its pass is still deleting it")),
+        "{done:?}"
+    );
+    assert!(
+        beside.contains(&at(&t, "debug/.aterm-removing-1")),
+        "{beside:?}"
+    );
+    assert!(
+        done.units.contains(&t.join("debug").join(INCREMENTAL)),
+        "{done:?}"
+    );
+    assert!(!t.join("debug").join(INCREMENTAL).exists());
+
+    drop(hold);
+    let again = reclaim(&t, &judge(now)).expect("the stage goes once its pass lets go");
+    assert!(!stage.exists());
+    assert!(again.units.contains(&stage), "{again:?}");
+}
+
+/// Only the idle row finishes what an earlier pass left staged with no cargo lock of its own.
+/// A pressure row, a whole removal and a tier-3 removal that refuse (here: a build holds a
+/// lock) answer with the refusal alone and leave the stage as it was, and a whole removal that
+/// goes finishes the stage at its root only once it let its own locks go.
+///
+/// Negative control: under the same held lock the idle reclaim finishes the stage and answers
+/// with it. A remover that finished stages before its own checks would answer "removed" for a
+/// row it refused, with no lock taken.
+#[cfg(unix)]
+#[test]
+fn a_removal_that_refuses_finishes_no_stage_unless_it_is_the_idle_row() {
+    let now = now_after_write(STALE + 1);
+    for method in 0..4 {
+        let tmp = Tmp::new("stage-refused");
+        let t = synthetic_target(&tmp, "target");
+        let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+        let stage = if method == 2 {
+            lay_stage(&t, STAGE)
+        } else {
+            lay_stage(&t.join("debug"), STAGE)
+        };
+        let build = Build::holds(&t.join("debug/.cargo-lock"));
+        let result = ordinary_method(method, &t, now, seen, &mut |_, _| {});
+        drop(build);
+        if method == 0 {
+            let done = result.expect("the idle row finishes the stage");
+            assert_eq!(done.units, vec![stage.clone()], "{done:?}");
+            assert!(!stage.exists());
+            assert!(
+                done.skipped
+                    .iter()
+                    .any(|(_, why)| why.contains("a build holds")),
+                "{done:?}"
+            );
+            continue;
+        }
+        let error = result.expect_err("refused");
+        assert!(
+            error.to_string().contains("a build holds"),
+            "method {method}: {error}"
+        );
+        assert_eq!(
+            std::fs::read(stage.join("taken.bin")).unwrap(),
+            [5u8; 8192],
+            "method {method}"
+        );
+        assert!(stage.join(STAGE_TAG).exists(), "method {method}");
+    }
+
+    let tmp = Tmp::new("stage-whole-after");
+    let t = synthetic_target(&tmp, "target");
+    let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+    let stage = lay_stage(&t, STAGE);
+    let mut released = false;
+    let mut finished_after = None;
+    let done = reclaim_whole_with(
+        &t,
+        &judge(now),
+        seen,
+        DAY,
+        &mut || Ok(()),
+        &mut |step, at| {
+            released |= step == Stage::Released;
+            if step == Stage::Removing && at == stage.as_path() && finished_after.is_none() {
+                finished_after = Some(released);
+            }
+        },
+    )
+    .expect("goes whole");
+    assert_eq!(finished_after, Some(true), "after its locks: {done:?}");
+    assert!(done.units.contains(&stage), "{done:?}");
+    assert!(done.units.contains(&t), "{done:?}");
+    assert!(!t.exists());
+}
+
+/// Where a rename says partway that nothing more can be staged here, what was not staged is
+/// deleted in place while the locks are still held, and only the stage once they are let go:
+/// each `Deleting` names what it deletes, the profile under its locks or the stage after them.
+///
+/// Negative control: with no fault nothing is removed under the lock. A pass that let go
+/// before it deleted the rest in place would show a removal outside the stage with the lock
+/// let go.
+#[cfg(unix)]
+#[test]
+fn what_cannot_be_staged_partway_is_deleted_in_place_before_the_locks_go() {
+    for fault in [Some((1, libc::ENOSYS)), None] {
+        let tmp = Tmp::new("stage-partway");
+        let t = synthetic_target(&tmp, "target");
+        let now = now_after_write(STALE + 1);
+        let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+        let taken = taken_by(3, &t);
+        let lock = t.join("debug/.cargo-lock");
+        let mut order = Vec::new();
+        let mut removals = Vec::new();
+        fd::inject_move_fault(fault);
+        let result = ordinary_method(3, &t, now, seen, &mut |stage, at| {
+            if stage == Stage::Removing {
+                removals.push((at.ancestors().any(is_stage_path), held(&lock)));
+            } else {
+                order.push((stage, is_stage_path(at)));
+            }
+        });
+        fd::inject_move_fault(None);
+        let done = result.expect("reclaimed");
+        assert_eq!(done.bytes, taken, "{fault:?}: {done:?}");
+        assert!(stages_in(&t).is_empty(), "{fault:?}");
+        let mut expected = vec![
+            (Stage::Locked, false),
+            (Stage::Staging, false),
+            (Stage::Staged, false),
+            (Stage::Released, false),
+            (Stage::Deleting, true),
+        ];
+        if fault.is_none() {
+            assert_eq!(order, expected, "(stage, names a stage)");
+            assert!(
+                removals.iter().all(|r| *r == (true, false)),
+                "(in the stage, lock held): {removals:?}"
+            );
+            continue;
+        }
+        expected.insert(3, (Stage::Deleting, false));
+        assert_eq!(order, expected, "(stage, names a stage)");
+        assert!(removals.contains(&(false, true)), "{removals:?}");
+        assert!(removals.contains(&(true, false)), "{removals:?}");
+        assert!(
+            removals.iter().all(|(staged, locked)| staged != locked),
+            "in place only under the lock, the stage only after: {removals:?}"
+        );
+    }
+}
+
+/// A whole removal reads what it carried again at its stage, under the locks: a managed build
+/// cache that landed in it after the scan made before the locks moves back with everything
+/// else, and all of it then goes in place under the locks, a delete that stops at the cache.
+///
+/// Negative control: with no cache the same removal deletes its stage once the locks are let
+/// go. Without the second read the stage would be deleted around the cache after the locks,
+/// the cache out of its place the while.
+#[cfg(unix)]
+#[test]
+fn a_whole_removal_reads_what_it_carried_again_at_the_stage() {
+    let marker = atpkg::build_cache::registered::MARKER;
+    for lands in [true, false] {
+        let tmp = Tmp::new("stage-reread");
+        let t = synthetic_target(&tmp, "target");
+        let now = now_after_write(STALE + 1);
+        let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+        let mut order = Vec::new();
+        let result = reclaim_whole_with(
+            &t,
+            &judge(now),
+            seen,
+            DAY,
+            &mut || Ok(()),
+            &mut |stage, _| {
+                if stage == Stage::Removing {
+                    return;
+                }
+                if stage == Stage::Staged && lands {
+                    let carried = at(&t, ".aterm-removing/debug/build/nested");
+                    std::fs::create_dir(&carried).expect("a cache");
+                    std::fs::write(carried.join(marker), b"held").expect("its marker");
+                }
+                order.push(stage);
+            },
+        );
+        assert!(stages_in(&t).is_empty(), "lands {lands}");
+        if !lands {
+            result.expect("goes whole");
+            assert_eq!(order, STAGED_ORDER);
+            assert!(!t.exists());
+            continue;
+        }
+        let text = match result {
+            Ok(done) => done.trouble.join("; "),
+            Err(error) => error.to_string(),
+        };
+        assert!(text.contains(MANAGED_CACHE), "{text}");
+        assert_eq!(
+            order,
+            [
+                Stage::Locked,
+                Stage::Staging,
+                Stage::Staged,
+                Stage::Deleting,
+                Stage::Released,
+            ]
+        );
+        assert_eq!(
+            std::fs::read(at(&t, "debug/build/nested").join(marker)).unwrap(),
+            b"held",
+            "the cache is back where it was, whole"
+        );
+    }
+}
+
+/// What moves back out of a stage never replaces an entry: where a fresh `incremental/` stands
+/// in the profile by the time custody refuses what was staged, the staged one stays in its
+/// stage, under its tag, and the fresh one is untouched.
+///
+/// Negative control: a move back by a plain rename would put the staged folder over the empty
+/// one, which would then hold the query cache. With nothing standing there everything is back
+/// and no stage is left (`custody_read_again_at_the_stage_moves_everything_back`).
+#[cfg(unix)]
+#[test]
+fn a_move_back_never_replaces_what_stands_there() {
+    let tmp = Tmp::new("stage-no-replace");
+    let t = synthetic_target(&tmp, "target");
+    let now = now_after_write(STALE + 1);
+    let inc = t.join("debug").join(INCREMENTAL);
+    let result = reclaim_with(&t, &judge(now), &mut |stage, _| {
+        if stage == Stage::Staged {
+            std::fs::create_dir(&inc).expect("a fresh incremental/");
+            std::fs::write(
+                t.join(atpkg::build_cache::registered::MARKER),
+                br#"{"schema":3}"#,
+            )
+            .unwrap();
+        }
+    });
+    let text = match result {
+        Ok(done) => done.trouble.join("; "),
+        Err(error) => error.to_string(),
+    };
+    assert!(text.contains("it stays staged"), "{text}");
+    assert!(names_in(&inc).is_empty(), "the fresh folder is as it was");
+    let stages = stages_in(&t);
+    assert_eq!(stages.len(), 1, "{stages:?}");
+    assert!(stages[0].join(STAGE_TAG).exists(), "it keeps its tag");
+    let cache = at(
+        &stages[0],
+        "incremental/lay-1x2y3z/s-abc-def/query-cache.bin",
+    );
+    assert_eq!(std::fs::read(cache).unwrap(), [9u8; 8192]);
+}
+
+/// What the delete of a stage leaves goes back only under the profile's cargo locks: while a
+/// build that started there holds one, what could not be deleted stays staged under its tag,
+/// and a later pass finishes it.
+///
+/// Negative control: with no build the same stuck entry is back where it was and no stage
+/// stands (`an_undeletable_entry_is_reported_and_its_siblings_still_go`).
+#[cfg(unix)]
+#[test]
+fn what_a_delete_leaves_stays_staged_while_a_build_holds_the_profile() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = Tmp::new("stage-left-held");
+    let t = synthetic_target(&tmp, "target");
+    let debug = t.join("debug");
+    let stuck = Stuck::at(&debug.join(INCREMENTAL).join("stuck"));
+    let now = now_after_write(STALE + 1);
+    let mut build: Option<Build> = None;
+    let done = reclaim_with(&t, &judge(now), &mut |stage, _| {
+        if stage == Stage::Removing && build.is_none() {
+            build = Some(Build::holds(&debug.join(".cargo-lock")));
+        }
+    })
+    .expect("partly reclaimed");
+    drop(stuck);
+    let stage = debug.join(STAGE);
+    let staged = at(&stage, "incremental/stuck");
+    assert!(staged.join("file").exists(), "{done:?}");
+    assert!(
+        !debug.join(INCREMENTAL).exists(),
+        "nothing went back beside the build"
+    );
+    assert!(
+        done.trouble.iter().any(|t| t.contains("stays staged")),
+        "{done:?}"
+    );
+    assert!(stage.join(STAGE_TAG).exists());
+    drop(build);
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let again = reclaim(&t, &judge(now)).expect("the next pass finishes the stage");
+    assert_eq!(again.units, vec![stage.clone()], "{again:?}");
+    assert!(!stage.exists());
+}
+
+/// A stage inside a build directory named inside this one is that directory's to finish: the
+/// outer directory's reclaim leaves it, as it leaves that directory's profiles.
+///
+/// Negative control: the same reclaim told of no directory inside finishes both stages.
+#[cfg(unix)]
+#[test]
+fn a_stage_in_a_build_directory_named_inside_is_left_to_it() {
+    let now = now_after_write(STALE + 1);
+    for named in [true, false] {
+        let tmp = Tmp::new("stage-leave");
+        let outer = synthetic_target(&tmp, "target");
+        let inner = lay_target(&outer.join("nested/target"));
+        let mine = lay_stage(&outer.join("debug"), STAGE);
+        let theirs = lay_stage(&inner.join("debug"), STAGE);
+        let leave = if named {
+            vec![inner.clone()]
+        } else {
+            Vec::new()
+        };
+        let done = reclaim_leaving(&outer, &judge(now), &leave).expect("reclaimed");
+        assert!(!mine.exists(), "named {named}: {done:?}");
+        assert!(done.units.contains(&mine), "named {named}: {done:?}");
+        assert_eq!(theirs.exists(), named, "{done:?}");
+        assert_eq!(done.units.contains(&theirs), !named, "{done:?}");
+    }
+}
+
+/// A build that starts in a build directory between a whole removal's last look at it and its
+/// `rmdir` keeps the directory, with its `CACHEDIR.TAG` written back as it was.
+///
+/// Negative control: with no build starting there the directory goes whole.
+#[cfg(unix)]
+#[test]
+fn a_build_that_starts_as_the_root_goes_gets_its_tag_back() {
+    for starts in [true, false] {
+        let tmp = Tmp::new("whole-tag-back");
+        let t = synthetic_target(&tmp, "target");
+        let now = now_after_write(STALE + 1);
+        let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+        let tag = std::fs::read(t.join("CACHEDIR.TAG")).expect("tag");
+        let done = reclaim_whole_with(
+            &t,
+            &judge(now),
+            seen,
+            DAY,
+            &mut || Ok(()),
+            &mut |stage, at| {
+                if starts && stage == Stage::Removing && at == t {
+                    std::fs::create_dir(t.join("debug")).expect("a build's profile");
+                }
+            },
+        )
+        .expect("the rest went");
+        if !starts {
+            assert_eq!(done.units, std::slice::from_ref(&t), "{done:?}");
+            assert!(!t.exists());
+            continue;
+        }
+        assert!(done.units.is_empty(), "{done:?}");
+        assert!(
+            done.skipped
+                .iter()
+                .any(|(p, why)| *p == t && why.contains("is written back")),
+            "{done:?}"
+        );
+        assert_eq!(std::fs::read(t.join("CACHEDIR.TAG")).expect("tag"), tag);
+        assert!(t.join("debug").is_dir());
     }
 }
 
@@ -2165,8 +3228,8 @@ fn the_compilers_own_names_say_what_a_died_build_left() {
 /// is free and an old metadata folder are listed, in `deps/` and in a build script's output
 /// folder laid out by unit (`build/<unit>/out/`, where a probe such as autocfg compiles); a young
 /// one of each ripens; a session whose lock a rustc holds is waited for and reads released once
-/// it is let go; a finished session, a session with no lock file and an `rmeta` file (no folder)
-/// are left.
+/// it is let go; a finished session, an unfamiliar session name, a session with no lock file
+/// and an `rmeta` file (no folder) are left.
 /// NEGATIVE CONTROL: a reader without the lock probe lists the held session as a piece to take,
 /// one without the age gate lists the young ones, and one that reads only
 /// `build/<unit>/<run>/out/` misses the build script's; each fails the `partials` line.
@@ -2193,6 +3256,7 @@ fn a_died_build_is_read_by_age_and_lock_and_a_held_session_is_waited_for() {
     let young = session("young1-b2", true, now - 5);
     let held = session("held1-c3", true, now - 600);
     session("nolock1-d4", false, now - 600);
+    let unknown = session("old1", true, now - 600);
     let finished = krate.join("s-abc-def-0123abcd");
     std::fs::create_dir_all(&finished).expect("finished");
     let metadata = |folder: &str, name: &str, at: i64| {
@@ -2232,7 +3296,7 @@ fn a_died_build_is_read_by_age_and_lock_and_a_held_session_is_waited_for() {
     assert!(!died.held[0].released(), "a rustc still holds it");
     drop(build);
     assert!(died.held[0].released(), "let go");
-    assert!(young.exists() && held.exists() && finished.exists());
+    assert!(young.exists() && held.exists() && finished.exists() && unknown.exists());
 }
 
 /// TIER 0's remover takes a died build's piece under the profile's locks and the session's own,
@@ -2342,6 +3406,144 @@ fn a_died_builds_piece_goes_under_its_locks_and_its_folders_times_stay() {
     reclaim_died(&target, &profile, &finished, &judge, now, &mut || Ok(()))
         .expect_err("a finished session is no piece of a died build");
     assert!(finished.exists());
+}
+
+/// A whole removal walks what it staged, under the locks, for a profile it did not lock: one
+/// a build started after the walk made under the locks (here, between that walk and the
+/// stage) moves back with everything else, and nothing goes.
+///
+/// Negative control: with no new profile the same removal goes whole. Without the walk at the
+/// stage, `release/` would be deleted with the rest once the locks were let go, its build's
+/// lock held the while.
+#[cfg(unix)]
+#[test]
+fn a_profile_a_build_starts_after_the_locks_moves_back_and_nothing_goes() {
+    let now = now_after_write(2);
+    for starts in [true, false] {
+        let tmp = Tmp::new("whole-late-profile");
+        let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
+        let mut build: Option<Build> = None;
+        let result = reclaim_whole_with(
+            &t,
+            &judge(now),
+            now,
+            DAY,
+            &mut || Ok(()),
+            &mut |stage, _| {
+                if stage == Stage::Staging && starts {
+                    lay_profile(&t.join("release"));
+                    build = Some(Build::holds(&at(&t, "release/.cargo-lock")));
+                }
+            },
+        );
+        if !starts {
+            result.expect("goes whole");
+            assert!(!t.exists());
+            continue;
+        }
+        let error = result.expect_err("nothing goes");
+        assert!(error.to_string().contains("did not lock"), "{error}");
+        assert!(at(&t, "release/deps/liblay.rlib").exists(), "{error}");
+        assert!(at(&t, "debug/deps/liblay.rlib").exists(), "{error}");
+        assert!(stages_in(&t).is_empty(), "{error}");
+        drop(build);
+    }
+}
+
+/// What a stage's finish cannot delete goes back where it was once its folder is quiet, and
+/// the stage goes; while a build holds the profile it stays staged, under its tag, for a later
+/// pass; where a build laid its own in its place, it stays in the stage, which loses its tag,
+/// so no pass counts or finishes it again.
+///
+/// Negative control: a finish that only deletes keeps, in every case, a tagged stage that each
+/// idle pass counts and fails on again.
+#[cfg(unix)]
+#[test]
+fn what_a_stage_finish_leaves_goes_back_or_stops_being_a_stage() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let now = now_after_write(STALE + 1);
+    for case in ["quiet", "held", "taken"] {
+        let tmp = Tmp::new("stage-settle");
+        let t = synthetic_target(&tmp, "target");
+        let debug = t.join("debug");
+        if case != "taken" {
+            std::fs::remove_dir_all(debug.join(INCREMENTAL)).expect("its name free");
+        }
+        let stage = lay_stage(&debug, STAGE);
+        let stuck = Stuck::at(&stage.join(INCREMENTAL).join("stuck"));
+        let build = (case == "held").then(|| Build::holds(&debug.join(".cargo-lock")));
+        let result = reclaim(&t, &judge(now));
+        drop(build);
+        drop(stuck);
+        let back = debug.join(INCREMENTAL).join("stuck");
+        let _ = std::fs::set_permissions(&back, std::fs::Permissions::from_mode(0o755));
+        let text = match &result {
+            Ok(done) => done.trouble.join("; "),
+            Err(error) => error.to_string(),
+        };
+        let staged = stage.join(INCREMENTAL).join("stuck/file");
+        match case {
+            "quiet" => {
+                assert!(back.join("file").exists(), "{case}: {text}");
+                assert!(stages_in(&t).is_empty(), "{case}: {text}");
+            }
+            "held" => {
+                assert!(staged.exists(), "{case}: {text}");
+                assert!(stage.join(STAGE_TAG).exists(), "{case}: {text}");
+                assert!(text.contains("a later pass finishes it"), "{case}: {text}");
+                assert_eq!(assessed(&t, now).stages.len(), 1, "{case}: {text}");
+            }
+            _ => {
+                assert!(staged.exists(), "{case}: {text}");
+                assert!(!stage.join(STAGE_TAG).exists(), "{case}: {text}");
+                assert!(text.contains("no longer a stage"), "{case}: {text}");
+                assert!(assessed(&t, now).stages.is_empty(), "{case}: {text}");
+            }
+        }
+    }
+}
+
+/// The scan a removal makes of what it would stage passes over a profile's `incremental/`,
+/// which rustc alone writes: a cache past the scan's bound still stages, so the largest
+/// removals are the ones that let the locks go first.
+///
+/// Negative control: the same entries in `deps/`, which the scan reads, run it into its bound,
+/// and what is taken is deleted in place under the locks.
+#[cfg(unix)]
+#[test]
+fn a_profiles_incremental_is_never_scanned_before_it_is_staged() {
+    let bounded = WalkBudget {
+        entries: 40,
+        ..WalkBudget::SHIPPED
+    };
+    for method in [2, 3] {
+        for folder in [INCREMENTAL, "deps"] {
+            let tmp = Tmp::new("stage-scan-inc");
+            let t = synthetic_target(&tmp, "target");
+            let now = now_after_write(STALE + 1);
+            let seen = assessed(&t, now).profiles[0].last_used.unwrap();
+            let many = t.join("debug").join(folder).join("many");
+            std::fs::create_dir_all(&many).expect("many");
+            for n in 0..100 {
+                std::fs::write(many.join(format!("e{n}")), b"x").expect("entry");
+            }
+            let mut order = Vec::new();
+            fd::inject_scan_budget(Some(bounded));
+            let result = ordinary_method(method, &t, now, seen, &mut |stage, _| {
+                if stage != Stage::Removing {
+                    order.push(stage);
+                }
+            });
+            fd::inject_scan_budget(None);
+            result.expect("reclaimed");
+            let case = format!("method {method}, {folder}");
+            if folder == INCREMENTAL {
+                assert_eq!(order, STAGED_ORDER, "{case}");
+            } else {
+                assert_eq!(order, IN_PLACE_ORDER, "{case}");
+            }
+        }
+    }
 }
 
 #[cfg(windows)]

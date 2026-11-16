@@ -140,7 +140,8 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
 
 /// On-demand diagnostic only: no subscription runs in the idle window or normal doctor.
 fn file_events(duration: std::time::Duration) -> ExitCode {
-    let footprint = || match aterm_uds::services::look(&aterm_uds::services::FSEVENTSD) {
+    let footprint = || match aterm_uds::services::look(aterm_vitals::services::FSEVENTSD.identity())
+    {
         aterm_uds::services::Look::Running(service, _) if service.live == 1 => {
             Some((service.pid, service.start_s, service.footprint))
         }

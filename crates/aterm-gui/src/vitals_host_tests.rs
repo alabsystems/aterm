@@ -2450,9 +2450,19 @@ fn journal_read_failures_keep_facts_and_retry_the_same_file_metadata() {
         r#""kind":"removed","path":"/u/old","freed_bytes":2000000000"#,
     );
     std::fs::write(&path, format!("{removed}\n")).expect("the journal writes");
-    let mut tail = DeedTail::new(Some(path));
+    let mut tail = DeedTail::new(Some(path.clone()));
     let t0 = Instant::now();
+    // CONTROL: before its first read, and while every window is hidden, the journal is not read.
+    tail.refresh(true, true, t0, now_ms);
+    assert!(!tail.read, "a hidden reader has read nothing");
+    let mut failed = DeedTail::new(Some(path.clone()));
+    failed.refresh_with(true, false, t0, now_ms, |_| Ok((1, None)), |_| None);
+    assert!(!failed.read, "a failed tail read is not a read journal");
+    let mut missing = DeedTail::new(Some(path.with_extension("gone")));
+    missing.refresh(true, false, t0, now_ms);
+    assert!(missing.read, "a journal found missing is read: it is empty");
     tail.refresh(true, false, t0, now_ms);
+    assert!(tail.read);
     let rows = tail.rows.clone();
     let removals = tail.removals.clone();
     let seen = tail.seen.expect("successful file marker");
@@ -2697,15 +2707,17 @@ fn the_request_hands_the_gather_every_session_the_table_holds() {
 /// rows made by the writers themselves: what it records, its bytes, the free space it read,
 /// whether the chart marks it a removal, and whose it is (its session). A `stopped` row (its
 /// writer needs a pass's stop) and DC-02a's `worktree` rows are spelled by hand as their writers
-/// spell them. Read as a tail ([`deeds_of`]): a build cache's sweep intent is closed by its
-/// outcome under its stage's path, a `disk-free` and a worktree intent by their outcome, and a
-/// list that is full takes no older row into its last deed while it counts every removal.
+/// spell them, and so are the `free-ask` rows, which no build writes now: a ledger holds those an
+/// earlier build wrote until its own bound drops them. Read as a tail ([`deeds_of`]): a build
+/// cache's sweep intent is closed by its outcome under its stage's path, a `disk-free` and a
+/// worktree intent by their outcome, and a list that is full takes no older row into its last
+/// deed while it counts every removal.
 /// CONTROLS: a sweep intent with no outcome after it is listed (`began removing`); a `stopped`
 /// row's released bytes, a free-space ask's freed bytes and a refusal are no removal; closing a
 /// sweep by its path, or merging into the last deed after the list filled, fails it.
 #[test]
 fn each_journal_row_reads_as_its_writer_wrote_it() {
-    use aterm_agent::harness::disk::{self, Level, SweepAction, ask, poke};
+    use aterm_agent::harness::disk::{self, Level, SweepAction, poke};
     use atpkg::build_cache::Unused;
     let hour_ms = 1_792_000_800_000_i64;
     let t = hour_ms / 1000 + 42 * 60;
@@ -2722,9 +2734,14 @@ fn each_journal_row_reads_as_its_writer_wrote_it() {
         (got.kind, got.bytes, got.free, got.removal, sid)
     };
     let room = 2_000_000_000_u64;
-    let host = ask::HostId {
-        pid: 7,
-        start: String::new(),
+    // A `free-ask` row as the build that wrote them spelled one: `more` is its word's own fields.
+    let free_ask = |sid: &str, said: &str, level: &str, more: &str| {
+        format!(
+            "{{\"ts\":\"2026-10-14T10:42:00Z\",\"sid\":\"{sid}\",\"kind\":\"free-ask\",\
+             \"rule\":\"disk-free@v1\",\"said\":\"{said}\",\"volume\":\"/\",\
+             \"level\":\"{level}\",\"free_bytes\":{room},\"host_pid\":7{more},\
+             \"text\":\"-\"}}"
+        )
     };
 
     let screen = poke::Cause::Screen {
@@ -2743,12 +2760,13 @@ fn each_journal_row_reads_as_its_writer_wrote_it() {
         "aterm's own write ran short"
     );
 
-    let freed = ask::Said::Freed {
-        sid: "S2".into(),
-        freed: 3_000_000_000,
-    };
     assert_eq!(
-        read(&ask::row(t, "/", &freed, Level::Short, room, &host)),
+        read(&free_ask(
+            "S2",
+            "freed",
+            "short",
+            ",\"freed_bytes\":3000000000"
+        )),
         (
             DeedKind::Asked("freed".into()),
             Some(3_000_000_000),
@@ -2758,16 +2776,8 @@ fn each_journal_row_reads_as_its_writer_wrote_it() {
         ),
         "the session freed space when asked: its subject, and no removal of the software's"
     );
-    let asked = ask::Said::Asked {
-        pick: ask::Pick {
-            host: host.clone(),
-            sid: "S3".into(),
-        },
-        until_ms: 0,
-        rose: 0,
-    };
     assert_eq!(
-        read(&ask::row(t, "/", &asked, Level::Short, room, &host)),
+        read(&free_ask("S3", "asked", "short", "")),
         (
             DeedKind::Asked("asked".into()),
             None,
@@ -2776,9 +2786,8 @@ fn each_journal_row_reads_as_its_writer_wrote_it() {
             "S3".to_owned()
         )
     );
-    let ended = ask::Said::Ended { asks: 2 };
     assert_eq!(
-        read(&ask::row(t, "/", &ended, Level::Ok, room, &host)),
+        read(&free_ask("", "ended", "ok", ",\"asks\":2")),
         (
             DeedKind::Asked("ended".into()),
             None,
@@ -2788,8 +2797,11 @@ fn each_journal_row_reads_as_its_writer_wrote_it() {
         ),
         "an ask of no session is aterm's"
     );
+    let step = "{\"ts\":\"2026-10-14T10:42:00Z\",\"sid\":\"S4\",\"kind\":\"free-ask\",\
+                \"rule\":\"disk-free@v1\",\"said\":\"step\",\"volume\":\"/\",\"host_pid\":7,\
+                \"step\":\"wait:fence\"}";
     assert_eq!(
-        read(&ask::step_row(t, "S4", "/", "wait:fence", &host)),
+        read(step),
         (
             DeedKind::Asked("step wait".into()),
             None,
@@ -3612,9 +3624,13 @@ fn the_disk_facts_carry_the_budgets_cap_only_where_the_watch_sized_one() {
     let survey = Where::default();
     let facts = |of: &VolumeKey| disk_facts(&shelf, Some(of), Clock::read, &survey, home);
     let before = facts(&key).level;
-    assert_eq!(facts(&key).cap, None, "no look yet: the budget is warming");
+    assert_eq!(
+        facts(&key).cap(),
+        None,
+        "no look yet: the budget is warming"
+    );
     shelf.publish(|b| b.budget_look(Cap::Written(466), Some(key.spelled())));
-    assert_eq!(facts(&key).cap, None, "looked and not sized: no cap");
+    assert_eq!(facts(&key).cap(), None, "looked and not sized: no cap");
     shelf.publish(|b| {
         b.budget_sized(Sizing {
             volume: key.spelled(),
@@ -3628,7 +3644,7 @@ fn the_disk_facts_carry_the_budgets_cap_only_where_the_watch_sized_one() {
         });
     });
     let sized = facts(&key);
-    assert_eq!(sized.cap, Some(466 << 30), "the cap as written");
+    assert_eq!(sized.cap(), Some(466 << 30), "the cap as written");
     assert_eq!(
         sized.level,
         Some(DiskLevel::Low),
@@ -3638,20 +3654,20 @@ fn the_disk_facts_carry_the_budgets_cap_only_where_the_watch_sized_one() {
     assert!(sized.watch && sized.warn == Some(69 * GB), "{sized:?}");
     shelf.publish(|b| b.budget_look(Cap::Unwritten, Some(key.spelled())));
     assert_eq!(
-        facts(&key).cap,
+        facts(&key).cap(),
         Some(1_600 * GB),
         "unwritten: 80% of the volume"
     );
 
     shelf.publish(|b| b.budget_look(Cap::Off, Some(key.spelled())));
-    assert_eq!(facts(&key).cap, None, "CONTROL: the budget off");
+    assert_eq!(facts(&key).cap(), None, "CONTROL: the budget off");
     shelf.publish(|b| b.budget_look(Cap::Written(466), None));
-    assert_eq!(facts(&key).cap, None, "CONTROL: this process sizes none");
+    assert_eq!(facts(&key).cap(), None, "CONTROL: this process sizes none");
     shelf.publish(|b| b.budget_look(Cap::Written(466), Some(key.spelled())));
     let other = VolumeKey::Container("disk7".to_owned());
-    assert_eq!(facts(&other).cap, None, "CONTROL: another volume");
+    assert_eq!(facts(&other).cap(), None, "CONTROL: another volume");
     assert_eq!(
-        facts(&key).cap,
+        facts(&key).cap(),
         Some(466 << 30),
         "CONTROL: and its own again"
     );

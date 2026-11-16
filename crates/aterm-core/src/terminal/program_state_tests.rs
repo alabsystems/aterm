@@ -975,7 +975,24 @@ fn a_report_is_a_run_sign_only_while_its_writers_group_holds_the_front() {
     use crate::terminal::Terminal;
     let working = Some("state=working:app=claude-code");
     let idle = Some("state=idle:app=claude-code");
-    let sign = |t: &Terminal| t.program_state().run_sign();
+    // `sign()` is the same judgment by value: the report standing exactly where `run_sign()`
+    // writes one.
+    let sign = |t: &Terminal| {
+        let report = t.program_state();
+        let run = report.run_sign();
+        assert_eq!(
+            report.sign().is_some(),
+            run.is_some(),
+            "sign() judges as run_sign()"
+        );
+        assert!(
+            report
+                .sign()
+                .is_none_or(|state| Some(state) == report.state),
+            "sign() is the report standing"
+        );
+        run
+    };
     let mut term = Terminal::new(24, 80);
     term.program_front_is(100);
     term.process(b"\x1b]7501;state=working:app=claude-code\x07");

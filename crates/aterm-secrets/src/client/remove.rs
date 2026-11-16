@@ -2291,6 +2291,9 @@ pub struct NodePass {
     repaired: Repaired,
     /// Something it signed has reached no server yet.
     unposted: bool,
+    /// The last pass's apply owes a converge pass: it changed something that pass reads
+    /// ([`SyncOutcome::Applied`]'s `moved`), repaired a version, or finished an apply cut short.
+    moved: bool,
 }
 
 impl NodePass {
@@ -2309,6 +2312,7 @@ impl NodePass {
         lock_wait: Duration,
         may_post: &dyn Fn() -> bool,
     ) -> Option<(NodePassReceipt, Option<Error>)> {
+        self.moved = false;
         match config(paths) {
             Ok(None) => return None,
             Ok(Some(_)) => {}
@@ -2362,13 +2366,23 @@ impl NodePass {
             repair,
         );
         match outcome {
-            Ok(SyncOutcome::Applied { seq, .. }) => Ok(Some(seq)),
+            Ok(SyncOutcome::Applied { seq, moved, .. }) => {
+                self.moved = moved || unfinished || repair;
+                Ok(Some(seq))
+            }
             Ok(_) => Ok(None),
             Err(error) => {
                 self.repaired = kept;
                 Err(error)
             }
         }
+    }
+
+    /// Whether the last [`Self::once`] applied a version that owes a converge pass. A version that
+    /// carried only other Macs' news changed nothing that pass reads and owes none.
+    #[must_use]
+    pub const fn moved(&self) -> bool {
+        self.moved
     }
 
     /// [`repair_due`]. A Mac that holds its vault as a log alone keeps no envelope for that rule's
@@ -2571,6 +2585,9 @@ fn run_node_pass_hearing<C: super::member_routes::Changes>(
     let mut last_said = None;
     let mut unfinished = 0_u32;
     let mut converge = NodeConverge::default();
+    // Its first look starts a runner whatever it finds, which reads everything applied before
+    // it: a pass left owed until now is that one.
+    let _ = super::converge_inputs::take_owed(host.paths);
     let mut inputs = None;
     let mut heard = host
         .rung
@@ -2600,7 +2617,12 @@ fn run_node_pass_hearing<C: super::member_routes::Changes>(
                 // that moved during a pass would otherwise skip the time that pass never saw.
                 due.ran(stamp, now_ms, node_pass_wait(&host.pace, unfinished));
                 if let Some((receipt, error)) = ended {
-                    if receipt.applied.is_some() {
+                    // A pass another process's apply left owed is taken here too.
+                    let owed = super::converge_inputs::take_owed(host.paths);
+                    if owed {
+                        converge.due.because(crate::converge::Causes::APPLIED);
+                    }
+                    if (receipt.applied.is_some() && pass.moved()) || owed {
                         converge
                             .due
                             .request(crate::converge::RepositoryRequest::Repair);

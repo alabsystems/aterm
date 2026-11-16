@@ -14,6 +14,9 @@ pub mod stale;
 #[path = "build_cache_tooling.rs"]
 pub mod tooling;
 
+#[path = "build_cache_shared_units.rs"]
+pub mod shared_units;
+
 #[path = "build_cache_leftovers.rs"]
 pub mod leftovers;
 
@@ -22,6 +25,9 @@ pub mod holders;
 
 #[path = "build_cache_retired.rs"]
 pub mod retired;
+
+#[path = "build_cache_gone_entries.rs"]
+pub mod gone_entries;
 
 #[path = "build_cache_registered.rs"]
 pub mod registered;
@@ -69,7 +75,8 @@ pub use aterm_toolchain::build_cache::*;
 const DOOMED: &str = ".cargo-build.removing";
 
 /// THE STAGE NAMES FROM `base`, lowest first: `base` itself for `n` 0, then `base-<n>`.
-fn stage_name(base: &OsStr, n: u32) -> OsString {
+#[must_use]
+pub fn stage_name(base: &OsStr, n: u32) -> OsString {
     let mut name = base.to_os_string();
     if n > 0 {
         name.push(format!("-{n}"));
@@ -78,7 +85,8 @@ fn stage_name(base: &OsStr, n: u32) -> OsString {
 }
 
 /// Whether `name` is an exact output of [`stage_name`], including its `u32` ordinal domain.
-fn is_stage(name: &OsStr, base: &OsStr) -> bool {
+#[must_use]
+pub fn is_stage(name: &OsStr, base: &OsStr) -> bool {
     match name
         .as_encoded_bytes()
         .strip_prefix(base.as_encoded_bytes())
@@ -101,10 +109,25 @@ fn take_stage_name(
     base: &OsStr,
     make: &mut dyn FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<PathBuf> {
+    take_stage(base, &mut |name| make(&holder.join(name))).map(|name| holder.join(name))
+}
+
+/// TAKE A STAGE NAME OF ITS OWN, by name alone: `make` tried at each stage name from `base`,
+/// lowest first ([`stage_name`]), until one is made; a name something stands at
+/// (`AlreadyExists`: `make` never replaces an entry) moves on to the next. Any other refusal is
+/// returned. [`take_stage_name`] is this in a folder named by its path; a caller that makes its
+/// stage relative to a pinned folder (the harness's disk pass, `mkdirat`) names it here.
+/// # Errors
+/// The first refusal of `make` other than `AlreadyExists`, or `AlreadyExists` once every name is
+/// taken.
+pub fn take_stage(
+    base: &OsStr,
+    make: &mut dyn FnMut(&OsStr) -> std::io::Result<()>,
+) -> std::io::Result<OsString> {
     for n in 0..u32::MAX {
-        let path = holder.join(stage_name(base, n));
-        match make(&path) {
-            Ok(()) => return Ok(path),
+        let name = stage_name(base, n);
+        match make(&name) {
+            Ok(()) => return Ok(name),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
@@ -680,6 +703,27 @@ if [ -n "$__atb_r" ]; then
       ;;
   esac
 fi
+# aterm: an explicit SDK root for a verb that builds or runs code. A Trust compiler that had
+# to find the SDK itself (it asks xcrun) withholds reuse of that unit, so with `SDKROOT`
+# unset every build compiles each build script, binary and test again; a root it is given it
+# reuses under. A root the caller set stands; an empty one names none. The root is the one
+# the compiler would find, asked the same way, and only where developer tools are selected
+# (xcrun without them can raise the system's install dialog); each ask is a fork, so a verb
+# that builds nothing skips both. A build for another Apple platform, named on the command
+# line or in the environment, keeps the compiler's own lookup of that platform's SDK.
+if [ -n "$__atb_r" ] && [ -z "${SDKROOT-}" ] && [ -x /usr/bin/xcrun ] && [ -x /usr/bin/xcode-select ]; then
+  case " $* ${CARGO_BUILD_TARGET-} ${TARGO_BUILD_TARGET-} " in
+    *-apple-ios* | *-apple-tvos* | *-apple-watchos* | *-apple-visionos*) ;;
+    *)
+      if /usr/bin/xcode-select -p >/dev/null 2>&1; then
+        __atb_y=$(/usr/bin/xcrun --show-sdk-path 2>/dev/null) || __atb_y=
+        case $__atb_y in
+          /?*) if [ -d "$__atb_y" ]; then SDKROOT=$__atb_y; export SDKROOT; fi ;;
+        esac
+      fi
+      ;;
+  esac
+fi
 "#;
 
 /// The block a shim forwarding to the store file `name` carries: `targo`'s, or `targo-tippy`'s, which names no subcommand (it is the lint).
@@ -874,6 +918,15 @@ pub enum Unused {
     Refused { by: Refusal },
     /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
     Tooling { idle: Duration, after: Duration },
+    /// Units of the shared dependency store targo fills ([`shared_units`]): `units` of them, the
+    /// most recently used unused for `idle`, at least `after` ([`RECLAIM_IDLE`], or
+    /// [`shared_units::OVER_BUDGET`] over the rebuildable budget). A removal takes one unit while
+    /// it holds that unit's lock; a plan lists the store once with every unit a pass would take.
+    SharedUnits {
+        units: usize,
+        idle: Duration,
+        after: Duration,
+    },
     /// A regenerable cache outside the shared cache ([`leftovers`]): a directory carrying a signed cache directory tag in a campaign scope, a worktree root or a per-campaign cache folder, it and its unit's own folder unwritten for `idle`, at least `after`; `finished` when the unit holds a receipt naming it landed or delivered ([`leftovers::receipt`]).
     Leftover {
         idle: Duration,
@@ -2331,8 +2384,9 @@ fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// One pass over this user's roots, now: the dead entries of the root the cache moved from
-/// ([`reclaim_moved`]), its tooling cache ([`tooling::reclaim`]), the leftovers outside the
-/// shared cache ([`leftovers`]) and each registered cache, then
+/// ([`reclaim_moved`]), its tooling cache ([`tooling::reclaim`]), the shared dependency stores'
+/// units unused a month ([`shared_units::reclaim`]), the leftovers outside the shared cache
+/// ([`leftovers`]) and each registered cache, then
 /// the shared cache ([`reclaim_watched`]), then each live registered cache's stale parts and each
 /// package target, unless the shared cache's record declined a prune; `record` is asked before
 /// each removal, and every path is returned with why it went. Nothing off macOS or without a home.
@@ -2401,11 +2455,13 @@ pub fn gone_leaves(root: &Path, home: Option<&Path>) -> std::collections::BTreeS
 }
 
 /// WHAT COSTS NOTHING GOES FIRST, ACROSS EVERY ROOT, because a pass may stop at a goal: the root
-/// the cache moved from, the tooling, the leftovers of finished and idle units ([`leftovers`])
+/// the cache moved from, the tooling, the shared dependency store's month-unused units
+/// ([`shared_units`]), the leftovers of finished and idle units ([`leftovers`])
 /// and each registered cache's dead entries, then the shared
 /// cache's dead entries and its live worktrees' stale parts, then each live registered cache's
 /// and each package target, whose retirement costs a cold build.
-/// `shared` adds the shared cache, the moved root, the tooling and the leftovers to the registered
+/// `shared` adds the shared cache, the moved root, the tooling, the dependency store and the
+/// leftovers to the registered
 /// caches. Once
 /// the shared cache's record declines a prune no registered cache is pruned, since that would only
 /// move its parts aside and back. Each registered cache decides for itself below that: a run's
@@ -2428,6 +2484,7 @@ fn reclaim_roots(
             record,
             fence,
         ));
+        removed.extend(shared_units::reclaim(home, now, record));
         removed.extend(leftovers::reclaim_on(
             home,
             now,
@@ -2484,11 +2541,13 @@ pub fn reclaim_beside_sessions(
     )
 }
 
-/// WHAT THE DISK WATCH SWEEPS OVER THE REBUILDABLE BUDGET: `home`'s shared build cache alone,
-/// as [`reclaim_home_watched`] sweeps it with room ([`ReclaimAfter::CALM`]), except that a stale
+/// WHAT THE DISK WATCH SWEEPS OVER THE REBUILDABLE BUDGET: `home`'s shared build cache, as
+/// [`reclaim_home_watched`] sweeps it with room ([`ReclaimAfter::CALM`]), except that a stale
 /// part of a build directory there whose workspace `keeps` does not keep (`keeps(leaf,
 /// workspace)`: a live session works in it, started a build there or used it in its recent
-/// runs) goes once unwritten an hour ([`ReclaimAfter::OVER_BUDGET`]). The other roots (the one
+/// runs) goes once unwritten an hour ([`ReclaimAfter::OVER_BUDGET`]); then the shared dependency
+/// stores' units unused an hour, least recently used first across them, each while no build holds its lock
+/// ([`shared_units::reclaim_lru`]), which no workspace keeps. The other roots (the one
 /// the cache moved from, tooling, the registered caches) are not swept here: `keeps` reads no
 /// session of their builds, so over the budget they would go by the calm sweep's age rule
 /// alone, which the watch's own sweeps and the daily passes apply already. `keeps` only ever
@@ -2507,7 +2566,7 @@ pub fn reclaim_over_budget(
         return Vec::new();
     }
     let root = cache_root(home);
-    reclaim_root_on(
+    let mut removed = reclaim_root_on(
         &root,
         Some(home),
         now,
@@ -2516,7 +2575,9 @@ pub fn reclaim_over_budget(
         record,
         &fence::Fence::default(),
     )
-    .0
+    .0;
+    removed.extend(shared_units::reclaim_lru(home, now, record));
+    removed
 }
 
 /// [`reclaim`] over this user's cache, now, each path returned with why it went; nothing off macOS or without a home.
@@ -2656,8 +2717,9 @@ pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
     planned
 }
 
-/// Advisory candidates for this user's current, moved, tooling and registered caches and the
-/// leftovers outside them ([`leftovers::plan`]), with
+/// Advisory candidates for this user's current, moved, tooling and registered caches, the
+/// shared dependency stores ([`shared_units::roots`], [`shared_units::plan`]) and the leftovers outside them
+/// ([`leftovers::plan`]), with
 /// the same observed per-volume stale-parts policy as explicit cleanup. Whole-cache,
 /// moved and tooling policies remain fixed. Active use is checked by cleanup. Nothing
 /// is listed off macOS or without a home.
@@ -2682,6 +2744,9 @@ fn plan_home_on(
     let mut planned = plan_on(&cache_root(home), Some(home), now, policy, None);
     planned.extend(plan_moved(&moved_from(home), now));
     planned.extend(tooling::plan(&tooling::root(home), now));
+    for store in shared_units::roots(home) {
+        planned.extend(shared_units::plan(&store, now));
+    }
     planned.extend(leftovers::plan(home, now, policy.pressed(home)));
     planned.extend(registered::plan_on(home, now, policy));
     planned

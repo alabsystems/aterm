@@ -21,6 +21,7 @@ pub mod model;
 pub mod net_counter;
 pub mod peaks;
 pub mod program_check;
+pub mod published_cpu;
 pub mod ring;
 pub mod runq;
 pub mod scheduling;

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `sys disk held`: who holds home's volume, and what aterm's own passes do with each holding
-//! by themselves. A record, not a request: it decides nothing, moves nothing and asks nothing
+//! `sys disk held`: who holds home's volume, what aterm's own passes do with each holding by
+//! themselves, and what the disk journal says they removed (`removed` lines, newest first). A record, not a request: it decides nothing, moves nothing and asks nothing
 //! of anyone. The host gathers the rows ([`Holdings`]) from what it already holds; this module
 //! balances them against the volume's used bytes ([`balance`]) and prints them as lines and as
 //! JSON.
@@ -10,7 +10,7 @@
 use super::json::Jv;
 use super::view::{self, Line};
 use super::{Ctx, VolumeFacts, exe_word, pct, under};
-use crate::model::{Snapshot, VolumeSample};
+use crate::model::{DeedBy, DeedKind, DiskDeed, Snapshot, VolumeSample};
 use crate::words;
 
 /// Whether the session that made a holding is at work.
@@ -79,6 +79,9 @@ pub enum Worktree {
     Cache,
     /// aterm's tooling cache: the pinned tools its checks provision.
     Tooling,
+    /// A cache folder tools rebuild or download again, outside aterm's own (`~/.cache`,
+    /// `~/Library/Caches`), less the cache rows of their own.
+    Caches,
     /// aterm's own folders, less the cache rows of their own: its state, and in its caches
     /// folder what no cache row holds (the disk reserve, virtual machines, …).
     Aterm,
@@ -99,6 +102,7 @@ impl Worktree {
             Self::Build => "build",
             Self::Cache => "cache",
             Self::Tooling => "tooling",
+            Self::Caches => "caches",
             Self::Aterm => "aterm",
             Self::OptIn => "opt-in",
             Self::Other => "unclassified",
@@ -137,6 +141,13 @@ pub enum Next {
         /// The daily pass's days, where it runs.
         stale_days: Option<u64>,
     },
+    /// The pressure pass's outside-cache step takes each proven cache in it that nothing used
+    /// for `idle_days`, least recently used first, once the tiers have nothing left and the
+    /// volume is still short.
+    OutsideCaches {
+        /// `[disk] idle_build_days`: the days a folder stays unwritten before the step takes it.
+        idle_days: u64,
+    },
     /// No walk measured it, so no pass can be named for it.
     Unknown,
 }
@@ -150,6 +161,7 @@ impl Next {
             Self::TierPass => "tier",
             Self::DailyCache { .. } | Self::DailyUnused { .. } => "daily-cache",
             Self::RunEnd { .. } => "run-end",
+            Self::OutsideCaches { .. } => "outside-caches",
             Self::Unknown => "unknown",
         }
     }
@@ -160,6 +172,16 @@ impl Next {
         match self {
             Self::DailyCache { stale_days } => Some(stale_days),
             Self::RunEnd { stale_days } => stale_days,
+            _ => None,
+        }
+    }
+
+    /// The days a folder stays unwritten before the outside-cache step takes it, where this
+    /// names that step.
+    #[must_use]
+    pub fn idle_days(self) -> Option<u64> {
+        match self {
+            Self::OutsideCaches { idle_days } => Some(idle_days),
             _ => None,
         }
     }
@@ -201,6 +223,12 @@ impl Next {
                 }
                 out
             }
+            Self::OutsideCaches { idle_days } => format!(
+                "each proven cache (a build or package tool's own, or one its tool tagged) \
+                 nothing used for {} goes, least recently used first, when the disk runs short \
+                 and aterm's other passes have nothing left; any other folder stays",
+                days(idle_days)
+            ),
             Self::Unknown => "not known, no walk measured it".to_owned(),
         }
     }
@@ -221,6 +249,9 @@ impl Next {
                 format!("daily pass, entries unused {}", span(after_s))
             }
             Self::RunEnd { .. } => "trimmed when a verify run ends here".to_owned(),
+            Self::OutsideCaches { idle_days } => {
+                format!("short-disk pass, caches unused {}", days(idle_days))
+            }
             Self::Unknown => "not known".to_owned(),
         }
     }
@@ -234,6 +265,7 @@ impl Next {
             Self::TierPass => "low-disk pass",
             Self::DailyCache { .. } | Self::DailyUnused { .. } => "daily pass",
             Self::RunEnd { .. } => "at a run's end",
+            Self::OutsideCaches { .. } => "short-disk pass",
             Self::Unknown => "not known",
         }
     }
@@ -453,6 +485,39 @@ fn filling_per_h(s: &Snapshot) -> Option<u64> {
         .map(|r| (r.max(0.0) * 3600.0).round() as u64)
 }
 
+/// What the disk journal says the software removed, newest first: each deed whose rows removed
+/// something ([`DeedKind::Removed`]), with what went.
+fn removals(s: &Snapshot) -> Vec<(&DiskDeed, &str)> {
+    s.facts
+        .disk
+        .as_ref()
+        .map(|d| {
+            d.deeds
+                .iter()
+                .filter_map(|deed| match &deed.kind {
+                    DeedKind::Removed(what) => Some((deed, what.as_str())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whose a removal was, as `by=` prints it: aterm's own passes, or a session's.
+fn by_word(by: &DeedBy) -> String {
+    match by {
+        DeedBy::Aterm => "aterm".to_owned(),
+        DeedBy::Tab(Some(tab)) => format!("tab:{tab}"),
+        DeedBy::Tab(None) => "session".to_owned(),
+    }
+}
+
+/// Seconds from `at_unix_ms` to the reply's `as_of_unix_ms`, never below 0.
+fn age_s(ctx: &Ctx<'_>, at_unix_ms: i64) -> u64 {
+    let at = u64::try_from(at_unix_ms).unwrap_or(0);
+    ctx.as_of_unix_ms.saturating_sub(at) / 1000
+}
+
 fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
@@ -518,6 +583,20 @@ pub(super) fn text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 Class::Unclassified.word(),
                 Next::Unknown.pass(),
                 Next::Unknown.says()
+            ),
+        ));
+    }
+    for (i, (deed, what)) in removals(s).into_iter().enumerate() {
+        let n = i + 1;
+        lines.push(view::line(
+            format!("removed {n}"),
+            format!(
+                "removed n={n} age_s={} rows={} bytes={} by={} what={}",
+                age_s(ctx, deed.at_unix_ms),
+                deed.n,
+                view::rec(deed.bytes, "not_read"),
+                by_word(&deed.by),
+                pct(what)
             ),
         ));
     }
@@ -617,6 +696,25 @@ pub(super) fn json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             Jv::known_or(h.oldest_walk_s, "not_sampled"),
         ),
         ("rows", Jv::Arr(rows)),
+        (
+            "removed",
+            Jv::Arr(
+                removals(s)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (deed, what))| {
+                        Jv::obj([
+                            ("n", Jv::u(i as u64 + 1)),
+                            ("age_s", Jv::u(age_s(ctx, deed.at_unix_ms))),
+                            ("rows", Jv::u(u64::from(deed.n))),
+                            ("bytes", Jv::known_or(deed.bytes, "not_read")),
+                            ("by", Jv::s(by_word(&deed.by))),
+                            ("what", Jv::s(what.to_owned())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
     ])
 }
 
@@ -662,6 +760,9 @@ fn next_json(next: Next) -> Jv {
     }
     if let Some(s) = next.unused_s() {
         o.set("unused_s", Jv::u(s));
+    }
+    if let Some(d) = next.idle_days() {
+        o.set("idle_days", Jv::u(d));
     }
     o
 }

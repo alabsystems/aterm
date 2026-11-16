@@ -2467,6 +2467,213 @@ fn prefreeze_supervisor_starts_once_per_main_and_states_a_yield() {
     assert_eq!(observing.observation_settles, 1);
 }
 
+/// What one authenticated main read does in [`ScriptedReads`]: its observer fails to start,
+/// it starts and exits failed, or it answers with a head the cutter cache already holds.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum MainRead {
+    StartFails(&'static str),
+    Fails(&'static str),
+    Answers,
+}
+
+/// A pre-freeze runtime whose main reads follow `script` by read number, on a clock that moves
+/// [`PREFREEZE_REFRESH`] per wait, and that is interrupted once `stop_after` reads were made.
+/// Every answer names a head already prepared, so it starts no worker.
+#[cfg(unix)]
+struct ScriptedReads {
+    now: std::time::Instant,
+    reads: u32,
+    stop_after: u32,
+    script: fn(u32) -> MainRead,
+    line: aterm_capacity::Record,
+    events: Vec<PrefreezeEvent>,
+}
+
+#[cfg(unix)]
+impl ScriptedReads {
+    fn new(script: fn(u32) -> MainRead, stop_after: u32) -> Self {
+        let line = aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::default(),
+            pid: 1,
+            start_ms: 1,
+            laid_at: None,
+            seq: 1,
+            checkout: String::new(),
+            need: aterm_capacity::Need::new("release line").rank(aterm_capacity::Rank::Release),
+            timing: Default::default(),
+            held: None,
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
+        ScriptedReads {
+            now: std::time::Instant::now(),
+            reads: 0,
+            stop_after,
+            script,
+            line,
+            events: Vec::new(),
+        }
+    }
+
+    fn failed_reads(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| matches!(event, PrefreezeEvent::ObservationFailed { .. }))
+            .count()
+    }
+}
+
+#[cfg(unix)]
+impl PrefreezeSupervisorRuntime for ScriptedReads {
+    type Worker = ();
+    type Observation = u32;
+
+    fn now(&mut self) -> std::time::Instant {
+        self.now
+    }
+
+    fn interrupted(&mut self) -> bool {
+        self.reads >= self.stop_after
+    }
+
+    fn rows(&mut self) -> Result<Vec<aterm_capacity::Record>, String> {
+        Ok(vec![self.line.clone()])
+    }
+
+    fn start_observation(&mut self) -> Result<Self::Observation, String> {
+        let read = self.reads;
+        if let MainRead::StartFails(why) = (self.script)(read) {
+            self.reads += 1;
+            return Err(why.to_owned());
+        }
+        Ok(read)
+    }
+
+    fn poll_observation(&mut self, read: &mut Self::Observation) -> Result<Option<String>, String> {
+        self.reads += 1;
+        match (self.script)(*read) {
+            MainRead::Answers => Ok(Some("1".repeat(40))),
+            MainRead::Fails(why) | MainRead::StartFails(why) => Err(why.to_owned()),
+        }
+    }
+
+    fn settle_observation(&mut self, _read: &mut Self::Observation) {}
+
+    fn prepared(&mut self, _target: &str) -> bool {
+        true
+    }
+
+    fn spawn(&mut self, target: &str, _covered: bool) -> Result<Self::Worker, String> {
+        Err(format!("no worker for the prepared head {target}"))
+    }
+
+    fn worker_pid(&self, _worker: &Self::Worker) -> u32 {
+        0
+    }
+
+    fn poll(&mut self, _worker: &mut Self::Worker) -> Result<Option<PrefreezeExit>, String> {
+        Ok(None)
+    }
+
+    fn settle(&mut self, _worker: &mut Self::Worker) {}
+
+    fn event(&mut self, event: PrefreezeEvent) {
+        self.events.push(event);
+    }
+
+    fn wait(&mut self) {
+        self.now += PREFREEZE_REFRESH;
+    }
+}
+
+/// RL-74: a supervisor whose every authenticated main read fails (its observer failing to start
+/// and failing after it started, in turn) ends once the failures span
+/// [`PREFREEZE_OBSERVATION_PATIENCE`]: its last event is `prefreeze-ended`, naming the last why
+/// and how many reads failed in a row, and it returns the error its exit status carries.
+/// CONTROL: the loop before RL-74 polled until interrupted (here after 1000 reads) and
+/// returned `Ok` with no ending event.
+#[cfg(unix)]
+#[test]
+fn a_prefreeze_whose_main_reads_keep_failing_ends_and_says_why() {
+    let script = |read: u32| {
+        if read.is_multiple_of(2) {
+            MainRead::StartFails("the observer could not start")
+        } else {
+            MainRead::Fails("authenticated main observer returned no full lowercase commit")
+        }
+    };
+    let mut reads = ScriptedReads::new(script, 1000);
+    let ended = supervise_prefreeze_loop(&reads.line.cover_marker(), &mut reads);
+    let Err(error) = ended else {
+        panic!("a supervisor whose reads never answer kept following: {ended:?}");
+    };
+    assert!(
+        reads.reads < 1000,
+        "it ended by its patience, not the interrupt"
+    );
+    let failed = reads.failed_reads();
+    let Some(PrefreezeEvent::Ended {
+        why,
+        failures,
+        failing_s,
+    }) = reads.events.last()
+    else {
+        panic!(
+            "the last event is not prefreeze-ended: {:?}",
+            reads.events.last()
+        );
+    };
+    assert_eq!(
+        *failures as usize, failed,
+        "it counts every failed read in the run"
+    );
+    assert!(
+        *failing_s >= PREFREEZE_OBSERVATION_PATIENCE.as_secs_f64(),
+        "{failing_s}"
+    );
+    let last = script(reads.reads - 1);
+    let (MainRead::StartFails(last) | MainRead::Fails(last)) = last else {
+        panic!("the last read answered");
+    };
+    assert_eq!(why, last, "it names the last failure");
+    assert!(
+        error.contains(last) && error.contains(&failed.to_string()),
+        "{error}"
+    );
+}
+
+/// RL-74: a read that answers starts the count again, so a supervisor whose reads fail for
+/// nine minutes, answer once, then fail for nine more keeps following between cuts until it is
+/// interrupted, with no ending. CONTROL: a count that never restarts spans eighteen minutes of
+/// failures and ends it.
+#[cfg(unix)]
+#[test]
+fn a_prefreeze_whose_read_recovers_keeps_following_between_cuts() {
+    // A failure every minute (a start, then a poll the next tick, at 30 s a tick): reads 0 to 9
+    // fail over nine minutes, read 10 answers, reads 11 to 20 fail over nine more.
+    let script = |read: u32| {
+        if read == 10 {
+            MainRead::Answers
+        } else {
+            MainRead::Fails("authenticated main observer returned no full lowercase commit")
+        }
+    };
+    let mut reads = ScriptedReads::new(script, 21);
+    let followed = supervise_prefreeze_loop(&reads.line.cover_marker(), &mut reads);
+    assert_eq!(followed, Ok(()), "{:?}", reads.events);
+    assert_eq!(reads.failed_reads(), 20, "every failure is still reported");
+    assert!(
+        !reads
+            .events
+            .iter()
+            .any(|event| matches!(event, PrefreezeEvent::Ended { .. })),
+        "{:?}",
+        reads.events
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {

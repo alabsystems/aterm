@@ -70,12 +70,7 @@ fn remaining_at(until: Instant, now: Instant) -> io::Result<Duration> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "control exchange deadline elapsed"))
 }
 
-/// Whether `sid` is an `s-<hex>` session ID: one word that can never be a path or a selector.
-#[must_use]
-pub fn session_id(sid: &str) -> bool {
-    sid.strip_prefix("s-")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
-}
+pub use crate::record::session_id;
 
 /// A session's rendezvous directory and validated session ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,10 +131,12 @@ impl Locator {
     /// Name an explicit rendezvous directory and session ID.
     ///
     /// # Errors
-    /// `sid` is not an `s-<hex>` session ID.
+    /// [`session_id`] refuses `sid` as a complete current or supported legacy ID.
     pub fn new(directory: PathBuf, sid: &str) -> io::Result<Self> {
         if !session_id(sid) {
-            return Err(invalid("the session ID is not s-<hex>"));
+            return Err(invalid(
+                "the session ID is not a complete current or supported legacy ID",
+            ));
         }
         Ok(Self {
             directory,
@@ -527,10 +524,11 @@ impl Connection {
         &self.version
     }
 
-    /// Bound every later exchange on this connection by `timeout` in place of the
-    /// one it was opened with. A caller that opens with a generous bound and then
-    /// asks from a loop that must not stall narrows it here; an exchange that
-    /// outlives the bound poisons the connection like any other failure.
+    /// Set the default timeout for later exchanges on this connection in place
+    /// of the one it was opened with. A caller that opens with a generous bound
+    /// and then asks from a loop that must not stall narrows it here; an exchange
+    /// that outlives the bound poisons the connection like any other failure.
+    /// [`Connection::request_line_until`] uses its caller's absolute deadline instead.
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
@@ -685,6 +683,23 @@ impl Connection {
     /// the server may already have committed the request, even when no ACK arrived.
     pub fn request_line(&mut self, request: &str) -> io::Result<String> {
         let until = self.begin(request)?;
+        let result = self.exchange_line(request, until);
+        self.finish(result, until)
+    }
+
+    /// Send one raw protocol line and read one `OK`/`ERR` reply by `until`.
+    ///
+    /// Reuse the same original absolute deadline for every step of a bounded
+    /// transaction. It covers every write and reply fragment, replacing the
+    /// per-exchange timeout set by [`Connection::set_timeout`] without changing it.
+    ///
+    /// # Errors
+    /// Invalid local input is unsent. Deadline checks return
+    /// [`io::ErrorKind::TimedOut`] when no time remains; socket errors are returned
+    /// unchanged. Any exchange failure poisons the connection; the server may
+    /// already have committed the request, even when no ACK arrived.
+    pub fn request_line_until(&mut self, request: &str, until: Instant) -> io::Result<String> {
+        self.prepare(request)?;
         let result = self.exchange_line(request, until);
         self.finish(result, until)
     }
@@ -1058,6 +1073,10 @@ impl AsRawFd for EventReader {
         self.stream.as_raw_fd()
     }
 }
+
+#[cfg(test)]
+#[path = "wire_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {

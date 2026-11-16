@@ -29,6 +29,15 @@ fn opened(lab: &Lab) -> App {
     app
 }
 
+/// Turn the fold off on the table shown, as a person does from the Columns list
+/// ([`super::native_tables_columns`]): these tests read the headers and cells of columns no row
+/// of the scratch registry fills.
+fn spread(app: &mut App) {
+    act(app, "tables/columns", None);
+    act(app, "tables/columns/fold", None);
+    act(app, "tables/columns", None);
+}
+
 /// The words the open cell's list shows, top down, as each is said.
 fn listed(ui: &CompiledUi) -> Vec<String> {
     (0..)
@@ -71,6 +80,7 @@ fn field_holds(ui: &CompiledUi) -> Option<String> {
 fn a_staged_enum_cell_offers_its_words_and_refuses_another() {
     let lab = two_macs();
     let mut app = opened(&lab);
+    spread(&mut app);
     let ui = render(&app);
     assert_eq!(said(&ui, "tables/type/role").as_deref(), Some("one of 6"));
     let cell = format!("{CELL}{MC}/role");
@@ -164,6 +174,218 @@ fn a_staged_enum_cell_offers_its_words_and_refuses_another() {
     assert_eq!(cell_says(&render(&app), MC, "role"), "lab, not written");
 }
 
+/// Select the cell of row `pk` in `column` without opening it: one press, unless it is
+/// selected already (a second press would open it).
+fn select(app: &mut App, pk: &str, column: &str) {
+    let view = view_of(app);
+    if view.row.as_deref() != Some(pk) || view.column.as_deref() != Some(column) {
+        act(app, &format!("{CELL}{pk}/{column}"), None);
+    }
+    let view = view_of(app);
+    assert_eq!(
+        (view.row.as_deref(), view.column.as_deref()),
+        (Some(pk), Some(column)),
+        "{pk}/{column} selected"
+    );
+    assert!(view.editing.is_none(), "{pk}/{column} is not open");
+}
+
+/// A staged cell the check refuses reads `refused` first in the cell bar, in the word and the
+/// danger ink of the tag the grid's cell wears, then that it is not written and what the
+/// registry holds; the rule it breaks is said in the pane, not in the bar. Staged over with a
+/// word of the column, it reads as a cell Write will write.
+/// NEGATIVE CONTROL: with `bar_words` never asking `TablesApp::refusal` (its refused arm never
+/// taken), the bar reads the refused cell as one Write will write: `` left: ["m9 · Role",
+/// "server", "not written · holds empty"] right: ["m9 · Role", "server", "refused · not
+/// written · holds empty"] ``.
+#[test]
+fn a_refused_staged_cell_reads_refused_in_the_cell_bar() {
+    use super::native_tables_tests::{bar_says, painted_words, style_of, tree};
+    let lab = two_macs();
+    let mut app = opened(&lab);
+    let cell = format!("{CELL}{MC}/role");
+    open(&mut app, &cell);
+    act(&mut app, EDIT, Some(SemanticInput::Text("server".into())));
+    key_in(&mut app, TextInputEvent::Submit);
+    select(&mut app, MC, "role");
+    let ui = render(&app);
+    let rule = "pick one of the column's own words";
+    assert_eq!(
+        cell_says(&ui, MC, "role"),
+        format!("server, not written, refused: {rule}")
+    );
+    assert_eq!(
+        bar_says(&ui),
+        [
+            "m9 \u{b7} Role",
+            "server",
+            "refused \u{b7} not written \u{b7} holds empty"
+        ]
+    );
+    assert!(
+        bar_says(&ui).iter().all(|seat| !seat.contains(rule)),
+        "the rule is the pane's to say: {:?}",
+        bar_says(&ui)
+    );
+    assert_eq!(said(&ui, "tables/pane/refused/role").as_deref(), Some(rule));
+    // The grid's word and ink.
+    let drawn = tree(&app);
+    let tag = format!("{CELL}{MC}/role/tag");
+    assert_eq!(painted_words(&ui, &tag).as_deref(), Some("refused"));
+    assert_eq!(style_of(&drawn, &tag), Some(StyleRef::Danger));
+    assert_eq!(
+        painted_words(&ui, "tables/cellbar/state/words").as_deref(),
+        Some("refused")
+    );
+    assert_eq!(
+        style_of(&drawn, "tables/cellbar/state/words"),
+        Some(StyleRef::Danger),
+        "the bar says it as the grid's tag does"
+    );
+    assert_eq!(
+        style_of(&drawn, "tables/cellbar/state/words/1"),
+        Some(StyleRef::Note),
+        "the words after it are neutral"
+    );
+
+    // A word of the column staged over it: not refused, in the bar as in the grid.
+    open(&mut app, &cell);
+    act(&mut app, &format!("{CHOICE}4"), None);
+    select(&mut app, MC, "role");
+    let ui = render(&app);
+    assert_eq!(cell_says(&ui, MC, "role"), "lab, not written");
+    assert_eq!(
+        bar_says(&ui),
+        ["m9 \u{b7} Role", "lab", "not written \u{b7} holds empty"]
+    );
+}
+
+/// Whether `words` name a Mac (`Mac`, `Macs`, `Mac's`) where they mean any machine running aterm.
+fn says_mac(words: &str) -> bool {
+    words
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == "Mac" || word == "Macs")
+}
+
+/// LT-C7 (decision TK-D21): the Tables page and the registry's findings name a machine, which
+/// is any computer running aterm, where they said a Mac: the Check view's store lines, the rail's
+/// titles of the machines' own facts and of the machine models, the header of the machine a
+/// machine's facts are of, the words in place of Add, a label's type words, the
+/// registry's finding sentences, the shared files' descriptions and the line a join prints
+/// where it cannot browse (off macOS). The stored column `machine-facts.mac` keeps its name.
+/// NEGATIVE CONTROL, observed: with the check panel's write line still `This Mac can write the
+/// registry`: `` the Check view says This Mac can write the registry ``; with `NO_BROWSE` still
+/// opening `this Mac cannot browse`: `` the join line off macOS says this Mac cannot browse the
+/// network for ALab's members ``; with `born_elsewhere` still `a Mac adds its model's row`: ``
+/// model: a Mac adds its model's row as it registers ``; with `label_of` saying `mac` as its
+/// name: `` left: "MAC" right: "MACHINE" ``.
+#[test]
+fn the_check_panel_the_titles_and_the_type_words_name_a_machine() {
+    let lab = two_macs();
+    let mut app = opened(&lab);
+    spread(&mut app);
+    let ui = render(&app);
+    for (sheet, title) in [
+        ("machine-facts", "Machine facts"),
+        ("model", "Machine models"),
+    ] {
+        let rail = said(&ui, &format!("tables/sheet/{sheet}")).expect("on the rail");
+        assert!(rail.starts_with(&format!("{title}: ")), "{rail}");
+    }
+    for (column, says) in [
+        ("label", "machine label"),
+        ("aliases", "set of machine labels"),
+        ("model", "\u{2192} Machine models"),
+    ] {
+        assert_eq!(
+            said(&ui, &format!("tables/type/{column}")).as_deref(),
+            Some(says),
+            "{column}"
+        );
+    }
+    let faces = aterm_db::alab::registry::FACES;
+    for (collection, title, singular) in [
+        ("machine-facts", "Machine facts", "Machine's facts"),
+        ("model", "Machine models", "Machine model"),
+    ] {
+        let face = faces.iter().find(|f| f.collection == collection).unwrap();
+        assert_eq!((face.title, face.singular), (title, singular));
+    }
+    assert!(
+        aterm_db::alab::registry::MACHINE_FACTS
+            .column("mac")
+            .is_some(),
+        "the stored column keeps its name"
+    );
+    // and its header says the machine it names.
+    let facts = app
+        .native_runtime
+        .tables_mut()
+        .unwrap()
+        .sheet_named("machine-facts")
+        .unwrap();
+    let mac = facts.columns.iter().find(|c| c.name == "mac").unwrap();
+    assert_eq!(mac.label, "MACHINE");
+    // What the page says in place of Add on a table of rows each machine writes.
+    for collection in [
+        "model",
+        "machine-facts",
+        "account-obs",
+        "mailbox-obs",
+        "roll",
+    ] {
+        let who = aterm_db::alab::registry::born_elsewhere(collection).unwrap();
+        assert!(!says_mac(who), "{collection}: {who}");
+    }
+
+    act(&mut app, crate::native_tables_check::OPEN, None);
+    settle(&mut app);
+    let ui = render(&app);
+    for key in ["write", "mine", "quota", "writers"] {
+        let line = said(&ui, &format!("tables/check/store/{key}")).expect("a store line");
+        assert!(
+            !says_mac(&line) && line.contains("machine"),
+            "the Check view says {line}"
+        );
+    }
+    // The lines this registry does not reach: a writer refused, a lone writer, the machines'
+    // own inert rows.
+    let store = crate::native_tables_check::Store {
+        cannot_write: Some("it is not a Commons writer here".to_owned()),
+        inert: vec!["0123456789abcdef".to_owned()],
+        inert_rows: 2,
+        writers: 1,
+        ..crate::native_tables_check::Store::default()
+    };
+    for (_, line) in store.lines() {
+        assert!(!says_mac(&line), "the Check view says {line}");
+    }
+
+    for kind in [
+        "facts-machine-unknown",
+        "facts-differ",
+        "hw-hint-clone",
+        "account-seen-unregistered",
+        "account-seen-unmarked",
+        "account-provider-retired",
+        "label-ambiguous",
+        "schema-split",
+        "quota-spent",
+    ] {
+        let sentence = aterm_db::typed::check::said(kind);
+        assert_ne!(sentence, kind, "{kind} has a sentence");
+        assert!(!says_mac(sentence), "{kind}: {sentence}");
+    }
+    for file in aterm_db::file::types::FILES {
+        assert!(!says_mac(file.about), "{}: {}", file.name, file.about);
+    }
+    assert!(
+        !says_mac(aterm_secrets::discover::NO_BROWSE),
+        "the join line off macOS says {}",
+        aterm_secrets::discover::NO_BROWSE
+    );
+}
+
 /// Each header says what its column holds under its name, marks a key, and names the table a
 /// reference leads to by its rail title; columns stand in the display order compiled beside the
 /// collection, the naming column first.
@@ -176,6 +398,7 @@ fn a_staged_enum_cell_offers_its_words_and_refuses_another() {
 fn each_header_says_its_type_and_the_naming_column_leads() {
     let lab = two_macs();
     let mut app = opened(&lab);
+    spread(&mut app);
     {
         let tables = app.native_runtime.tables_mut().unwrap();
         let names = |name: &str, n: usize| -> Vec<String> {
@@ -198,13 +421,13 @@ fn each_header_says_its_type_and_the_naming_column_leads() {
     }
     let ui = render(&app);
     for (column, says) in [
-        ("label", "Mac label"),
-        ("aliases", "set of Mac labels"),
+        ("label", "machine label"),
+        ("aliases", "set of machine labels"),
         ("nickname", "text"),
         ("status", "one of 4"),
         ("ram_gb", "whole number"),
         ("clis", "\u{2192} CLIs, several"),
-        ("model", "\u{2192} Mac models"),
+        ("model", "\u{2192} Machine models"),
     ] {
         assert_eq!(
             said(&ui, &format!("tables/type/{column}")).as_deref(),

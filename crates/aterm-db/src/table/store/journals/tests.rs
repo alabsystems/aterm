@@ -120,7 +120,7 @@ fn answer(replay: Result<Replay>) -> Answer {
                 .iter()
                 .map(|entry| {
                     (
-                        entry.receipt,
+                        entry.receipt(),
                         entry.wire.wire().to_vec(),
                         entry.wire.id(),
                         entry.conflict,
@@ -1232,6 +1232,9 @@ fn a_kept_table_read_holds_no_plaintext() {
 #[cfg(target_os = "macos")]
 #[path = "payload_measurement_tests.rs"]
 mod measurements;
+
+#[path = "replay_measurement_tests.rs"]
+mod replay_measurements;
 
 #[test]
 fn empty_metadata_slots_and_spare_slot_capacity_obey_the_real_heap_budget() {

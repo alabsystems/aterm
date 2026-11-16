@@ -279,7 +279,9 @@ fn competing_append_cannot_replace_a_claim_and_pruning_keeps_recent_rows() {
     )
     .unwrap();
     assert_eq!(
-        decode_objects(objects.as_bytes()).unwrap().len(),
+        decode_objects(objects.as_bytes(), &vec![blob.as_str(); 3000])
+            .unwrap()
+            .len(),
         3000,
         "large journals must drain output while feeding more object requests"
     );
@@ -827,6 +829,94 @@ fn a_land_record_reads_back_byte_for_byte_and_its_signature_verifies() {
     assert_eq!(words, [Ok(Word::Ok), Ok(Word::Fail)]);
 }
 
+/// A selected tree bucket replaced by a file is visible as unreadable. Selecting its
+/// neighbor still reads that neighbor's valid record without widening to the malformed path.
+#[test]
+fn verdict_records_report_a_file_replacing_the_selected_tree_bucket() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, DAY, NOW, T, T2, record, signer};
+    let (_tmp, root) = scratch(&[]);
+    git(
+        &root,
+        &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+    )
+    .unwrap();
+    let empty = rev(&root, "HEAD");
+    let neighbor = record(Check::Fmt, Word::Ok, T2, BASE, NOW)
+        .sign(Some(&signer(7)))
+        .unwrap();
+    let path = format!("{LAND}/{DAY}/{T}");
+    let tree = with_blobs(
+        &root,
+        &empty,
+        &[
+            (path.clone(), b"not a directory".to_vec()),
+            (neighbor.path.clone(), neighbor.bytes),
+        ],
+    );
+    let entries = land_records(&root, Some(&tree), &[T], deadline()).unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].path, path);
+    assert!(entries[0].body.is_err());
+    let entries = land_records(&root, Some(&tree), &[T2], deadline()).unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].path, neighbor.path);
+    assert!(entries[0].body.is_ok(), "{entries:?}");
+}
+
+/// Git stores symlink targets as blobs too. Valid signed bytes do not make that tree
+/// entry a regular record file; an executable regular file remains readable.
+#[test]
+fn journal_records_require_regular_files_even_when_a_link_holds_valid_signed_bytes() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, NOW, T, record, signer};
+    let (_tmp, root) = scratch(&["origin"]);
+    let signed = record(Check::Lint, Word::Ok, T, BASE, NOW)
+        .sign(Some(&signer(7)))
+        .unwrap();
+    let parent = append_land(
+        &root,
+        "origin",
+        std::slice::from_ref(&signed),
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    let blob = rev(&root, &format!("{parent}:{}", signed.path));
+    for (mode, readable) in [("100755", true), ("120000", false)] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let index = dir.path().join("index");
+        let run = |args: &[&str]| {
+            let mut cmd = command(&root, args);
+            cmd.env("GIT_INDEX_FILE", &index);
+            fixture(&mut cmd, None).unwrap()
+        };
+        run(&["read-tree", &parent]);
+        run(&["update-index", "--cacheinfo", mode, &blob, &signed.path]);
+        let tree = run(&["write-tree"]);
+        assert_eq!(bytes_at(&root, tree.trim(), &signed.path), signed.bytes);
+        let entries = land_records(&root, Some(tree.trim()), &[T], deadline()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].body.is_ok(),
+            readable,
+            "mode={mode}: {entries:?}"
+        );
+        if !readable {
+            assert!(
+                entries[0]
+                    .body
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("regular file")
+            );
+        }
+    }
+}
+
 /// A FAIL's path keeps the first record filed there: a second FAIL record at the same path,
 /// from a writer whose append raced the first and so re-read the journal under the CAS, leaves
 /// the first in place and pushes nothing; so does a second FAIL later in one batch. CONTROL: an
@@ -1013,6 +1103,30 @@ fn the_land_prune_runs_on_its_own_marker() {
         ),
         "CONTROL: the day's second land append prunes nothing"
     );
+}
+
+/// Missing journals are empty; a file replacing either run-history directory is corruption,
+/// and must be visible to the caller instead of looking like a journal with no runs.
+#[test]
+fn run_records_report_non_directory_roots() {
+    let (_tmp, root) = scratch(&[]);
+    git(
+        &root,
+        &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+    )
+    .unwrap();
+    let empty = rev(&root, "HEAD");
+    for head in [None, Some(empty.as_str())] {
+        assert!(run_records(&root, head, 0, deadline()).unwrap().is_empty());
+    }
+    for path in [LAND, RUNS] {
+        let broken = with_blobs(&root, &empty, &[(path.into(), b"not a directory".to_vec())]);
+        let entries = run_records(&root, Some(&broken), 0, deadline()).unwrap();
+        assert_eq!(entries.len(), 1, "{path}: {entries:?}");
+        assert_eq!(entries[0].path, path);
+        assert_eq!(entries[0].origin, crate::land_record::Origin::Journal);
+        assert_eq!(entries[0].body.as_ref().unwrap_err(), "it is no directory");
+    }
 }
 
 /// RUN RECORDS KEEP FOURTEEN DAYS BESIDE VERDICTS OF TWO: one store, a retention per kind. The
@@ -1521,7 +1635,9 @@ fn journal_timeout_does_not_spawn_after_the_inherited_budget_expires() {
 #[test]
 fn journal_mutation_admission_expires_but_an_admitted_writer_owns_its_full_window() {
     let now = std::time::Instant::now();
-    let budget = ReadBudget(now + std::time::Duration::from_secs(60));
+    let read_until = now + std::time::Duration::from_secs(60);
+    let budget = AppendBudget::new(read_until);
+    assert_eq!(budget.deadline(), read_until);
     assert!(
         budget
             .admit(now + std::time::Duration::from_secs(60))
@@ -1530,7 +1646,29 @@ fn journal_mutation_admission_expires_but_an_admitted_writer_owns_its_full_windo
     let admitted_at = now + std::time::Duration::from_secs(59);
     let MutationBudget(until) = budget.admit(admitted_at).unwrap();
     assert_eq!(until.duration_since(admitted_at), agh::git::GRANT_MAX);
-    assert!(until > budget.0);
+    assert!(until > read_until);
+    assert_eq!(
+        budget.deadline(),
+        until,
+        "race readback gets the admitted work window"
+    );
+    let later = read_until + std::time::Duration::from_secs(1);
+    let MutationBudget(second) = budget.admit(later).unwrap();
+    assert_eq!(
+        second, until,
+        "a race must not renew the publication window"
+    );
+    let MutationBudget(last) = budget
+        .admit(until - std::time::Duration::from_nanos(1))
+        .unwrap();
+    assert_eq!(last, until);
+    assert!(budget.admit(until).is_err());
+    assert!(
+        budget
+            .admit(until + std::time::Duration::from_secs(1))
+            .is_err()
+    );
+    assert_eq!(budget.deadline(), until, "expiry cannot reset admission");
 }
 
 #[test]
@@ -1592,50 +1730,54 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
     for code in [0, 9, 13] {
         let pushes = Cell::new(0);
         let reads = Cell::new(0);
-        let run = |tool, args: &[std::ffi::OsString]| {
-            let output = |code: i32, stdout: &[u8], stderr: &[u8]| std::process::Output {
-                status: std::process::ExitStatus::from_raw(code << 8),
-                stdout: stdout.to_vec(),
-                stderr: stderr.to_vec(),
-            };
-            match tool {
-                Tool::Git => {
-                    let words: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
-                    assert!(
-                        words == ["remote", "get-url", "--all", "origin"]
-                            || words == ["remote", "get-url", "--all", "--push", "origin"],
-                        "GitHub journal transport must not fall back to git: {words:?}"
-                    );
-                    Ok(output(0, b"https://github.com/fixture/repo.git\n", b""))
-                }
-                Tool::Agh if args.get(1).is_some_and(|word| word == "push") => {
-                    assert_eq!(pushes.replace(pushes.get() + 1), 0);
-                    assert_eq!(args[0], "repo");
-                    assert_eq!(args[2], "fixture/repo");
-                    let input = args.iter().position(|word| word == "--input").unwrap();
-                    let batch: aterm_json::Value = aterm_json::from_slice(
-                        &std::fs::read(Path::new(&args[input + 1])).unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        batch,
-                        aterm_json::json!([{"ref":REF,"before":parent,"after":sha}])
-                    );
-                    Ok(output(code, b"", b"original push refusal"))
-                }
-                Tool::Agh => {
-                    reads.set(reads.get() + 1);
-                    Err("controlled head lookup failure".to_owned())
-                }
+        let output = |code: i32, stdout: &[u8], stderr: &[u8]| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        let read = |tool, args: &[std::ffi::OsString]| match tool {
+            Tool::Git => {
+                let words: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+                assert!(
+                    words == ["remote", "get-url", "--all", "origin"]
+                        || words == ["remote", "get-url", "--all", "--push", "origin"],
+                    "GitHub journal transport must not fall back to git: {words:?}"
+                );
+                Ok(output(0, b"https://github.com/fixture/repo.git\n", b""))
             }
+            Tool::Agh => {
+                assert_ne!(
+                    args.get(1).and_then(|word| word.to_str()),
+                    Some("push"),
+                    "the read runner must never own publication"
+                );
+                reads.set(reads.get() + 1);
+                Err("controlled head lookup failure".to_owned())
+            }
+        };
+        let write = |tool, args: &[std::ffi::OsString]| {
+            assert_eq!(tool, Tool::Agh);
+            assert_eq!(pushes.replace(pushes.get() + 1), 0);
+            assert_eq!(args[0], "repo");
+            assert_eq!(args[1], "push");
+            assert_eq!(args[2], "fixture/repo");
+            let input = args.iter().position(|word| word == "--input").unwrap();
+            let batch: aterm_json::Value =
+                aterm_json::from_slice(&std::fs::read(Path::new(&args[input + 1])).unwrap())
+                    .unwrap();
+            assert_eq!(
+                batch,
+                aterm_json::json!([{"ref":REF,"before":parent,"after":sha}])
+            );
+            Ok(output(code, b"", b"original push refusal"))
         };
         let result = push_journal(
             dir.path(),
             "origin",
             Some(parent),
             sha,
-            &run,
-            crate::remote::WriteRunner(&run),
+            &read,
+            crate::remote::WriteRunner(&write),
         );
         assert_eq!(pushes.get(), 1);
         if let Err(why) = &result {
@@ -1745,11 +1887,11 @@ fn a_journal_race_reuses_written_blobs_but_rebuilds_over_the_moved_head() {
         deadline(),
     )
     .unwrap();
-    let until = deadline();
+    let budget = AppendBudget::new(deadline());
     let writes = Cell::new(0);
     let mut blob = cached_blobs(|bytes| {
         writes.set(writes.get() + 1);
-        write_blob(&root, bytes, until)
+        write_blob(&root, bytes, budget.deadline())
     });
     let mut attempts = 0;
     let head = append_land_through(
@@ -1763,7 +1905,7 @@ fn a_journal_race_reuses_written_blobs_but_rebuilds_over_the_moved_head() {
                 parent,
                 std::slice::from_ref(&mine),
                 NOW,
-                until,
+                &budget,
                 &mut blob,
             )
         },
@@ -1785,4 +1927,189 @@ fn a_journal_race_reuses_written_blobs_but_rebuilds_over_the_moved_head() {
         2,
         "only different bytes require another write"
     );
+}
+
+#[test]
+fn lane_batches_require_every_requested_object_in_order() {
+    let first = "1".repeat(40);
+    let second = "2".repeat(40);
+    let frame = |id: &str, body: &str| format!("{id} blob {}\n{body}\n", body.len());
+    let a = frame(&first, "a\n雪");
+    let b = frame(&second, "");
+    let both = format!("{a}{b}");
+    assert_eq!(
+        blobs(both.as_bytes(), &[&first, &second]).unwrap(),
+        ["a\n雪", ""]
+    );
+    assert_eq!(
+        blobs(format!("{a}{a}").as_bytes(), &[&first, &first]).unwrap(),
+        ["a\n雪", "a\n雪"]
+    );
+    assert!(blobs(b"", &[]).unwrap().is_empty());
+    for (answer, requested) in [
+        (both.as_bytes(), vec![second.as_str(), first.as_str()]),
+        (a.as_bytes(), vec![second.as_str()]),
+        (a.as_bytes(), vec![first.as_str(), second.as_str()]),
+        (both.as_bytes(), vec![first.as_str()]),
+        (a.as_bytes(), vec![]),
+        (b"".as_slice(), vec![first.as_str()]),
+        (&a.as_bytes()[..a.len() - 1], vec![first.as_str()]),
+    ] {
+        assert!(
+            blobs(answer, &requested).is_err(),
+            "{answer:?} for {requested:?}"
+        );
+    }
+}
+
+#[test]
+fn journal_history_includes_roots_hidden_by_local_log_settings() {
+    let (_tmp, root) = scratch(&["origin"]);
+    let held = lane_record("t", "held", "pass", 42);
+    assert!(append(&root, "origin", None, &held, deadline()).unwrap());
+    let parent = head(&root, "origin", deadline()).unwrap().unwrap();
+    git(&root, &["config", "log.showRoot", "false"]).unwrap();
+    assert!(
+        git(&root, &["log", "--format=", "--raw", &parent])
+            .unwrap()
+            .is_empty(),
+        "negative control: local log settings hide the root diff"
+    );
+    assert_eq!(history(&root, &parent, 0).unwrap(), [held.clone()]);
+    assert!(published(&root, Some(&parent), &held, deadline()).unwrap());
+}
+
+#[test]
+fn journal_identity_ignores_local_object_replacements() {
+    let (_tmp, root) = scratch(&["origin"]);
+    let held = lane_record("t", "held", "pass", 42);
+    let never = lane_record("t", "never", "red", 42);
+    assert!(append(&root, "origin", None, &held, deadline()).unwrap());
+    let parent = head(&root, "origin", deadline()).unwrap().unwrap();
+    let path = format!("{parent}:verdicts/t.toml");
+    let original = rev(&root, &path);
+    let replacement = blob_of(&root, &aterm_toml::to_string(&never).unwrap());
+    git(&root, &["replace", &original, &replacement]).unwrap();
+    let mut raw = crate::git_provider::command();
+    raw.current_dir(&root)
+        .args(["show", &path])
+        .env_remove("GIT_NO_REPLACE_OBJECTS");
+    let replaced: Record = aterm_toml::from_str(&fixture(&mut raw, None).unwrap()).unwrap();
+    assert_eq!(
+        replaced, never,
+        "negative control: ordinary Git sees the replacement"
+    );
+    assert_eq!(
+        records(&root, Some(&parent), deadline()).unwrap(),
+        [held.clone()]
+    );
+    assert_eq!(
+        record(&root, Some(&parent), "t", deadline()).unwrap(),
+        Some(held.clone())
+    );
+    assert_eq!(history(&root, &parent, 0).unwrap(), [held.clone()]);
+    assert!(published(&root, Some(&parent), &held, deadline()).unwrap());
+    assert!(!published(&root, Some(&parent), &never, deadline()).unwrap());
+}
+
+#[test]
+fn journal_commands_stay_in_the_requested_repository() {
+    const CHILD: &str = "ATERM_VERIFY_JOURNAL_REPOSITORY_CHILD";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = std::path::PathBuf::from(root).canonicalize().unwrap();
+        let mut raw = crate::git_provider::command();
+        raw.current_dir(&root)
+            .args(["rev-parse", "--absolute-git-dir"]);
+        let redirected = fixture(&mut raw, None).unwrap();
+        assert_ne!(
+            std::path::Path::new(redirected.trim()),
+            root.join(".git"),
+            "negative control: ordinary Git follows the inherited directory"
+        );
+        assert_eq!(
+            std::path::Path::new(&git(&root, &["rev-parse", "--absolute-git-dir"]).unwrap()),
+            root.join(".git")
+        );
+        let held = lane_record("t", "held", "pass", 42);
+        let parent = head(&root, "origin", deadline()).unwrap().unwrap();
+        assert_eq!(records(&root, Some(&parent), deadline()).unwrap(), [held]);
+        write_blob(&root, b"journal repository custody sentinel", deadline()).unwrap();
+        return;
+    }
+    let (_tmp, root) = scratch(&["origin"]);
+    let held = lane_record("t", "held", "pass", 42);
+    assert!(append(&root, "origin", None, &held, deadline()).unwrap());
+    let foreign = root.parent().unwrap().join("origin");
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "judged::tests::journal_commands_stay_in_the_requested_repository",
+            "--nocapture",
+        ])
+        .env(CHILD, &root)
+        .env("GIT_DIR", &foreign)
+        .env("GIT_WORK_TREE", &foreign)
+        .env("GIT_OBJECT_DIRECTORY", foreign.join("objects"));
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_with_limit(
+        &mut child,
+        aterm_uds::deadline::ECHO_HANG,
+        "journal repository child",
+        1024 * 1024,
+    )
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = fixture(
+        &mut command(&root, &["hash-object", "--stdin"]),
+        Some(b"journal repository custody sentinel"),
+    )
+    .unwrap();
+    git(&root, &["cat-file", "-e", id.trim()]).unwrap();
+    assert!(
+        git(&foreign, &["cat-file", "-e", id.trim()]).is_err(),
+        "the journal write must not reach the inherited object store"
+    );
+}
+
+#[test]
+fn journal_reads_do_not_lazy_fetch_missing_promisor_objects() {
+    let (_tmp, root) = scratch(&["origin"]);
+    let held = lane_record("t", "held", "pass", 42);
+    assert!(append(&root, "origin", None, &held, deadline()).unwrap());
+    let parent = head(&root, "origin", deadline()).unwrap().unwrap();
+    let id = rev(&root, &format!("{parent}:verdicts/t.toml"));
+    let foreign = root.parent().unwrap().join("origin");
+    git(&foreign, &["config", "uploadpack.allowFilter", "true"]).unwrap();
+    git(
+        &foreign,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    )
+    .unwrap();
+    git(&root, &["config", "remote.origin.promisor", "true"]).unwrap();
+    git(
+        &root,
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    )
+    .unwrap();
+    // Only this fixture's loose blob is removed; its local promisor still holds it.
+    std::fs::remove_file(root.join(".git/objects").join(&id[..2]).join(&id[2..])).unwrap();
+    assert!(
+        records(&root, Some(&parent), deadline()).is_err(),
+        "a local journal read must report the absent object, not fetch it"
+    );
+    let mut raw = crate::git_provider::command();
+    raw.current_dir(&root)
+        .args(["cat-file", "blob", &id])
+        .env_remove("GIT_NO_LAZY_FETCH");
+    let restored: Record = aterm_toml::from_str(&fixture(&mut raw, None).unwrap()).unwrap();
+    assert_eq!(
+        restored, held,
+        "negative control: ordinary Git fetches the missing blob from the local promisor"
+    );
+    assert_eq!(records(&root, Some(&parent), deadline()).unwrap(), [held]);
 }

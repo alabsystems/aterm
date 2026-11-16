@@ -8,7 +8,9 @@
 //!
 //! What is read from the stores ([`Seen`]): this Mac's custody and the home a pass opens, the
 //! home and frontier the snapshot was projected from, the state word with the kind of custody
-//! its pass met, and whether a credential-shaped value reached a file. The model's other
+//! its pass met, whether a credential-shaped value reached a file, and whether a later build's
+//! rules hold (`Unrecorded`: an input of the projection that moves with no record) and the
+//! snapshot was projected under them. The model's other
 //! variables are its own account of how the stores came to that (the newest snapshot ever
 //! written, what a view holds between its look and its record, what a snapshot lacked when it
 //! was read): they follow the model's step, and the laws are judged on the two together.
@@ -86,6 +88,10 @@ struct Seen {
     met: i64,
     /// A credential-shaped value in a snapshot, a face or a history.
     ssecret: i64,
+    /// Whether the passes run as a later build whose guards refuse the seed machine's label
+    /// (`seam::new_build`), and whether the snapshot shows that label refused.
+    inp: i64,
+    sinp: i64,
 }
 
 impl Seen {
@@ -103,6 +109,8 @@ impl Seen {
                 _ => 1,
             },
             ssecret: state["ssecret"],
+            inp: state["inp"],
+            sinp: state["sinp"],
         }
     }
 
@@ -116,6 +124,8 @@ impl Seen {
             ("sfr", self.sfr),
             ("word", self.word),
             ("ssecret", self.ssecret),
+            ("inp", self.inp),
+            ("sinp", self.sinp),
         ] {
             state.insert(name, value);
         }
@@ -140,6 +150,8 @@ struct Stores {
 
 impl Stores {
     fn new() -> Self {
+        // Each walk starts as this build: an earlier walk on this thread may have moved it.
+        seam::this_build();
         let lab = Lab::new(&[Role::Writer, Role::Writer]);
         let original = lab.paths[0].clone();
         let config = lab._home.path().join("aterm.toml");
@@ -203,6 +215,17 @@ impl Stores {
                     ]])
                     .unwrap();
             }
+            // A later build, whose guards refuse the seed machine's label: an input of the
+            // projection moves, and no record arrives. A handoff import is not this walk's
+            // `Unrecorded`: this stand's registry is a first generation that carries no record,
+            // and both its Macs hold the key of every roster its records are sealed under, so a
+            // handoff would move nothing the projection reads here. The parts of the key a
+            // handoff moves elsewhere (the carried records' resolution; the log's judgment, which
+            // a payload key this Mac comes to hold moves as a cutoff that comes to count does)
+            // are walked on stands of their own, by a heard rotation and by a removal:
+            // `file::tests::a_rotation_that_opens_a_carried_record_is_projected_by_the_next_pass`
+            // and `file::tests::a_remove_that_makes_a_cutoff_count_is_projected_by_the_next_pass`.
+            "Unrecorded" => seam::new_build("m7"),
             // A record whose note is shaped like a credential, stored as an older or modified
             // build would store it (no guard ran).
             "PeerSecret" => {
@@ -303,6 +326,9 @@ impl Stores {
             .iter()
             .any(|path| std::fs::read_to_string(path).is_ok_and(|text| text.contains(&run)))
         });
+        let sinp = read.rows().iter().any(|row| {
+            row.pk == self.seed && row.cell("label").contains(crate::typed::grid::REFUSED)
+        });
         Seen {
             custody,
             era: i64::try_from(held.era).unwrap(),
@@ -311,6 +337,8 @@ impl Stores {
             word,
             met,
             ssecret: i64::from(ssecret),
+            inp: i64::from(seam::build().is_some()),
+            sinp: i64::from(sinp),
         }
     }
 }
@@ -321,6 +349,8 @@ struct Walk {
     path: Vec<&'static str>,
     states: Vec<State>,
     stores: Stores,
+    /// What recording did for each file, at each `Materialize` step in the order they ran.
+    materialized: RefCell<Vec<Vec<Option<Recorded>>>>,
 }
 
 impl Walk {
@@ -340,6 +370,7 @@ impl Walk {
             path: path.to_vec(),
             states,
             stores: Stores::new(),
+            materialized: RefCell::new(Vec::new()),
         })
     }
 
@@ -402,6 +433,9 @@ impl Walk {
                             assert!(outcome.problem.is_none(), "{:?}", outcome.problem);
                             assert_ne!(outcome.recorded, Some(Recorded::Raced));
                         }
+                        self.materialized
+                            .borrow_mut()
+                            .push(outcomes.iter().map(|outcome| outcome.recorded).collect());
                     }
                     self.check(at);
                     at += 1;
@@ -452,7 +486,10 @@ const UNSETTLED_BEHIND: [&str; 7] = [
 /// projects the original (no pass had read the successor) and where it keeps the successor's
 /// snapshot, with and without a record of the successor's own in it; a completion made again;
 /// a pass custody refuses; a view another pass overtakes
-/// (a fenced pass, a refused pass) and one none does; a credential-shaped record; a read.
+/// (a fenced pass, a refused pass, and a refused pass that changes nothing, which writes nothing
+/// but the count it fences the view with) and one none does; a credential-shaped record; an
+/// input of the projection that moves with no record (a later build's rules), which the next
+/// ordinary pass takes up; a read.
 ///
 /// NEGATIVE CONTROLS, each a state the model has no step to, which breaks the law named:
 /// - a recording that calls the unsettled home's read the newest (`Opened::newest` set where
@@ -468,12 +505,20 @@ const UNSETTLED_BEHIND: [&str; 7] = [
 /// `newest`, the first path stops at its unsettled pass, the stores at `word: 1, met: 0` where
 /// the model says `word: 2, met: 1`; with `Frontier::admits_over` never ordering two homes,
 /// the third stops at its unsettled pass, the stores at `sera: 0` where the model says
-/// `sera: 1`.
+/// `sera: 1`. With the key leaving the rules out (`seam::leave_out(materialize::Unkeyed::Rules)`
+/// as each walk's stores are made, 2026-11-14: mutant 17's skip, at the code), the fourth stops
+/// at the pass after `Unrecorded`, the stores at `sinp: 0` where the model says `sinp: 1`
+/// (`LiveIsCurrent`). With `aterm_file::File::record` taking every look lock it tries as its
+/// own (`Ok(None) | Err(_)` returning `Recorded::Settled`: no look is ever outstanding), the
+/// sixth path's refused pass under the view writes nothing, and the view the model has
+/// overtaken records, the model's mutant 2 (`RefreshTakesOlder`, which `SnapshotMonotone`'s
+/// `older` names) at a pass that changes nothing, 2026-11-14:
+/// `` at step 8: Some(Recorded { replaced: false }) `` `` left: false right: true ``.
 #[test]
 fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_snapshot_moved_back_is_detected()
  {
     let model = aterm_models_db::shared_file_model();
-    let paths: [&[&'static str]; 5] = [
+    let paths: [&[&'static str]; 6] = [
         &[
             "ChooseRead",
             "Materialize",
@@ -523,6 +568,8 @@ fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_
             "Materialize",
             "PeerSecret",
             "Materialize",
+            "Unrecorded",
+            "Materialize",
             "Read",
         ],
         &[
@@ -535,6 +582,20 @@ fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_
             "Admit",
             "RefreshWrite",
             "Materialize",
+        ],
+        // A refused pass under a view finds the word the last refused pass recorded: it changes
+        // nothing, and with the view's look outstanding it fences it, so the view's `live`
+        // does not land over the later `held`.
+        &[
+            "ChooseRead",
+            "Materialize",
+            "Refuse",
+            "Materialize",
+            "Recover",
+            "RefreshLook",
+            "Refuse",
+            "Materialize",
+            "RefreshWrite",
         ],
     ];
     assert_eq!(paths[0][..9], UNSETTLED_PROJECTS);
@@ -554,11 +615,20 @@ fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_
         }
     }
     assert_eq!(ran, reading, "every action of the reading walk runs");
-    for path in paths {
+    for (n, path) in paths.into_iter().enumerate() {
         let walk = walked(&model, path);
         let last = walk.states.last().unwrap();
         for law in &model.invariants {
             assert!(model.check_invariant(law.name, last), "{}", law.name);
+        }
+        if n == 5 {
+            // The refused pass under the view, the third `Materialize`, changed nothing: it
+            // fenced the view's look, its one write the status.
+            assert_eq!(
+                walk.materialized.borrow()[2],
+                [Some(Recorded::Fenced); FILES.len()],
+                "{path:?}"
+            );
         }
     }
 
@@ -568,16 +638,21 @@ fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_
     assert_eq!((held["custody"], held["word"], held["lacks"]), (2, 2, 1));
     for file in FILES {
         let file = File::at(&super::root(&walk.stores.original), &file.file());
+        // The pass at the key the snapshot was recorded at, which projects nothing again.
+        let mut key = [0_u8; 32];
+        let recorded_at = file.state().and_then(|state| state.key).unwrap();
+        assert!(aterm_codec::hex::decode_into(
+            recorded_at.as_bytes(),
+            &mut key
+        ));
         let recorded = file
             .record(
-                file.look(),
+                file.look().unwrap(),
                 aterm_file::Pass::Opened(Box::new(aterm_file::Opened {
                     newest: true,
                     frontier: file.frontier().unwrap(),
-                    projection: materialize::PROJECTION,
-                    withheld: 0,
-                    inert: 0,
-                    projected: None,
+                    key,
+                    projection: aterm_file::Projection::Unchanged,
                 })),
                 NOW,
             )

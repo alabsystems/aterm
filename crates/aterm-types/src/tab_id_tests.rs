@@ -149,3 +149,60 @@ fn a_map_keyed_by_tab_id_is_found_by_its_text() {
     assert_eq!(map.get(id.as_str()), Some(&7));
     assert_eq!(map.get("t0000000000"), None);
 }
+
+#[test]
+fn prefix_names_the_one_tab_it_begins_and_refuses_one_two_begin() {
+    let ids = ["tqn5r6e0148", "tqn5rzz0000", "tab12345678"];
+    assert_eq!(by_prefix("tab12", ids), Ok("tab12345678"));
+    assert_eq!(by_prefix("tqn5r6", ids), Ok("tqn5r6e0148"));
+    assert_eq!(by_prefix("tqn5r6e0148", ids), Ok("tqn5r6e0148"));
+    // Ambiguous: refused, naming both.
+    assert_eq!(
+        by_prefix("tqn5r", ids),
+        Err(vec!["tqn5r6e0148", "tqn5rzz0000"])
+    );
+    // Nothing begins it, or it is no prefix at all: shorter than the shown form, not lower-case
+    // Crockford, longer than an ID, or not a `t` ID.
+    assert_eq!(by_prefix("txxxx", ids), Err(Vec::<&str>::new()));
+    for word in [
+        "t",
+        "",
+        "ta",
+        "tab1",
+        "qn5r6",
+        "tQN5R",
+        "tqn5ri",
+        "tqn5r6e01480",
+        "s-0123",
+    ] {
+        assert!(!is_prefix(word), "{word}");
+        assert_eq!(by_prefix(word, ids), Err(Vec::<&str>::new()), "{word}");
+    }
+    // Only a tab ID is begun: another word in the set never matches.
+    assert_eq!(
+        by_prefix("tqn5r", ["tqn5r", "tqn5r6e0148"]),
+        Ok("tqn5r6e0148")
+    );
+}
+
+#[test]
+fn prefix_display_is_five_and_longer_only_where_two_share_them() {
+    let a = TabId::parse("tqn5r6e0148").expect("an id");
+    let b = TabId::parse("tqn5rzz0000").expect("an id");
+    let c = TabId::parse("tqn5r6f0000").expect("an id");
+    let d = TabId::parse("tab12345678").expect("an id");
+    assert_eq!(a.shown([&d]), "tqn5r");
+    assert_eq!(a.shown([&a]), "tqn5r");
+    assert_eq!(a.shown([&a, &b, &d]), "tqn5r6");
+    assert_eq!(b.shown([&a, &b, &d]), "tqn5rz");
+    assert_eq!(a.shown([&a, &b, &c, &d]), "tqn5r6e");
+    assert_eq!(c.shown([&a, &b, &c, &d]), "tqn5r6f");
+    // Each shown form is a prefix that names its own tab and no other.
+    let all = [a, b, c, d];
+    for id in &all {
+        assert_eq!(
+            by_prefix(id.shown(&all), all.iter().map(TabId::as_str)),
+            Ok(id.as_str())
+        );
+    }
+}

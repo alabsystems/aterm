@@ -154,6 +154,8 @@ impl Finalizing {
             let mut state = app.windows.get_mut(&wid).expect("live re-grid window");
             state.restore_regrid_owed = None;
             state.restore_maximize_asked = false;
+            // Marked only: the park pays it once the drain ends (`App::settle_dock_fall`).
+            state.dock.restore_settled();
             drop(state);
             window.geometry = Geometry::read(app, wid);
         }

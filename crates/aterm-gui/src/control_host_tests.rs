@@ -423,3 +423,48 @@ fn a_verbs_engine_change_rings_the_keepers_meta_pump() {
     );
     assert_eq!(rings(), before + 1, "an engine change rings once");
 }
+
+/// A `wait` (a block's completion) WHOSE CALLER CLOSES WAKES ON THE RING, though it asked for ten
+/// minutes: its subscription's park arms the process's hang-up bell on the served connection,
+/// one wait for all that is left, and the caller closes only once that arm stands, so only the
+/// bell's ring of the subscription's slot can end it within the hang detector; the woken wait's
+/// holder then finds its caller gone.
+/// NEGATIVE CONTROL: arming the bell to ring a slot that is not the subscription's leaves the
+/// wait parked past the hang detector.
+#[cfg(unix)]
+#[test]
+fn a_wait_whose_caller_closes_wakes_on_the_ring() {
+    use std::os::fd::AsRawFd as _;
+    let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
+    let served = server.as_raw_fd();
+    let watchers = Arc::<crate::session_watch::Watchers>::default();
+    let lane = {
+        let watchers = Arc::clone(&watchers);
+        std::thread::spawn(move || {
+            let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+            let wait = SubscriberWait(Subscription::single(&watchers));
+            let woke = wait.wait(Duration::from_secs(600));
+            (woke, wait.caller_gone())
+        })
+    };
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the wait to arm the bell on its connection",
+        || {
+            aterm_uds::hangup::Bell::process()
+                .armed_for_test(served)
+                .then_some(())
+        },
+    );
+    drop(client);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the parked wait to hear its caller hang up",
+        || lane.is_finished().then_some(()),
+    );
+    assert_eq!(
+        lane.join().expect("the lane"),
+        (true, true),
+        "woken by the ring, its caller gone"
+    );
+}

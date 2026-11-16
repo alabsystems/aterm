@@ -42,6 +42,9 @@ pub(crate) struct ScriptedPresenter {
     age: u8,
     script: VecDeque<ScriptedOutcome>,
     commits: usize,
+    /// The successful commits that presented the whole surface (`present`), not damage rects.
+    #[cfg(test)]
+    whole_commits: usize,
     /// The window system asks for part of the glass to be drawn again
     /// ([`Self::owe_repaint`]); a successful commit settles it.
     owed: bool,
@@ -67,6 +70,13 @@ impl ScriptedPresenter {
     /// Successful commits so far.
     pub(crate) fn commits(&self) -> usize {
         self.commits
+    }
+
+    /// The successful commits so far that presented the whole surface rather than damage rects:
+    /// a CPU frame that copied and presented every pixel.
+    #[cfg(test)]
+    pub(crate) fn whole_commits(&self) -> usize {
+        self.whole_commits
     }
 
     /// Fill `rows` on glass with white and mark the surface as owing a repaint.
@@ -237,7 +247,14 @@ impl CpuFrameBuffer for TestCpuFrame<'_> {
     fn present(self) -> Result<(), Self::Error> {
         match self {
             Self::Platform(b) => b.present().map_err(wrap),
-            Self::Scripted(s) => Self::commit_scripted(s),
+            Self::Scripted(s) => {
+                Self::commit_scripted(s)?;
+                #[cfg(test)]
+                {
+                    s.whole_commits += 1;
+                }
+                Ok(())
+            }
         }
     }
 

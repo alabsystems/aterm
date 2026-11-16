@@ -216,66 +216,38 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
 }
 
 #[test]
-fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
+fn reported_cpu_honesty_preserves_diagnostics_through_deferred_publication() {
     let model = explain_honesty_model();
 
-    for (dial, law) in [
-        (1, "CauseOnlyWithEvidence"),
-        (2, "ClaimNeverVouches"),
-        (3, "StartIsEarliestBirth"),
-        (4, "ContextOnlyWhereItHolds"),
-        (5, "ContextOnlyWhereItHolds"),
-        (6, "CauseNeedsFloor"),
-        (7, "RoleNeedsBound"),
-        (8, "UnknownNeverZero"),
-        (9, "ClauseNeverFlickers"),
-        (10, "LostWorkNeverNothingNeeded"),
+    let mut delayed = model.init_state();
+    for action in [
+        "DeferBefore",
+        "ExecuteUnpublished",
+        "PublishOne",
+        "PublishOne",
+        "PublishOne",
+        "PublishOne",
+        "PublishOne",
+        "Evaluate",
     ] {
-        let broken = interp::violated_invariants(&interp::with_buggy(&model, dial));
-        assert_eq!(
-            broken.into_iter().collect::<Vec<_>>(),
-            [law],
-            "Buggy {dial}"
-        );
-    }
-
-    let mut s = model.init_state();
-    for (tick, clause) in [("Hold", 0), ("Hold", 0), ("Hold", 1)] {
-        assert!(model.fire(tick, &mut s), "{tick}");
-        assert_eq!(s["clause"], clause);
-        assert!(model.check_invariant("ClauseNeverFlickers", &s));
-    }
-    for k in 1..=7 {
-        assert!(model.fire("Fail", &mut s));
-        assert_eq!(s["clause"], i64::from(k < 7), "failing tick {k}");
-        assert!(model.check_invariant("ClauseNeverFlickers", &s));
-    }
-
-    let mut s = model.init_state();
-    for action in ["Detect", "Attach"] {
-        assert!(model.fire(action, &mut s), "{action}");
+        assert!(model.fire(action, &mut delayed), "{action}");
     }
     assert_eq!(
-        (
-            s["shown"],
-            s["tabshown"],
-            s["actstart"],
-            s["tabstart"],
-            s["role"],
-            s["start"],
-            s["none"]
-        ),
-        (1, 0, 1, 0, 1, 0, 1)
+        (delayed["prior"], delayed["actual"], delayed["reported"]),
+        (4, 1, 5)
     );
-
-    let mut s = model.init_state();
-    for action in ["Lost", "Detect"] {
-        assert!(model.fire(action, &mut s), "{action}");
-    }
     assert_eq!(
-        s["none"], 0,
-        "a core no coalition held is never nothing needed"
+        (delayed["window"], delayed["role"], delayed["cause"]),
+        (0, 0, 0)
     );
+    assert_eq!(delayed["diagnostic"], 5);
+
+    let mut unpublished = model.init_state();
+    for action in ["ExecuteUnpublished", "Evaluate"] {
+        assert!(model.fire(action, &mut unpublished), "{action}");
+    }
+    assert_eq!((unpublished["actual"], unpublished["reported"]), (1, 0));
+    assert_eq!((unpublished["role"], unpublished["none"]), (0, 0));
 }
 
 #[test]

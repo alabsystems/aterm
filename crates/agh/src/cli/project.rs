@@ -235,6 +235,7 @@ const INTENT: &[&str] = &[
     "op",
     "key",
     "open",
+    "closable",
     "settled",
     "at_secs",
     "identity",

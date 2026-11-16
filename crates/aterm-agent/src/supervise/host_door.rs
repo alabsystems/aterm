@@ -216,11 +216,10 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = point;
         self.at_background()
     }
-    /// Whether the host owes a fact of its own (`HostTurn::Fact`: the `disk-free@v1` ask's line)
-    /// that it would type at a settled break of the agent's own background work, where the turn
-    /// is over and only a shell or a monitor it left runs on ([`Self::at_background_fact`]). Asked
-    /// before the loop reads anything more for that step, so a break with nothing owed costs one
-    /// question.
+    /// Whether the host owes a fact of its own (`HostTurn::Fact`) that it would type at a
+    /// settled break of the agent's own background work, where the turn is over and only a shell
+    /// or a monitor it left runs on ([`Self::at_background_fact`]). Asked before the loop reads
+    /// anything more for that step, so a break with nothing owed costs one question.
     fn fact_owed(&self) -> bool {
         false
     }
@@ -378,8 +377,9 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// before the host is asked whether it [`Self::wants`] a step there; the wait's later looks at
     /// the same point are not told. `theirs` is whose the session is for as long as they keep it,
     /// as [`IdlePoint::theirs`] says. A host that keeps a finding of the session as of its last
-    /// turn break (the `disk-free@v1` seat rule's) makes it here, so the finding is never older
-    /// than the turn break the session rests at, whether or not the host owes a step there.
+    /// turn break (the window's look at the session's work) makes it here, so the finding is
+    /// never older than the turn break the session rests at, whether or not the host owes a step
+    /// there.
     fn turn_break(&self, theirs: Option<Guard>) {
         let _ = theirs;
     }
@@ -413,19 +413,17 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// later limit point moves it later or the usage tap ([`Self::tap_window`]) times the wall at
     /// another reset, earlier or later: the reset at which, plus its grace, the loop takes the
     /// wall as spent and rests there, where a host's line could go. A host that publishes the
-    /// wall to others (the `disk-free@v1` seat rule's board) dates it by this, so the two never
-    /// disagree on when the wall is spent.
+    /// wall to others dates it by this, so the two never disagree on when the wall is spent.
     fn limit_wall(&self, reset_unix: Option<i64>) {
         let _ = reset_unix;
     }
     /// What lasting withhold of the loop's holds the session at the turn break it last decided
     /// (`None`: none now), told once per change ([`Lasting`]): the credits hold, with when it lifts,
     /// or a wall that is no usage limit, by its kind. A host that publishes what holds a session
-    /// to others (the `disk-free@v1` seat rule's board) holds it out of what it offers while this
-    /// stands, rather than electing a session that could not take its line. A wall's hold is
-    /// told over (`None`) at the session's next live read as well, where it works past the wall;
-    /// a break of its own background work reads busy too ([`Self::busy_tap`]) and ends no wall, so
-    /// the host keeps what it was told until the loop tells it otherwise.
+    /// to others holds it out of what it offers while this stands. A wall's hold is told over
+    /// (`None`) at the session's next live read as well, where it works past the wall; a break of
+    /// its own background work reads busy too ([`Self::busy_tap`]) and ends no wall, so the host
+    /// keeps what it was told until the loop tells it otherwise.
     fn lasting_hold(&self, hold: Option<Lasting>) {
         let _ = hold;
     }

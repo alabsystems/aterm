@@ -32,6 +32,7 @@ mod process_thermal;
 pub use process_thermal::{ProcessThermal, ProcessThermalState, process_thermal};
 pub mod identity;
 pub mod iflist;
+pub mod image;
 #[cfg(target_os = "macos")]
 mod iokit;
 pub mod jobs;
@@ -46,7 +47,9 @@ pub mod neural_engine;
 pub mod notify;
 #[cfg(any(target_os = "linux", test))]
 mod nvml;
-pub mod paths;
+#[cfg(all(test, windows))]
+#[path = "paths_tests.rs"]
+mod paths_tests;
 #[cfg(windows)]
 pub mod peb;
 pub mod power;
@@ -221,6 +224,24 @@ pub fn quiet_errors() -> QuietErrors {
         _quiet: win_paths::quiet(),
         _this_thread: std::marker::PhantomData,
     }
+}
+
+/// Whether the directory `dir` tells its entries' names apart by case: Windows' per-directory case sensitivity (`FILE_CS_FLAG_CASE_SENSITIVE_DIR`, which `fsutil file setCaseSensitiveInfo` sets and every directory WSL makes carries), read through a handle on `dir`, a link on the way followed. Off by default: such a directory holds `proj` and `PROJ` as two folders, which a comparison that folds case reads as one.
+///
+/// # Errors
+/// `dir` cannot be opened, or its file system answers no case sensitivity (one that keeps none, as FAT and exFAT, or a network share whose server answers none).
+#[cfg(windows)]
+pub fn case_sensitive_dir(dir: &std::path::Path) -> std::io::Result<bool> {
+    win_paths::case_sensitive_dir(dir)
+}
+
+/// Turn the directory `dir`'s case sensitivity ([`case_sensitive_dir`]) on or off, for a test that needs a folder holding two names that differ only by case. Turning it on needs `dir` empty (`ERROR_DIR_NOT_EMPTY` otherwise, MEASURED 2026-11-15 with `fsutil` on Windows 11 x64); a directory made in it afterwards takes the setting.
+///
+/// # Errors
+/// `dir` cannot be opened for its attributes, or its file system refuses the setting.
+#[cfg(all(windows, any(test, debug_assertions)))]
+pub fn set_case_sensitive_dir(dir: &std::path::Path, on: bool) -> std::io::Result<()> {
+    win_paths::set_case_sensitive_dir(dir, on)
 }
 
 /// The 8.3 short spelling of the existing `path` as the file system generated it (Windows' `GetShortPathNameW`: `C:\Users\ANDREW~1\x`), for a test that must start a process in, or report, a short-spelled path (`volumes::Table::long_spelling`'s callers' tests).

@@ -28,19 +28,6 @@ fn run(readings: &[(u64, Option<Reading>)]) -> Vec<State> {
 }
 
 #[test]
-fn daemon_started_us_is_microseconds_since_the_epoch() {
-    assert_eq!(D.started_us(), 1_791_000_000_000_001);
-    for (start_s, start_us) in [(u64::MAX, 0), (u64::MAX / 1_000_000, 999_999)] {
-        let late = Daemon {
-            start_s,
-            start_us,
-            ..D
-        };
-        assert_eq!(late.started_us(), u64::MAX, "saturates: {late:?}");
-    }
-}
-
-#[test]
 fn a_pool_full_for_five_minutes_is_stuck_and_one_below_it_is_not() {
     let full = Some(reading(D, 95, true));
     let states = run(&[
@@ -121,27 +108,6 @@ fn a_new_syspolicyd_answers_and_a_missing_reading_changes_nothing() {
         judge.absorb(6 * MIN, full.as_ref()),
         State::Full { since_ms: 6 * MIN }
     );
-}
-
-#[test]
-fn the_kernel_flag_alone_reads_full() {
-    let flagged = Reading {
-        daemon: D,
-        workers: 12,
-        at_limit: true,
-        limit: None,
-    };
-    assert!(flagged.full());
-    assert!(
-        !Reading {
-            at_limit: false,
-            ..flagged
-        }
-        .full()
-    );
-    assert!(!reading(D, 90, false).full());
-    assert!(!reading(D, 100, false).full());
-    assert!(reading(D, 95, true).full());
 }
 
 #[test]

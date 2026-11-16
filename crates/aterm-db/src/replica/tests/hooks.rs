@@ -155,7 +155,10 @@ fn a_lead_survives_the_witness_answer() {
 /// A led table the peer does not list is no table of that round, which takes the scan's; the
 /// lead waits one round, and once the peer lists the table (a ring table it took up from this
 /// side's list, here a table its next endpoint is given) the next round repairs it. A peer that
-/// still lacks it then ends the lead, so none is owed for ever.
+/// still lacks it then ends the lead, so none is owed for ever. The table the peer takes up is
+/// one the lists newly share, which the round leads for that alone
+/// (`witness::a_table_the_lists_newly_share_is_the_next_rounds_before_the_scans_turn`): each round
+/// here leaves that unled (`TAKEN_UP_UNLED`), so what takes the table is the lead that waited.
 /// MUTANT (`LEAD_NEEDS_COMMON`): the lead is dropped in the round that finds it unshared.
 #[test]
 fn a_led_table_the_peer_lacks_is_taken_in_the_next_round() {
@@ -173,7 +176,9 @@ fn a_led_table_the_peer_lacks_is_taken_in_the_next_round() {
         let mut pending = Vec::new();
         for endpoints in [lacking, holding, holding] {
             rounds.push(with_mutant(&LEAD_NEEDS_COMMON, mutant, || {
-                round(endpoints, &tables, &mut ours, &mut theirs)
+                with_mutant(&TAKEN_UP_UNLED, true, || {
+                    round(endpoints, &tables, &mut ours, &mut theirs)
+                })
             }));
             pending.push(ours.pending());
         }

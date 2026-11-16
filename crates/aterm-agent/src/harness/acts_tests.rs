@@ -451,7 +451,6 @@ fn the_harness_labels_its_own_moments_in_closed_words() {
     for words in [
         RESTARTING_LABEL,
         DISK_RESUME_LABEL,
-        DISK_FREE_LABEL,
         LIMIT_RESUME_LABEL,
         "upgrading to 0.164.0-dev.12521",
         "upgrading to 1234567890123456789",

@@ -12,7 +12,7 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 use crate::control::Scope;
-use crate::control::control_media::{MainPost, Waited, park_for_answer};
+use crate::control::control_media::{DoorReply, MainPost, Waited, park_at_door, park_for_answer};
 
 pub(crate) mod hold;
 
@@ -35,14 +35,15 @@ pub(crate) struct EditCall {
     pub(crate) reply: Sender<String>,
 }
 
-/// An `await edit` request posted to the main thread with its outcome channel.
+/// An `await edit` request posted to the main thread with its outcome channel, whose answer
+/// rings the door its lane parks at ([`serve_await_edit`]).
 #[derive(Debug)]
 pub(crate) struct AwaitCall {
     pub(crate) waiter: WaiterId,
     pub(crate) key: AwaitKey,
     /// A `uri=` key's file in its realpath spelling, when it resolves.
     pub(crate) real_uri: Option<String>,
-    pub(crate) reply: Sender<String>,
+    pub(crate) reply: DoorReply<String>,
 }
 
 /// Resolves the canonical `file://` URI for `uri` on the filesystem.
@@ -141,24 +142,22 @@ pub(crate) fn serve_edit(
     }
 }
 
-/// Handles `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]`.
-pub(crate) fn await_edit(proxy: &EventLoopProxy<Wake>, scope: Scope, rest: &str) -> String {
-    serve_await_edit(
-        scope,
-        rest,
-        &mut MainPost::new(proxy),
-        &mut crate::control::caller_hung_up,
-        crate::control::hangup_park,
-    )
+/// Handles `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]`, posting to the main thread
+/// through `post` ([`MainPost::new`] as shipped): [`serve_await_edit`] on
+/// [`crate::park::Lane::SERVED`]'s slotted lane, one wait at its door for all that is left while
+/// the hang-up bell's arm stands, and [`aterm_control::hangup::HANGUP_POLL`] slices where no arm
+/// does.
+pub(crate) fn await_edit(post: &mut MainPost<'_>, scope: Scope, rest: &str) -> String {
+    serve_await_edit(scope, rest, post, crate::park::Lane::SERVED.slotted())
 }
 
-/// Runs [`await_edit`]'s lane logic.
+/// Runs [`await_edit`]'s lane logic: it parks at a door the main thread's answer rings, and the
+/// hang-up bell too while `lane` arms it ([`park_at_door`]), so neither waits out a slice.
 pub(crate) fn serve_await_edit(
     scope: Scope,
     rest: &str,
     post: &mut MainPost<'_>,
-    hung_up: &mut dyn FnMut() -> bool,
-    park: fn(Duration) -> Duration,
+    lane: crate::park::Lane,
 ) -> String {
     if scope != Scope::Owner {
         return "ERR scope\n".to_string();
@@ -175,7 +174,7 @@ pub(crate) fn serve_await_edit(
         wait.timeout_ms,
     ));
     let waiter = mint_waiter();
-    let (answer, _hop) = match post.ask(|reply| {
+    let (answer, door, _hop) = match post.ask_at_door(|reply| {
         Wake::EditAwait(Box::new(AwaitCall {
             waiter,
             key: wait.key,
@@ -190,7 +189,7 @@ pub(crate) fn serve_await_edit(
     let deadline = now
         .checked_add(timeout)
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
-    let waited = park_for_answer(&answer, deadline, hung_up, park);
+    let waited = park_at_door(&answer, &door, deadline, lane);
     post.tell(Wake::EditAwaitWithdraw { waiter });
     match waited {
         Waited::Answer(line) => line,

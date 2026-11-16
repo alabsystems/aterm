@@ -795,6 +795,14 @@ fn switching_from(
     words: impl FnOnce(&mut Mock),
 ) -> (Mock, Arc<Holds>, Vec<String>) {
     let host = Arc::new(Holds::default());
+    let mut m = repeating_from(from, by, words);
+    let lines = run(&mut m, &host, None);
+    (m, host, lines)
+}
+
+/// The stand-in [`switching_from`] runs: the same quick reply to every act, under `from`, the
+/// word set `by`, with the moves `words` sets.
+fn repeating_from(from: &'static str, by: &'static str, words: impl FnOnce(&mut Mock)) -> Mock {
     let mut screens = vec![busy_screen()];
     for _ in 0..4 {
         screens.extend([quick(ALL_DONE), busy_screen()]);
@@ -806,8 +814,35 @@ fn switching_from(
     m.autopilot_by = Some(by);
     words(&mut m);
     m.vanish_after = Some(12);
-    let lines = run(&mut m, &host, None);
-    (m, host, lines)
+    m
+}
+
+/// [`switching_from`] with a journal (`tag` names its scratch folder): the stand-in, and what the
+/// loop journaled, its PARKED and UNPARKED notes among it.
+fn switching_noted(
+    from: &'static str,
+    by: &'static str,
+    tag: &str,
+    words: impl FnOnce(&mut Mock),
+) -> (Mock, Vec<String>) {
+    let host = Arc::new(Holds::default());
+    let mut m = repeating_from(from, by, words);
+    let (dir, journal) = journal_file(tag);
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(&host, None)
+    };
+    let _ = watch_lines_with(&mut m, &opts, |s| {
+        at_test_speed(s);
+        s.set_approval_ledger(None);
+    });
+    let said = journal_records(&journal)
+        .0
+        .into_iter()
+        .map(|r| r.line)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (m, said)
 }
 
 /// LIMIT 1 HOLDS AT A SWITCH NO PERSON MADE, AT THE LOOP (v6 §14.17 item 3): the same switch to
@@ -834,38 +869,57 @@ fn a_switch_no_person_made_over_a_held_tab_types_nothing_at_the_loop() {
 
 /// THE PERSON'S OWN LIFT FROM AN OFF NO PERSON SET OVER A TAB HELD UNDER LAND ASKS ONCE, AT THE
 /// LOOP (the second review, 2026-11-01): a stand-in that repeats its reply holds Land; Off by
-/// `aterm ctl` parks the loop with the hold kept, and Land set by the person (`human:chip`) at the
-/// park's second tick is their move from Off, so the switch's one ask is typed, once. CONTROL:
-/// the same lift by `aterm ctl` types nothing. Negative control: the park leaving the word it saw
-/// (Land) reads the person's lift as no move and types nothing.
+/// `aterm ctl` parks the loop with the hold kept (its journal's PARKED line), and Land set by the
+/// person (`human:chip`) while the park waits is their move from Off, so the park ends on it
+/// (UNPARKED) and the switch's one ask is typed, once. The lift lands on the park's wait, which on
+/// a host that answers the word reads no `meta` (ATERM-KI-1108-2). On a host that takes the word
+/// and never answers it the held loop sees neither the Off nor the lift until its screen moves,
+/// which this stand-in's never does: there the park's read of a lift is
+/// `an_off_park_wakes_on_land_and_types_it_at_once`'s deaf control, and the person's move from Off
+/// over the hold is the policy's test of the same name without `_at_the_loop`
+/// (`turn_end_hold_tests.rs`). CONTROL: the same lift by `aterm ctl` types nothing.
+/// NEGATIVE CONTROLS (each run, then undone): the park leaving the word it saw as Land
+/// (`TurnEndState::park_kept` not setting `word_seen` to Off) reads the person's lift as no move
+/// and types nothing; the park's long wait carrying no word (`park(.., false)` on the heard branch)
+/// never hears the lift.
 #[test]
 fn the_persons_own_lift_from_an_off_no_person_set_over_a_land_hold_asks_once_at_the_loop() {
     let (m, _, lines) = switching_from("land", "ctl", |_| {});
     let held_after = count(&m, "turn");
     assert!(held_after >= 1, "{lines:#?}");
     let gate = 2 * held_after + 1;
-    let parked = |m: &Mock| {
-        m.requests
-            .iter()
-            .position(|r| r.ends_with(" autopilot=off"))
-            .map(|at| m.requests[..at].iter().filter(|r| *r == "meta").count())
+    let parked = |said: &[String]| {
+        said.iter()
+            .any(|l| crate::supervise::run::lifecycle::parked_off_seq(l).is_some())
     };
-    let (m, _, _) = switching_from("land", "ctl", |m| {
+    // The `meta` reads before the first wait that carries a word other than the hold's Land: the
+    // Off's settle, or the park's own first wait.
+    let (m, said) = switching_noted("land", "ctl", "lift-off", |m| {
         m.autopilot_once.insert(gate + 1, Some("off"));
     });
-    let metas = parked(&m).unwrap_or_else(|| panic!("the Off parked: {:#?}", m.requests));
+    assert!(parked(&said), "the Off parked: {said:#?}");
+    let metas = m
+        .requests
+        .iter()
+        .position(|r| {
+            r.split_whitespace()
+                .any(|w| w.starts_with("autopilot=") && w != "autopilot=land")
+        })
+        .map(|at| m.requests[..at].iter().filter(|r| *r == "meta").count())
+        .unwrap_or_else(|| panic!("{:#?}", m.requests));
     for (by, asks) in [("human:chip", 1), ("ctl", 0)] {
-        let (m, _, lines) = switching_from("land", "ctl", |m| {
+        let (m, said) = switching_noted("land", "ctl", &format!("lift-{asks}"), |m| {
             m.autopilot_once.insert(gate + 1, Some("off"));
-            m.autopilot_at = vec![(metas + 2, Some("land"))];
-            m.autopilot_by_at = vec![(metas + 2, Some(by))];
+            m.lift_at_rest = Some((metas + 1, Some("land"), Some(by)));
         });
         assert!(
-            parked(&m).is_some() && m.requests.iter().any(|r| r.ends_with(" autopilot=land")),
-            "{by}: parked, then Land: {:#?}",
-            m.requests
+            parked(&said)
+                && said
+                    .iter()
+                    .any(|l| l.starts_with("UNPARKED ") && l.contains(" autopilot=land ")),
+            "{by}: parked, then Land: {said:#?}"
         );
-        assert_eq!(switch_asks(&m), asks, "{by}: {:#?}\n{lines:#?}", m.requests);
+        assert_eq!(switch_asks(&m), asks, "{by}: {:#?}\n{said:#?}", m.requests);
         assert_eq!(
             count(&m, "turn"),
             held_after + asks,

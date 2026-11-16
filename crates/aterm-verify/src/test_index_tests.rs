@@ -3,6 +3,36 @@
 
 use super::*;
 
+/// Identity evidence must be complete, including at the collector's inclusive bound. Overflow
+/// is a refusal, not a truncated compiler identity; a failed child still supplies no identity.
+#[cfg(unix)]
+#[test]
+fn identity_keeps_complete_output_and_refuses_overflow_or_failed_children() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let source = dir.path().join("identity");
+    let source_arg = source.to_str().unwrap();
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    let cap = aterm_uds::deadline::OUTPUT_KEEP;
+    for len in [0, cap, cap + 1] {
+        let expected = "i".repeat(len);
+        std::fs::write(&source, &expected).unwrap();
+        let read = identity(&cat, dir.path(), &[source_arg]);
+        if len <= cap {
+            assert_eq!(read.unwrap(), expected);
+        } else {
+            assert!(read.is_err(), "an oversized identity cannot be evidence");
+        }
+    }
+    std::fs::write(&source, b" \ncompiler identity\n\t ").unwrap();
+    assert_eq!(
+        identity(&cat, dir.path(), &[source_arg]).unwrap(),
+        "compiler identity"
+    );
+    let missing = dir.path().join("missing-identity");
+    let failed = identity(&cat, dir.path(), &[missing.to_str().unwrap()]).unwrap_err();
+    assert!(failed.to_string().contains("missing-identity"), "{failed}");
+}
+
 #[test]
 fn dirty_sources_never_supply_head_tree_evidence() {
     let dir = aterm_tempfile::tempdir().unwrap();

@@ -1431,6 +1431,7 @@ fn edr_present(
 /// its source, and how far the destination outgrows the source (the bands).
 #[cfg(target_os = "macos")]
 struct BlitCase {
+    dock: bool,
     inset: u32,
     name: &'static str,
     target: crate::metal::ffi::PixelFormat,
@@ -1451,6 +1452,7 @@ struct BlitCase {
 #[cfg(target_os = "macos")]
 impl BlitCase {
     const PLAIN: Self = Self {
+        dock: false,
         inset: 0,
         name: "",
         target: crate::metal::ffi::PixelFormat::Rgba8Unorm,
@@ -1639,6 +1641,42 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
     let cases = [
         BlitCase { name: "exact", ..p },
         BlitCase {
+            name: "dock",
+            dock: true,
+            inset: 40,
+            extra: (47, 3),
+            source: "chrome",
+            ..p
+        },
+        BlitCase {
+            name: "dock-encode-srgb",
+            dock: true,
+            inset: 40,
+            extra: (47, 3),
+            source: "chrome",
+            encode_srgb: true,
+            ..p
+        },
+        BlitCase {
+            name: "dock-hdr",
+            dock: true,
+            inset: 40,
+            extra: (47, 3),
+            source: "chrome",
+            target: PixelFormat::Rgba16Float,
+            hdr: true,
+            ..p
+        },
+        BlitCase {
+            name: "dock-invert",
+            dock: true,
+            inset: 40,
+            extra: (47, 3),
+            source: "chrome",
+            invert: true,
+            ..p
+        },
+        BlitCase {
             name: "side-inset",
             inset: 40,
             extra: (47, 3),
@@ -1727,6 +1765,19 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
             ..p
         },
     ];
+    let dock_size = (36, sh.saturating_sub(6).max(1));
+    let dock_pixels = dock_blit_pixels(dock_size);
+    let dock = TrayQuad {
+        rgba: &dock_pixels,
+        pw: dock_size.0,
+        ph: dock_size.1,
+        dx: 2,
+        dy: 3,
+        scrim: None,
+        serial: 42,
+        delta: None,
+        above: &[],
+    };
     for c in &cases {
         let src = source(&mut gpu, &mut win, c.source);
         assert_eq!((src.width as u32, src.height as u32), (sw, sh));
@@ -1742,14 +1793,26 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
         );
         let bytes = crate::metal::blit::MetalBlit::new(c.target)
             .and_then(|b| {
-                b.run(
-                    &src.rgba_bytes(),
-                    sw,
-                    sh,
-                    aterm_bits::bytes_of(&uniform),
-                    dw,
-                    dh,
-                )
+                if c.dock {
+                    let dock_uniform = uniform.for_dock(&dock);
+                    b.run_docked(
+                        (&src.rgba_bytes(), sw, sh),
+                        aterm_bits::bytes_of(&uniform),
+                        (dw, dh),
+                        dock,
+                        aterm_bits::bytes_of(&dock_uniform),
+                        [2, 3, 2 + dock_size.0, 3 + dock_size.1],
+                    )
+                } else {
+                    b.run(
+                        &src.rgba_bytes(),
+                        sw,
+                        sh,
+                        aterm_bits::bytes_of(&uniform),
+                        dw,
+                        dh,
+                    )
+                }
             })
             .unwrap_or_else(|e| panic!("blit/{}: the Metal blit: {e}", c.name));
         let (texel, dest) = match c.target {
@@ -1762,7 +1825,11 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
             if mutant == Mutant::WideBorder {
                 u.border_px += 2.0;
             }
-            let texels = blit_twin(&src.rgba_bytes(), (sw, sh), &u, (dw, dh));
+            let mut texels = blit_twin(&src.rgba_bytes(), (sw, sh), &u, (dw, dh));
+            if c.dock {
+                let dock_u = dock_blit_twin_uniform(u, dock_size);
+                dock_blit_twin_over(&mut texels, &dock_pixels, dock_size, &dock_u, (dw, dh));
+            }
             Drawn::twin(dw as usize, dh as usize, &texels, dest)
         };
         let name = format!("blit/{}", c.name);
@@ -1784,6 +1851,7 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
     gpu.set_background_opacity(1.0);
     gpu.set_chrome_bleed(None);
     for (a, b) in [
+        ("side-inset", "dock"),
         ("exact", "exact-invert"),
         ("exact", "encode-srgb"),
         ("glass-bands", "glass-premultiplied"),
@@ -2447,4 +2515,67 @@ fn planted_texel_is_decided(arch: &str, adapter: &str, frames: &Named, twins: &T
         "frame-record: a texel planted in {name} fails its twin as drawn on {adapter} and on \
          {UNRECORDED_ADAPTER}, an adapter the record holds no block for"
     );
+}
+
+/// An opaque native card with distinct corners and a narrow row of ink. Every texel differs
+/// from the terminal band's background, so ignoring the second source fails its CPU twin.
+#[cfg(target_os = "macos")]
+fn dock_blit_pixels((w, h): (u32, u32)) -> Vec<u8> {
+    (0..h)
+        .flat_map(|y| {
+            (0..w).flat_map(move |x| {
+                if x == w - 1 {
+                    [95, 105, 119, 255]
+                } else if (4..w.saturating_sub(4)).contains(&x) && (7..10).contains(&y) {
+                    [212, 223, 235, 255]
+                } else {
+                    [28 + (x % 7) as u8, 34 + (y % 11) as u8, 48, 255]
+                }
+            })
+        })
+        .collect()
+}
+
+/// The independent CPU description of the chrome blit: one-to-one texels under a rectangle,
+/// with the frame's colour encoding and output format, without a pane's inversion or wash.
+#[cfg(target_os = "macos")]
+fn dock_blit_twin_uniform(frame: BlitUniform, (w, h): (u32, u32)) -> BlitUniform {
+    BlitUniform {
+        flag: 0,
+        overlay: 0,
+        border_px: 0.0,
+        encode_srgb: frame.encode_srgb,
+        accent: [0.0; 3],
+        chrome_y1: 0.0,
+        dims: [w as f32, h as f32],
+        wash_a: 0.0,
+        border_a: 0.0,
+        band: [0.0; 4],
+        content_off: [2.0, 3.0],
+        hdr: frame.hdr,
+        translucent: 0.0,
+        sdr_white_scale: frame.sdr_white_scale,
+        visible_y: 0.0,
+        visible_h: h as f32,
+        premult: frame.premult,
+        chrome_y0: 0.0,
+        chrome_pad: [0.0; 3],
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn dock_blit_twin_over(
+    texels: &mut [[f32; 4]],
+    rgba: &[u8],
+    size: (u32, u32),
+    uniform: &BlitUniform,
+    dest: (u32, u32),
+) {
+    let card = blit_twin(rgba, size, uniform, dest);
+    for y in 3..3 + size.1 {
+        for x in 2..2 + size.0 {
+            let at = (y * dest.0 + x) as usize;
+            texels[at] = card[at];
+        }
+    }
 }

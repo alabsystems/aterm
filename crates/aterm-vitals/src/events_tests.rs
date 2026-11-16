@@ -270,6 +270,7 @@ fn a_closed_tab_whose_processes_live_on_is_an_orphan_event() {
         pgid: pid,
         name: name.into(),
         cores: Some(cores),
+        cpu_read_span_ns: None,
         wait: None,
         footprint: None,
         peak: None,

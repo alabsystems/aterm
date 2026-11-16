@@ -25,7 +25,9 @@ use crate::wire::{Method, Origin, WireBody};
 use crate::write::{Effect, Ensured, Outcome, WriteOp};
 
 /// One repository-wide intent bucket: an unknown batch blocks another batch,
-/// including one whose inputs differ, until its intent is reconciled.
+/// including one whose inputs differ, until its intent is reconciled or, its
+/// writer able to send nothing more, agh's window for it ends
+/// (`Journal::closable`).
 pub(crate) const ATOMIC_KEY: &str = "atomic refs";
 const ZERO: &str = "0000000000000000000000000000000000000000";
 const MAX_UPDATES: usize = 128;

@@ -1413,21 +1413,23 @@ impl Github {
     ///
     /// # Errors
     ///
-    /// As `git::run`.
+    /// Mutable atomic ref pushes require the journaled refs resource API.
+    /// Otherwise, as `git::run`.
     pub fn run_git(&self, run: &GitRun) -> Result<GitOut> {
         if matches!(
             run.op,
             crate::git::GitOp::PushControl { dry_run: false, .. }
+                | crate::git::GitOp::PushRefs { dry_run: false, .. }
         ) {
             return Err(Error::usage(
-                "a control transaction requires the journaled refs resource boundary",
+                "a mutable atomic push requires the journaled refs resource boundary",
             ));
         }
         crate::git::run(self, run)
     }
 
     /// One exact native ref push, using the same repository-wide journal bucket
-    /// as the API batch. Preparation failures close with no remote side effect;
+    /// as the API batch. Preparation failures create no intent or remote side effect;
     /// an ambiguous push keeps the intent open and cannot be retried silently.
     pub(crate) fn push_git_once(
         &self,
@@ -1450,6 +1452,19 @@ impl Github {
                 .to_string()
         };
         let canonical = canon::git_request(run);
+        let latest = intents.latest(WriteOp::RefUpdateAtomic, crate::github::refs::ATOMIC_KEY)?;
+        if let Some(view) = latest.as_ref().filter(|view| view.open) {
+            let id = &view.intent.id;
+            return Err(Error::new(
+                Kind::OutcomeUnknown,
+                "an atomic ref update intent is still open",
+            )
+            .with_sub(Sub::IntentOpen {
+                intent: id.to_string(),
+            })
+            .with_repo(run.slug.to_string())
+            .with_next(format!("agh intent show {} {id}", run.slug)));
+        }
         let draft = IntentDraft::new(
             WriteOp::RefUpdateAtomic,
             &run.slug,
@@ -1459,15 +1474,20 @@ impl Github {
         )
         .with_request(canon::request_digest(&canonical))
         .with_body_digest(Some(crate::model::Sha256Digest::of(&canonical).to_string()))
-        .with_after(
-            intents
-                .latest(WriteOp::RefUpdateAtomic, crate::github::refs::ATOMIC_KEY)?
-                .map(|v| v.intent.id),
-        );
-        let id = intents.begin(&draft)?;
-        // This private entry is reached only after the durable intent begins.
-        // Public run_git refuses unjournaled mutable control transactions.
-        let result = crate::git::run_with_credential(self, run, decided.cred.clone());
+        .with_after(latest.map(|view| view.intent.id));
+        let mut id = None;
+        let mut admit = || {
+            id = Some(intents.begin(&draft)?);
+            Ok(())
+        };
+        // Retain the original draft and credential across preparation. The runner
+        // calls this once, immediately before its first receive-capable child.
+        let result = crate::git::run_with_credential(self, run, decided.cred.clone(), &mut admit);
+        let Some(id) = id else {
+            return Err(before_the_write(result.err().unwrap_or_else(|| {
+                Error::local("the native write returned without journal admission")
+            })));
+        };
         let settled = match &result {
             Ok(_) => Settled::Created {
                 id: 0,

@@ -496,7 +496,9 @@ pub use aterm_sysprobe::procargs;
 /// then becomes the build, and the holder it leaves behind; named here so the census, which does
 /// not link atpkg, names their processes.
 pub mod build_front;
-/// The leftover view's reader (`sys left`): which of this uid's processes are candidates, and each one's kernel facts for the pure judge (`aterm_vitals::left`), composed from this crate's readers through one injected seam, never reading a held program's environment or arguments.
+/// The leftover view's reader (`sys left`): which of this uid's processes are candidates, and each
+/// one's kernel facts (`aterm_process_facts::left`), composed from this crate's readers through
+/// one injected seam, never reading a held program's environment or arguments.
 pub mod left;
 /// Linux's proc connector as one listener for the whole process: a subscription proven by the kernel's ack and a probe child's `exec`, each `exec` routed to the session whose shell leads the process's session (Linux 6.6 on, no capability asked).
 #[cfg(unix)]

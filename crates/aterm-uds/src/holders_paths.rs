@@ -66,7 +66,16 @@ fn scan_with(
         }
         crate::progress::tick();
         scan.scanned += 1;
-        let failure = match uses(pid, dirs) {
+        // One read's `ESRCH` is not an exit: a removal fence must not drop a live process on a
+        // single errno. A pid whose short BSD read answers `ESRCH` too has exited ([`exited`]);
+        // otherwise it is read once more, and that read's answer is folded below in place of
+        // the first. Any other first answer stands.
+        let read = match uses(pid, dirs) {
+            Err((super::Failed::Exited, _)) if exited(pid) => continue,
+            Err((super::Failed::Exited, _)) => uses(pid, dirs),
+            read => read,
+        };
+        let failure = match read {
             Ok(Some(read)) => {
                 if !unexeced_fork(pid, skip) {
                     scan.users.push(read.user);
@@ -77,13 +86,17 @@ fn scan_with(
             Err(failure) => Some(failure),
         };
         match failure {
-            None | Some((super::Failed::Exited, _)) => {}
+            None => {}
+            // An `ESRCH` the short BSD read now confirms ([`exited`]): the process has exited.
+            // Otherwise it is read as any other failed read below.
+            Some((super::Failed::Exited, _)) if exited(pid) => {}
             // A process of this user's that became a set-user-ID program (`/bin/ps`, `top`)
             // since the listing is refused (`EPERM`) and outside the scan, as it is once listed
             // so ([`super::runs_as_another_user`]).
             Some(_) if super::runs_as_another_user(pid) => {}
             Some((
-                super::Failed::Closed
+                super::Failed::Exited
+                | super::Failed::Closed
                 | super::Failed::Dead
                 | super::Failed::Refused
                 | super::Failed::Other,
@@ -216,25 +229,45 @@ const ELF_MACHINE: u16 = if cfg!(target_arch = "x86_64") {
 
 #[cfg(target_vendor = "apple")]
 fn parent_of(pid: u32) -> Option<u32> {
+    let record = short_bsd(i32::try_from(pid).ok()?).ok()?;
+    let b = record.get(4..8)?;
+    Some(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// The size of `struct proc_bsdshortinfo`, which `PROC_PIDT_SHORTBSDINFO` fills.
+#[cfg(target_vendor = "apple")]
+const SHORT_BSD_SIZE: usize = 64;
+
+/// `pid`'s short BSD record as `proc_pidinfo(PROC_PIDT_SHORTBSDINFO, 0)` answers it, or why the
+/// read failed: `Exited` (`ESRCH`) when the kernel finds no process `pid`, which it answers for
+/// a pid reaped and for a zombie; a short answer is `Other`.
+#[cfg(target_vendor = "apple")]
+fn short_bsd(pid: i32) -> Result<[u8; SHORT_BSD_SIZE], super::Failed> {
     const PROC_PIDT_SHORTBSDINFO: i32 = 13;
-    const SIZE: usize = 64;
-    let n = i32::try_from(pid).ok()?;
-    let mut buf = [0u8; SIZE];
+    #[cfg(test)]
+    if let Some(failed) = super::hook::answer(super::hook::Read::Short, pid) {
+        return Err(failed);
+    }
+    let mut buf = [0u8; SHORT_BSD_SIZE];
+    let size = i32::try_from(SHORT_BSD_SIZE).map_err(|_| super::Failed::Other)?;
+    super::clear_errno();
     // SAFETY: `buf` is exactly the structure this flavor fills.
     let got = unsafe {
         super::ffi::proc_pidinfo(
-            n,
+            pid,
             PROC_PIDT_SHORTBSDINFO,
             0,
             buf.as_mut_ptr().cast(),
-            i32::try_from(SIZE).ok()?,
+            size,
         )
     };
-    if usize::try_from(got).ok() != Some(SIZE) {
-        return None;
+    if got <= 0 {
+        return Err(super::Failed::last());
     }
-    let b = buf.get(4..8)?;
-    Some(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+    if got != size {
+        return Err(super::Failed::Other);
+    }
+    Ok(buf)
 }
 
 /// What the kernel says of a process's executable ([`exe_of`]).
@@ -246,14 +279,25 @@ pub enum Exe {
 }
 
 /// The executable of `pid`, as the kernel holds it, told apart from a process that has exited.
+/// The executable read's `ESRCH` is `Exited` only once the short BSD read answers `ESRCH` too
+/// (`exited`): `proc_pidpath` also answers `ESRCH` for a process with no text vnode, so for any
+/// other short answer it is `Unnamed`.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn exe_of(pid: u32) -> Exe {
     match i32::try_from(pid).map(mac::exe) {
         Ok(Ok(Some(path))) => Exe::At(path),
-        Ok(Err(super::Failed::Exited)) => Exe::Exited,
+        Ok(Err(super::Failed::Exited)) if exited(pid) => Exe::Exited,
         _ => Exe::Unnamed,
     }
+}
+
+/// Whether the kernel finds no process `pid`: its short BSD read answers `ESRCH` ([`short_bsd`]),
+/// as it does for a pid reaped and for a zombie. A record, a refusal or any other failed read
+/// shows no exit. What confirms another read's `ESRCH`.
+#[cfg(target_vendor = "apple")]
+fn exited(pid: u32) -> bool {
+    i32::try_from(pid).is_ok_and(|n| matches!(short_bsd(n), Err(super::Failed::Exited)))
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -275,46 +319,12 @@ fn parent_of(pid: u32) -> Option<u32> {
         .ok()
 }
 
-/// See the macOS twin.
+/// See the macOS twin. Linux: `/proc/<pid>/exe`'s target, a link that does not read naming an
+/// exit only once the process's `stat` shows one ([`super::procfs::exe_in`]).
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn exe_of(pid: u32) -> Exe {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let gone = |e: &io::Error| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH));
-    let dir = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(format!("/proc/{pid}"))
-    {
-        Ok(dir) => dir,
-        Err(e) if gone(&e) => return Exe::Exited,
-        Err(_) => return Exe::Unnamed,
-    };
-    let mut buf = [0u8; 4096];
-    // SAFETY: `dir` is open, `name` is NUL-terminated, and `readlinkat` writes at most `buf.len()` bytes.
-    let n = unsafe {
-        libc::readlinkat(
-            dir.as_raw_fd(),
-            c"exe".as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    let Ok(len) = usize::try_from(n) else {
-        return if gone(&io::Error::last_os_error()) {
-            Exe::Exited
-        } else {
-            Exe::Unnamed
-        };
-    };
-    match buf.get(..len) {
-        Some(path) if len < buf.len() => {
-            Exe::At(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
-        }
-        _ => Exe::Unnamed,
-    }
+    super::procfs::exe_in(Path::new(super::procfs::PROC), pid)
 }
 
 /// See the macOS twin: no reader here, so none is named.
@@ -364,8 +374,8 @@ mod mac {
     /// The working directory of `pid`, as the kernel answers it.
     pub(super) fn cwd(pid: i32) -> Result<Option<PathBuf>, Failed> {
         #[cfg(test)]
-        if super::super::hook::cwd_dead(pid) {
-            return Err(super::super::hook::as_read(Failed::Dead));
+        if let Some(failed) = super::super::hook::answer(super::super::hook::Read::Cwd, pid) {
+            return Err(super::super::hook::as_read(failed));
         }
         let mut buf = [0u8; ffi::VNODEPATHINFO_SIZE];
         let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
@@ -391,6 +401,10 @@ mod mac {
 
     /// The executable of `pid`.
     pub(super) fn exe(pid: i32) -> Result<Option<PathBuf>, Failed> {
+        #[cfg(test)]
+        if let Some(failed) = super::super::hook::answer(super::super::hook::Read::Exe, pid) {
+            return Err(failed);
+        }
         let mut buf = [0u8; ffi::PIDPATH_MAX];
         let size = u32::try_from(buf.len()).map_err(|_| Failed::Other)?;
         clear_errno();
@@ -560,7 +574,15 @@ mod mac {
             path.and_then(|p| placed(&p, dirs))
                 .map(|path| PathUse { pid, how, path })
         };
-        let exe = exe(n).map_err(|f| (f, None))?;
+        // `proc_pidpath` answers `ESRCH` for a process with no text vnode too: one whose exit
+        // the short BSD read does not confirm ([`super::exited`]) is read on through its other
+        // reads, as one whose executable was unlinked is (`Ok(None)`): the mapping walk still
+        // finds an image mapped from under `dirs`.
+        let exe = match exe(n) {
+            Ok(exe) => exe,
+            Err(Failed::Exited) if !super::exited(pid) => None,
+            Err(f) => return Err((f, None)),
+        };
         let fail = |f: Failed| (f, exe.clone());
         if let Some(found) = hit("exe", exe.clone()) {
             return Ok(Some(ObservedUse::known(found)));

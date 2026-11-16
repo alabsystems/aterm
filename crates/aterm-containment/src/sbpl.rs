@@ -45,7 +45,7 @@ pub const USER_TEMP_PARENT: &str = "/private/var/folders";
 /// shape macOS gives it, `<USER_TEMP_PARENT>/<xx>/<id>/T`, or as that folder's quiet
 /// folder `T/.ubd` ([`user_temp_root`]), which a test run's `TMPDIR` names: then only
 /// the quiet folder is writable.
-fn admitted_user_temp(temp: &Path) -> Option<PathBuf> {
+pub(crate) fn admitted_user_temp(temp: &Path) -> Option<PathBuf> {
     let canon = std::fs::canonicalize(temp).ok()?;
     let t = user_temp_root(&canon);
     let bucket = t.parent()?.parent()?;
@@ -59,6 +59,54 @@ pub(crate) fn user_temp_root(temp: &Path) -> &Path {
         (Some(name), Some(parent)) if name == aterm_tempfile::QUIET => parent,
         _ => temp,
     }
+}
+
+/// The temporary root, beside the user's `$TMPDIR`, a job server's socket is admitted under:
+/// where a Trust `targo` binds when `TMPDIR`'s path leaves no room in a socket address.
+pub const JOB_SERVER_FALLBACK_ROOT: &str = "/private/tmp";
+
+/// The hexadecimal digits in a job-server folder's name, `tjs-<digits>`.
+const JOB_SERVER_NAME_DIGITS: usize = 16;
+
+/// The one opening in [`BASE_PROFILE`]'s network denial: the socket of a Trust `targo`'s job
+/// server. That `targo` (Trust build 20882 on) makes a folder `tjs-<16 hex>` under `TMPDIR`,
+/// or under `/tmp` where the path there would not fit a socket address, binds `s` in it, and
+/// ends `Operation not permitted` when the bind is refused, so no contained shell could build.
+///
+/// Bind, accept and connect are admitted on that one path shape, directly under
+/// [`JOB_SERVER_FALLBACK_ROOT`] and under the user's `$TMPDIR` where [`admitted_user_temp`]
+/// admits it, or under the quiet folder of either (a test run's `TMPDIR`); where the admitted
+/// `$TMPDIR` is itself the quiet folder, only there. Every other socket stays refused, a
+/// launchd listener's or an agent's in the same roots included. What this opens: a contained
+/// process may serve at such a path, and may connect to another `targo`'s socket, which hands
+/// its scheduling pipe to its own descendants alone (Trust's `jobserver_utils::handoff`).
+fn push_job_server_sockets(profile: &mut String, user_temp: Option<&Path>) {
+    profile.push_str("(allow network-bind network-inbound network-outbound");
+    push_job_server_clause(profile, Path::new(JOB_SERVER_FALLBACK_ROOT), false);
+    if let Some(temp) = user_temp.and_then(admitted_user_temp) {
+        let root = user_temp_root(&temp);
+        push_job_server_clause(profile, root, root != temp);
+    }
+    profile.push(')');
+}
+
+/// Append ` (regex "^<root>(/\.ubd)?/tjs-<16 hex>/s$")`, the quiet folder required rather than
+/// optional where `quiet_only`. Seatbelt's expressions have no counted repetition, so each
+/// digit is its own class.
+fn push_job_server_clause(out: &mut String, root: &Path, quiet_only: bool) {
+    let mut pattern = String::from("^");
+    push_regex_escaped(&mut pattern, &root.to_string_lossy());
+    pattern.push_str("(/");
+    push_regex_escaped(&mut pattern, aterm_tempfile::QUIET);
+    pattern.push_str(if quiet_only { ")" } else { ")?" });
+    pattern.push_str("/tjs-");
+    for _ in 0..JOB_SERVER_NAME_DIGITS {
+        pattern.push_str("[0-9a-f]");
+    }
+    pattern.push_str("/s$");
+    out.push_str(" (regex \"");
+    push_sbpl_escaped_str(out, &pattern);
+    out.push_str("\")");
 }
 
 /// SBPL rule denying `user-preference-write` under [`FsCapability::TmpOnly`].
@@ -257,6 +305,7 @@ fn profile_scoped(
 
     let mut profile = String::new();
     profile.push_str(BASE_PROFILE);
+    push_job_server_sockets(&mut profile, user_temp);
     if tmp_only {
         push_write_confinement(&mut profile, user_temp, canon_home.as_deref());
     }

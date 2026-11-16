@@ -229,11 +229,10 @@ impl Guards {
     }
 
     /// The first of the guards that hold a fact a host types at an idle point of its own
-    /// (`HostTurn::Fact`, the ask to free disk space: `IdlePoint::held`), in [`Self::each_for`]'s
-    /// order: a person within their grace or another driver's hand ([`Guard::Person`]), the
-    /// person's own exchange ([`Guard::Exchange`]), a manager's wait ([`Guard::Managed`]). The
-    /// host's fenced write judges the halt and a draft itself, and its own seat rule the task and
-    /// the autopilot, so those are not asked here.
+    /// (`HostTurn::Fact`: `IdlePoint::held`), in [`Self::each_for`]'s order: a person within
+    /// their grace or another driver's hand ([`Guard::Person`]), the person's own exchange
+    /// ([`Guard::Exchange`]), a manager's wait ([`Guard::Managed`]). The host's fenced write
+    /// judges the halt and a draft itself, so those are not asked here.
     #[must_use]
     pub fn held_host_fact(&self) -> Option<Guard> {
         [

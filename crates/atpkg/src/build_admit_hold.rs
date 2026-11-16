@@ -3,9 +3,10 @@
 
 //! A BUILD'S CLAIM KEPT BY A HOLDER WHILE THE BUILD RUNS IN ITS FRONT'S PID (BUILD-ADMIT, the shim
 //! hop). The front ([`super::front_exec_bounded`]) claims, spawns `<aterm> __build_hold <pid>
-//! <serial> <claim> <key> <book>` detached ([`aterm_uds::spawnfd::detached_with_two_fds`]: its own
-//! session, stdio on `/dev/null`, a copy of the claim's descriptor at 3 and the arming pipe's write
-//! end at 4), waits for the arming byte, hands its own copy off and execs the build. That call's
+//! <serial> <claim> <key> <book> <build-dir>` detached
+//! ([`aterm_uds::spawnfd::detached_with_two_fds`]: its own session, stdio on `/dev/null`, a copy
+//! of the claim's descriptor at 3 and the arming pipe's write end at 4), waits for the arming
+//! byte, hands its own copy off and execs the build. That call's
 //! first act ([`entry`]) forks once, while it has one thread, and the parent exits, so the holder
 //! is launchd's: no job's signal, no `TaskStop` of the caller's tree and no wait of the build's
 //! reaches it.
@@ -38,6 +39,11 @@
 //! (a daemon holding what it took), at [`SURVIVORS_HELD_WITHIN`] at the latest, or at once when
 //! the front's pid is seen live as another process. The holder signals nothing. A holder that
 //! dies lets the claim go with it, so every failure of it fails open.
+//!
+//! Once the claim is let go and its peak kept ([`at_end`]), a holder whose front named the build
+//! directory ([`Words::leaf`]) takes the receipts `targo` kept there into its record and trims
+//! what they retired ([`build_ended`], DC-12d), within [`TRIM_WITHIN`]. A build with no holder is trimmed
+//! from the same receipts by the cache's next pass, which reads them as kept runs.
 
 /// The longest a holder keeps a claim for what a build killed by a signal left running: a
 /// production bound past which the claim ends anyway, so survivors that keep growing (a test
@@ -101,8 +107,9 @@ pub const UNARMED_ENV: &str = "ATERM_BUILD_HOLD_UNARMED";
 #[cfg(any(test, debug_assertions))]
 pub const UNARMED_PANICS: &str = "panic";
 
-/// What a holder's command line names: the front's pid and serial, the claim's file, its key, and
-/// the book its peak is kept in (`-` for none).
+/// What a holder's command line names: the front's pid and serial, the claim's file, its key, the
+/// book its peak is kept in (`-` for none), and the build directory the build writes
+/// ([`receipt_leaf`], `-` for none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Words {
     /// The front's pid: the build's, once it execs.
@@ -116,36 +123,73 @@ pub struct Words {
     pub key: aterm_capacity::book::Key,
     /// The book its peak is kept in.
     pub own: Option<std::path::PathBuf>,
+    /// The build directory whose receipts the holder takes and which it trims at the build's end
+    /// ([`build_ended`]); `None` where the front knew none.
+    pub leaf: Option<std::path::PathBuf>,
 }
 
 impl Words {
+    /// The words a front of pid `pid` and serial `serial` hands `held`'s holder: its claim's
+    /// file, its key, its book, and the build directory its build writes
+    /// ([`super::Held::build_dir`]). Only macOS hands a claim to a holder.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn of(held: &super::Held, pid: u32, serial: u64) -> Words {
+        Words {
+            pid,
+            serial,
+            claim: held.claim.path().to_path_buf(),
+            key: held.key.clone(),
+            own: held.own.clone(),
+            leaf: held.build_dir.clone(),
+        }
+    }
+
+    /// The claim these words hand the holder, `claim` once adopted, as the holder holds it
+    /// ([`Self::of`] read back): its key, its book and its build's build directory.
+    #[cfg(target_os = "macos")]
+    fn held(&self, claim: aterm_capacity::Claim) -> super::Held {
+        super::Held {
+            claim,
+            key: self.key.clone(),
+            own: self.own.clone(),
+            cohort: false,
+            build_dir: self.leaf.clone(),
+        }
+    }
+
     /// The words after [`HOLD_VERB`].
     #[must_use]
     pub fn render(&self) -> Vec<std::ffi::OsString> {
+        let path = |p: &Option<std::path::PathBuf>| {
+            p.clone()
+                .map_or_else(|| "-".into(), std::path::PathBuf::into_os_string)
+        };
         vec![
             self.pid.to_string().into(),
             self.serial.to_string().into(),
             self.claim.clone().into_os_string(),
             self.key.to_json().into(),
-            self.own
-                .clone()
-                .map_or_else(|| "-".into(), std::path::PathBuf::into_os_string),
+            path(&self.own),
+            path(&self.leaf),
         ]
     }
 
     /// The words [`Self::render`] wrote; `None` for any others.
     #[must_use]
     pub fn parse(words: &[std::ffi::OsString]) -> Option<Words> {
-        let [pid, serial, claim, key, own] = words else {
+        let [pid, serial, claim, key, own, leaf] = words else {
             return None;
         };
         let claim = std::path::PathBuf::from(claim);
-        let own = match own.to_str() {
-            Some("-") => None,
-            _ => Some(std::path::PathBuf::from(own))
-                .filter(|p| p.is_absolute())?
-                .into(),
+        let path = |word: &std::ffi::OsString| match word.to_str() {
+            Some("-") => Some(None),
+            _ => Some(std::path::PathBuf::from(word))
+                .filter(|p| p.is_absolute())
+                .map(Some),
         };
+        let own = path(own)?;
+        let leaf = path(leaf)?;
         let pid = pid.to_str()?;
         let serial = serial.to_str()?;
         if pid.is_empty()
@@ -161,8 +205,89 @@ impl Words {
             claim: claim.is_absolute().then_some(claim)?,
             key: aterm_capacity::book::Key::from_json(key.to_str()?)?,
             own,
+            leaf,
         })
     }
+}
+
+/// The longest a holder's trim at its build's end ([`build_ended`]) takes: what it had moved
+/// aside when its time ran out stays staged in the build directory, and the next trim there
+/// finishes it. Nothing waits on a holder, but the trim holds the build directory's cargo locks
+/// while it moves units aside, and the next build there waits on them.
+pub const TRIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The build directory a build the shim placed at `named` writes (its `.targo-receipts`, its
+/// profiles): a placement under a target directory is read back as that target directory
+/// (`ShimBuild::build_dir`), so where `named` holds its quiet build folder
+/// (`<target>/.ubd/build.noindex`) as a real directory it is that folder, else `named`.
+#[must_use]
+pub fn receipt_leaf(named: &std::path::Path) -> std::path::PathBuf {
+    let quiet = named.join(crate::build_cache::target_build_relative());
+    if std::fs::symlink_metadata(&quiet).is_ok_and(|m| m.is_dir()) {
+        quiet
+    } else {
+        named.to_path_buf()
+    }
+}
+
+/// THE BUILD WRITING THE BUILD DIRECTORY `leaf` ENDED (DC-12d): the record at its top
+/// ([`crate::build_cache::stale::USED`]) takes the receipts `targo` keeps there
+/// ([`crate::build_cache::stale::Kept::take_receipts`], under the record's lock,
+/// [`crate::build_cache::stale::Kept::update`]), so a selection whose receipt a later build of
+/// it replaced retires what its build before used and its build since does not, and where it
+/// retired anything, `trim` (the run-end trim, `crate::build_cache::trim_run_end`) takes what no
+/// build reads again there. `None` where `leaf` is no real directory, the record did not change
+/// (no receipt, as before receipts; the same receipts as it last took; a read of them that was
+/// not whole) or could not be written, or nothing was retired; else what the trim took.
+pub fn build_ended(
+    leaf: &std::path::Path,
+    trim: &dyn Fn(&std::path::Path) -> crate::build_cache::Trimmed,
+) -> Option<crate::build_cache::Trimmed> {
+    use crate::build_cache::stale;
+    if !std::fs::symlink_metadata(leaf).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let receipts = stale::Receipts::read(leaf);
+    let retired = stale::Kept::update(leaf, |kept| kept.take_receipts(&receipts, None)).ok()??;
+    (retired > 0).then(|| trim(leaf))
+}
+
+/// THE HOLDER'S BUILD ENDED `built`: `held`'s claim is let go at once, the meter stopped
+/// (`stop`, its peak), the run phase's peak (`run_peak`) and the whole peak kept
+/// ([`super::Ended::keep_run`], [`super::Ended::keep`]), and then, where `held` names the build
+/// directory its build wrote ([`super::Held::build_dir`]), its receipts are taken and what they
+/// retired trimmed ([`build_ended`], within [`TRIM_WITHIN`]). What the trim took; `None` where
+/// none ran.
+#[cfg(target_os = "macos")]
+fn at_end(
+    held: super::Held,
+    built: super::BuildEnd,
+    run_peak: Option<u64>,
+    stop: impl FnOnce() -> u64,
+) -> Option<crate::build_cache::Trimmed> {
+    let build_dir = held.build_dir.clone();
+    let ended = held.let_go();
+    #[cfg(any(test, debug_assertions))]
+    trace_record(|| aterm_json::json!({"kind": "claim-released", "succeeded": built.succeeded()}));
+    let peak = stop();
+    #[cfg(any(test, debug_assertions))]
+    trace_record(|| aterm_json::json!({"kind": "meter-stopped", "peak": peak}));
+    ended.keep_run(&built, run_peak, &mut |_| {});
+    ended.keep(built, peak, &mut |_| {});
+    let leaf = build_dir?;
+    let until = std::time::Instant::now() + TRIM_WITHIN;
+    let within = || std::time::Instant::now() < until;
+    let trimmed = build_ended(&leaf, &|dir| {
+        crate::build_cache::trim_run_end(dir, std::time::SystemTime::now(), &within)
+    });
+    #[cfg(any(test, debug_assertions))]
+    trace_record(|| {
+        aterm_json::json!({
+            "kind": "trimmed", "freed": trimmed.as_ref().map(|t| t.freed),
+            "kept": trimmed.as_ref().and_then(|t| t.kept.clone()),
+        })
+    });
+    trimmed
 }
 
 /// An executable's first call in `main`, while it has one thread: asked for [`HOLD_VERB`], it
@@ -297,12 +422,7 @@ fn hold(words: &Words) -> u8 {
             "end": format!("{end:?}"),
         })
     });
-    let held = super::Held {
-        claim,
-        key: words.key.clone(),
-        own: words.own.clone(),
-        cohort: false,
-    };
+    let held = words.held(claim);
     let held = match end {
         End::Status(status) if libc::WIFSIGNALED(status) => survive(held, &meter, words),
         End::Status(_) | End::Unknown => held,
@@ -313,14 +433,7 @@ fn hold(words: &Words) -> u8 {
         }
         End::Unknown => super::BuildEnd::Unknown,
     };
-    let ended = held.let_go();
-    #[cfg(any(test, debug_assertions))]
-    trace_record(|| aterm_json::json!({"kind": "claim-released", "succeeded": built.succeeded()}));
-    let peak = meter.stop(0);
-    #[cfg(any(test, debug_assertions))]
-    trace_record(|| aterm_json::json!({"kind": "meter-stopped", "peak": peak}));
-    ended.keep_run(&built, phases.run_peak(), &mut |_| {});
-    ended.keep(built, peak, &mut |_| {});
+    let _ = at_end(held, built, phases.run_peak(), || meter.stop(0));
     #[cfg(any(test, debug_assertions))]
     trace_record(|| {
         aterm_json::json!({

@@ -141,6 +141,12 @@ pub struct Report {
     pub received: usize,
     /// Offered nodes without a durable acknowledgement, including local refusal.
     pub deferred: usize,
+    /// Of [`Self::received`], the records the store did not hold before ([`Kept::Added`]): by
+    /// how much the control journal's batch exchange grew it. A node another of this Mac's
+    /// rounds put in the journal after this round read its inventory counts in `received` and
+    /// not here. The membership records' store does not tell held from new, and an enrollment's
+    /// witness is not counted: both count none.
+    pub added: usize,
 }
 
 /// How long a peer is offered no membership records once it has refused every record this Mac
@@ -334,6 +340,38 @@ thread_local! {
     /// Mutant (tests): a peer's hints name pending table work after a round that completed no
     /// table exchange.
     pub(crate) static PENDING_UNEXCHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): the control journal's retain counts a node it already held as one it
+    /// added ([`Kept`]), as every acknowledged node counted before 2026-11-14.
+    pub(crate) static HELD_NODES_ADDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A [`BEFORE_RETAIN`] hook: it is handed the batch's records as they arrived.
+#[cfg(test)]
+pub(crate) type RetainHook = Box<dyn FnOnce(&[Vec<u8>]) + Send>;
+
+/// Seam (tests): what runs on whichever thread retains a batch into the control journal in the
+/// directory each names, before the journal is read ([`Disk::retain`]), as another of this Mac's
+/// rounds may append between a round's inventory and its batch. Each runs once; the directory
+/// keys it, so tests that run beside each other on their own journals never meet.
+#[cfg(test)]
+pub(crate) static BEFORE_RETAIN: std::sync::Mutex<Vec<(PathBuf, RetainHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run the [`BEFORE_RETAIN`] hook kept for the journal in `dir`, if one is, on the batch `wires`.
+#[cfg(test)]
+fn before_retain(dir: &Path, wires: &[Vec<u8>]) {
+    let hook = {
+        let mut hooks = BEFORE_RETAIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooks
+            .iter()
+            .position(|(held, _)| held == dir)
+            .map(|at| hooks.swap_remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook(wires);
+    }
 }
 
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
@@ -576,8 +614,11 @@ impl Repair {
     }
     /// Name `table` for the rounds this side initiates from this state: once a round's peer
     /// authenticates, each repairs the first led table both sides list before its regular turn,
-    /// and the table leaves as a round selects it. One the lists do not share waits one round
-    /// and is then dropped. False where the bound of led tables is reached and this one is not
+    /// a table named here before one a round led only because the lists newly share it
+    /// ([`crate::replica::Repair::lead`]). The table leaves once a round this side initiated has
+    /// exchanged it; a round that broke off before then leaves it led, and the next round to
+    /// choose it spends it whatever that round's exchange does. One the lists do not share
+    /// waits one round and is then dropped. False where the bound of led tables is reached and this one is not
     /// kept. A lead is an order among tables and grants nothing: whichever peer authenticates
     /// next from this state takes it, and the round's own lists and inventories decide what is
     /// repaired.
@@ -634,21 +675,16 @@ impl Repair {
     pub(crate) fn listed(&self) -> Option<&crate::replica::Listing> {
         self.data.listed()
     }
-    /// This state once a round's lists named `tables` as the ones both sides list
-    /// ([`Self::listed`]) (tests).
-    #[cfg(test)]
-    pub(crate) fn listing(mut self, tables: impl IntoIterator<Item = Digest>) -> Self {
-        self.data.listing(tables);
-        self
-    }
-    /// [`Self::listing`] at an explicit exchange time (tests).
+    /// This state once a round that read its lists at `at` found this side listing `listed` and
+    /// the peer leaving out `left_out` of them ([`Self::listed`]) (tests).
     #[cfg(test)]
     pub(crate) fn listing_at(
         mut self,
-        tables: impl IntoIterator<Item = Digest>,
+        listed: impl IntoIterator<Item = Digest>,
+        left_out: impl IntoIterator<Item = Digest>,
         at: Instant,
     ) -> Self {
-        self.data.listing_at(tables, at);
+        self.data.listing_at(listed, left_out, at);
         self
     }
     /// This state once its round's table exchange broke off having reported `report`
@@ -839,7 +875,7 @@ impl Protocol {
 }
 
 fn require_legacy_bound(bound: aterm_secrets::crossing::RecordsBound) -> Result<()> {
-    if bound.crossed {
+    if bound.fenced() {
         return Err(Error::repair(
             "crossed membership history requires a database protocol newer than atdb/3",
             aterm_types::network_state::RepairCause::LegacyPastCrossing,
@@ -939,7 +975,11 @@ impl Endpoint {
         if let Some(paths) = &self.paths {
             let crossed = aterm_secrets::client::records_marked_crossed(paths)
                 .map_err(|error| local_failure("records protocol", error))?;
-            require_legacy_bound(aterm_secrets::crossing::RecordsBound::here(crossed))?;
+            let format = aterm_secrets::client::records_marked_format(paths)
+                .map_err(|error| local_failure("records protocol", error))?;
+            require_legacy_bound(
+                aterm_secrets::crossing::RecordsBound::here(crossed).at_format(format),
+            )?;
         }
         Ok(())
     }
@@ -2720,7 +2760,21 @@ trait Store {
         Ok(ids)
     }
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>>;
-    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>>;
+    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<Kept>>;
+}
+/// What a store made of one record a peer sent ([`Store::retain`]): only a durable one is
+/// acknowledged, and only one this batch added counts toward [`Report::added`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kept {
+    /// Not durably retained: invalid, refused, or left for the peer to offer again.
+    No,
+    /// Durably retained; the store does not tell whether it held the record before (the
+    /// membership records').
+    Retained,
+    /// Durably retained, and held before this batch.
+    Held,
+    /// Durably retained by this batch: the store holds one more record than it did.
+    Added,
 }
 struct Disk<'a> {
     dir: &'a Path,
@@ -2811,7 +2865,9 @@ impl Store for Disk<'_> {
             })
             .collect()
     }
-    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>> {
+    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<Kept>> {
+        #[cfg(test)]
+        before_retain(self.dir, wires);
         // Reject garbage before taking the writer lock or replaying a large
         // journal. Authenticated legacy evidence is still retained: omitting it
         // could hide restrictions that this version cannot safely interpret.
@@ -2825,7 +2881,7 @@ impl Store for Disk<'_> {
             })
             .collect();
         if !valid.iter().any(Option::is_some) {
-            return Ok(vec![false; wires.len()]);
+            return Ok(vec![Kept::No; wires.len()]);
         }
         // Peers mostly offer what is already held. Acknowledge those from the
         // lock-free view; take the writer only when a valid record is new.
@@ -2864,15 +2920,33 @@ impl Store for Disk<'_> {
                 aterm_durable::durable_dir(self.dir)
                     .map_err(|error| Error::from(error).context("Commons control retain"))?;
             }
-            return Ok(held);
+            return Ok(held
+                .into_iter()
+                .map(|held| if held { Kept::Held } else { Kept::No })
+                .collect());
         };
+        #[cfg(test)]
+        let held_adds = HELD_NODES_ADDED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let held_adds = false;
         Ok(wires
             .iter()
             .zip(valid)
             .map(|(wire, id)| {
+                let Some(id) = id else {
+                    return Kept::No;
+                };
+                // Under the writer nothing else appends: a node the journal holds now (one the
+                // view saw, or one another writer added since) is acknowledged by its receipt,
+                // and adds nothing.
+                let had = journal.receipt(&id).is_some() && !held_adds;
                 // Journal verifies signatures and pins and commits its checkpoint
                 // before returning a receipt. Uncertain appends yield no positive ack.
-                id.is_some_and(|id| journal.ingest(wire).is_ok_and(|receipt| receipt.id == id))
+                match journal.ingest(wire) {
+                    Ok(receipt) if receipt.id == id && had => Kept::Held,
+                    Ok(receipt) if receipt.id == id => Kept::Added,
+                    _ => Kept::No,
+                }
             })
             .collect())
     }
@@ -3123,7 +3197,7 @@ impl Store for MembershipDisk<'_> {
         })
     }
 
-    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>> {
+    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<Kept>> {
         if wires.is_empty() {
             return Ok(Vec::new());
         }
@@ -3131,7 +3205,7 @@ impl Store for MembershipDisk<'_> {
         #[cfg(test)]
         if self.busy.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             self.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(vec![false; wires.len()]);
+            return Ok(vec![Kept::No; wires.len()]);
         }
         let verdicts = aterm_secrets::client::retain_records_for_commons(
             self.paths,
@@ -3143,7 +3217,12 @@ impl Store for MembershipDisk<'_> {
         if verdicts.iter().any(|&v| v) {
             self.invalidate();
         }
-        Ok(verdicts)
+        // The records' store acknowledges a record it held as one it took: it does not tell
+        // which, and the records' moves are told by their digest alone (`runtime::moved`).
+        Ok(verdicts
+            .into_iter()
+            .map(|durable| if durable { Kept::Retained } else { Kept::No })
+            .collect())
     }
 }
 
@@ -3184,12 +3263,13 @@ fn exchange_membership_round(
     } else {
         Vec::new()
     };
+    let turn = exchange_batches(stream, store, side, &ids, RECORDS_PER_ROUND, |_| {})?;
     let Turn {
         sent,
         received,
         deferred,
         ..
-    } = exchange_batches(stream, store, side, &ids, RECORDS_PER_ROUND, |_| {})?;
+    } = turn;
     hint.settle(
         key,
         &ids,
@@ -3200,14 +3280,7 @@ fn exchange_membership_round(
     let done =
         (unsent_local <= RECORDS_PER_ROUND && unsent_remote <= RECORDS_PER_ROUND && deferred == 0)
             || (sent + received == 0);
-    Ok((
-        Report {
-            sent,
-            received,
-            deferred,
-        },
-        done,
-    ))
+    Ok((turn.into(), done))
 }
 
 /// Repair the control journal over `stream`, the grant `pass` clears: on `atdb/8` (`ranges`, the
@@ -3244,20 +3317,11 @@ fn exchange(
     };
     let ids = repair.next(&local, &remote);
     repair.phase = Phase::ControlBatch;
-    let Turn {
-        sent,
-        received,
-        deferred,
-        ..
-    } = exchange_batches(stream, store, side, &ids, RECORDS_PER_ROUND, |phase| {
+    let turn = exchange_batches(stream, store, side, &ids, RECORDS_PER_ROUND, |phase| {
         repair.phase = phase;
     })?;
     repair.phase = Phase::ControlComplete;
-    Ok(Report {
-        sent,
-        received,
-        deferred,
-    })
+    Ok(turn.into())
 }
 
 /// Repair the control journal over `stream` on `atdb/8`, the grant `pass` clears. The two
@@ -3268,7 +3332,9 @@ fn exchange(
 /// holds in memory, never on what the exchange moves: batch after batch each way, until both sides
 /// offer an empty one in the same turn, which each side reads alike, or either side's `until`
 /// passes ([`proceed`]), which leaves the rest for the next session. A peer offers at most the
-/// nodes the reconciliation found it holds that this side lacks.
+/// nodes the reconciliation found it holds that this side lacks. The report counts as added only
+/// the nodes the journal lacked as their batch arrived ([`Report::added`]): one another of this
+/// Mac's rounds brought after the reconciliation is received and adds nothing.
 fn exchange_ranges(
     pass: Pass,
     stream: &mut (impl Read + Write),
@@ -3303,6 +3369,7 @@ fn exchange_ranges(
         total.sent += turn.sent;
         total.received += turn.received;
         total.deferred += turn.deferred;
+        total.added += turn.added;
         if batch.is_empty() && turn.offered == 0 {
             break;
         }
@@ -3401,13 +3468,34 @@ fn lead(stream: &mut (impl Read + Write), side: Side, held: usize, most: usize) 
 }
 
 /// One turn of batches each way: what the peer durably took of this side's batch (`sent`), what
-/// this side durably took of the peer's (`received`), what either refused (`deferred`), and how
-/// many records the peer offered (`offered`).
+/// this side durably took of the peer's (`received`), what either refused (`deferred`), how
+/// many records the peer offered (`offered`), and how many of those received the store did not
+/// hold as the batch arrived (`added`, [`Report::added`]).
 struct Turn {
     sent: usize,
     received: usize,
     deferred: usize,
     offered: usize,
+    added: usize,
+}
+
+/// A wire that moves one turn of batches a round reports that turn.
+impl From<Turn> for Report {
+    fn from(turn: Turn) -> Self {
+        let Turn {
+            sent,
+            received,
+            deferred,
+            offered: _,
+            added,
+        } = turn;
+        Self {
+            sent,
+            received,
+            deferred,
+            added,
+        }
+    }
 }
 
 /// Fetch outgoing wires in the send turn. Receiving may change which records the
@@ -3421,24 +3509,22 @@ fn exchange_batches(
     most: usize,
     mut phase: impl FnMut(Phase),
 ) -> Result<Turn> {
-    let (sent, out, received, incoming) = match side {
+    let ((sent, out), (received, incoming, added)) = match side {
         Side::Initiator => {
             phase(Phase::ControlBatch);
             let batch = store.batch(ids)?;
             phase(Phase::BatchSend);
-            let (sent, out) = send_batch(stream, &batch)?;
+            let sent = send_batch(stream, &batch)?;
             phase(Phase::BatchReceive);
-            let (received, incoming) = receive_batch(stream, store, most)?;
-            (sent, out, received, incoming)
+            (sent, receive_batch(stream, store, most)?)
         }
         Side::Responder => {
             phase(Phase::BatchReceive);
-            let (received, incoming) = receive_batch(stream, store, most)?;
+            let received = receive_batch(stream, store, most)?;
             phase(Phase::ControlBatch);
             let batch = store.batch(ids)?;
             phase(Phase::BatchSend);
-            let (sent, out) = send_batch(stream, &batch)?;
-            (sent, out, received, incoming)
+            (send_batch(stream, &batch)?, received)
         }
     };
     Ok(Turn {
@@ -3446,6 +3532,7 @@ fn exchange_batches(
         received,
         deferred: out + incoming,
         offered: received + incoming,
+        added,
     })
 }
 
@@ -3516,14 +3603,17 @@ fn send_batch(stream: &mut (impl Read + Write), batch: &[Vec<u8>]) -> Result<(us
     }
     Ok((retained, batch.len() - retained))
 }
+/// Receive a batch of at most `most` records (and never more than [`RECORDS_PER_ROUND`]) into
+/// `store` and acknowledge each record: how many it durably retained, how many it did not, and
+/// how many of those retained it added ([`Kept::Added`]).
 fn receive_batch<S: Store>(
     stream: &mut (impl Read + Write),
     store: &S,
     most: usize,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let n = read_u32(stream)? as usize;
     if n == 0 {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
     if n > RECORDS_PER_ROUND || n > most {
         return Err(Error::new("Commons batch exceeds its bound"));
@@ -3541,20 +3631,22 @@ fn receive_batch<S: Store>(
         wires.push(wire);
     }
     // Acquire the local journal only after the entire bounded batch has arrived.
-    let verdicts = store.retain(&wires).unwrap_or_else(|_| vec![false; n]);
+    let verdicts = store.retain(&wires).unwrap_or_else(|_| vec![Kept::No; n]);
     if verdicts.len() != n {
         return Err(Error::new("invalid local Commons receipt count"));
     }
-    let mut retained = 0;
+    let (mut retained, mut added) = (0, 0);
     let mut acks = Vec::with_capacity(n * 33);
-    for (digest, durable) in digests.iter().zip(verdicts) {
+    for (digest, kept) in digests.iter().zip(verdicts) {
+        let durable = kept != Kept::No;
         acks.extend_from_slice(digest);
         acks.push(u8::from(durable));
         retained += usize::from(durable);
+        added += usize::from(kept == Kept::Added);
     }
     stream.write_all(&acks)?;
     stream.flush()?;
-    Ok((retained, n - retained))
+    Ok((retained, n - retained, added))
 }
 pub(crate) fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     stream.write_all(&(bytes.len() as u32).to_le_bytes())?;

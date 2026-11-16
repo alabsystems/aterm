@@ -337,7 +337,7 @@ pub(crate) fn shown(path: &Path, home: &Path) -> String {
                 .collect();
             format!("~/{}", names.join("/"))
         }
-        _ => aterm_sysprobe::paths::plain(path).display().to_string(),
+        _ => aterm_path::plain(path).display().to_string(),
     }
 }
 

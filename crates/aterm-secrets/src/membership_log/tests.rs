@@ -6,6 +6,8 @@ use crate::age;
 use aterm_digest::Sha256;
 use std::sync::OnceLock;
 
+#[path = "down_set_tests.rs"]
+mod down_set_tests;
 #[path = "payload_tests.rs"]
 mod payload_tests;
 

@@ -39,11 +39,14 @@
 //! elsewhere, which the count always passes. Several merge bases are folded in Git's order into
 //! virtual commits: their raw union trees and original parents, with their entry-level replays
 //! held separately ([`Replay::virtual_base`]). This fold handles readable regular issue files
-//! merged by the built-in union driver, not arbitrary whole-tree conflict resolution: a missing,
+//! merged by the built-in union driver, including proven split retitles, not arbitrary
+//! whole-tree conflict resolution: a missing,
 //! nonregular, binary or unreadable issue file, or a conflict at its path, keeps the earlier
 //! first-parent replay instead. A merge with no merge base, or of more than two parents, is also
 //! replayed as a commit of its first parent, and a file
-//! [`known_issues::parts`] does not read is taken as the commit holds it. Main's own reopening of
+//! [`known_issues::parts`] does not read is taken as the commit holds it, except split headings
+//! of an existing issue that [`coalesce_retitles`] can bind to the base and both sides before
+//! replaying the merge. Main's own reopening of
 //! an entry needs no exception: the landing's merge of main's tip takes it from main's side.
 
 use super::{Compose, Git, LOCAL, Seams, short};
@@ -91,13 +94,25 @@ impl Held {
         }
     }
 
-    /// A present regular issue file whose raw and replayed texts support a virtual union.
-    fn virtual_text(&self) -> bool {
+    /// A present regular text file; its entries still need the merge's identity checks.
+    fn virtual_file(&self) -> bool {
         self.blob.is_some()
-            && [self.own.as_deref(), self.text()].into_iter().all(|text| {
-                text.is_some_and(|text| {
-                    !text.as_bytes().contains(&0) && known_issues::ordered(text).is_some()
-                })
+            && self
+                .own
+                .as_deref()
+                .is_some_and(|text| !text.as_bytes().contains(&0))
+    }
+
+    /// A virtual-base input whose replay is readable, including splits already repaired.
+    fn virtual_text(&self) -> bool {
+        self.virtual_file()
+            && self.text().is_some_and(|text| {
+                !text.as_bytes().contains(&0)
+                    && known_issues::ordered(text).is_some()
+                    && self
+                        .own
+                        .as_deref()
+                        .is_some_and(|own| coalesce_repaired(own, own, text).is_some())
             })
     }
 }
@@ -203,7 +218,7 @@ impl Replay<'_, '_> {
             let base = match &bases[..] {
                 [] => None,
                 [base] => Some(self.read(base)?),
-                _ if own.virtual_text() && ours.virtual_text() && theirs.virtual_text() => {
+                _ if own.virtual_file() && ours.virtual_text() && theirs.virtual_text() => {
                     self.virtual_base(bases)?
                 }
                 _ => None,
@@ -229,7 +244,7 @@ impl Replay<'_, '_> {
                 };
                 self.read(&union)?
             };
-            if several && !union.virtual_text() {
+            if several && !union.virtual_file() {
                 return Ok(self.single(own, &ours));
             }
             let names = [first.as_str(), second.as_str()];
@@ -293,7 +308,7 @@ impl Replay<'_, '_> {
                 return Ok(None);
             }
             let union = self.read(&tree)?;
-            if !union.virtual_text() {
+            if !union.virtual_file() {
                 return Ok(None);
             }
             let names = [at.as_str(), next.as_str()];
@@ -317,19 +332,29 @@ impl Replay<'_, '_> {
     /// one side deleted it, as the other changed it), and a part whose heading `union` lost put
     /// back after the part before it on the side that holds it ([`place`]). The merge is `union`
     /// and what a person changed of it, and that change is made on the entry-level merge
-    /// ([`reapply`]). `None` where a text is one [`known_issues::parts`] does not read.
+    /// ([`reapply`]). Split headings of an existing issue are gathered first
+    /// ([`coalesce_retitles`]); `None` where a text still cannot be read as parts.
     fn merged(&self, own: &Held, union: &Held, names: [&str; 2], held: [&Held; 3]) -> Option<Held> {
         let (Some(text), Some(gits)) = (own.own.as_deref(), union.own.as_deref()) else {
             return None;
         };
         let [base, ours, theirs] = held.map(|held| held.text().and_then(known_issues::ordered));
-        let (Some(base), Some(ours), Some(theirs), Some(gits_order)) =
-            (base, ours, theirs, known_issues::ordered(gits))
-        else {
+        let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs) else {
             return None;
         };
-        let [base_of, ours_of, theirs_of, gits_of] = [&base, &ours, &theirs, &gits_order]
-            .map(|parts| parts.iter().copied().collect::<BTreeMap<_, _>>());
+        let [base_of, ours_of, theirs_of] =
+            [&base, &ours, &theirs].map(|parts| parts.iter().copied().collect::<BTreeMap<_, _>>());
+        let sources = [&base_of, &ours_of, &theirs_of];
+        // A side may still carry split headings whose earlier replay proved one identity.
+        // Keep that proof when the other side has since closed the issue.
+        let repairs: Vec<_> = held
+            .iter()
+            .filter_map(|side| Some((side.own.as_deref()?, side.fixed.as_deref()?)))
+            .collect();
+        let gits = coalesce_retitles(gits, sources, &repairs)?;
+        let edited = coalesce_retitles(text, sources, &repairs)?;
+        let gits_order = known_issues::ordered(&gits)?;
+        let gits_of = gits_order.iter().copied().collect::<BTreeMap<_, _>>();
         let decided = known_issues::merge(&base_of, &ours_of, &theirs_of);
         let both = |key: &str| match (ours_of.get(key), theirs_of.get(key)) {
             (Some(&mine), Some(&other)) => known_issues::merge_part(
@@ -367,8 +392,8 @@ impl Replay<'_, '_> {
             .iter()
             .map(|(key, body)| (*key, body.as_ref()))
             .collect();
-        let entry_level = known_issues::rewrite(gits, &want)?;
-        let now = reapply(gits, &entry_level, text)?;
+        let entry_level = known_issues::rewrite(&gits, &want)?;
+        let now = reapply(&gits, &entry_level, &edited)?;
         // The line a side's replay said of a part, where the merge holds that part (or none) as
         // the side's own file does: the merge took it from that file, which the replay changed.
         let mine = known_issues::parts(text).unwrap_or_default();
@@ -428,16 +453,143 @@ impl Replay<'_, '_> {
     }
 }
 
+/// Gather a union's repeated headings only for an issue present in the base and both sides,
+/// or bound to one identity by an earlier repair. Each heading must come from those sources;
+/// independent new issues sharing an identifier remain unreadable. Keep every body byte, in
+/// occurrence order, at the last occurrence (the union can leave an earlier bare heading above
+/// a new neighboring issue). The entry merge
+/// decides the heading, so a later edit choosing a different single heading remains an edit.
+pub(super) fn coalesce_retitles<'t>(
+    text: &'t str,
+    sources: [&BTreeMap<&str, &str>; 3],
+    repairs: &[(&str, &str)],
+) -> Option<Cow<'t, str>> {
+    coalesce(text, |key, headings| {
+        retitle(key, headings, sources).or_else(|| {
+            repairs
+                .iter()
+                .find_map(|(was, fixed)| repaired_title(key, headings, was, fixed))
+        })
+    })
+}
+
+/// Choose a heading only where the base and both sides identify the same issue.
+fn retitle(key: &str, headings: &[&str], sources: [&BTreeMap<&str, &str>; 3]) -> Option<String> {
+    let [base, ours, theirs] = sources.map(|parts| parts.get(key).copied());
+    let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs) else {
+        return None;
+    };
+    let allowed = [base, ours, theirs].map(|body| body.lines().next());
+    if headings
+        .iter()
+        .any(|heading| !allowed.contains(&Some(*heading)))
+    {
+        return None;
+    }
+    Some(known_issues::merge_part(
+        key,
+        allowed[0]?,
+        allowed[1]?,
+        allowed[2]?,
+    ))
+}
+
+/// An earlier repair established the identity of these split headings. A later edit may keep
+/// them and change their prose; it may not introduce another duplicated identifier or heading.
+fn coalesce_repaired<'t>(text: &'t str, was: &str, repaired: &str) -> Option<Cow<'t, str>> {
+    coalesce(text, |key, headings| {
+        repaired_title(key, headings, was, repaired)
+    })
+}
+
+/// Carry an established identity only for headings already present in the repaired source.
+fn repaired_title(key: &str, headings: &[&str], was: &str, repaired: &str) -> Option<String> {
+    let parts = known_issues::parts(repaired)?;
+    let before = known_issues::entries(was);
+    let allowed: Vec<_> = before
+        .iter()
+        .filter(|entry| entry.id == Some(key))
+        .filter_map(|entry| entry.body.lines().next())
+        .collect();
+    if allowed.len() < 2 || headings.iter().any(|heading| !allowed.contains(heading)) {
+        return None;
+    }
+    parts.get(key)?.lines().next().map(str::to_owned)
+}
+
+/// Gather repeated parts only where `title` establishes their identity and heading.
+fn coalesce<'t>(
+    text: &'t str,
+    mut title: impl FnMut(&str, &[&str]) -> Option<String>,
+) -> Option<Cow<'t, str>> {
+    if known_issues::ordered(text).is_some() {
+        return Some(Cow::Borrowed(text));
+    }
+    let entries = known_issues::entries(text);
+    let first = entries.first()?.span.start;
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut at = first;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.span.start != at {
+            return None;
+        }
+        at = entry.span.end;
+        groups.entry(entry.id?).or_default().push(i);
+    }
+    if at != text.len() {
+        return None;
+    }
+    let mut gathered = BTreeMap::new();
+    for (&key, positions) in &groups {
+        if positions.len() == 1 {
+            continue;
+        }
+        let headings: Vec<_> = positions
+            .iter()
+            .map(|&i| entries[i].body.lines().next())
+            .collect::<Option<_>>()?;
+        let mut body = title(key, &headings)?;
+        body.push_str(line_end(text));
+        for &i in positions {
+            let entry = &entries[i];
+            if let Some((_, rest)) = text[entry.span.clone()].split_once('\n') {
+                body.push_str(rest);
+            }
+        }
+        gathered.insert(key, body);
+    }
+    let mut out = text[..first].to_owned();
+    for (i, entry) in entries.iter().enumerate() {
+        let key = entry.id?;
+        if groups.get(key)?.last() != Some(&i) {
+            continue;
+        }
+        out.push_str(
+            gathered
+                .get(key)
+                .map_or(&text[entry.span.clone()], String::as_str),
+        );
+    }
+    known_issues::ordered(&out)?;
+    Some(Cow::Owned(out))
+}
+
 /// `edited`, an edit of the text `was`, made instead on `repaired`, the rule's repair of `was`
-/// ([`Edit`]); `None` where a text is one [`known_issues::parts`] does not read. Each part is as
+/// ([`Edit`]); `None` where a text remains unreadable after gathering proven split headings.
+/// Each part is as
 /// the entry-level merge of the three decides it ([`known_issues::merge`]); a part the edit and
 /// the repair both changed is their three-way merge line by line ([`known_issues::merge_part`]),
 /// with the edit's change of a line the repair moved to another part made there. Where that
 /// result fails the line count ([`accounts`]), each part is instead the edit's where the edit
 /// changed it and the repair's where it did not, which the count always passes: no step of the
 /// rule loses a line Git's merge or a person kept, or makes one up, beyond what the repair moved,
-/// took out or put in.
+/// took out or put in. Split headings already bound to one entry by the repair are gathered
+/// before replay; newly introduced duplicate identifiers or headings remain unreadable.
 pub(super) fn reapply(was: &str, repaired: &str, edited: &str) -> Option<String> {
+    let normalized = coalesce_repaired(was, was, repaired)?;
+    let edited = coalesce_repaired(edited, was, repaired)?;
+    let was = normalized.as_ref();
+    let edited = edited.as_ref();
     let edit = Edit::of(was, repaired, edited)?;
     let now = edit.made(true)?;
     if accounts(was, repaired, edited, &now) {

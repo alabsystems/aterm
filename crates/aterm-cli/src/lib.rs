@@ -1630,7 +1630,8 @@ struct FactReads<'a> {
     /// [`spotlight::facts`].
     spotlight: &'a (dyn Fn() -> Option<Result<spotlight::Spotlit, String>> + Sync),
     /// [`services_fact`].
-    services: &'a (dyn Fn() -> Option<Result<aterm_uds::services::Reading, String>> + Sync),
+    services:
+        &'a (dyn Fn() -> Option<Result<aterm_process_facts::services::Reading, String>> + Sync),
     /// [`privacy_facts`].
     privacy: &'a (dyn Fn() -> PrivacyFacts + Sync),
     /// [`debugger_facts`].
@@ -1917,7 +1918,7 @@ struct MachineFacts {
     /// ([`aterm_uds::program_check::look`]).
     program_check: Option<aterm_uds::program_check::Look>,
     /// macOS: what its own services hold ([`services_fact`]).
-    services: Option<Result<aterm_uds::services::Reading, String>>,
+    services: Option<Result<aterm_process_facts::services::Reading, String>>,
     /// macOS: the cache root plain `targo` builds in ([`shim_cache_fact`]).
     shim_cache: Option<std::path::PathBuf>,
     /// Unix: this Mac's network place in the words every reporter uses ([`network_fact`]):
@@ -2259,7 +2260,7 @@ fn offered_token_live(pid: u32) -> Option<String> {
 /// judged as a reading that knows no tab: only a run's witness (W-group or W-run with C-tree, of
 /// a dead run) or W-writer can offer one, and nothing tied by a name. `None` for every other row.
 fn offered_token(
-    facts: &aterm_vitals::left::Facts,
+    facts: &aterm_process_facts::left::Facts,
     launchd: Option<i32>,
     me: u32,
 ) -> Option<String> {
@@ -2281,9 +2282,9 @@ fn program_check_fact() -> Option<aterm_uds::program_check::Look> {
 
 /// macOS: one unprivileged read of what its own services hold ([`aterm_uds::services::read`]);
 /// `None` elsewhere.
-fn services_fact() -> Option<Result<aterm_uds::services::Reading, String>> {
+fn services_fact() -> Option<Result<aterm_process_facts::services::Reading, String>> {
     cfg!(target_os = "macos").then(|| {
-        aterm_uds::services::read()
+        aterm_uds::services::read(aterm_vitals::services::followed_from)
             .ok_or_else(|| "the process table or the machine's memory could not be read".to_owned())
     })
 }
@@ -2336,7 +2337,9 @@ fn services_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(read) = &facts.services else {
         return Vec::new();
     };
-    let name = |s: &aterm_uds::services::Service| aterm_vitals::sys::exe_word(&s.name).to_owned();
+    let name = |s: &aterm_process_facts::services::Service| {
+        aterm_vitals::sys::exe_word(&s.name).to_owned()
+    };
     let (mark, mut fact, unmeasured) = match read {
         Err(why) => (
             Mark::Note,
@@ -2920,6 +2923,11 @@ const fn walks(access: aterm_types::macos_setup::Access, own: bool) -> bool {
     match access {
         Access::DeveloperTools | Access::Debugger => true,
         Access::FullDiskAccess | Access::Accessibility => own,
+        Access::LocalNetwork
+        | Access::NameRule
+        | Access::SpotlightScope
+        | Access::NetworkAuth
+        | Access::NetworkHelper => false,
     }
 }
 

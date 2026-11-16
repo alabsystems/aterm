@@ -552,13 +552,19 @@ fn a_read_answers_from_the_snapshot_while_custody_refuses_every_way() {
         .view_until(must())
         .expect_err("no home is known to hold the newest records");
     assert_eq!(unsettled.to_string(), PRESERVING);
+    let views = materialize::PROJECTIONS.with(std::cell::Cell::get);
     let invalidated = stand.pass(true);
+    assert!(
+        materialize::PROJECTIONS.with(std::cell::Cell::get) > views,
+        "the unsettled home's records are projected"
+    );
     all(&stand, &invalidated, Word::Held, Some(Why::Succession));
     for outcome in &invalidated {
         assert_eq!(
             outcome.recorded,
-            Some(Recorded::Recorded { replaced: true }),
-            "the unsettled home's records are projected"
+            Some(Recorded::Settled),
+            "they are the rows and the word the files here hold: {}",
+            outcome.name
         );
     }
     untouched(reads(&stand, Word::Held, Some(Why::Succession)));
@@ -606,8 +612,62 @@ fn revoke(stand: &Stand) {
 #[test]
 fn a_revoked_macs_strict_read_refuses_for_the_revocation_and_its_snapshot_still_reads() {
     let stand = Stand::new();
+    let registry = Registry::at(stand.paths().clone());
+    registry
+        .write(vec![vec![
+            put(&MACHINE, &stand.machine, "nickname", json!("Heron")),
+            crate::database::Change {
+                collection: crate::alab::registry::MACHINE_FACTS.name.into(),
+                key: uuid_of(&stand.lab, SEAT),
+                value: Some(json!({"r": 1, "n": 1, "mac": stand.machine, "label": "m7"})),
+            },
+        ]])
+        .unwrap();
     all(&stand, &stand.pass(false), Word::Live, None);
     let live = reads(&stand, Word::Live, None);
+    let nickname = super::live_here_nickname(stand.paths()).expect("the live own row");
+    assert_eq!(nickname.0, stand.machine);
+    assert_eq!(
+        nickname.1,
+        crate::alab::view::MachineNickname::Named {
+            word: "Heron".into(),
+            automatic: false,
+        }
+    );
+
+    // A snapshot whose last status vouches for another revision is retained, never a source
+    // for automatic naming. Re-admission of the same rows restores their eligibility.
+    let status_path = stand.root().state(&super::MACHINES.file());
+    let status_bytes = std::fs::read(&status_path).unwrap();
+    let mut status = aterm_file::State::decode(&status_bytes).unwrap();
+    status.rev = status.rev.wrapping_add(1);
+    aterm_secrets::fsx::write_atomic(&status_path, &status.encode(), 0o600).unwrap();
+    assert_eq!(
+        super::here_nickname(stand.paths()),
+        Some(nickname.1.clone())
+    );
+    assert_eq!(super::live_here_nickname(stand.paths()), None);
+    aterm_secrets::fsx::write_atomic(&status_path, &status_bytes, 0o600).unwrap();
+    assert_eq!(
+        super::live_here_nickname(stand.paths()),
+        Some(nickname.clone())
+    );
+
+    aterm_secrets::fsx::write_atomic(&stand.config, b"[commons]\nenabled = false\n", 0o600)
+        .unwrap();
+    all(&stand, &stand.pass(true), Word::Off, Some(Why::Policy));
+    assert_eq!(
+        super::here_nickname(stand.paths()),
+        Some(nickname.1.clone())
+    );
+    assert_eq!(super::live_here_nickname(stand.paths()), None);
+    aterm_secrets::fsx::write_atomic(&stand.config, b"", 0o600).unwrap();
+    all(&stand, &stand.pass(true), Word::Live, None);
+    assert_eq!(
+        super::live_here_nickname(stand.paths()),
+        Some(nickname.clone())
+    );
+
     revoke(&stand);
     let refused = Registry::at(stand.paths().clone())
         .view_until(Instant::now() + aterm_spec::wait::MUST_HAPPEN)
@@ -622,6 +682,8 @@ fn a_revoked_macs_strict_read_refuses_for_the_revocation_and_its_snapshot_still_
         );
     }
     assert_eq!(reads(&stand, Word::Held, Some(Why::Membership)), live);
+    assert_eq!(super::here_nickname(stand.paths()), Some(nickname.1));
+    assert_eq!(super::live_here_nickname(stand.paths()), None);
 }
 
 /// A face's cells, split at tabs: no cell of these fixtures holds one.
@@ -958,9 +1020,9 @@ fn the_status_counts_the_records_a_file_holds_inert() {
     let ls = verb(&stand.root(), &["ls"]);
     assert!(!ls.contains("inert"), "{ls}");
 
-    // An older build rewrote a status without the count (a refused pass keeps the projection
-    // version it read): at the same frontier the next pass projects again rather than trust a
-    // count nobody recorded.
+    // An older build rewrote a status without the count (a refused pass keeps the key it
+    // read): at the same key the next pass projects again rather than trust a count nobody
+    // recorded.
     // NEGATIVE CONTROL, observed: with `opened` keeping a status that does not say its count,
     // the pass projects nothing and the count stays unknown: `` left: None right: Some(0) ``.
     let accounts = stand.file(&super::ACCOUNTS);
@@ -981,7 +1043,7 @@ fn the_status_counts_the_records_a_file_holds_inert() {
 }
 
 /// A pass projects what arrived, moves the revision only when the content changed, projects
-/// nothing again for a frontier it already holds, and never shows a value the guards refuse.
+/// nothing again at a key it already holds, and never shows a value the guards refuse.
 /// NEGATIVE CONTROL: with `table` writing a cell's stored value in place of the text the grid
 /// shows, the note's cell is the stored run, which the `REFUSED` assertion prints.
 #[test]
@@ -989,21 +1051,30 @@ fn a_pass_projects_what_arrived_and_withholds_what_the_guards_refuse() {
     let stand = Stand::new();
     let first = stand.pass(false);
     all(&stand, &first, Word::Live, None);
-    // Nothing arrived: nothing is projected again, and the word is recorded all the same.
+    // Nothing arrived: nothing is projected again, and nothing is written, the status included.
     for outcome in stand.pass(false) {
         assert_eq!(
             outcome.recorded,
-            Some(Recorded::Recorded { replaced: false })
+            Some(Recorded::Settled),
+            "{}",
+            outcome.name
         );
     }
     assert_eq!(stand.file(&super::ACCOUNTS).status().rev(), 1);
-    // A projection of the same records keeps the revision.
+    // A projection of the same records keeps the revision, and the files with it.
+    let views = materialize::PROJECTIONS.with(std::cell::Cell::get);
     for outcome in stand.pass(true) {
         assert_eq!(
             outcome.recorded,
-            Some(Recorded::Recorded { replaced: true })
+            Some(Recorded::Settled),
+            "{}",
+            outcome.name
         );
     }
+    assert!(
+        materialize::PROJECTIONS.with(std::cell::Cell::get) > views,
+        "the pass projected again"
+    );
     assert_eq!(stand.file(&super::ACCOUNTS).status().rev(), 1);
 
     // A record arrives: a status, and a note shaped like a credential, stored as an older or
@@ -1187,11 +1258,30 @@ fn files_left_by_another_replica_are_replaced_by_this_ones_read() {
     copy_tree(other.root().path(), stand.root().path());
     assert_eq!(stand.file(&super::ACCOUNTS).read().rows().len(), 4);
 
+    // The accounts are replaced, and so are the journal ring's files, whose rows each lab's Mac
+    // states at its own machine's key; the links and machines, and the limits folded from the
+    // one reading of the one account, the same rows at the same revision in both labs, keep
+    // their snapshot files, now vouched for by this replica's frontier.
+    let replaced = [
+        &super::ACCOUNTS,
+        &super::LOGINS,
+        &super::USAGE,
+        &super::EVENTS,
+    ]
+    .map(Type::file);
     let first = stand.pass(false);
     for outcome in &first {
         assert_eq!(
             outcome.recorded,
-            Some(Recorded::Recorded { replaced: true }),
+            Some(Recorded::Recorded {
+                replaced: replaced.contains(&outcome.name)
+            }),
+            "{}",
+            outcome.name
+        );
+        assert_ne!(
+            aterm_file::File::at(&stand.root(), &outcome.name).frontier(),
+            aterm_file::File::at(&other.root(), &outcome.name).frontier(),
             "{}",
             outcome.name
         );
@@ -1201,6 +1291,150 @@ fn files_left_by_another_replica_are_replaced_by_this_ones_read() {
     assert_eq!(read.rows().len(), 3, "this lab's accounts");
     assert!(read.rows().iter().all(|row| row.pk != extra));
     assert_eq!(read.status.rev(), 2);
+}
+
+/// A pass keeps a snapshot it would not take without projecting it (the kept skip of
+/// `materialize::opened`): a read behind the snapshot here makes no table view and records
+/// `Kept(Behind)`; a projection too large to take at a key is not made again at that key (once
+/// the status records `held` for it, a pass there writes nothing and still says why), and a
+/// pass whose key moved projects again, while one whose key stands keeps it still. The files
+/// ahead are another copy of the lab's, projected from a registry record this Mac's replica
+/// lacks: the registry's files, and `ai/limits`, whose frontier is the registry's read it names
+/// accounts by, are behind them, while the journal ring's files, whose window holds the same
+/// records in both copies, are not, and their key stands. The projection too large is the
+/// status `aterm_file::File::record` leaves for one: the read's key as the one too large
+/// ([`aterm_file::State::kept_key`]), and the snapshot kept at an earlier read's key; a
+/// registry record moves the keys of the registry's files and the view's, and none of the
+/// journal ring's files'.
+///
+/// NEGATIVE CONTROLS (2026-11-14, run again 2026-11-15 once main's journal ring files joined
+/// the pass): with `opened` judging no kept reason before it projects (`let kept = None;`), the
+/// pass behind the snapshot made the registry's view: `a read behind the snapshot makes no
+/// view` failed, `left: 3 right: 2`; with the skip passing over a key the status records too
+/// large (`false && state.kept == Some(Kept::TooLarge) …`), the pass at that key projected
+/// again, making the registry's view: `a projection too large at this key is not made again`
+/// failed, `left: 4 right: 3` (2026-11-15, the status as `record` leaves it; while the test's
+/// status recorded the snapshot at that same key, the pass found the snapshot unchanged, made no
+/// view, and failed only on the word it recorded, `Recorded { replaced: false }`); and
+/// (2026-11-15) with the view's frontier the ring's again, as the merge first had it, the pass
+/// behind the snapshot projected `ai/limits` from the older registry, making the registry's view
+/// to fold it: `a read behind the snapshot makes no view` failed, `left: 3 right: 2`.
+#[test]
+fn a_kept_snapshot_is_not_projected_again_until_its_key_moves() {
+    use crate::alab::upkeep::tests::machine_row;
+    use aterm_file::Kept;
+    let views = || materialize::PROJECTIONS.with(std::cell::Cell::get);
+    let kept = |outcomes: &[Outcome], why: Kept| {
+        assert_eq!(outcomes.len(), super::FILES.len());
+        for outcome in outcomes {
+            assert_eq!(
+                outcome.recorded,
+                Some(Recorded::Kept(why)),
+                "{}",
+                outcome.name
+            );
+        }
+    };
+
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let fork = stand.lab.fork();
+    Registry::at(fork.paths[SEAT].clone())
+        .write(vec![machine_row("m8")])
+        .unwrap();
+    let ahead = materialize::pass(
+        &fork.paths[SEAT],
+        &fork._home.path().join("aterm.toml"),
+        None,
+        &Pass {
+            read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            vault_wait: materialize::VAULT_WAIT,
+            again: false,
+            now_ms: NOW,
+        },
+    );
+    every(&ahead, Word::Live, None);
+    copy_tree(super::root(&fork.paths[SEAT]).path(), stand.root().path());
+    let before = views();
+    let behind = stand.pass(false);
+    assert_eq!(views(), before, "a read behind the snapshot makes no view");
+    assert_eq!(behind.len(), super::FILES.len());
+    for (file, outcome) in super::FILES.iter().zip(&behind) {
+        let expected = if matches!(file.store, Store::Journal(_)) {
+            Recorded::Settled
+        } else {
+            Recorded::Kept(Kept::Behind)
+        };
+        assert_eq!(outcome.recorded, Some(expected), "{}", outcome.name);
+    }
+
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    // The status a projection too large to take leaves (`aterm_file::File::record`): the key of
+    // this read as the one too large, and the snapshot kept at the key of an earlier read.
+    for file in super::FILES {
+        let mut state = stand.file(file).state().unwrap();
+        state.kept = Some(Kept::TooLarge);
+        state.kept_key.clone_from(&state.key);
+        state.key = Some(aterm_codec::hex::encode_lower(&[0_u8; 32]));
+        assert_ne!(state.key, state.kept_key, "{}", file.name);
+        aterm_uds::atomic_file::write(&stand.root().state(&file.file()), &state.encode(), 0o600)
+            .unwrap();
+    }
+    // The pass keeps the snapshot for the reason the status already records: it changes nothing
+    // and writes nothing, and says why the snapshot is kept all the same.
+    let settled = |outcomes: &[Outcome], why: Kept| {
+        assert_eq!(outcomes.len(), super::FILES.len());
+        for outcome in outcomes {
+            assert_eq!(
+                outcome.recorded,
+                Some(Recorded::Settled),
+                "{}",
+                outcome.name
+            );
+            let state = aterm_file::File::at(&stand.root(), &outcome.name).state();
+            assert_eq!(state.unwrap().kept, Some(why), "{}", outcome.name);
+            assert!(outcome.detail.is_some(), "{}", outcome.name);
+        }
+    };
+    // The first pass at the key records `held` for the reason the status gives (the status here
+    // says `live` beside it), and the pass after changes nothing.
+    let before = views();
+    let outcomes = stand.pass(false);
+    assert_eq!(
+        views(),
+        before,
+        "a projection too large at this key is not made again"
+    );
+    assert_eq!(outcomes.len(), super::FILES.len());
+    kept(&outcomes, Kept::TooLarge);
+    settled(&stand.pass(false), Kept::TooLarge);
+    assert_eq!(views(), before, "nor by the pass after");
+    Registry::at(stand.paths().clone())
+        .write(vec![machine_row("m8")])
+        .unwrap();
+    let outcomes = stand.pass(false);
+    assert_eq!(outcomes.len(), super::FILES.len());
+    for (file, outcome) in super::FILES.iter().zip(&outcomes) {
+        if matches!(file.store, Store::Journal(_)) {
+            // Its key stands: the snapshot is kept still, and the pass writes nothing.
+            assert_eq!(
+                (outcome.word, outcome.recorded),
+                (Word::Held, Some(Recorded::Settled)),
+                "{}",
+                outcome.name
+            );
+        } else {
+            assert_eq!(
+                (outcome.word, outcome.why),
+                (Word::Live, None),
+                "{}: {:?}",
+                outcome.name,
+                outcome.detail
+            );
+        }
+    }
+    assert!(views() > before, "a pass whose key moved projects again");
 }
 
 /// A pass that read live custody before a fence records nothing once the fenced pass has
@@ -1266,6 +1500,20 @@ fn refresh_runs_a_pass_and_reports_each_file() {
          ai/usage: live · snapshot written\n\
          ai/events: live · snapshot written\n\
          ai/limits: live · snapshot written\n"
+    );
+    // Again with nothing changed: the forced pass projects, finds what the files say, and
+    // writes nothing.
+    let (text, code) = refresh(&[]).unwrap();
+    assert_eq!(code, aterm_file::exit::OK);
+    assert_eq!(
+        text,
+        "ai/accounts: live · nothing changed\n\
+         ai/links: live · nothing changed\n\
+         lab/machines: live · nothing changed\n\
+         ai/logins: live · nothing changed\n\
+         ai/usage: live · nothing changed\n\
+         ai/events: live · nothing changed\n\
+         ai/limits: live · nothing changed\n"
     );
     stand.commons("[commons]\nenabled = false\n");
     let (text, code) = refresh(&["ai/links", "--json"]).unwrap();
@@ -2324,6 +2572,1176 @@ fn a_spent_vault_wait_reads_an_unheld_vault_and_a_spent_pass_is_out_of_time_not_
     }
 }
 
+/// Two Writers whose Commons the membership log backs, as every lab Mac's is now, their registry
+/// rolled to its second generation: m1 writes both machine rows and its own facts row, m2 its
+/// own, and m1's roll, once m2 has declared the second generation, carries each facts row into
+/// it as a signed record of the first. Mac 0 (m1) is the Mac whose files are read.
+fn carried_lab() -> Lab {
+    use crate::alab::upkeep::tests::{bound_facts, machine_row};
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    client::test_sign_genesis(
+        &lab.paths[0],
+        &lab._home.path().join("f18.genesis"),
+        &lab.signer,
+    )
+    .unwrap();
+    client::save_records(
+        &lab.paths[1],
+        &client::load_records(&lab.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        crate::table::Session::observe(&lab.bootstrap(0))
+            .unwrap()
+            .is_log_backed(),
+        "CONTROL: the membership log backs Commons"
+    );
+    let (a, b) = (
+        Registry::at(lab.paths[0].clone()),
+        Registry::at(lab.paths[1].clone()),
+    );
+    a.open().unwrap();
+    a.write(vec![
+        machine_row("m1"),
+        machine_row("m2"),
+        bound_facts(&lab, 0, "m1"),
+    ])
+    .unwrap();
+    crate::table::tests::repair_commons(&lab, 6);
+    b.write(vec![bound_facts(&lab, 1, "m2")]).unwrap();
+    crate::table::tests::repair_commons(&lab, 6);
+    let now_ms = || aterm_time::unix_millis().unwrap();
+    let staged = a.roll(true, now_ms()).unwrap();
+    assert!(!staged.sealed && staged.records > 0, "{staged:?}");
+    crate::table::tests::repair_commons(&lab, 6);
+    b.release(now_ms()).unwrap();
+    crate::table::tests::repair_commons(&lab, 6);
+    let rolled = a.roll(true, now_ms()).unwrap();
+    assert!(rolled.sealed && rolled.waiting.is_empty(), "{rolled:?}");
+    assert_eq!(a.generation().generation, 2);
+    lab
+}
+
+/// One pass over Mac 0's files of `lab`, forced where `again`.
+fn first_mac_pass(lab: &Lab, again: bool) -> Vec<Outcome> {
+    materialize::pass(
+        &lab.paths[0],
+        &lab._home.path().join("aterm.toml"),
+        None,
+        &Pass {
+            read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            vault_wait: materialize::VAULT_WAIT,
+            again,
+            now_ms: NOW,
+        },
+    )
+}
+
+/// Every one of `outcomes` is `word` (`why`).
+#[track_caller]
+fn every(outcomes: &[Outcome], word: Word, why: Option<Why>) {
+    assert_eq!(outcomes.len(), super::FILES.len());
+    for outcome in outcomes {
+        assert_eq!(
+            (outcome.word, outcome.why),
+            (word, why),
+            "{}: {:?}",
+            outcome.name,
+            outcome.detail
+        );
+    }
+}
+
+/// The `seats` cell of the machine row `label` in Mac 0's `lab/machines` of `lab`.
+fn seats_of(lab: &Lab, label: &str) -> String {
+    let machines = File::at(&super::root(&lab.paths[0]), &super::MACHINES.file()).published();
+    let row = machines.named(label);
+    assert_eq!(row.len(), 1, "{label}");
+    row[0].cell("seats").to_owned()
+}
+
+/// C1's exit test: a carried record that cannot be authenticated because a vault writer (one
+/// landing a membership record) holds the vault's state lock while the pass reads is no record
+/// that is not there. The pass refuses (`held`, `busy`), so the owner tries again within seconds,
+/// and `lab/machines` keeps what the last pass that read the record showed: the peer's carried
+/// facts row still gives m2's machine its `seats`. Once the writer lets go, the next pass is
+/// `live` again with the same `seats`.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `att::carried` authenticating each carried wire on
+/// its own and leaving out one that fails (`let Ok(record) = session.authenticate(scope, wire)
+/// else { continue }`), the pass with the lock held recorded `live`: `ai/accounts: None; left:
+/// (Live, None) right: (Held, Some(Busy))`.
+#[test]
+fn a_carried_row_is_refused_never_dropped_while_membership_moves() {
+    let lab = carried_lab();
+    let peer = keys::uuid32(&lab.machine(1));
+    every(&first_mac_pass(&lab, false), Word::Live, None);
+    assert_eq!(
+        seats_of(&lab, "m2"),
+        peer,
+        "CONTROL: the peer's carried facts give its machine its seats"
+    );
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    seam::before_carried({
+        let writer = std::rc::Rc::clone(&writer);
+        let vault = lab.paths[0].dir.clone();
+        move || {
+            *writer.borrow_mut() = Some(
+                aterm_uds::private_file::PrivateLock::take(
+                    &vault,
+                    ".lock",
+                    Duration::ZERO,
+                    "a vault writer",
+                )
+                .unwrap(),
+            );
+        }
+    });
+    let outcomes = first_mac_pass(&lab, true);
+    let held = writer.borrow_mut().take();
+    assert!(
+        held.is_some(),
+        "CONTROL: the pass reached the carried records"
+    );
+    drop(held);
+    every(&outcomes, Word::Held, Some(Why::Busy));
+    assert_eq!(
+        seats_of(&lab, "m2"),
+        peer,
+        "the refused pass leaves the peer's seats as the last read showed them"
+    );
+    every(&first_mac_pass(&lab, true), Word::Live, None);
+    assert_eq!(seats_of(&lab, "m2"), peer);
+}
+
+/// The signed record `id` as Mac `n` of `lab` stores it in the registry's first generation.
+fn first_generation_wire(lab: &Lab, n: usize, id: &astream_wire::sync::Digest) -> Vec<u8> {
+    let bootstrap = lab.bootstrap(n);
+    let session = crate::table::Session::observe(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&lab.paths[n], bootstrap.trust());
+    let scope = att::REGISTRY.descriptor(bootstrap.trust()).unwrap().scope;
+    let store = directory
+        .observe_store_if_exists(&session, scope)
+        .unwrap()
+        .unwrap();
+    store.wire(&session, id).unwrap().unwrap().to_vec()
+}
+
+/// Rotate the membership epoch of `lab`, a lab of one Writer, as [`Lab::rotate`] does, and
+/// return the rotation's node, for another copy of the lab to hear later ([`hear`]).
+fn rotate_alone(lab: &Lab) -> Vec<u8> {
+    use aterm_secrets::commons::{journal::Journal, roster::Grant};
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let mut journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let grants = vec![Grant::recorded(
+        "m1".to_owned(),
+        bootstrap.request().unwrap().binding().clone(),
+        Role::Writer,
+    )];
+    let node = admin.prepare_commons_rotation(&journal, grants).unwrap();
+    journal.ingest(node.bytes()).unwrap();
+    node.bytes().to_vec()
+}
+
+/// Mac `n` of `lab` hears the rotation `node` another copy of the lab made.
+fn hear(lab: &Lab, n: usize, node: &[u8]) {
+    let bootstrap = lab.bootstrap(n);
+    aterm_secrets::commons::journal::Journal::open_existing(
+        bootstrap.journal_dir(),
+        bootstrap.trust(),
+    )
+    .unwrap()
+    .ingest(node)
+    .unwrap();
+}
+
+/// One Writer's lab whose registry, in its second generation, holds in an archived row m1's
+/// own facts row rebinding its machine to m9, sealed under an epoch only a copy of the lab holds
+/// (the copy's control journal rotated alone, as a peer's does before this Mac hears of it), as
+/// any Writer may write one. m1's carried facts row, which the roll carried, binds its machine
+/// to m1. Returns the lab, the facts row's key, the operation the roll carried and the rotation
+/// only the copy holds.
+fn unheld_carried_lab() -> (Lab, String, astream_wire::sync::Digest, Vec<u8>) {
+    use crate::alab::{
+        registry::{ARCHIVED, MACHINE_FACTS},
+        upkeep::tests::{bound_facts, machine_row},
+    };
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry
+        .write(vec![
+            machine_row("m1"),
+            machine_row("m9"),
+            bound_facts(&lab, 0, "m1"),
+        ])
+        .unwrap();
+    let key = keys::uuid32(&lab.machine(0));
+    let fork = lab.fork();
+    let rotation = rotate_alone(&fork);
+    let moved = Registry::at(fork.paths[0].clone());
+    moved.write(vec![bound_facts(&fork, 0, "m9")]).unwrap();
+    let unheld = moved.view().unwrap().owned[MACHINE_FACTS.name].rows[&key].operation;
+    let wire = first_generation_wire(&fork, 0, &unheld);
+    registry
+        .roll(true, aterm_time::unix_millis().unwrap())
+        .unwrap();
+    assert_eq!(registry.generation().generation, 2);
+    let carried = registry.view().unwrap().owned[MACHINE_FACTS.name].rows[&key].operation;
+    let archived = |col: &str, x: Value| {
+        crate::typed::cell::change(
+            &ARCHIVED,
+            crate::typed::cell::CellKey {
+                pk: &keys::archived_pk(&unheld),
+                col,
+                elem: None,
+            },
+            &crate::typed::cell::CellValue::owner(1, x),
+        )
+        .unwrap()
+    };
+    registry
+        .write(vec![vec![
+            archived("generation", json!(1)),
+            archived("wire", json!(aterm_secrets::b64::encode_padded(&wire))),
+        ]])
+        .unwrap();
+    (lab, key, carried, rotation)
+}
+
+/// A carried record whose roster the history this Mac holds cannot open is left out, and the
+/// file stays `live`: that omission is decided by the record's bytes and the history held here
+/// ([`aterm_secrets::ErrorKind::HistoryUnopened`]), and the same pass over the same history
+/// leaves it out again, so it is no refusal ([`unheld_carried_lab`]).
+///
+/// NEGATIVE CONTROL (2026-11-14): with `Session::authenticate_carried` refusing a roster this Mac
+/// cannot open as it refuses any other failure, the registry's own view refused before any pass:
+/// `called Result::unwrap() on an Err value: Error("roster is outside the selected control
+/// history")`.
+#[test]
+fn a_carried_row_whose_roster_this_mac_cannot_open_is_left_out_and_the_file_is_live() {
+    use crate::alab::registry::MACHINE_FACTS;
+    let (lab, key, carried, _) = unheld_carried_lab();
+    let registry = Registry::at(lab.paths[0].clone());
+    let facts = registry.view().unwrap().owned[MACHINE_FACTS.name].rows[&key].clone();
+    assert_eq!(
+        facts.operation, carried,
+        "the record sealed under the epoch held only by the copy is left out"
+    );
+    every(&first_mac_pass(&lab, false), Word::Live, None);
+    assert_eq!(seats_of(&lab, "m1"), key);
+    assert_eq!(seats_of(&lab, "m9"), "");
+}
+
+/// What the last pass left of each shared file over `paths`: its snapshot's content digest (hex)
+/// and revision, and the history beside it.
+type Left = std::collections::BTreeMap<&'static str, (Option<(String, u64)>, Option<String>)>;
+
+fn left_by(paths: &Paths) -> Left {
+    let root = super::root(paths);
+    super::FILES
+        .iter()
+        .map(|file| {
+            let snapshot = File::at(&root, &file.file())
+                .published()
+                .snapshot
+                .map(|snapshot| {
+                    (
+                        aterm_codec::hex::encode_lower(&snapshot.content()),
+                        snapshot.rev,
+                    )
+                });
+            let history = std::fs::read_to_string(root.history(&file.file())).ok();
+            (file.name, (snapshot, history))
+        })
+        .collect()
+}
+
+/// One step of a walk: its name, what an unforced pass left, and what a forced pass then left.
+type Step = (&'static str, Left, Left);
+
+/// An unforced pass over the files of `paths`, which records each file `live`, then a forced
+/// one: what each left.
+#[track_caller]
+fn unforced_then_forced(paths: &Paths, config: &std::path::Path, step: &'static str) -> Step {
+    unforced_then_forced_at(paths, config, step, NOW)
+}
+
+/// [`unforced_then_forced`], both passes on the clock `now_ms`.
+#[track_caller]
+fn unforced_then_forced_at(
+    paths: &Paths,
+    config: &std::path::Path,
+    step: &'static str,
+    now_ms: u64,
+) -> Step {
+    let pass = |again| {
+        materialize::pass(
+            paths,
+            config,
+            None,
+            &Pass {
+                read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                vault_wait: materialize::VAULT_WAIT,
+                again,
+                now_ms,
+            },
+        )
+    };
+    for outcome in pass(false) {
+        assert!(outcome.problem.is_none(), "{step}: {:?}", outcome.problem);
+        assert_eq!(
+            (outcome.word, outcome.why),
+            (Word::Live, None),
+            "{step}: {}: {:?}",
+            outcome.name,
+            outcome.detail
+        );
+    }
+    let unforced = left_by(paths);
+    pass(true);
+    (step, unforced, left_by(paths))
+}
+
+/// The step after `before` moved what the files hold: its forced pass left other than the one
+/// before. Records the step in `steps`.
+#[track_caller]
+fn moved(steps: &mut Vec<Step>, step: Step) {
+    let before = &steps.last().expect("a first step").2;
+    assert_ne!(
+        &step.2, before,
+        "CONTROL: {} moves what the files hold",
+        step.0
+    );
+    steps.push(step);
+}
+
+/// The law of each walk: in every step of `walk`, run as is, an unforced pass leaves what a
+/// forced one would. With each `(part, step)` of `parts` left out of the key (or, for
+/// `Unkeyed::History`, out of the skip) by `seam::leave_out` (the walk run again on a thread of
+/// its own, whose seams start unset), exactly that step parts the two: the NEGATIVE CONTROL that
+/// the part is needed, run with the law.
+#[track_caller]
+fn walked(walk: fn() -> Vec<Step>, parts: &[(materialize::Unkeyed, &'static str)]) {
+    let apart = |steps: &[Step]| -> Vec<&'static str> {
+        steps
+            .iter()
+            .filter(|(_, unforced, forced)| unforced != forced)
+            .map(|(step, ..)| *step)
+            .collect()
+    };
+    let steps = walk();
+    assert_eq!(
+        apart(&steps),
+        Vec::<&str>::new(),
+        "an unforced pass leaves what a forced one would: {:#?}",
+        steps
+            .iter()
+            .find(|(_, unforced, forced)| unforced != forced)
+    );
+    for &(part, step) in parts {
+        let steps = std::thread::spawn(move || {
+            seam::leave_out(part);
+            walk()
+        })
+        .join()
+        .expect("the walk ran");
+        assert_eq!(
+            apart(&steps),
+            [step],
+            "NEGATIVE CONTROL: with {part:?} left out, the unforced pass of `{step}` alone \
+             leaves other than the forced one"
+        );
+    }
+}
+
+/// C2's exit test: a pass projects again exactly where what its projection reads moved, so an
+/// ordinary pass leaves what `aterm file refresh` would ([`walked`]). Each step of the stand's
+/// walk moves one input of the projection: a record arrives (the frontier); an account is
+/// relabelled (the registry's frontier, which is the frontier of `ai/limits` too, so the view
+/// names the account by its new slug as `ai/accounts` does); the members bind this Mac's actor
+/// to another machine, so `=here` leaves m7 (`me`); a later build's guards refuse a stored text
+/// the build before showed (the rules); the publisher's done marker for an operation the
+/// snapshot already holds says whose intent it carries (the provenance); the history file is
+/// removed (the skip's history check); the snapshot is replaced by a whole one at its revision
+/// that leaves a row out (the skip's check of the snapshot's content, recorded in the status as
+/// `snapshot`). Each step is a CONTROL too: what the files hold moves. The binding moves by a
+/// test's seam (`seam::bound_to`): a deny of this Mac's machine in the swarm roster revokes it,
+/// and a revoked Mac's pass is `held`. What the carried records authenticate to and how the log
+/// judges its records are walked on labs of their own
+/// ([`a_rotation_that_opens_a_carried_record_is_projected_by_the_next_pass`],
+/// [`a_remove_that_makes_a_cutoff_count_is_projected_by_the_next_pass`]), and so are the
+/// `ai/usage` snapshot a view folds and the members it folds by
+/// ([`a_reading_whose_span_passed_leaves_the_limits_view_by_the_next_pass`],
+/// [`a_member_that_leaves_gives_way_in_the_limits_view_by_the_next_pass`]).
+///
+/// NEGATIVE CONTROLS, run with the law ([`walked`]), each part needed at its own step; first
+/// seen 2026-11-14 as `lab/machines` at revision 3 against 4 (`Rules`), 2 against 3 (`Me`), the
+/// same content at revision 5 with the histories apart (`Provenance`), and `None` against the
+/// history written again (`History`); and, seen 2026-11-15 with the snapshot's content left out
+/// of the skip (`Snapshot`), the unforced pass after the replacement serves it as it found it:
+/// `lab/machines` at revision 5, its content without m8's row, against the forced pass's
+/// revision 6 with it, the histories alike.
+#[test]
+fn an_unforced_pass_leaves_what_a_forced_one_would() {
+    use materialize::Unkeyed::{History, Me, Provenance, Rules, Snapshot};
+    walked(
+        stand_walk,
+        &[
+            (Me, "this Mac is bound to another machine"),
+            (Rules, "a later build"),
+            (Provenance, "the done marker"),
+            (History, "the history removed"),
+            (Snapshot, "the snapshot replaced at its revision"),
+        ],
+    );
+}
+
+/// [`an_unforced_pass_leaves_what_a_forced_one_would`]'s walk.
+fn stand_walk() -> Vec<Step> {
+    use crate::alab::upkeep::tests::{bound_facts, machine_row};
+    let stand = Stand::new();
+    let (paths, config) = (stand.paths(), &stand.config);
+    let registry = Registry::at(paths.clone());
+    // This Mac's facts bind its machine to m7: `=here` names m7.
+    registry
+        .write(vec![bound_facts(&stand.lab, SEAT, "m7")])
+        .unwrap();
+    let mut steps = vec![unforced_then_forced(paths, config, "the first pass")];
+    let here = || shown(&stand.root(), &stand.machine, "here");
+    assert_eq!(here(), "yes");
+
+    registry.write(vec![machine_row("m8")]).unwrap();
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "a record arrives"),
+    );
+
+    // An account is relabelled: its slug moves in `ai/accounts`, and in `ai/limits`, which
+    // names accounts by the registry's read.
+    let slugs = || {
+        let of = |file: &Type, column: &str| {
+            stand
+                .file(file)
+                .read()
+                .named(&stand.claude_ada)
+                .first()
+                .map(|row| row.cell(column).to_owned())
+                .unwrap_or_default()
+        };
+        (
+            of(&super::ACCOUNTS, "slug"),
+            of(&super::LIMITS, "account_slug"),
+        )
+    };
+    let before = slugs();
+    assert_eq!(before.0, before.1, "CONTROL: the view names the account");
+    registry
+        .write(vec![vec![put(
+            &ACCOUNT,
+            &stand.claude_ada,
+            "label",
+            json!("desk"),
+        )]])
+        .unwrap();
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "an account relabelled"),
+    );
+    let after = slugs();
+    assert_ne!(after.0, before.0, "the account's slug moved");
+    assert_eq!(
+        after.0, after.1,
+        "the view names the account as `ai/accounts` does"
+    );
+
+    // The members bind this Mac's actor to Mac 0's machine, which no facts row binds.
+    seam::bound_to(stand.lab.machine(0));
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "this Mac is bound to another machine"),
+    );
+    assert_eq!(here(), "", "`=here` left m7");
+
+    seam::new_build("m8");
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "a later build"),
+    );
+
+    // The publisher is killed once it has signed: the record arrives with no done marker.
+    publish::seam::kill_at(publish::seam::Stop::AfterSign);
+    let (answer, _) = wrote(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "note", "kept"],
+    );
+    let id = id_of(&answer);
+    assert_eq!(carrying(paths, &id).len(), 1, "the record is signed");
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "the intent's record arrives"),
+    );
+    let machines = stand.file(&super::MACHINES);
+    assert!(machines.outbox().done.is_empty());
+    let _ = publish_pass(paths, config);
+    assert_eq!(
+        (carrying(paths, &id).len(), machines.outbox().done.len()),
+        (1, 1),
+        "CONTROL: the publisher found the record and wrote its marker, signing nothing"
+    );
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "the done marker"),
+    );
+    let history = || std::fs::read_to_string(stand.root().history(&super::MACHINES.file()));
+    let written = history().unwrap();
+    assert!(written.contains(&id), "{written}");
+
+    std::fs::remove_file(stand.root().history(&super::MACHINES.file())).unwrap();
+    let step = unforced_then_forced(paths, config, "the history removed");
+    assert_eq!(
+        step.2,
+        steps.last().unwrap().2,
+        "the history is written again as it was"
+    );
+    steps.push(step);
+
+    // The snapshot is replaced by one at its revision that says otherwise, whole (its own end
+    // digest holds), as a copy put back or another hand would leave it.
+    let snap = stand.root().snapshot(&super::MACHINES.file());
+    let mut swapped = aterm_file::Snapshot::decode(&std::fs::read(&snap).unwrap()).unwrap();
+    let rev = swapped.rev;
+    let m8 = keys::machine_pk("m8");
+    let at = swapped
+        .rows
+        .iter()
+        .position(|row| row.pk == m8)
+        .expect("m8's row");
+    swapped.rows.remove(at);
+    std::fs::write(&snap, swapped.encode()).unwrap();
+    assert_eq!(
+        stand
+            .file(&super::MACHINES)
+            .published()
+            .snapshot
+            .map(|snapshot| snapshot.rev),
+        Some(rev),
+        "CONTROL: the replaced snapshot reads, at its revision"
+    );
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "the snapshot replaced at its revision"),
+    );
+    steps
+}
+
+/// A file of the journal ring shows a row its window no longer holds until the row's span
+/// passes ([`aterm_file::retain::carry`]), and this Mac's clock moves that with no record: the
+/// first unforced pass after an event's 30 days passed projects `ai/events` without it, as a
+/// forced one would ([`walked`]). The stand's event is first seen by the pass at [`NOW`]; an
+/// hour before its span ends the window has moved on four weeks, holds no table, and the event
+/// is carried; an hour after, in the same week, so under the same window and frontier, it has
+/// left. The `ai/logins` and `ai/usage` rows, whose span is 120 days, are carried through both.
+///
+/// NEGATIVE CONTROL, run with the law (first run 2026-11-15): with the aged rows left out of the
+/// key (`Unkeyed::Aged`), the step `the event's span passed` alone leaves the unforced pass other
+/// than the forced one.
+#[test]
+fn an_event_whose_span_passed_is_projected_out_by_the_next_pass() {
+    walked(
+        || {
+            let stand = Stand::new();
+            let (paths, config) = (stand.paths(), &stand.config);
+            let span = aterm_file::retain::LOG.age_ms;
+            let hour = 3_600_000;
+            let rows = |file: &Type| {
+                stand
+                    .file(file)
+                    .published()
+                    .snapshot
+                    .map_or(0, |snapshot| snapshot.rows.len())
+            };
+            let events = || rows(&super::EVENTS);
+            let mut steps = vec![unforced_then_forced(paths, config, "the event read")];
+            assert_eq!(events(), 1, "CONTROL: the window holds the stand's event");
+            let (before, after) = (NOW + span - hour, NOW + span + hour);
+            let week = |ms: u64| crate::catalog::ring::JOURNAL.epoch_of(ms / 1000);
+            assert_eq!(
+                week(before),
+                week(after),
+                "CONTROL: both clocks are in one week, so one window"
+            );
+            moved(
+                &mut steps,
+                unforced_then_forced_at(paths, config, "the event carried", before),
+            );
+            assert_eq!(events(), 1, "CONTROL: the moved window carries the event");
+            moved(
+                &mut steps,
+                unforced_then_forced_at(paths, config, "the event's span passed", after),
+            );
+            assert_eq!(events(), 0, "the event left once its span passed");
+            for file in [&super::LOGINS, &super::USAGE] {
+                assert_eq!(rows(file), 1, "{}: carried still", file.name);
+            }
+            steps
+        },
+        &[(materialize::Unkeyed::Aged, "the event's span passed")],
+    );
+}
+
+/// A view folds the `ai/usage` snapshot, which this Mac's clock moves with no record: once a
+/// reading's 120 days pass, the next unforced pass projects `ai/usage` without it and
+/// `ai/limits` without the account's row, as a forced one would ([`walked`]). The stand's
+/// reading is first seen by the pass at [`NOW`]; an hour before its span ends the window has
+/// moved on, holds no table, and the reading is carried and folded; an hour after, in the same
+/// week, so under the same window and frontier, it and its fold have left.
+///
+/// NEGATIVE CONTROLS, run with the law (first run 2026-11-15): with the aged rows left out of
+/// the ring files' key (`Unkeyed::Aged`), or the content of the `ai/usage` snapshot left out of
+/// the view's (`Unkeyed::Usage`), the step `the reading's span passed` alone leaves the
+/// unforced pass other than the forced one.
+#[test]
+fn a_reading_whose_span_passed_leaves_the_limits_view_by_the_next_pass() {
+    walked(
+        || {
+            let stand = Stand::new();
+            let (paths, config) = (stand.paths(), &stand.config);
+            let span = aterm_file::retain::MINE.age_ms;
+            let hour = 3_600_000;
+            let rows = || {
+                [&super::USAGE, &super::LIMITS].map(|file| {
+                    stand
+                        .file(file)
+                        .published()
+                        .snapshot
+                        .map_or(0, |snapshot| snapshot.rows.len())
+                })
+            };
+            let mut steps = vec![unforced_then_forced(paths, config, "the reading read")];
+            assert_eq!(
+                rows(),
+                [1, 1],
+                "CONTROL: the view folds the stand's reading"
+            );
+            let (before, after) = (NOW + span - hour, NOW + span + hour);
+            let week = |ms: u64| crate::catalog::ring::JOURNAL.epoch_of(ms / 1000);
+            assert_eq!(
+                week(before),
+                week(after),
+                "CONTROL: both clocks are in one week, so one window"
+            );
+            moved(
+                &mut steps,
+                unforced_then_forced_at(paths, config, "the reading carried", before),
+            );
+            assert_eq!(
+                rows(),
+                [1, 1],
+                "CONTROL: the moved window carries the reading"
+            );
+            moved(
+                &mut steps,
+                unforced_then_forced_at(paths, config, "the reading's span passed", after),
+            );
+            assert_eq!(
+                rows(),
+                [0, 0],
+                "the reading and its fold left once its span passed"
+            );
+            steps
+        },
+        &[
+            (materialize::Unkeyed::Aged, "the reading's span passed"),
+            (materialize::Unkeyed::Usage, "the reading's span passed"),
+        ],
+    );
+}
+
+/// A view takes a current member's reading over its fenced predecessor's where the registry
+/// binds both uuids to one Mac (`super::limits::Seats`), and who the current members are moves
+/// with no record of any table: once the peer, whose facts row binds its uuid to this Mac's
+/// machine, is no current member, the next unforced pass folds this Mac's reading alone, as a
+/// forced one would ([`walked`]). The members move by a test's seam (`seam::leaves`); the
+/// peer's facts row and reading stand, as a fenced predecessor's do.
+///
+/// NEGATIVE CONTROL, run with the law (first run 2026-11-15): with the members left out of the
+/// view's key (`Unkeyed::Members`), the step `the peer is no member` alone leaves the unforced
+/// pass other than the forced one.
+#[test]
+fn a_member_that_leaves_gives_way_in_the_limits_view_by_the_next_pass() {
+    walked(
+        members_walk,
+        &[(materialize::Unkeyed::Members, "the peer is no member")],
+    );
+}
+
+/// [`a_member_that_leaves_gives_way_in_the_limits_view_by_the_next_pass`]'s walk.
+fn members_walk() -> Vec<Step> {
+    use crate::alab::upkeep::tests::bound_facts;
+    const PEER: usize = 0;
+    let stand = Stand::new();
+    let lab = &stand.lab;
+    let (paths, config) = (stand.paths(), &stand.config);
+    let t = NOW / 1000;
+    let clocks = [t; 2];
+    // Each Mac's facts row binds its uuid to m7: the registry binds both to one Mac, as it binds
+    // a fenced predecessor's uuid and its successor's.
+    Registry::at(paths.clone())
+        .write(vec![bound_facts(lab, SEAT, "m7")])
+        .unwrap();
+    repair_commons_among(lab, 6, &[PEER, SEAT], &clocks);
+    Registry::at(lab.paths[PEER].clone())
+        .write(vec![bound_facts(lab, PEER, "m7")])
+        .unwrap();
+    // The peer reads the stand's account in the same week: 60% against this Mac's 40%.
+    let peer = uuid_of(lab, PEER);
+    assert_eq!(
+        peer,
+        keys::uuid32(&lab.machine(PEER)),
+        "CONTROL: the peer's reading is at the uuid its facts row binds"
+    );
+    state_ring(
+        lab,
+        PEER,
+        Stand::ring_rows(&stand.claude_ada, &peer, 600, RESET, 1),
+        t,
+    );
+    repair_commons_among(lab, 6, &[PEER, SEAT], &clocks);
+    let limit = || {
+        let read = stand.file(&super::LIMITS).read();
+        let row = read.named(&stand.claude_ada);
+        assert_eq!(row.len(), 1, "{:?}", read.rows());
+        (
+            row[0].cell("readers").to_owned(),
+            row[0].cell("w7d").to_owned(),
+        )
+    };
+    let mut steps = vec![unforced_then_forced(paths, config, "both members read")];
+    assert_eq!(
+        limit(),
+        ("2".to_owned(), "600".to_owned()),
+        "CONTROL: both members' readings fold, the larger percent standing"
+    );
+    seam::leaves(lab.machine(PEER));
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, config, "the peer is no member"),
+    );
+    assert_eq!(
+        limit(),
+        ("1".to_owned(), "400".to_owned()),
+        "this Mac's reading takes the place of its predecessor's"
+    );
+    steps
+}
+
+/// A view never folds without the registry it names accounts and seats by: where the
+/// registry's read refuses once the ring has read (here busy: a vault writer takes the vault's
+/// state lock as the registry's read is about to authenticate the records its roll carried),
+/// `ai/limits` refuses with it and keeps what the last pass that read the registry showed, the
+/// account's slug included, rather than record a fold with no names `live`. Once the writer
+/// lets go, the next pass is `live` again with the same rows.
+///
+/// NEGATIVE CONTROL (2026-11-15): with a registry that refuses taken for none, as the merge
+/// first had it (`projector(&att::REGISTRY).ok()`, the names left blank), the busy pass recorded
+/// the view `live`: `left: (Live, None) right: (Held, Some(Busy))`.
+#[test]
+fn a_registry_that_refuses_refuses_the_limits_view_which_keeps_its_names() {
+    let lab = carried_lab();
+    let address = keys::address_pk(ADA).unwrap();
+    let account = keys::account_pk("claude", ADA).unwrap();
+    Registry::at(lab.paths[0].clone())
+        .write(vec![vec![
+            put(&ADDRESS, &address, "addr", json!(ADA)),
+            put(&ACCOUNT, &account, "provider", json!("anthropic")),
+            put(&ACCOUNT, &account, "realm", json!("claude")),
+            put(&ACCOUNT, &account, "login", json!(address)),
+            put(&ACCOUNT, &account, "status", json!("active")),
+        ]])
+        .unwrap();
+    state_ring(
+        &lab,
+        0,
+        Stand::ring_rows(&account, &uuid_of(&lab, 0), 400, RESET, 1),
+        NOW / 1000,
+    );
+    every(&first_mac_pass(&lab, false), Word::Live, None);
+    let root = super::root(&lab.paths[0]);
+    let limits = || {
+        let snapshot = File::at(&root, &super::LIMITS.file())
+            .published()
+            .snapshot
+            .expect("a snapshot of the view");
+        let slug = snapshot
+            .rows
+            .iter()
+            .find(|row| row.pk == account)
+            .map(|row| row.cell("account_slug").to_owned());
+        (snapshot.rev, snapshot.content(), slug)
+    };
+    let shown = limits();
+    assert!(
+        shown.2.as_deref().is_some_and(|slug| !slug.is_empty()),
+        "CONTROL: the view names the account: {shown:?}"
+    );
+    let over_limits = || {
+        materialize::pass(
+            &lab.paths[0],
+            &lab._home.path().join("aterm.toml"),
+            Some(&super::LIMITS.file()),
+            &Pass {
+                read_by: Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                vault_wait: materialize::VAULT_WAIT,
+                again: false,
+                now_ms: NOW,
+            },
+        )
+    };
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    seam::before_carried({
+        let writer = std::rc::Rc::clone(&writer);
+        let vault = lab.paths[0].dir.clone();
+        move || {
+            *writer.borrow_mut() = Some(
+                aterm_uds::private_file::PrivateLock::take(
+                    &vault,
+                    ".lock",
+                    Duration::ZERO,
+                    "a vault writer",
+                )
+                .unwrap(),
+            );
+        }
+    });
+    let busy = over_limits();
+    let held = writer.borrow_mut().take();
+    assert!(
+        held.is_some(),
+        "CONTROL: the registry's read reached the carried records"
+    );
+    drop(held);
+    assert_eq!(busy.len(), 1);
+    assert_eq!(
+        (busy[0].word, busy[0].why),
+        (Word::Held, Some(Why::Busy)),
+        "{:?}",
+        busy[0].detail
+    );
+    assert_eq!(
+        limits(),
+        shown,
+        "the refused pass leaves the view as the last read showed it"
+    );
+    let again = over_limits();
+    assert_eq!(
+        (again[0].word, again[0].why),
+        (Word::Live, None),
+        "{:?}",
+        again[0].detail
+    );
+    assert_eq!(limits(), shown);
+}
+
+/// A roster that does not read leaves this Mac's machine and the members unknown: each file
+/// that reads them refuses (`lab/machines`, for `=here`; `ai/limits`, for the members it folds
+/// by) and keeps its snapshot, while the files whose projection reads neither (`ai/accounts`,
+/// `ai/links` and the journal ring's) are projected and stay `live`. Once the roster reads,
+/// every file is `live`.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with the whole pass refused where the roster does not read,
+/// as the merge first had it, the ring's files were held with the rest: `ai/logins`, `left:
+/// (Held, Some(Membership)) right: (Live, None)`; with every catalog table's file reading the
+/// roster in `read_files`, as the amended merge had it, `ai/accounts` was held: `left: (Held,
+/// Some(Membership)) right: (Live, None)`; and with `Inputs::read` reading a catalog table's
+/// family only where the roster read, as it also had it, `ai/accounts` was held for its family
+/// unread (`the table was not read`): `left: (Held, Some(Custody)) right: (Live, None)`.
+#[test]
+fn a_roster_that_does_not_read_holds_only_the_files_that_read_it() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let revs = || {
+        super::FILES
+            .iter()
+            .map(|file| stand.file(file).status().rev())
+            .collect::<Vec<_>>()
+    };
+    let before = revs();
+    seam::roster_unread();
+    let outcomes = stand.pass(true);
+    seam::roster_reads();
+    assert_eq!(outcomes.len(), super::FILES.len());
+    for (file, outcome) in super::FILES.iter().zip(&outcomes) {
+        let expected = if [super::MACHINES.name, super::LIMITS.name].contains(&file.name) {
+            (Word::Held, Some(Why::Membership))
+        } else {
+            (Word::Live, None)
+        };
+        assert_eq!(
+            (outcome.word, outcome.why),
+            expected,
+            "{}: {:?}",
+            outcome.name,
+            outcome.detail
+        );
+    }
+    assert_eq!(
+        revs(),
+        before,
+        "every snapshot stays as the last pass wrote it"
+    );
+    all(&stand, &stand.pass(false), Word::Live, None);
+}
+
+/// What the carried records authenticate to moves with no record of the registry: once this Mac
+/// hears the rotation its copy made, the record the archived row carries under that epoch is
+/// read ([`unheld_carried_lab`]), and the next unforced pass projects it, as a forced one would
+/// ([`walked`]; the C2 exit test's step for the resolution,
+/// [`an_unforced_pass_leaves_what_a_forced_one_would`]).
+///
+/// NEGATIVE CONTROL, run with the law: the resolution left out of the key, the pass after the
+/// rotation projects nothing (first seen 2026-11-14 as `lab/machines` at revision 1 against 2).
+#[test]
+fn a_rotation_that_opens_a_carried_record_is_projected_by_the_next_pass() {
+    walked(
+        || {
+            let (lab, key, _, rotation) = unheld_carried_lab();
+            let (paths, config) = (&lab.paths[0], lab._home.path().join("aterm.toml"));
+            let mut steps = vec![unforced_then_forced(paths, &config, "the record unheld")];
+            assert_eq!(seats_of(&lab, "m9"), "");
+            hear(&lab, 0, &rotation);
+            moved(
+                &mut steps,
+                unforced_then_forced(paths, &config, "the rotation heard"),
+            );
+            assert_eq!(
+                (seats_of(&lab, "m1"), seats_of(&lab, "m9")),
+                (String::new(), key)
+            );
+            steps
+        },
+        &[(materialize::Unkeyed::Resolved, "the rotation heard")],
+    );
+}
+
+/// How the log judges its records moves with no record of the registry: a cutoff counts only
+/// once the reader's log shows its writer removed. Two Writers whose Commons the membership log
+/// backs: m1 writes the machine rows and its facts, m2 its facts binding its machine to m2;
+/// m1 signs its cutoff of m2 in each table it holds, as every removal path does before its
+/// `Remove`; m2, which has not heard of it, rebinds its machine to m9, and the record arrives.
+/// An unforced pass shows m9's `seats` (the cutoff alone counts for nothing). m1's log then takes
+/// the `Remove`, which no table holds: the next unforced pass leaves m2's record past the cutoff
+/// out, as a forced one would ([`walked`]; the C2 exit test's step for the judgment,
+/// [`an_unforced_pass_leaves_what_a_forced_one_would`]).
+///
+/// NEGATIVE CONTROL, run with the law: the judgment left out of the key, the pass after the
+/// `Remove` projects nothing (first seen 2026-11-14 as `lab/machines` at revision 1 against 2).
+#[test]
+fn a_remove_that_makes_a_cutoff_count_is_projected_by_the_next_pass() {
+    walked(
+        remove_walk,
+        &[(materialize::Unkeyed::Judgment, "m2 removed")],
+    );
+}
+
+/// [`a_remove_that_makes_a_cutoff_count_is_projected_by_the_next_pass`]'s walk.
+fn remove_walk() -> Vec<Step> {
+    use crate::alab::upkeep::tests::{bound_facts, machine_row};
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    client::test_sign_genesis(
+        &lab.paths[0],
+        &lab._home.path().join("f18.genesis"),
+        &lab.signer,
+    )
+    .unwrap();
+    client::save_records(
+        &lab.paths[1],
+        &client::load_records(&lab.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
+    )
+    .unwrap();
+    let (a, b) = (
+        Registry::at(lab.paths[0].clone()),
+        Registry::at(lab.paths[1].clone()),
+    );
+    a.open().unwrap();
+    a.write(vec![
+        machine_row("m1"),
+        machine_row("m2"),
+        machine_row("m9"),
+        bound_facts(&lab, 0, "m1"),
+    ])
+    .unwrap();
+    crate::table::tests::repair_commons(&lab, 6);
+    b.write(vec![bound_facts(&lab, 1, "m2")]).unwrap();
+    crate::table::tests::repair_commons(&lab, 6);
+    let m2 = crate::table::Session::observe(&lab.bootstrap(1))
+        .unwrap()
+        .actor();
+    assert!(
+        crate::table::store::cut_removed_writer(&lab.paths[0], &m2, client::CutPass::BeforeRemove)
+            > 0,
+        "m1 signs its cutoff of m2"
+    );
+    b.write(vec![bound_facts(&lab, 1, "m9")]).unwrap();
+    crate::table::tests::repair_commons(&lab, 6);
+    let key = keys::uuid32(&lab.machine(1));
+    let (paths, config) = (&lab.paths[0], lab._home.path().join("aterm.toml"));
+    let mut steps = vec![unforced_then_forced(
+        paths,
+        &config,
+        "m2's record past the cutoff arrives",
+    )];
+    assert_eq!(
+        (seats_of(&lab, "m2"), seats_of(&lab, "m9")),
+        (String::new(), key),
+        "CONTROL: a cutoff whose writer is not removed counts for nothing"
+    );
+    client::remove_member_in_log(&lab.paths[0], m2).unwrap();
+    moved(
+        &mut steps,
+        unforced_then_forced(paths, &config, "m2 removed"),
+    );
+    assert_eq!(
+        seats_of(&lab, "m9"),
+        "",
+        "m2's record past the cutoff is out"
+    );
+    steps
+}
+
+/// Every collection of `compiled`'s table, asked of one [`crate::typed::view::Projections`] of
+/// `view` in the table's order and then backwards, so that each second ask is answered from
+/// what the first projected, projects what a fresh [`crate::typed::View::project`] of `view`
+/// does.
+#[track_caller]
+fn memoized_is_fresh(compiled: &att::Compiled, view: &crate::typed::View, fixture: &str) {
+    let projections = crate::typed::view::Projections::new(view);
+    let collections = compiled.table.collections;
+    for collection in collections.iter().chain(collections.iter().rev()) {
+        assert_eq!(
+            *projections.project(collection),
+            view.project(collection),
+            "{fixture}: {}",
+            collection.name
+        );
+    }
+}
+
+/// C4's exit test (docs/DESIGN-shared-files-2026-11-11.md §4): a pass projects each collection
+/// of a family's view once for every file of the family it projects, and what each file is
+/// handed is what a fresh projection of that collection would be. Two registries are read. The
+/// first is in its first generation and holds the stand's addresses, accounts, machine and
+/// link, a note two Macs wrote at once, the label `m5` two machines claimed at once, and a
+/// writer's automatic records one past its quota. The second is a roll's second generation,
+/// whose machine labels and facts rows are those the roll carried from the first.
+/// NEGATIVE CONTROL, observed: with `Projections::project` knowing a collection by its kind
+/// (cells, owned or log) rather than its name, the first cells collection's projection (the
+/// provider's, which holds no row) is handed out for MACHINE's: `` the first generation:
+/// machine `` `` left: Projection { rows: {}, malformed: 0 } ``.
+#[test]
+fn a_memoized_projection_equals_a_fresh_one() {
+    use crate::alab::registry::SELF_QUOTA;
+    use crate::typed::cell;
+    let stand = Stand::new();
+    crate::table::tests::repair_commons(&stand.lab, 6);
+    let (ours, theirs) = (
+        Registry::at(stand.paths().clone()),
+        Registry::at(stand.lab.paths[0].clone()),
+    );
+    let automatic = |column: &str, value: Value| {
+        cell::change(
+            &MACHINE,
+            cell::CellKey {
+                pk: &stand.machine,
+                col: column,
+                elem: None,
+            },
+            &cell::CellValue::automatic(1, value),
+        )
+        .unwrap()
+    };
+    // Written on each Mac before either hears the other's.
+    let (five, six) = (keys::machine_pk("m5"), keys::machine_pk("m6"));
+    ours.write(vec![
+        vec![put(
+            &MACHINE,
+            &stand.machine,
+            "note",
+            json!("by the window"),
+        )],
+        vec![
+            put(&MACHINE, &five, "label", json!("m5")),
+            put(&MACHINE, &five, "status", json!("active")),
+        ],
+    ])
+    .unwrap();
+    let mut records: Vec<_> = (0..SELF_QUOTA)
+        .map(|n| vec![automatic("location", json!(format!("rack {n}")))])
+        .collect();
+    records.push(vec![automatic("location", json!("past the quota"))]);
+    records.push(vec![put(
+        &MACHINE,
+        &stand.machine,
+        "note",
+        json!("by the door"),
+    )]);
+    records.push(vec![
+        put(&MACHINE, &six, "label", json!("m5")),
+        put(&MACHINE, &six, "status", json!("active")),
+    ]);
+    theirs.write(records).unwrap();
+    crate::table::tests::repair_commons(&stand.lab, 6);
+    let compiled = ours.generation();
+    assert_eq!(compiled.generation, 1);
+    let view = ours.view().unwrap();
+    assert_eq!(
+        view.quota.over.len(),
+        1,
+        "CONTROL: one record past the quota"
+    );
+    let machines = view.project(&MACHINE);
+    assert!(
+        machines.rows[&stand.machine].fields["note"].conflicted(),
+        "CONTROL: the note two Macs wrote at once is conflicted"
+    );
+    assert_ne!(
+        machines,
+        cell::project(&MACHINE, &view.cells),
+        "CONTROL: the label two machines claim is settled by the claim rules"
+    );
+    memoized_is_fresh(compiled, &view, "the first generation");
+
+    let lab = carried_lab();
+    let registry = Registry::at(lab.paths[0].clone());
+    let compiled = registry.generation();
+    assert_eq!(compiled.generation, 2);
+    let view = registry.view().unwrap();
+    assert_eq!(
+        view.owned[crate::alab::registry::MACHINE_FACTS.name]
+            .rows
+            .len(),
+        2,
+        "CONTROL: both facts rows are carried"
+    );
+    let machines = view.project(&MACHINE);
+    for label in ["m1", "m2"] {
+        assert_eq!(
+            machines.rows[&keys::machine_pk(label)].get("label"),
+            Some(&json!(label)),
+            "CONTROL: the roll carried {label}'s label"
+        );
+    }
+    memoized_is_fresh(compiled, &view, "the second generation");
+}
+
 /// A text set's snapshot value is its members' texts (LT-15B): on registry.4, `lab/machines`
 /// keeps a Mac's nickname aliases as the aliases, never as nothing.
 /// NEGATIVE CONTROL (run 2026-11-15): with the snapshot reading a set by `Field::members` (the
@@ -2526,10 +3944,14 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         t,
     );
 
-    // The peer's record reaches this Mac through the older peer only.
+    // The peer's record reaches this Mac through the older peer only. A pair's rounds take the
+    // tables whose witnesses differ one a round, and a round leads ahead of them a table the
+    // lists newly share, which one side took up once an earlier round brought its declaration
+    // (`crate::replica::Repair::lead`): the ring window that holds the peer's record may wait
+    // for the third round.
     let clocks = [t; 3];
     repair_commons_among(lab, 2, &[OLD, PEER], &clocks);
-    repair_commons_among(lab, 2, &[OLD, SEAT], &clocks);
+    repair_commons_among(lab, 3, &[OLD, SEAT], &clocks);
 
     // THE OLDER PEER reads the record as v0.201.0 does: every row of its collections, and
     // nothing of the new ones, exactly as if the record carried no new row.
@@ -2676,7 +4098,8 @@ fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_mer
         Stand::ring_rows(&ada, &peer, 30, RESET + 7 * 86_400_000, 3),
         t,
     );
-    repair_commons_among(lab, 2, &[PEER, SEAT], &clocks);
+    // Three rounds, as above: the pair's first, whose second round may lead a newly shared table.
+    repair_commons_among(lab, 3, &[PEER, SEAT], &clocks);
     all(&stand, &stand.pass(true), Word::Live, None);
     let next = limit(&stand);
     assert_eq!(next.values.get("w7d").and_then(Value::as_u64), Some(30));

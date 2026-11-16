@@ -21,6 +21,7 @@ fn child_digest_of_wire(wire: &str) -> Option<[u8; 32]> {
 
 fn realistic_layout() -> RestoreManifest {
     RestoreManifest::new(vec![WindowLayout {
+        dock: None,
         rows: 46,
         cols: 168,
         active_tab: 0,

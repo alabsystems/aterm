@@ -5216,7 +5216,7 @@ struct AnnounceWorld {
     watches: Vec<Watch>,
     cursors: PushCursors,
     handle: crate::session_store::SessionHandle,
-    sid: String,
+    sid: aterm_session::SessionId,
     created: Option<u64>,
     told: i64,
     ack_written: bool,
@@ -5246,7 +5246,7 @@ impl AnnounceWorld {
             sub,
             watches,
             cursors,
-            sid: handle.sid.as_str().to_string(),
+            sid: handle.sid.clone(),
             handle,
             created: None,
             told: 0,
@@ -5279,9 +5279,7 @@ impl AnnounceWorld {
     fn project(&self) -> aterm_spec::interp::State {
         use crate::control::MAX_SUBSCRIBE_TARGETS as CAP;
         let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-        let live = g
-            .by_sid(&aterm_session::SessionId::new(&self.sid))
-            .is_some();
+        let live = g.by_sid(&self.sid).is_some();
         let seq = self.cursors.roster.as_ref().expect("sessions stream").seq;
         let watched = self.watched();
         [

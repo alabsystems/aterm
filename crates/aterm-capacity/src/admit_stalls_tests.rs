@@ -74,9 +74,12 @@ fn a_new_claim_cannot_inherit_the_previous_claims_stall() {
     let mut cache = Cache::new();
     let now = Instant::now();
     let old = claim(1, 1_000);
-    assert_eq!(look(&mut cache, &[old.clone()], &old, now).stalled, None);
     assert_eq!(
-        look(&mut cache, &[old.clone()], &old, now + BOUND).stalled,
+        look(&mut cache, std::slice::from_ref(&old), &old, now).stalled,
+        None
+    );
+    assert_eq!(
+        look(&mut cache, std::slice::from_ref(&old), &old, now + BOUND).stalled,
         Some(BOUND)
     );
 
@@ -84,14 +87,14 @@ fn a_new_claim_cannot_inherit_the_previous_claims_stall() {
     let fresh = claim(2, 901_000);
     let began = now + BOUND + Duration::from_secs(1);
     assert_eq!(
-        look(&mut cache, &[fresh.clone()], &fresh, began).stalled,
+        look(&mut cache, std::slice::from_ref(&fresh), &fresh, began).stalled,
         None,
         "a fresh claim starts its own observation"
     );
     assert_eq!(
         look(
             &mut cache,
-            &[fresh.clone()],
+            std::slice::from_ref(&fresh),
             &fresh,
             began + BOUND - Duration::from_nanos(1)
         )
@@ -99,7 +102,7 @@ fn a_new_claim_cannot_inherit_the_previous_claims_stall() {
         None
     );
     for at in [began + BOUND, began + BOUND + Duration::from_secs(1)] {
-        let observed = look(&mut cache, &[fresh.clone()], &fresh, at);
+        let observed = look(&mut cache, std::slice::from_ref(&fresh), &fresh, at);
         let stuck = super::super::stuck(&[observed]).expect("genuine qualifying stall look");
         assert_eq!(stuck.holders, [PID]);
         assert!(stuck.span >= BOUND);
@@ -142,35 +145,69 @@ fn observed_credit_changes_reset_without_resurrecting_a_previous_work_set() {
     let mut record = claim(1, 1_000);
     record.credit = vec![98];
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now).stalled,
+        look(&mut cache, std::slice::from_ref(&record), &record, now).stalled,
         None
     );
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND
+        )
+        .stalled,
         Some(BOUND)
     );
     record.credit = vec![99];
     // A complete scan sees the changed work even while this claim blocks another resource.
-    cache.refresh(Path::new("/ledger"), &[record.clone()], now + BOUND);
+    cache.refresh(
+        Path::new("/ledger"),
+        std::slice::from_ref(&record),
+        now + BOUND,
+    );
     record.credit = vec![98];
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND
+        )
+        .stalled,
         None,
         "a nonblocking observed epoch change also retires the old history"
     );
     record.credit = vec![99];
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND
+        )
+        .stalled,
         None,
         "the same member count and counters cannot identify the credited work"
     );
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND * 2).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND * 2
+        )
+        .stalled,
         Some(BOUND)
     );
     record.credit = vec![98];
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND * 2).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND * 2
+        )
+        .stalled,
         None,
         "returning to an observed old set must not resurrect its clock"
     );
@@ -183,7 +220,7 @@ fn unchanged_claim_writes_keep_history_but_a_changed_admission_stamp_does_not() 
     let mut record = claim(1, 1_000);
     record.credit = vec![98, 99];
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now).stalled,
+        look(&mut cache, std::slice::from_ref(&record), &record, now).stalled,
         None
     );
     record.credit = vec![99, 98, 99];
@@ -191,13 +228,25 @@ fn unchanged_claim_writes_keep_history_but_a_changed_admission_stamp_does_not() 
     record.need.stepped = Some(1 << 30);
     record.held.as_mut().unwrap().alone = false;
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND
+        )
+        .stalled,
         Some(BOUND),
         "canonical unchanged credit, writes and steps preserve same-claim history"
     );
     record.held.as_mut().unwrap().admitted_ms += 1;
     assert_eq!(
-        look(&mut cache, &[record.clone()], &record, now + BOUND).stalled,
+        look(
+            &mut cache,
+            std::slice::from_ref(&record),
+            &record,
+            now + BOUND
+        )
+        .stalled,
         None
     );
 }
@@ -230,7 +279,7 @@ fn complete_snapshots_prune_ended_claims_and_keep_live_nonblockers() {
         Some(KEPT),
         "a live nonblocking claim is not expired inside an observed ledger"
     );
-    cache.refresh(dir, &[b.clone()], now + KEPT);
+    cache.refresh(dir, std::slice::from_ref(&b), now + KEPT);
     assert_eq!(
         cache.ledgers[dir].claims.len(),
         1,
@@ -262,7 +311,7 @@ fn unknown_work_and_nested_waits_keep_their_existing_meaning() {
     let now = Instant::now();
     let record = claim(1, 1_000);
     let dir = Path::new("/ledger");
-    cache.refresh(dir, &[record.clone()], now);
+    cache.refresh(dir, std::slice::from_ref(&record), now);
     let mut holders = [holder(&record)];
     cache.read(dir, &mut holders, Some(&idle()), &[], now, BOUND);
     cache.read(dir, &mut holders, None, &[], now + BOUND, BOUND);
@@ -292,7 +341,7 @@ fn unknown_work_and_nested_waits_keep_their_existing_meaning() {
         }),
     )];
     let fresh = claim(2, 2_000);
-    cache.refresh(dir, &[fresh.clone()], now + BOUND * 2);
+    cache.refresh(dir, std::slice::from_ref(&fresh), now + BOUND * 2);
     holders = [holder(&fresh)];
     cache.read(
         dir,

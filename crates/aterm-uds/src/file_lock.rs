@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deadline-bounded exclusive file-lock contention waits on Unix and Windows; on macOS, a wait
-//! for a lock to come free that takes nothing (`wait_unlocked`); and a thread's rule that it
-//! takes no lock at all ([`takes_nothing`]).
+//! Deadline-bounded file-lock contention waits on Unix and Windows: exclusive, and the shared
+//! lease [`LockFile::share`] takes; on macOS, a wait for a lock to come free that takes nothing
+//! (`wait_unlocked`); and a thread's rule that it takes no lock at all ([`takes_nothing`]).
 
 use std::io;
 use std::time::{Duration, Instant};
+
+/// Which lock a contention wait takes: one holder alone, or any number of shared holders while
+/// no exclusive one has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    Exclusive,
+    Shared,
+}
 
 std::thread_local! {
     /// Whether this thread runs inside [`takes_nothing`].
@@ -234,6 +242,19 @@ pub(crate) fn lock_exclusive_with_clock(
     file: &std::fs::File,
     deadline: Option<Instant>,
     busy: &str,
+    held: impl FnMut(),
+    now: impl Fn() -> Instant,
+    sleep: impl FnMut(Duration),
+) -> io::Result<()> {
+    lock_with_clock(file, Hold::Exclusive, deadline, busy, held, now, sleep)
+}
+
+/// [`lock_exclusive_with_clock`] for either [`Hold`].
+fn lock_with_clock(
+    file: &std::fs::File,
+    hold: Hold,
+    deadline: Option<Instant>,
+    busy: &str,
     mut held: impl FnMut(),
     now: impl Fn() -> Instant,
     mut sleep: impl FnMut(Duration),
@@ -257,7 +278,10 @@ pub(crate) fn lock_exclusive_with_clock(
             clippy::disallowed_methods,
             reason = "the caller retains the validated file and explicitly unlocks before close"
         )]
-        let taken = file.try_lock();
+        let taken = match hold {
+            Hold::Exclusive => file.try_lock(),
+            Hold::Shared => file.try_lock_shared(),
+        };
         match taken {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => return Err(error),
@@ -313,10 +337,11 @@ pub fn with_lock_wait_observer<T>(
     run()
 }
 
-/// An exclusive lock on a file of its own that guards something beside it (a record that is
-/// replaced whole by a rename, so its own inode is no place for a lock), taken by
-/// [`LockFile::take`] and let go by `LOCK_UN` as it drops, before the close: clippy.toml's flock
-/// release rule.
+/// A lock on a file of its own that guards something beside it (a record that is replaced whole
+/// by a rename, so its own inode is no place for a lock): exclusive, taken by [`LockFile::take`]
+/// or [`LockFile::try_take`], or shared, taken by [`LockFile::share`]; let go by `LOCK_UN` as it
+/// drops, before the close: clippy.toml's flock release rule. A lock belongs to the open file it
+/// was taken on, so two of one process are two holders, as two processes' are.
 #[derive(Debug)]
 pub struct LockFile(std::fs::File);
 
@@ -333,6 +358,52 @@ impl LockFile {
     /// `path` included; [`takes_nothing`]'s refusal on a thread inside it.
     pub fn take(path: &std::path::Path, deadline: Instant, busy: &str) -> io::Result<Self> {
         Self::lock(open_or_make(path)?, path, deadline, busy)
+    }
+
+    /// Take a shared lock on the regular file at `path`, opened or made as [`Self::take`] opens
+    /// or makes it: any number of shared holders hold it at once, and none beside an exclusive
+    /// holder, whose let-go it waits for until `deadline`, with [`Self::take`]'s bounded wait.
+    ///
+    /// # Errors
+    /// [`Self::take`]'s, `WouldBlock` with `busy` where an exclusive holder kept it past
+    /// `deadline`.
+    pub fn share(path: &std::path::Path, deadline: Instant, busy: &str) -> io::Result<Self> {
+        let file = open_or_make(path)?;
+        plain(&file, path)?;
+        lock_with_clock(
+            &file,
+            Hold::Shared,
+            Some(deadline),
+            busy,
+            || {},
+            Instant::now,
+            std::thread::sleep,
+        )?;
+        Ok(Self(file))
+    }
+
+    /// Take an exclusive lock on the regular file at `path`, opened or made as [`Self::take`]
+    /// opens or makes it, where no other holder, shared or exclusive, has it now: `None` where
+    /// one does. It never waits.
+    ///
+    /// # Errors
+    /// The open's and the lock's own error; `InvalidData` when `path` holds anything but a
+    /// regular file; [`takes_nothing`]'s refusal on a thread inside it.
+    pub fn try_take(path: &std::path::Path) -> io::Result<Option<Self>> {
+        let file = open_or_make(path)?;
+        plain(&file, path)?;
+        refused_here()?;
+        crate::keep_out_of_children(&file)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the LockFile it becomes keeps the file and unlocks before the close"
+        )]
+        let taken = file.try_lock();
+        match taken {
+            Ok(()) => Ok(Some(Self(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
     }
 
     /// Take an exclusive lock on an existing plain regular file, without creating a missing file.
@@ -356,23 +427,30 @@ impl LockFile {
         deadline: Instant,
         busy: &str,
     ) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        let plain_file = metadata.is_file();
-        #[cfg(windows)]
-        let plain_file = {
-            use std::os::windows::fs::MetadataExt as _;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-            plain_file && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-        };
-        if !plain_file {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is no regular file", path.display()),
-            ));
-        }
+        plain(&file, path)?;
         lock_exclusive_until(&file, deadline, busy)?;
         Ok(Self(file))
     }
+}
+
+/// `InvalidData` unless `file`, opened at `path`, is a regular file (on Windows, and no reparse
+/// point).
+fn plain(file: &std::fs::File, path: &std::path::Path) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    let plain_file = metadata.is_file();
+    #[cfg(windows)]
+    let plain_file = {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        plain_file && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    };
+    if !plain_file {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is no regular file", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for LockFile {

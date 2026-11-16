@@ -478,6 +478,7 @@ pub(crate) enum MenuAction {
     Navigator,
     /// Navigator in Left Split: the same list as the active tab's left pane.
     NavigatorSplit,
+    ToggleNavigator,
     /// Next That Needs You ⇧⌘J.
     NextNeed,
     /// Harness Log for This Tab ⇧⌘L.
@@ -575,6 +576,7 @@ impl MenuAction {
             MenuAction::Workers => 99,
             MenuAction::Navigator => 107,
             MenuAction::NavigatorSplit => 108,
+            MenuAction::ToggleNavigator => 109,
             MenuAction::Allocation => 100,
             MenuAction::NextKitty => 57,
             MenuAction::HarnessLog => 60,
@@ -669,6 +671,7 @@ impl MenuAction {
             99 => MenuAction::Workers,
             107 => MenuAction::Navigator,
             108 => MenuAction::NavigatorSplit,
+            109 => MenuAction::ToggleNavigator,
             100 => MenuAction::Allocation,
             57 => MenuAction::NextKitty,
             60 => MenuAction::HarnessLog,
@@ -1071,6 +1074,7 @@ pub(crate) struct MenuLive {
     pub kitty_favourited: bool,
     /// The front tab is split, so ⌘W closes a pane (the row's title).
     pub front_tab_split: bool,
+    pub navigator_shown: bool,
     /// The focused pane records its screen, so Rewind can open on it.
     pub can_rewind: bool,
     /// The front window's glow is recorded (`aos attach`), so Record Keys Not Echoed… can grant.
@@ -1097,6 +1101,7 @@ impl MenuLive {
         rain_on: false,
         kitty_favourited: false,
         front_tab_split: false,
+        navigator_shown: false,
         can_rewind: false,
         aos_attached: false,
         aos_unseen: false,
@@ -1112,6 +1117,7 @@ impl MenuLive {
             | (self.rain_on as u16) << 5
             | (self.kitty_favourited as u16) << 6
             | (self.front_tab_split as u16) << 7
+            | (self.navigator_shown as u16) << 15
             | (self.can_save as u16) << 8
             | (self.can_find as u16) << 9
             | (self.can_find_again as u16) << 10
@@ -1134,6 +1140,7 @@ impl MenuLive {
             rain_on: b & (1 << 5) != 0,
             kitty_favourited: b & (1 << 6) != 0,
             front_tab_split: b & (1 << 7) != 0,
+            navigator_shown: b & (1 << 15) != 0,
             can_rewind: b & (1 << 11) != 0,
             aos_attached: b & (1 << 12) != 0,
             aos_unseen: b & (1 << 13) != 0,
@@ -1184,6 +1191,11 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
 pub(crate) fn native_live_title(action: MenuAction) -> Option<&'static str> {
     match action {
         MenuAction::CloseTab => Some(close_row_title(menu_live().front_tab_split)),
+        MenuAction::ToggleNavigator => Some(if menu_live().navigator_shown {
+            "Hide Navigator"
+        } else {
+            "Show Navigator"
+        }),
         MenuAction::SummarizeFleet => Some(summarize_title(agents_live().in_fleet)),
         _ => None,
     }
@@ -1210,13 +1222,14 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         MenuAction::HandBackAll if !any_person_hold() => return false,
         MenuAction::NextNeed
         | MenuAction::Overview
+        | MenuAction::ToggleNavigator
         | MenuAction::ReadFleet
         | MenuAction::FleetMachines
         | MenuAction::SummarizeFleet => {
             let agents = agents_live();
             let live = match action {
                 MenuAction::NextNeed => agents.needs_local,
-                MenuAction::Overview => agents.any_window,
+                MenuAction::Overview | MenuAction::ToggleNavigator => agents.any_window,
                 MenuAction::ReadFleet | MenuAction::FleetMachines => agents.in_fleet == Some(true),
                 _ => agents.summarize_ready(),
             };
@@ -1302,6 +1315,7 @@ impl MenuAction {
             | MenuAction::Workers
             | MenuAction::Navigator
             | MenuAction::NavigatorSplit
+            | MenuAction::ToggleNavigator
             | MenuAction::Allocation
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
@@ -1435,6 +1449,7 @@ impl MenuAction {
             | MenuAction::Workers
             | MenuAction::Navigator
             | MenuAction::NavigatorSplit
+            | MenuAction::ToggleNavigator
             | MenuAction::NextNeed
             | MenuAction::HarnessLog
             | MenuAction::TakeOver
@@ -1544,6 +1559,9 @@ impl MenuAction {
             MenuAction::Navigator => {
                 "List every live session of every window: your tabs first, each with the \
                  sessions under it, then the rest of this machine's."
+            }
+            MenuAction::ToggleNavigator => {
+                "Show or hide the navigator beside this window’s terminal grid."
             }
             MenuAction::NavigatorSplit => {
                 "Open the list of every live session as the left pane of this tab."
@@ -1736,6 +1754,7 @@ impl MenuAction {
             "Workers" => Some(MenuAction::Workers),
             "Navigator" => Some(MenuAction::Navigator),
             "NavigatorSplit" => Some(MenuAction::NavigatorSplit),
+            "ToggleNavigator" => Some(MenuAction::ToggleNavigator),
             "NextNeed" => Some(MenuAction::NextNeed),
             "HarnessLog" => Some(MenuAction::HarnessLog),
             "ReadThisMac" => Some(MenuAction::ReadThisMac),
@@ -1779,6 +1798,7 @@ pub(crate) enum MenuMods {
     Command,
     CommandShift,
     CommandControl,
+    CommandOption,
 }
 
 /// One entry of a menu section.
@@ -2107,6 +2127,12 @@ const EDIT_MENU: &[MenuEntry] = &[
 ];
 
 const VIEW_MENU: &[MenuEntry] = &[
+    MenuEntry::Item {
+        label: "Show Navigator",
+        action: MenuAction::ToggleNavigator,
+        key: "o",
+        mods: MenuMods::CommandOption,
+    },
     Item {
         label: "Increase Font Size",
         action: MenuAction::FontIncrease,
@@ -3277,6 +3303,7 @@ mod macos {
             super::MenuMods::Command => command_mask(),
             super::MenuMods::CommandShift => command_shift_mask(),
             super::MenuMods::CommandControl => command_control_mask(),
+            super::MenuMods::CommandOption => command_mask() | (1 << 19),
         }
     }
 

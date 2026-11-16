@@ -15,7 +15,7 @@
 //! deleted one (their blank lines match), the union puts one entry's heading over another's
 //! text. An entry-level merge decides each entry by the side that changed it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::guards::conflict_marker::{fence_closes, fence_open};
@@ -156,9 +156,10 @@ fn split(text: &str) -> Option<Vec<Part<'_>>> {
         body: text[..first].trim_end(),
     }];
     let mut at = first;
+    let mut seen = HashSet::with_capacity(found.len());
     for entry in found {
         let key = entry.id?;
-        if entry.span.start != at || split.iter().any(|part| part.key == key) {
+        if entry.span.start != at || !seen.insert(key) {
             return None;
         }
         at = entry.span.end;

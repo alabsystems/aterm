@@ -1961,8 +1961,8 @@ impl App {
                             SpawnPlace::Split(dir) => {
                                 self.install_split_session(window, dir, session)
                             }
-                            SpawnPlace::Window { .. } => {
-                                self.install_window_session(window, session, parent, grid, os)
+                            SpawnPlace::Window { from } => {
+                                self.install_window_session(window, session, parent, grid, os, from)
                             }
                         };
                         drop(acted);
@@ -2004,7 +2004,8 @@ impl App {
         landed
     }
 
-    /// Build window `wid` around `session`, register it under `parent`, and attach its OS window.
+    /// Build window `wid` around `session`, register it under `parent`, give it the dock record
+    /// of `from`, the window it was opened from, and attach its OS window.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2028,12 +2029,19 @@ impl App {
         parent: Option<aterm_session::SessionId>,
         grid: Option<SpawnGrid>,
         os: &dyn LandingOs,
+        from: Option<WindowId>,
     ) -> Result<(), String> {
         let (rows, cols) = grid.map_or_else(
             || self.new_window_frame(None).0,
             |(rows, cols, _)| (rows, cols),
         );
         self.install_window_state_with_parent(wid, session, rows, cols, parent);
+        // The window it came from, reserved at the booking: the front window at the landing
+        // may be another, focused while the shell spawned. An origin gone since keeps the
+        // front's record.
+        if let Some(from) = from.filter(|from| self.windows.contains_key(from)) {
+            self.inherit_dock_record(from, wid);
+        }
         if !os.attach(self, wid) {
             self.close_window_logical(wid);
             self.post_message(crate::message_reporters::new_window_failed(

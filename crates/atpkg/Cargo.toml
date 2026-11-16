@@ -166,10 +166,11 @@ aterm-dirfd = { workspace = true }
 # On Windows, the one reader of another process's environment block
 # (`aterm_sysprobe::peb::parameters`), which `caller_shell::process_args`
 # splits, and the case fold a variable's name is looked up by
-# (`aterm_sysprobe::paths::fold_case`, `RtlUpcaseUnicodeChar`'s), for
+# (`aterm_path::fold_case`, `RtlUpcaseUnicodeChar`'s), for
 # `caller_shell::ProcArgs::env_var`. Already in atpkg's Windows graph through
 # aterm-toolchain and aterm-uds; pure Rust and kernel32/ntdll FFI there.
 [target.'cfg(windows)'.dependencies]
+aterm-path = { workspace = true }
 aterm-sysprobe = { workspace = true }
 
 # `input_seal::machine_facts`: the OS build and model a sealed identity binds

@@ -4074,11 +4074,11 @@ fn a_successor_books_no_second_would_row_for_a_carried_wake() {
 #[path = "facts_loop_tests.rs"]
 mod facts_loop;
 
-/// The ask to free space's line (`disk-free@v1`, a fact of the host's own) as its host answers a
-/// break it is offered at: typed.
-fn disk_free_typed() -> HostStep {
+/// A fact of the host's own (`HostTurn::Fact`) as its host answers a break it is offered at:
+/// typed. The line is this fake host's own words.
+fn host_fact_typed() -> HostStep {
     HostStep {
-        line: "disk-free@v1 step=typed".to_string(),
+        line: "host-fact step=typed".to_string(),
         moved: true,
         typed: Some(HostTurn::Fact),
         repeat: false,
@@ -4086,16 +4086,15 @@ fn disk_free_typed() -> HostStep {
 }
 
 /// A session whose turn ended with its own background shell still running (a manager awaiting
-/// its workers) reads busy for hours and comes to no idle point. The host's own fact owed it, the
-/// ask to free space's line, is offered at such a break once it settles, through the same act and
-/// the guards an idle point's fact is: before, only the upgrade's notice was, and the line waited
-/// out its delivery window and was handed on undelivered, and as the only seat the episode parked
-/// for six hours with nothing asked.
+/// its workers) reads busy for hours and comes to no idle point. A fact the host owes it is
+/// offered at such a break once it settles, through the same act and the guards an idle point's
+/// fact is: before, only the upgrade's notice was, and a fact owed such a session had no point
+/// to go at.
 #[test]
 fn a_fact_owed_at_a_settled_background_break_is_offered_there() {
     let host = Arc::new(DoorHost::default());
     host.wants.store(true, Ordering::SeqCst);
-    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    *host.fact.lock().expect("fact") = Some(host_fact_typed());
     let ran = Script {
         host: Arc::clone(&host),
         ..Script::new("background-fact", Occupancy::Off, &[0, 60])
@@ -4113,7 +4112,7 @@ fn a_fact_owed_at_a_settled_background_break_is_offered_there() {
     assert!(
         ran.noted
             .iter()
-            .any(|n| n.ends_with("background disk-free@v1 step=typed")),
+            .any(|n| n.ends_with("background host-fact step=typed")),
         "{:#?}",
         ran.noted
     );
@@ -4135,7 +4134,7 @@ fn a_fact_owed_at_a_settled_background_break_is_offered_there() {
 fn a_fact_at_a_background_break_keeps_an_idle_points_guards() {
     let host = Arc::new(DoorHost::default());
     host.wants.store(true, Ordering::SeqCst);
-    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    *host.fact.lock().expect("fact") = Some(host_fact_typed());
     let ran = Script {
         host: Arc::clone(&host),
         drawn: &|_| drafted_break(),
@@ -4159,7 +4158,7 @@ fn a_fact_at_a_background_break_keeps_an_idle_points_guards() {
 
     let host = Arc::new(DoorHost::default());
     host.wants.store(true, Ordering::SeqCst);
-    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    *host.fact.lock().expect("fact") = Some(host_fact_typed());
     let _ = Script {
         host: Arc::clone(&host),
         ..Script::new("background-fact-exchange", Occupancy::Off, &[0, 60])
@@ -4202,7 +4201,7 @@ fn no_fact_is_offered_where_the_agent_waits_on_its_own_workflows() {
     assert!(!aterm_phase::turn_over_background(&workflows()));
     let host = Arc::new(DoorHost::default());
     host.wants.store(true, Ordering::SeqCst);
-    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    *host.fact.lock().expect("fact") = Some(host_fact_typed());
     let ran = Script {
         host: Arc::clone(&host),
         drawn: &|_| workflows(),
@@ -4248,7 +4247,7 @@ fn a_fact_owed_at_a_monitor_under_an_outlived_progress_row_is_offered_there() {
     let offered = |tag: &str, drawn: &dyn Fn(usize) -> Vec<String>| {
         let host = Arc::new(DoorHost::default());
         host.wants.store(true, Ordering::SeqCst);
-        *host.fact.lock().expect("fact") = Some(disk_free_typed());
+        *host.fact.lock().expect("fact") = Some(host_fact_typed());
         let ran = Script {
             host: Arc::clone(&host),
             drawn,
@@ -4275,8 +4274,8 @@ fn a_fact_owed_at_a_monitor_under_an_outlived_progress_row_is_offered_there() {
 }
 
 /// The credits hold at a background break is a lasting withhold of the loop's: it is told to the
-/// host, with when it lifts, once, so the window's seat rule (`disk-free@v1`) holds the session
-/// out of its seats meanwhile.
+/// host, with when it lifts, once, so a host that offers the session work it would type at a
+/// break holds it out meanwhile.
 #[test]
 fn the_credits_hold_at_a_background_break_is_told_once() {
     let host = Arc::new(DoorHost::default());
@@ -4312,7 +4311,7 @@ fn the_credits_hold_at_a_background_break_is_told_once() {
 fn a_fact_at_a_background_break_reads_the_persons_grace_there() {
     let host = Arc::new(DoorHost::default());
     host.wants.store(true, Ordering::SeqCst);
-    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    *host.fact.lock().expect("fact") = Some(host_fact_typed());
     let ran = Script {
         host: Arc::clone(&host),
         set: &|m| m.human_ms = Some(5_000),
@@ -4345,7 +4344,7 @@ fn a_halt_or_a_hand_lifted_since_the_last_read_holds_no_fact_at_a_background_bre
     for tag in ["halted", "driver"] {
         let host = Arc::new(DoorHost::default());
         host.wants.store(true, Ordering::SeqCst);
-        *host.fact.lock().expect("fact") = Some(disk_free_typed());
+        *host.fact.lock().expect("fact") = Some(host_fact_typed());
         let ran = Script {
             host: Arc::clone(&host),
             ..Script::new(tag, Occupancy::Off, &[0, 60])
@@ -4375,7 +4374,7 @@ fn a_halt_or_a_hand_lifted_since_the_last_read_holds_no_fact_at_a_background_bre
 fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
     let host = Arc::new(DoorHost::default());
     host.wants.store(true, Ordering::SeqCst);
-    *host.fact.lock().expect("fact") = Some(disk_free_typed());
+    *host.fact.lock().expect("fact") = Some(host_fact_typed());
     let ran = Script {
         host: Arc::clone(&host),
         ..Script::new("background-fact-awaited", Occupancy::Off, &[0])
@@ -4400,7 +4399,7 @@ fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
     assert!(
         ran.noted
             .iter()
-            .any(|n| n.ends_with("background disk-free@v1 step=typed")),
+            .any(|n| n.ends_with("background host-fact step=typed")),
         "{:#?}",
         ran.noted
     );

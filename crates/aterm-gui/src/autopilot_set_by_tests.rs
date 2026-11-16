@@ -150,7 +150,7 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let mut edges = ctx.edges.lock().unwrap();
         edges.grant(
-            aterm_session::SessionId::new("s-test-controller"),
+            aterm_session::SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(0x7e57)),
             ctx.self_id.clone(),
             aterm_session::Op::WriteInput,
             ctx.nonce,
@@ -196,7 +196,7 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
         last_line(&app, 0),
         Some(format!(
             "set from session {}",
-            aterm_messages::presence::short_sid(gone.as_str())
+            crate::presence::short_sid(gone.as_str())
         ))
     );
     host.shutdown_and_join();

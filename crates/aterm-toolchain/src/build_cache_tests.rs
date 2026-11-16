@@ -1020,6 +1020,80 @@ fn config_dirs_read_each_file_as_targo_parses_it() {
     }
 }
 
+/// A CONFIG NAMES WHAT ITS `build` TABLE NAMES, not what its lines mention ([`config_dirs`]): a
+/// line that spells a directory's key in an alias's words (trust-mc's `build-dev = "run
+/// --target-dir target/tools …"`), a comment after a value or another string names no
+/// directory, and leaves a call from the folder unresolved by no config
+/// ([`configs_unresolved`]); only a call whose alias words this reader cannot tell reads the
+/// mention ([`configs_mention_dirs`]). Text no reader parses whose lines tell names what they
+/// spell, as before it was parsed. NEGATIVE CONTROL: the line scan named a target, build or
+/// artifact directory for each of the first four rows, so every call from such a folder owed
+/// custody of a directory no config named, and its front refused it; a `build` table that
+/// names one, in either spelling, still names it, and a file that mentions none mentions none.
+#[test]
+fn a_config_names_what_its_build_table_names_not_what_its_lines_mention() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = home.join("project");
+    let dir = root.join(".cargo");
+    let config = dir.join("config.toml");
+    let trust_mc = "[build]\njobs = 12\nrustc-wrapper = \"scripts/trustc-private-wrapper.sh\"\n\
+                    [alias]\nbuild-dev = \"run --target-dir target/tools -p build-trust-mc -- \
+                    build-dev\"\n[env]\nRAYON_NUM_THREADS = { value = \"2\", force = true }\n";
+    // (target, build, artifact, mentioned)
+    for (text, expected) in [
+        (trust_mc, (false, false, false, true)),
+        (
+            "[build]\njobs = 4 # target-dir, build-dir\n",
+            (false, false, false, true),
+        ),
+        (
+            "[env]\nNOTE = \"target-dir\"\n",
+            (false, false, false, true),
+        ),
+        (
+            "[alias]\ndist = \"build --artifact-dir dist\"\n",
+            (false, false, false, true),
+        ),
+        ("[build]\ntarget-dir = \"t\"\n", (true, false, false, true)),
+        ("build.build-dir = \"b\"\n", (false, true, false, true)),
+        (
+            "[build]\nartifact-dir = \"a\"\n",
+            (false, false, true, true),
+        ),
+        ("build.target-dir = [\n", (true, false, false, true)),
+        ("[build]\njobs = 4\n", (false, false, false, false)),
+    ] {
+        let read = |path: &Path| Ok((path == config).then(|| text.to_owned()));
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        let named = config_dirs(&dir, &machine);
+        assert_eq!(
+            (named.target, named.build, named.artifact, named.mentioned),
+            expected,
+            "{text:?}"
+        );
+        let (target, build, artifact, mentioned) = expected;
+        assert_eq!(
+            configs_unresolved(&root, Tool::Targo, &machine, true),
+            target || build || artifact,
+            "{text:?}"
+        );
+        assert_eq!(
+            configs_mention_dirs(&root, Tool::Targo, &machine),
+            mentioned,
+            "{text:?}"
+        );
+    }
+}
+
 /// A `--config` VALUE IS READ AS TARGO READS IT (`context/mod.rs`'s `cli_args_as_table`): the
 /// config file standing at its path against the working directory, parsed whole with the files
 /// it includes against its own folder, or else an inline dotted key, with an `include` against

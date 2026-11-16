@@ -141,6 +141,11 @@ fn full_input() -> SessionChromeInput {
     }
 }
 
+/// The session whose tab ID is `id`.
+fn tab_sid(id: &str) -> SessionId {
+    SessionId::parse(id).expect("a tab id")
+}
+
 fn fact(
     sid: &str,
     title: &str,
@@ -149,7 +154,7 @@ fn fact(
     live: bool,
 ) -> ConnectionFact {
     ConnectionFact {
-        peer_sid: SessionId::new(sid),
+        peer_sid: tab_sid(sid),
         peer_title: title.to_string(),
         direction,
         kind,
@@ -518,7 +523,7 @@ fn timeline_tail_leaves_out_agent_moves_and_typing() {
 fn menu_matches_tooltip_headers_and_orders_actions() {
     let mut input = full_input();
     input.connections = vec![fact(
-        "s-peer",
+        "tpeer000000",
         "build",
         ConnDirection::Outbound,
         ConnFlow::Push,
@@ -594,7 +599,7 @@ fn the_agent_section_offers_the_hold_and_the_team_rows() {
         })
     };
     let mut plain = full_input();
-    plain.sid = Some(SessionId::new("s-me"));
+    plain.sid = Some(tab_sid("tme00000000"));
     assert!(
         compose_tab_menu(&plain)
             .iter()
@@ -608,20 +613,20 @@ fn the_agent_section_offers_the_hold_and_the_team_rows() {
     assert_eq!(first_agent_action(&held), Some(MenuAction::HandBack));
 
     let mut worker = plain.clone();
-    worker.agent.manager = Some((SessionId::new("s-boss"), "lab-sweep".to_string()));
+    worker.agent.manager = Some((tab_sid("tbss0000000"), "lab-sweep".to_string()));
     worker.agent.stoppable = true;
     assert_eq!(
         rows(&worker),
         [
-            ("s-boss".to_string(), ConnVerb::Show),
-            ("s-me".to_string(), ConnVerb::StopWorker),
+            ("tbss0000000".to_string(), ConnVerb::Show),
+            ("tme00000000".to_string(), ConnVerb::StopWorker),
         ]
     );
 
     let mut manager = plain.clone();
     manager.agent.workers = vec![
-        (SessionId::new("s-w1"), "bench".to_string()),
-        (SessionId::new("s-w2"), "fmt".to_string()),
+        (tab_sid("tw100000000"), "bench".to_string()),
+        (tab_sid("tw200000000"), "fmt".to_string()),
     ];
     let menu = compose_tab_menu(&manager);
     let header = menu
@@ -635,8 +640,8 @@ fn the_agent_section_offers_the_hold_and_the_team_rows() {
     assert_eq!(
         rows(&manager),
         [
-            ("s-w1".to_string(), ConnVerb::Show),
-            ("s-w2".to_string(), ConnVerb::Show),
+            ("tw100000000".to_string(), ConnVerb::Show),
+            ("tw200000000".to_string(), ConnVerb::Show),
         ]
     );
 }
@@ -646,14 +651,14 @@ fn the_tooltip_carries_connection_lines_and_no_forged_one() {
     let mut peers = full_input();
     peers.connections = vec![
         fact(
-            "s-b",
+            "tb000000000",
             "claude (b)",
             ConnDirection::Peer,
             ConnFlow::Push,
             false,
         ),
         fact(
-            "s-c",
+            "tc000000000",
             "build",
             ConnDirection::Outbound,
             ConnFlow::Push,
@@ -665,7 +670,7 @@ fn the_tooltip_carries_connection_lines_and_no_forged_one() {
     assert!(tip.contains("\u{21e5} pushes into \"build\" \u{00b7} live"));
     let mut hostile = full_input();
     hostile.connections = vec![fact(
-        "s-evil",
+        "tev11000000",
         "a\u{202e}b\nAGENT",
         ConnDirection::Outbound,
         ConnFlow::Pull,
@@ -725,10 +730,10 @@ fn chrome_line_mirrors_composed_model() {
         cwd: Some("/tmp".to_string()),
         has_session: true,
         can_rename: true,
-        sid: Some(SessionId::new("s-me")),
+        sid: Some(tab_sid("tme00000000")),
         ..SessionChromeInput::default()
     };
-    input.agent.manager = Some((SessionId::new("s-boss"), "boss".to_string()));
+    input.agent.manager = Some((tab_sid("tbss0000000"), "boss".to_string()));
     let menu = compose_tab_menu(&input);
     let line = tab_menu_chrome_line(2, &menu, NOW);
     let items: Vec<String> = menu_shown_at(&menu, NOW)
@@ -737,7 +742,10 @@ fn chrome_line_mirrors_composed_model() {
         .collect();
     assert_eq!(line, format!("tab-menu tab=2 items={items:?}"));
     assert_eq!(items.iter().filter(|t| *t == "---").count(), 2);
-    assert!(items.iter().any(|t| t.ends_with(" @s-boss")), "{items:?}");
+    assert!(
+        items.iter().any(|t| t.ends_with(" @tbss0000000")),
+        "{items:?}"
+    );
     input.has_session = false;
     let greyed: Vec<String> = compose_tab_menu(&input)
         .iter()

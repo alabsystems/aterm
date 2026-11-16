@@ -2391,7 +2391,10 @@ impl crate::App {
                 self.except_clear(mr::SESSION_JOURNAL_PAUSED_KEY);
             }
             Attention::Paused(cause) => {
-                self.except(&mr::session_journal_paused_entry(cause.word()));
+                // A record, not a line: the disk watch's own passes free space, and the
+                // journal resumes by itself. One an earlier build raised ends.
+                self.except_clear(mr::SESSION_JOURNAL_PAUSED_KEY);
+                self.record_message(mr::session_journal_paused_record(cause.word()));
             }
             Attention::Stopped(cause) => {
                 self.except_clear(mr::SESSION_JOURNAL_PAUSED_KEY);

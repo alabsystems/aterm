@@ -1043,6 +1043,7 @@ fn a_session_is_its_tab_id_or_its_shown_prefix_with_a_digit_and_a_letter() {
         "t0000000000",
         "tqn5r",
         "t0a00",
+        "s-7ee8c3",
         "s-7ee8c3b62f",
         "s-0123456789abcdef0123",
     ] {
@@ -1063,6 +1064,7 @@ fn a_session_is_its_tab_id_or_its_shown_prefix_with_a_digit_and_a_letter() {
         "tqnxr",
         "tq15i",
         "s-7ee8c",
+        "s-0123456789abcdef01234",
         "s-7ee8cz",
         "s-",
     ] {
@@ -1078,7 +1080,9 @@ fn a_reply_names_another_session_by_its_tab_id_in_any_case_and_not_by_a_number()
     for theirs in [
         "stop the TQN5R6E0148 build",
         "stop the TQN5R build",
+        "stop the T0A00 build",
         "stop the s-7ee8c3 build",
+        "stop the S-7EE8C3 build",
     ] {
         assert!(someone_else(&Unit::new(theirs, false)), "{theirs}");
     }
@@ -1088,5 +1092,47 @@ fn a_reply_names_another_session_by_its_tab_id_in_any_case_and_not_by_a_number()
         "stop the build",
     ] {
         assert!(!someone_else(&Unit::new(ours, false)), "{ours}");
+    }
+}
+
+/// Current and retained legacy session references remain someone else's work at every drawn
+/// width, in prose and inline code. Ordinary code identifiers remain the agent's own work.
+#[test]
+fn current_and_legacy_session_work_stays_protected_in_prose_and_inline_code() {
+    for reply in [
+        "I won't rebuild tqn5r6e0148's build on my own.",
+        "I won't rebuild `tqn5r6e0148`'s build on my own.",
+        "I won't rebuild TQN5R's build on my own.",
+        "I won't rebuild s-557be3727c7ee8c3b62f's build on my own.",
+        "I won't rebuild `s-557be3727c7ee8c3b62f`'s build on my own.",
+        "I won't rebuild S-557BE3's build on my own.",
+        "I won't rebuild `s-557be3`'s build on my own.",
+        "I won't rebuild `S-557BE3`'s build on my own.",
+    ] {
+        for bare in [false, true] {
+            let reply = if bare {
+                rendered(reply)
+            } else {
+                reply.to_owned()
+            };
+            for columns in DRAWN {
+                let text = drawn(&reply, columns);
+                assert!(someone_else(&Unit::new(&text, false)), "{text}");
+                assert!(parked("", &text).is_none(), "{text}");
+            }
+        }
+    }
+    let own = "I won't rebuild `build_cache` on my own.";
+    for bare in [false, true] {
+        let reply = if bare { rendered(own) } else { own.to_owned() };
+        for columns in DRAWN {
+            let text = drawn(&reply, columns);
+            assert!(parked("", &text).is_some(), "{text}");
+        }
+    }
+    // Extracted code words do not acquire the prose reader's foreign-party meanings.
+    for columns in DRAWN {
+        let text = drawn("I won't rebuild `worker` on my own.", columns);
+        assert!(parked("", &text).is_some(), "{text}");
     }
 }

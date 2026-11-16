@@ -31,6 +31,7 @@ fn arm_pending_overlap(app: &mut App) -> std::sync::mpsc::Receiver<()> {
         teardown: crate::DeferredHandoffTeardown::None,
         commit_drain_started: None,
         commit_flush: None,
+        table_flush: None,
         held_commit: None,
         revoked_by_activity: false,
     });

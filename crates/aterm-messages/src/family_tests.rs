@@ -214,7 +214,6 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::ApiOutage,
             Family::LongHold,
             Family::FleetUnreadable,
-            Family::HugeDir,
             Family::ServiceMemory,
             Family::Vitals,
             Family::Stranded,
@@ -223,26 +222,21 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::NetworkPlace
         ]
     );
-    // The leftovers' stem sits beside the two vitals families built before it, which a bare
-    // `vitals` stem would shadow (and a level pass of it would sweep).
+    // The leftovers' stem sits beside the vitals family built before it, which a bare `vitals`
+    // stem would shadow (and a level pass of it would sweep).
     assert_eq!(Family::Vitals.stem(), "vitals.proc");
     assert_eq!(Family::Vitals.tag(), tags::SYSTEM);
-    // The stranded programs' entry is a vitals family of its own as well: the four are four level
-    // passes, and none sweeps another's entries.
-    let vitals = [
-        Family::HugeDir,
-        Family::ServiceMemory,
-        Family::Vitals,
-        Family::Stranded,
-    ];
+    // The stranded programs' entry is a vitals family of its own as well: the three are three
+    // level passes, and none sweeps another's entries. No family owns `vitals.huge-dir.`: a huge
+    // folder is the disk pass's to take or to leave with a row, never a digest entry.
+    let vitals = [Family::ServiceMemory, Family::Vitals, Family::Stranded];
     assert_eq!(
         vitals.map(Family::prefix),
-        [
-            "vitals.huge-dir.",
-            "vitals.service-memory.",
-            "vitals.proc.",
-            "vitals.stranded."
-        ]
+        ["vitals.service-memory.", "vitals.proc.", "vitals.stranded."]
+    );
+    assert!(
+        all.iter()
+            .all(|f| !f.prefix().starts_with("vitals.huge-dir."))
     );
     assert_eq!(Family::Stranded.tag(), tags::SYSTEM);
     // The asking Macs' entries are the members desk's, filed apart from the need ledger's.

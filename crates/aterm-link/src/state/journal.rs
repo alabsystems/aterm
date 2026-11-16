@@ -25,7 +25,8 @@
 //! keeps under the frame's CRC and every reader skips ([`astream_wire::steps::decode_step`]: a
 //! reader that refused them would refuse journals that open today). A reservation and a record
 //! in flight carry their heads there ([`PublishPin::at`], [`InFlight::at`]: `at <n>`, and
-//! `pin-at <n>` for an entry's pin), the one fact this build adds to the B19 record, so a
+//! `pin-at <n>` for an entry's pin; `any` for [`super::Head::Anywhere`], which a build before
+//! ATERM-KI-1114-1414 cannot read), the one fact this build adds to the B19 record, so a
 //! journal this build wrote reads the same, record for record, to a build of the journal before
 //! it, whose parse of a body is strict (aterm-link B05 review). A tail this build cannot read
 //! is no head: the record reads without one, and is not read back before it is published again.
@@ -45,7 +46,7 @@ use astream_wire::steps::{
     decode_step_header, encode_step_header, scan_steps_from, StepEnd, STEP_HEADER,
 };
 
-use super::{InFlight, PublishPin};
+use super::{Head, InFlight, PublishPin};
 
 /// The journal's directory in the state dir.
 pub(crate) const DIR: &str = "journal";
@@ -178,7 +179,7 @@ impl Frame {
                 ["pin-at", n] if pin_at.is_none() => (&mut pin_at, n),
                 _ => return self,
             };
-            let Some(value) = number(value) else {
+            let Some(value) = Head::of_word(value) else {
                 return self;
             };
             *slot = Some(value);
@@ -255,10 +256,10 @@ impl Record for Frame {
         };
         let mut words = Vec::new();
         if let Some(at) = at {
-            words.push(format!("at {at}"));
+            words.push(format!("at {}", at.word()));
         }
         if let Some(at) = pin_at {
-            words.push(format!("pin-at {at}"));
+            words.push(format!("pin-at {}", at.word()));
         }
         words.join(" ")
     }

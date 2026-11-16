@@ -333,6 +333,10 @@ pub struct CheckerWatch {
     next_check: AtomicU64,
     /// Optional host event-loop wake invoked on phase transitions.
     phase_wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The wake the waiters of this watch wait on, nudged at each retirement
+    /// ([`Self::wake_on_retire`]).
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    retire_wake: OnceLock<&'static crate::check_wake::WakeSignal>,
 }
 
 struct Workers {
@@ -370,7 +374,17 @@ impl CheckerWatch {
             #[cfg(any(target_os = "macos", test))]
             next_check: AtomicU64::new(0),
             phase_wake: OnceLock::new(),
+            #[cfg(any(target_os = "macos", target_os = "linux", test))]
+            retire_wake: OnceLock::new(),
         }
+    }
+
+    /// Nudge `wake` at each retirement ([`Self::supersede`]), so a retired waiter leaves its wait
+    /// at once and posts nothing: no backoff reset, settle or wake grace follows. The first wake
+    /// bound stays.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn wake_on_retire(&self, wake: &'static crate::check_wake::WakeSignal) {
+        let _ = self.retire_wake.set(wake);
     }
 
     /// Wake the host on a phase change, before the old deadline expires.
@@ -558,7 +572,8 @@ impl CheckerWatch {
         })
     }
 
-    /// Retire `stalled` and return its replacement's generation, stamped `Starting` now.
+    /// Retire `stalled` and return its replacement's generation, stamped `Starting` now; the wake
+    /// its waiters wait on (`wake_on_retire`) is nudged once `stalled` is retired.
     pub fn supersede(&self, stalled: u64) -> Option<u64> {
         let mut workers = self
             .workers
@@ -591,6 +606,12 @@ impl CheckerWatch {
                 replacement: true,
             },
         );
+        drop(workers);
+        // After the retirement, so the retired waiter's ownership predicate reads false.
+        #[cfg(any(target_os = "macos", target_os = "linux", test))]
+        if let Some(wake) = self.retire_wake.get() {
+            wake.nudge();
+        }
         Some(next)
     }
 

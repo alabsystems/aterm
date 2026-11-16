@@ -83,9 +83,9 @@ $AtermPagesMax = 10
 $AtermListingMax = 16777216
 # The release verifier's pin: the repository and release whose Windows verifier
 # this script runs, and that verifier's SHA-256.
-$AtermVerifierRepo = ""
-$AtermVerifierTag = ""
-$AtermVerifierSha256X86_64 = ""
+$AtermVerifierRepo = "alabsystems/aterm"
+$AtermVerifierTag = "v0.203.0"
+$AtermVerifierSha256X86_64 = "e3c63541ab0e2c63d3c3a98cde700a4edc52e010d8081754927b4e3bae63baa1"
 # The largest verifier it downloads (install.sh's bound for the Linux one).
 $AtermVerifierMax = 67108864
 

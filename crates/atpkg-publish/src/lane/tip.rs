@@ -27,9 +27,15 @@
 //! What it leaves alone, by name: a repository the lifecycle registry does not hold active or
 //! whose public tier is closed ([`super::lifecycle`]), a coherence-group member (one seal cuts
 //! those), a program built from another product's repository (it ships with that product), a
-//! program with no row for this machine's target, a program the head does not pin (a first pin
-//! is a person's), and a program whose repository declares no qualification list (nothing
-//! ships unqualified).
+//! program with no row for this machine's target, and a program the head does not pin (a first
+//! pin is a person's).
+//!
+//! A candidate whose repository declares no qualification list is not left alone: it is
+//! pinned, active and behind its main, and nothing ships unqualified, so it can only fall
+//! further behind. It ships nothing and counts no attempt (the list is the repository's
+//! standing, and the next main is a new build), but it is listed under the pass's failed, its
+//! notice is recorded once per program and frozen commit, and the pass, having qualified and
+//! queued every other candidate, ends red naming each such program and its frozen commit.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -420,7 +426,8 @@ pub struct Outcome {
     /// `<program>=<build>` enqueued this pass (or, in a dry run, that a real pass would
     /// qualify).
     pub enqueued: Vec<String>,
-    /// `<program>=<build>: why` that failed to qualify or stage.
+    /// `<program>=<build>: why` that failed to qualify or stage, or whose repository declares
+    /// no qualification list.
     pub failed: Vec<String>,
     /// Programs left for another pass or another hand, and why.
     pub skipped: Vec<String>,
@@ -445,17 +452,35 @@ pub fn standing_refusal(def: &ProgramDef, registry: &Registry, host: Triple) -> 
 /// One pass of the tip lane.
 ///
 /// # Errors
-/// A refusal for a downgrade, an unverifiable head, a stalled pass, or a pass whose every
-/// candidate failed; a could-not-run when the head or the lifecycle registry cannot be read, or
-/// the machine lacks what a signing pass needs.
+/// As [`run_into`].
 pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Result<Outcome> {
+    let mut outcome = Outcome::default();
+    run_into(ctx, opts, deps, tx, &mut outcome).map(|()| outcome)
+}
+
+/// One pass of the tip lane, leaving what it did in `outcome` whether or not it ends red, for
+/// the typed outcome to report.
+///
+/// # Errors
+/// A refusal for a downgrade, an unverifiable head, a stalled pass, a pass whose every
+/// candidate failed, or a pass that met a pinned, active program whose repository declares no
+/// qualification list; a could-not-run when the head or the lifecycle registry cannot be read,
+/// or the machine lacks what a signing pass needs.
+pub fn run_into(
+    ctx: &Ctx,
+    opts: &Options,
+    deps: &Deps<'_>,
+    tx: &Transcript,
+    outcome: &mut Outcome,
+) -> Result<()> {
     let state = LaneState::of(LaneKind::Tip, &ctx.state_dir);
     if opts.dry_run {
         // No lock, no lane state: every read lands in a private scratch directory that is
         // removed when the run ends. (Reading a recipe holds the toolchain's ordinary lease
         // for that read, as any use of the toolchain does.)
         let scratch = crate::channel::Scratch::new("tip-dry-run")?;
-        return pass(ctx, opts, deps, &state, scratch.path(), tx);
+        return pass(ctx, opts, deps, &state, scratch.path(), tx, outcome)
+            .and_then(|red| red.map_or(Ok(()), Err));
     }
     state.ensure()?;
     let Lock::Held(_guard) = state.try_lock()? else {
@@ -480,10 +505,8 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
             "another pass holds {} — it covers this one; exiting 0",
             state.lock.display()
         ));
-        return Ok(Outcome {
-            covered: true,
-            ..Outcome::default()
-        });
+        outcome.covered = true;
+        return Ok(());
     };
     state.mark_started(ctx.now_unix);
     state.prune(ctx.now_unix);
@@ -493,12 +516,18 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
     let _ = std::fs::remove_dir_all(&work);
     let result = std::fs::create_dir_all(&work)
         .map_err(|e| Error::io(format!("mkdir {}", work.display()), &e))
-        .and_then(|()| pass(ctx, opts, deps, &state, &work, tx));
+        .and_then(|()| pass(ctx, opts, deps, &state, &work, tx, outcome));
     state.clear_started();
-    if let Err(e) = &result {
-        notice(ctx, deps, &state, &format!("FAILED: {e}"));
+    match result {
+        Err(e) => {
+            notice(ctx, deps, &state, &format!("FAILED: {e}"));
+            Err(e)
+        }
+        // Each program it names already has its own notice, recorded once per program and
+        // frozen commit: the pass is not noticed again as a whole.
+        Ok(Some(red)) => Err(red),
+        Ok(None) => Ok(()),
     }
-    result
 }
 
 /// Remove the unpacked trees of earlier passes whose first-exec hold is over. macOS checks a
@@ -725,6 +754,9 @@ fn ready_name(program: &str, build: Build) -> String {
     format!("{program}-{build}{}", ready::SUFFIX)
 }
 
+/// One pass, filling `outcome` as it goes. `Ok(Some(red))`: the pass ran to its end and ends
+/// red for a candidate whose repository declares no qualification list, each such program
+/// already noticed on its own.
 #[allow(clippy::too_many_lines)]
 fn pass(
     ctx: &Ctx,
@@ -733,7 +765,8 @@ fn pass(
     state: &LaneState,
     work: &Path,
     tx: &Transcript,
-) -> Result<Outcome> {
+    outcome: &mut Outcome,
+) -> Result<Option<Error>> {
     tx.raw(format!(
         "=== {ME} {} pid {}{} ===",
         aterm_types::rfc3339::format_rfc3339(u64::try_from(ctx.now_unix).unwrap_or(0)),
@@ -798,10 +831,7 @@ fn pass(
         .collect();
     say_table(tx, n, &rows);
 
-    let mut outcome = Outcome {
-        head: Some(n),
-        ..Outcome::default()
-    };
+    outcome.head = Some(n);
     for row in &rows {
         match &row.decision {
             Decision::Refused(why) | Decision::Unread(why) => {
@@ -850,17 +880,20 @@ fn pass(
             list(unlisted.iter().map(String::as_str))
         ));
         outcome.rows = rows;
-        return Ok(outcome);
+        return Ok(None);
     }
 
     if candidates.is_empty() {
         raise_floors(state, n, &served, &pins)?;
         tx.say("every tracked program's main is pinned, queued or left alone — clean no-op");
         outcome.rows = rows;
-        return Ok(outcome);
+        return Ok(None);
     }
     let repos: Vec<&str> = candidates.iter().map(|&i| rows[i].program.repo).collect();
     preflight(ctx, deps, &head, &repos)?;
+    // Each candidate whose repository declares no list: `<program> at <frozen commit> (build
+    // <b>)`.
+    let mut unlisted = Vec::new();
     for &i in &candidates {
         let fate = bench.qualify(&rows[i], n);
         let name = rows[i].program.name;
@@ -875,13 +908,18 @@ fn pass(
                 outcome.enqueued.push(format!("{name}={build}"));
             }
             Fate::Unqualified => {
-                let why = format!(
-                    "{name}: its repository declares no [workspace.metadata.atpkg] qualify \
-                     list at {} — nothing ships unqualified",
-                    rows[i].frozen.as_ref().map_or("?", Frozen::short)
+                // No attempt is counted and nothing is latched: the list is the repository's
+                // standing, and the next main is a new build.
+                let at = rows[i].frozen.as_ref().map_or("?", Frozen::short);
+                let line = format!(
+                    "{name}={build}: its repository declares no [workspace.metadata.atpkg] \
+                     qualify list at {at} — nothing ships unqualified"
                 );
-                tx.warn(&why);
-                outcome.skipped.push(why);
+                tx.warn(&line);
+                // Recorded once per program and frozen commit, however many passes meet it.
+                notice(ctx, deps, state, &line);
+                outcome.failed.push(line);
+                unlisted.push(format!("{name} at {at} (build {build})"));
             }
             Fate::Failed(headline) => {
                 bench.fail(name, build, headline);
@@ -901,7 +939,8 @@ fn pass(
     }
     raise_floors(state, n, &served, &pins)?;
     outcome.rows = rows;
-    if outcome.enqueued.is_empty() && !outcome.failed.is_empty() {
+    // A missing list alone is no failed qualification: it ends the pass red below instead.
+    if outcome.enqueued.is_empty() && outcome.failed.len() > unlisted.len() {
         return Err(Error::refused(format!(
             "every candidate failed to qualify — see the receipts, logs and attempts/BLOCKED \
              markers under {}: {}",
@@ -923,7 +962,16 @@ fn pass(
         list(outcome.enqueued.iter().map(String::as_str)),
         list(outcome.failed.iter().map(String::as_str))
     ));
-    Ok(outcome)
+    if unlisted.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Error::refused(format!(
+        "no [workspace.metadata.atpkg] qualify list in the repository of {}: each is pinned by \
+         the head, active in the lifecycle registry and behind its main, and nothing ships \
+         unqualified, so it falls further behind with every commit until its repository \
+         declares the list (docs/RELEASING.md, the tip lane)",
+        unlisted.join("; ")
+    ))))
 }
 
 /// Raise the lane's floors to what this pass read. The dispatcher records the same floors

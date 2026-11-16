@@ -24,10 +24,24 @@ pub(super) struct Replay {
 }
 
 pub(super) struct Entry {
-    pub receipt: Receipt,
-    /// The record's bytes, which `receipt.id` names: their identifier, taken once as they were read.
+    pub received_ms: u64,
+    pub offset: u64,
+    /// The record's bytes and content identifier, taken once as they were read.
     pub wire: Identified,
     pub conflict: bool,
+}
+
+impl Entry {
+    /// The immutable identified wire already owns this operation's digest.
+    /// Form the complete receipt when consumed instead of duplicating it in
+    /// every temporary replay descriptor.
+    pub(super) fn receipt(&self) -> Receipt {
+        Receipt {
+            id: self.wire.id(),
+            received_ms: self.received_ms,
+            offset: self.offset,
+        }
+    }
 }
 
 #[cfg_attr(
@@ -121,11 +135,8 @@ impl Linked {
 
     fn entry(self) -> Entry {
         Entry {
-            receipt: Receipt {
-                id: self.wire.id(),
-                received_ms: self.received_ms,
-                offset: self.offset(),
-            },
+            received_ms: self.received_ms,
+            offset: self.offset(),
             wire: self.wire,
             conflict: self.conflict,
         }

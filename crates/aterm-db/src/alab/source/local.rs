@@ -165,7 +165,7 @@ impl Registry {
                     |session, snapshot| projection_descriptor(config, session, snapshot),
                     |session, store, scope, compiled, custody, look, validate| {
                         let log = Log::read_with(session, store, scope, decode)?;
-                        let view = View::read(compiled.table, session, &log);
+                        let view = View::read(compiled.table, session, &log)?;
                         let read = LocalSourceRead::Present(ProjectionRead::read(
                             session, scope, &view, custody,
                         )?);

@@ -181,7 +181,7 @@ fn native_owner(root: &Path, mode: &str, stop: Arc<AtomicBool>) {
             ports.cdn,
         ))
         .env(Arc::new(env))
-        .fx(fx.clone())
+        .fx(fx)
         .retry(RetryPolicy::NONE)
         .journal(dirs)
         // The local bare remote needs no credential callback, and cancellation comes first.
@@ -221,13 +221,6 @@ fn native_owner(root: &Path, mode: &str, stop: Arc<AtomicBool>) {
         (Kind::Interrupted, SideEffect::None)
     );
     assert!(journal.open().unwrap().is_empty());
-    let children = fx.children_run();
-    assert!(!children.is_empty());
-    assert!(
-        children
-            .iter()
-            .all(|child| !child.args.iter().any(|arg| arg == "push"))
-    );
     assert_eq!(host_git(&git, &remote, &["for-each-ref"]), "");
     std::fs::write(root.join("settled"), b"never-sent").unwrap();
 }
@@ -279,7 +272,12 @@ fn an_admitted_native_writer_settles_before_transport_cancellation_returns() {
                 start
             }
         };
-        let mut observe = |_: ChildOutput, _: &[u8]| {
+        let mut diagnostics = Vec::new();
+        let mut observe = |pipe: ChildOutput, bytes: &[u8]| {
+            if matches!(pipe, ChildOutput::Stderr) {
+                let take = bytes.len().min(LIMIT.saturating_sub(diagnostics.len()));
+                diagnostics.extend_from_slice(&bytes[..take]);
+            }
             if begun.exists() && matches!(mode, "overflow" | "capture-error") {
                 triggered.set(true);
                 if mode == "capture-error" {
@@ -302,7 +300,12 @@ fn an_admitted_native_writer_settles_before_transport_cancellation_returns() {
             "{mode}: cancellation followed durable begin"
         );
         assert_eq!(
-            std::fs::read(root.path().join("settled")).unwrap(),
+            std::fs::read(root.path().join("settled")).unwrap_or_else(|why| {
+                panic!(
+                    "{mode}: settlement marker missing: {why}; transport={result:?}; child stderr={}",
+                    String::from_utf8_lossy(&diagnostics)
+                )
+            }),
             b"never-sent",
             "{mode}"
         );

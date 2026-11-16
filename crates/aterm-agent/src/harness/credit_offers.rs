@@ -75,7 +75,7 @@
 //! organization, the offer and the link ([`OfferKey`]).
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::Deserialize;
@@ -488,10 +488,26 @@ pub fn vendor_url(link: &str) -> Option<String> {
 
 /// Whether `p`, a session's trusted folder (`meta trusted_cwd=`), is a claim worker's: its last
 /// component is [`CLAIM_FOLDER`] and its parent's is the harness state directory's, read by
-/// the two names as the disk-free worker's folder is ([`super::disk::fence::is_harness_folder`]).
+/// the two names ([`is_harness_folder`]).
 #[must_use]
 pub fn is_claim_folder(p: &Path) -> bool {
-    super::disk::fence::is_harness_folder(p, CLAIM_FOLDER)
+    is_harness_folder(p, CLAIM_FOLDER)
+}
+
+/// Whether `p` is the folder `name` right under the harness state directory: its last component
+/// is `name` and its parent's is [`super::cli::HARNESS`].
+///
+/// The two names are read, not the whole path. A trusted folder reaches the supervisor as the
+/// task record spells it (a `meta` reply, or a tape's facts), which another state root spells
+/// otherwise (a scratch home, a lab instance, `ATERM_STATE_HOME`), as does a firmlink
+/// (`/private/var` for `/var`); the pair of names is a folder only aterm's own worker launch
+/// makes.
+#[must_use]
+pub fn is_harness_folder(p: &Path, name: &str) -> bool {
+    let mut names = p.components().rev();
+    let named =
+        |c: Option<Component<'_>>, name: &str| matches!(c, Some(Component::Normal(n)) if n == name);
+    named(names.next(), name) && named(names.next(), super::cli::HARNESS)
 }
 
 /// Whether `host`, as a page's link spells it, is one of [`VENDOR_HOSTS`] or a name under one: the

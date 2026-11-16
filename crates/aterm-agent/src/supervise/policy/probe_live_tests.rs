@@ -287,9 +287,11 @@ fn an_rm_escalates_when_the_disk_does_not_answer_and_resolves_when_it_does() {
 }
 
 /// Off Unix the rm circuit breaker places no path (`abs_components` reads a `/`-rooted one
-/// alone, and a session stands on a drive): no scratch root is set up there, and an rm of a
-/// folder inside the test's own temp dir, quoted as drawn, is refused for the session's cwd
-/// before the disk is asked, so no look starts and nothing is proved.
+/// alone, and a session stands on a drive): an rm of a folder inside the test's own temp dir,
+/// quoted as drawn, is refused for the session's cwd before the disk is asked, so no look starts
+/// and nothing is proved, even under a scratch root over that temp dir. On Windows that root is
+/// placed (a root reads a Windows folder, as the folder-trust lane's trust roots need), and it
+/// holds no rm.
 #[cfg(not(unix))]
 #[test]
 fn an_rm_off_unix_is_refused_before_the_disk_is_asked() {
@@ -297,9 +299,11 @@ fn an_rm_off_unix_is_refused_before_the_disk_is_asked() {
     let root = real_dir(&tree);
     std::fs::create_dir(root.join("out")).expect("the rm's folder");
     std::fs::create_dir(root.join("work")).expect("the session's folder");
-    assert!(
-        ScratchRoot::dir(&root).is_none(),
-        "off Unix no scratch root is placed: {}",
+    let roots: Vec<ScratchRoot> = ScratchRoot::dir(&root).into_iter().collect();
+    assert_eq!(
+        roots.len(),
+        usize::from(cfg!(windows)),
+        "on Windows alone a scratch root is placed: {}",
         root.display()
     );
     let line = format!("rm -rf '{}/out'", root.display());
@@ -313,7 +317,7 @@ fn an_rm_off_unix_is_refused_before_the_disk_is_asked() {
             &RmScope {
                 cwd: &cwd,
                 home: Some(root.as_path()),
-                roots: &[],
+                roots: &roots,
                 probe: &LiveProbe,
             },
         )

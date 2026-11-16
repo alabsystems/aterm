@@ -1222,11 +1222,32 @@ fn tape_text() -> String {
         "< ok 124",
         "! timeout",
         "|",
+        "exchange ctl stamp=40,1792867301000",
+        "> @s7",
+        "> meta",
+        "< ok 0",
+        "!",
+        "| OK autopilot=off autopilot_by=ctl",
+        "|",
+        "exchange ctl stamp=50,1792867301200",
+        "> @s7",
+        "> await",
+        "> seq",
+        "> 883",
+        "> autopilot=cruise",
+        "< ok 0",
+        "!",
+        "| OK autopilot off",
+        "|",
         "",
     ]
     .join("\n")
 }
 
+/// The tape's witness is each wait at rest woken on a word other than the one stored; the Off
+/// park's first wait, answered with the stored word, is none.
+/// NEGATIVE CONTROL: `woke_of` keeping every answer (`stored != Some(word)` dropped) takes that
+/// wait for a switch: two entries where one is asserted.
 #[test]
 fn the_tapes_witness_is_each_wait_that_carried_the_word_and_woke_on_another() {
     let text = tape_text();
@@ -1250,6 +1271,17 @@ fn the_tapes_witness_is_each_wait_that_carried_the_word_and_woke_on_another() {
     assert!(
         line.contains("await seq … autopilot=cruise answered OK autopilot land"),
         "{line}"
+    );
+    // An answer naming the word the last read stored (the Off park's first wait, which asks with
+    // another word) is no switch; after a read that stored another word, the same answer is one.
+    let moved = woke_of(&text.replace("| OK autopilot=off ", "| OK autopilot=land "));
+    assert_eq!(
+        moved
+            .iter()
+            .map(|w| w.answered.as_str())
+            .collect::<Vec<_>>(),
+        ["OK autopilot land", "OK autopilot off"],
+        "{moved:#?}"
     );
     // Controls: no tape, and tapes whose waits never woke on a word.
     assert_eq!(woke_line(None, T0), "no tape of the session read");

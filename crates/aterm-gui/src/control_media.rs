@@ -210,6 +210,23 @@ impl<'a> MainPost<'a> {
         post_counted(self.hops, None, &mut self.send, make)
     }
 
+    /// [`Self::ask`] for a lane that waits on a [`Door`]: the main thread answers through a
+    /// [`DoorReply`], whose send and drop each ring the door the lane parks on.
+    pub(crate) fn ask_at_door<T>(
+        &mut self,
+        make: impl FnOnce(DoorReply<T>) -> Wake,
+    ) -> Result<(std::sync::mpsc::Receiver<T>, Door, HopGuard<'static>), MainHopError> {
+        let (ring, rung) = std::sync::mpsc::sync_channel(1);
+        let door = ring.clone();
+        let (answer, hop) = post_counted(self.hops, None, &mut self.send, |reply| {
+            make(DoorReply {
+                answer: Some(reply),
+                door,
+            })
+        })?;
+        Ok((answer, Door { ring, rung }, hop))
+    }
+
     /// Posts an uncounted [`Wake`] event and returns whether the receiver accepted it.
     pub(crate) fn tell(&mut self, wake: Wake) -> bool {
         (self.send)(wake)
@@ -273,7 +290,8 @@ impl Claim {
     }
 }
 
-/// How a parked lane stopped waiting for the main thread's answer ([`park_for_answer`]).
+/// How a parked lane stopped waiting for the main thread's answer ([`park_for_answer`],
+/// [`park_at_door`]).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Waited<T> {
     Answer(T),
@@ -281,6 +299,92 @@ pub(crate) enum Waited<T> {
     Deadline,
     /// The main thread dropped the channel unanswered (the event loop ended).
     Dropped,
+}
+
+/// A parked lane's doorbell: a single-slot channel the main thread's [`DoorReply`] rings as it
+/// answers or drops, and the hang-up bell rings as the lane's caller hangs up
+/// ([`crate::park::park_on_slot`]), so one wait hears all three ([`park_at_door`]).
+pub(crate) struct Door {
+    ring: std::sync::mpsc::SyncSender<()>,
+    rung: std::sync::mpsc::Receiver<()>,
+}
+
+/// The main thread's end of a lane's answer ([`MainPost::ask_at_door`]): [`Self::send`] answers,
+/// and both it and the drop ring the lane's [`Door`].
+#[derive(Debug)]
+pub(crate) struct DoorReply<T> {
+    /// `None` only inside the drop, which lets it go before it rings.
+    answer: Option<std::sync::mpsc::Sender<T>>,
+    door: std::sync::mpsc::SyncSender<()>,
+}
+
+impl<T> DoorReply<T> {
+    /// Answer the lane, then ring its door.
+    ///
+    /// # Errors
+    /// The lane stopped waiting and let its end go: the answer comes back.
+    pub(crate) fn send(&self, answer: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        let sent = match &self.answer {
+            Some(to) => to.send(answer),
+            None => Err(std::sync::mpsc::SendError(answer)),
+        };
+        let _ = self.door.try_send(());
+        sent
+    }
+
+    /// A reply whose door no lane waits on, and the receiver of its answer: a test's main thread
+    /// answering a request it made itself.
+    #[cfg(test)]
+    pub(crate) fn pair() -> (Self, std::sync::mpsc::Receiver<T>) {
+        let (answer, answers) = std::sync::mpsc::channel();
+        let (door, _rung) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                answer: Some(answer),
+                door,
+            },
+            answers,
+        )
+    }
+}
+
+impl<T> Drop for DoorReply<T> {
+    /// Let the answer go first, so the lane the ring wakes reads it gone unanswered.
+    fn drop(&mut self) {
+        drop(self.answer.take());
+        let _ = self.door.try_send(());
+    }
+}
+
+/// Wait at `door` for `answer` until `deadline`, asking after the caller ([`crate::park::Lane`])
+/// at the loop head and as [`crate::park::park_on_slot`] does: the main thread's answer or drop
+/// rings the door, and so does the hang-up bell, armed on the served connection by
+/// `lane.bell`, while it serves; unarmed, the lane slices as it says.
+pub(crate) fn park_at_door<T>(
+    answer: &std::sync::mpsc::Receiver<T>,
+    door: &Door,
+    deadline: std::time::Instant,
+    lane: crate::park::Lane,
+) -> Waited<T> {
+    loop {
+        if (lane.hung_up)() {
+            return Waited::HungUp;
+        }
+        match answer.try_recv() {
+            Ok(answer) => return Waited::Answer(answer),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Waited::Dropped,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Waited::Deadline;
+        }
+        let rung = |bound| door.rung.recv_timeout(bound).is_ok();
+        if crate::park::park_on_slot(rung, deadline, lane, &|| false, &door.ring)
+            == crate::park::Woke::HungUp
+        {
+            return Waited::HungUp;
+        }
+    }
 }
 
 /// Wait on `answer` until `deadline`, re-checking `hung_up` between slices.
@@ -630,14 +734,31 @@ fn prepare_image_target(
     Ok((target, Some(path)))
 }
 
-/// Handles `image`, capturing the client frame of the window showing the target session (the
-/// front window by default) as a PNG file, or inline with `--bytes`.
+/// Handles `image`: the target session's window frame (front by default), or an explicit
+/// shown dock's native view, as a PNG file or inline with `--bytes`.
 pub(crate) fn cmd_image(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
     sock_dir: &std::path::Path,
     session: Option<u64>,
 ) -> crate::control::ControlReply {
+    let mut view = None;
+    let mut tokens = Vec::new();
+    for token in rest.split_whitespace() {
+        if let Some(raw) = token.strip_prefix("view=") {
+            if view.is_some() || session.is_some() {
+                return "ERR image: choose one view or session\n".into();
+            }
+            let Ok(raw) = raw.parse::<u64>() else {
+                return "ERR image: invalid view id\n".into();
+            };
+            view = Some(crate::tab_model::ViewId::from_stored(raw));
+        } else {
+            tokens.push(token);
+        }
+    }
+    let rest = tokens.join(" ");
+    let rest = rest.as_str();
     let options = parse_image_options(rest);
     let want_bytes = options.want_bytes;
     let want_metadata = options.want_metadata;
@@ -684,7 +805,7 @@ pub(crate) fn cmd_image(
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
     let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
     let posted = post_main(proxy, |reply| {
-        Wake::Image(Box::new(ImageReq {
+        let request = Box::new(ImageReq {
             handoff,
             target,
             clean,
@@ -694,7 +815,11 @@ pub(crate) fn cmd_image(
             frame_metadata: std::sync::Arc::clone(&frame_metadata),
             cancel,
             reply,
-        }))
+        });
+        match view {
+            Some(view) => Wake::NativeImage { view, request },
+            None => Wake::Image(request),
+        }
     });
     let (rx, _hop) = match posted {
         Ok(posted) => posted,
@@ -2805,10 +2930,10 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
             });
         } else if let Some(v) = tok.strip_prefix("of=") {
             // A bare sid, as `from=` and a hold's argument name one.
-            if v.is_empty() || v.starts_with('@') {
+            let Some(sid) = aterm_session::SessionId::parse(v) else {
                 return Err(refused());
-            }
-            origin = Some(aterm_session::SessionId::new(v));
+            };
+            origin = Some(sid);
         } else if let Some(v) = tok.strip_prefix("agent=") {
             if program.is_some() {
                 return Err(refused());
@@ -2842,10 +2967,10 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
             }
         } else if let Some(v) = tok.strip_prefix("from=") {
             // A session id, as a task record's `from=` reads one.
-            if v == crate::task_record::FROM_CTL || !crate::task_record::valid_from(v) {
+            let Some(sid) = aterm_session::SessionId::parse(v) else {
                 return Err(refused());
-            }
-            from = Some(aterm_session::SessionId::new(v));
+            };
+            from = Some(sid);
         } else if let Some(v) = tok.strip_prefix("why=") {
             let said = aterm_types::control_verbs::request_why(v).map_err(|_| refused())?;
             if why.replace(said.to_owned()).is_some() {
@@ -3761,8 +3886,8 @@ impl crate::App {
         let account_scope = None;
         let (newborn, caller) = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-            let newborn = g
-                .by_sid(&aterm_session::SessionId::new(sid))
+            let newborn = aterm_session::SessionId::parse(sid)
+                .and_then(|sid| g.by_sid(&sid))
                 .map(|h| (h.local_id, h.term.clone(), h.ctx.clone()));
             let caller = worker
                 .caller
@@ -3840,12 +3965,13 @@ impl crate::App {
     }
 
     fn unspawn_worker(&mut self, sid: &str, seed: Option<&crate::task_launch::TaskSeed>) {
-        let local = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(&aterm_session::SessionId::new(sid))
-            .map(|h| h.local_id);
+        let local = aterm_session::SessionId::parse(sid).and_then(|sid| {
+            self.store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_sid(&sid)
+                .map(|h| h.local_id)
+        });
         if let Some(local) = local {
             let _closing = crate::session_store::CloseAttribution::enter(
                 crate::session_store::ExitReason::CtlClose,

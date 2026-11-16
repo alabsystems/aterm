@@ -59,17 +59,20 @@ fn the_decks_height_is_its_points_at_the_scale_at_the_heads_top() {
         ))
         .expect("dims")
     };
-    assert!(head(&dims("1.00", 106, 0, 92)).is_ok());
-    assert!(head(&dims("1.25", 134, 0, 116)).is_ok());
-    assert!(head(&dims("1.50", 159, 0, 138)).is_ok());
-    assert!(head(&dims("2.00", 212, 0, 184)).is_ok());
+    // The Deck's rows, the Disk Custody band and Network State: 62 + 30 + 30 pt.
+    assert!(head(&dims("1.00", 136, 0, 122)).is_ok());
+    assert!(head(&dims("1.25", 172, 0, 154)).is_ok());
+    assert!(head(&dims("1.50", 204, 0, 183)).is_ok());
+    assert!(head(&dims("2.00", 272, 0, 244)).is_ok());
+    // CONTROL: the reservation before the Disk Custody band (62 + 30 pt) is refused.
+    assert!(head(&dims("1.00", 106, 0, 92)).is_err());
     assert!(head(&dims("1.00", 76, 0, 62)).is_err());
-    assert!(head(&dims("1.25", 134, 0, 115)).is_err());
-    assert!(head(&dims("1.00", 106, 14, 92)).is_err());
-    assert!(head(&dims("2.00", 212, 0, 92)).is_err());
+    assert!(head(&dims("1.25", 172, 0, 153)).is_err());
+    assert!(head(&dims("1.00", 136, 14, 122)).is_err());
+    assert!(head(&dims("2.00", 272, 0, 122)).is_err());
     assert!(head(&dims("1.00", 14, 0, 0)).is_err());
-    let d = dims("1.00", 106, 0, 92);
-    assert_eq!(d.band_foot(), 128);
-    assert_eq!(d.deck_rows(), 0..92);
+    let d = dims("1.00", 136, 0, 122);
+    assert_eq!(d.band_foot(), 158);
+    assert_eq!(d.deck_rows(), 0..122);
     assert!(Dims::read("OK 24x80 scale=1.00").is_err());
 }

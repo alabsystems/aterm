@@ -282,7 +282,7 @@ fn adopted(id: u64, rec: &SessionRecord) -> crate::Session {
     crate::prime_test_timing();
     let session = crate::ptyless_session(
         id,
-        aterm_session::SessionId::new(&rec.sid),
+        aterm_session::SessionId::parse(&rec.sid).expect("the record names a session"),
         aterm_core::terminal::Terminal::new(24, 80),
         Arc::new(aterm_session::sink::SinkWriter::new(-1)),
     );

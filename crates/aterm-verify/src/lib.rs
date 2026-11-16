@@ -2013,9 +2013,9 @@ impl<'ctx> RunPlan<'ctx> {
         }
         // A missing or mismatched preparation cannot lower any compiler admission.
         let cells_compile = wanted
-            && cells.as_ref().map_or(true, |prepared| {
-                prepared.needs_compiler(ctx).unwrap_or(true)
-            });
+            && cells
+                .as_ref()
+                .is_none_or(|prepared| prepared.needs_compiler(ctx).unwrap_or(true));
         if !cells_compile {
             for spec in &mut stages {
                 if spec.id == plan::StageId::ForeignCells {
@@ -2045,6 +2045,8 @@ impl<'ctx> RunPlan<'ctx> {
         self.stages.iter().any(|s| self.compiles(s.id))
     }
 
+    // Read by `disk::run_planned` (unix) and by `cells_prerequisite_tests`.
+    #[cfg(any(unix, test))]
     pub(crate) fn builds(&self, check: Check) -> bool {
         disk::builds(check) && (check != Check::Cells || self.cells_compile)
     }
@@ -4502,6 +4504,13 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     }
     #[cfg(unix)]
     {
+        // What its compiles built under a second hash is recorded whatever ended the run: the
+        // units were built.
+        let second = aterm_types::dirs::account_state_dir()
+            .map(|state| state.join(aterm_capacity::second_hash::RECORD));
+        for line in disk::record_second_hashes(&ctx, second.as_deref()) {
+            let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+        }
         // A run an interrupt or its first proven red ended stopped short of its compile calls:
         // it keeps nothing. The verdict does not decide it otherwise: a run that compiled all
         // it uses and failed a test used the same units.

@@ -1459,7 +1459,8 @@ fn a_row_acting_on_the_newborn_runs_with_its_registered_sid() {
         TabSpawnThen::Run(Box::new(move |app: &mut App, landed| {
             let registered = landed.map(|sid| {
                 let store = app.store.read().unwrap_or_else(|p| p.into_inner());
-                store.by_sid(&aterm_session::SessionId::new(sid)).is_some()
+                aterm_session::SessionId::parse(&sid)
+                    .is_some_and(|sid| store.by_sid(&sid).is_some())
             });
             seen.borrow_mut().push(registered);
         }))

@@ -444,6 +444,57 @@ fn frontier_native_tls_repairs_marked_history_and_preserves_its_mark_in_either_d
     }
 }
 
+/// A frontier responder whose custody's format mark names a later format writes nothing, not even
+/// its metadata: the `ACX4`/`AFR4` bound states format 1 alone, and the haves and evidence that
+/// follow it are read without loading the records file, so the mark is read where the bound is
+/// made (`own_bound`), as the crossed mark is.
+///
+/// NEGATIVE CONTROL: with `own_bound` reading the crossed mark alone (as first built), the
+/// responder wrote its metadata stating format 1 before anything refused
+/// (`Whole: 306 bytes written`).
+#[test]
+fn vault_fence_a_frontier_responder_past_format_one_writes_nothing() {
+    for wire in [Wire::Whole, Wire::Delta] {
+        let fixture = RecordsLab::new();
+        aterm_secrets::fsx::write_atomic(
+            &fixture.paths[1].records_file().with_extension("format"),
+            b"aterm-secrets records format 2\n",
+            0o600,
+        )
+        .unwrap();
+        let endpoint = &fixture.endpoints[1];
+        let input = opening(
+            fixture.lab.trust,
+            &fixture.lab.requests[0],
+            RecordsBound::uncrossed(),
+            wire,
+        );
+        let mut stream = Script {
+            input: Cursor::new(input),
+            output: Vec::new(),
+        };
+        let mut repair = Repair::default();
+        assert!(
+            endpoint
+                .connected_until(
+                    &mut stream,
+                    Some(&proof_of(&fixture.endpoints[0])),
+                    Side::Responder,
+                    &mut repair,
+                    Instant::now() + EXCHANGE,
+                    Protocol::Frontier(wire)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            stream.output.len(),
+            0,
+            "{wire:?}: {} bytes written",
+            stream.output.len()
+        );
+    }
+}
+
 #[test]
 fn frontier_native_tls_converges_equal_count_forks() {
     let fixture = RecordsLab::new();
@@ -3230,6 +3281,11 @@ fn atdb8_converges_two_hundred_control_nodes_and_a_hundred_records_in_one_sessio
     let (dialed, answered) = (dialed.unwrap(), answered.unwrap());
     assert_eq!((dialed.sent, answered.received), (CONTROL, CONTROL));
     assert_eq!((dialed.deferred, answered.deferred), (0, 0));
+    assert_eq!(
+        (dialed.added, answered.added),
+        (0, CONTROL),
+        "every node Mac 1 received was one it lacked"
+    );
     for repair in [&dialing, &answering] {
         assert!(repair.membership_error().is_none(), "{repair:?}");
         assert_eq!(
@@ -3309,6 +3365,62 @@ fn atdb8_converges_two_hundred_control_nodes_and_a_hundred_records_in_one_sessio
     );
     let whole_lists = 2 * 4 + 32 * (union.len() + SHARED + 1);
     assert!(whole_lists > 8 * 1024, "{whole_lists}");
+}
+
+/// On `atdb/8`, as on every earlier wire, a round counts as added only the nodes the control
+/// journal lacked as their batch arrived ([`Report::added`]), summed over every batch of
+/// [`super::exchange_ranges`]. Mac 0 holds 40 nodes Mac 1 lacks, three batches; as Mac 1 retains
+/// the first, another of its rounds (a [`BEFORE_RETAIN`] hook) has put that batch's first node in
+/// its journal, after the reconciliation found it lacking. Mac 1 receives all 40 and adds 39, so
+/// the node it held covers no write a look finds beside it (`crate::runtime::moved`); Mac 0
+/// receives nothing and adds nothing.
+/// MUTANT (`HELD_NODES_ADDED`): the held node counts as added, 40.
+#[test]
+fn an_atdb8_round_counts_as_added_only_the_nodes_the_journal_lacked() {
+    const SHARED: usize = 4;
+    const CONTROL: usize = 2 * RECORDS_PER_ROUND + 8;
+    for mutant in [false, true] {
+        let (fixture, updates) = diverged(SHARED, CONTROL, 0, false);
+        let (dir, trust) = (fixture.lab.path(1), fixture.lab.trust);
+        let journal = dir.clone();
+        let hook: RetainHook = Box::new(move |wires| {
+            // The retaining thread is the one whose switch counts this batch.
+            HELD_NODES_ADDED.with(|flag| flag.set(mutant));
+            Journal::open(&journal, trust)
+                .unwrap()
+                .ingest(&wires[0])
+                .unwrap();
+        });
+        BEFORE_RETAIN.lock().unwrap().push((dir.clone(), hook));
+        let [(dialed, _, dialed_bytes), (answered, _, _)] =
+            reconciling_dial(&fixture.endpoints[0], &fixture.endpoints[1], None, false);
+        let (dialed, answered) = (dialed.unwrap(), answered.unwrap());
+        assert!(
+            BEFORE_RETAIN
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(held, _)| *held != dir),
+            "Mac 1 retained a batch"
+        );
+        assert_eq!(dialed_bytes.len(), 2, "the session ran on atdb/8");
+        assert_eq!(
+            (dialed.sent, dialed.received, dialed.added),
+            (CONTROL, 0, 0),
+            "MUTANT {mutant}"
+        );
+        assert_eq!(
+            (answered.received, answered.deferred, answered.added),
+            (CONTROL, 0, if mutant { CONTROL } else { CONTROL - 1 }),
+            "Mac 1 adds what it lacked as each batch arrived (MUTANT {mutant})"
+        );
+        let union: BTreeSet<Digest> = std::iter::once(fixture.lab.genesis.id())
+            .chain(updates.iter().map(Node::id))
+            .collect();
+        for mac in 0..2 {
+            assert_eq!(control_held(&fixture, mac), union, "Mac {mac}'s journal");
+        }
+    }
 }
 
 /// An `atdb/7` build dials this one, and they meet on `atdb/7` and converge on its frames: control

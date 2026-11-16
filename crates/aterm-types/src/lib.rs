@@ -61,6 +61,7 @@ pub mod index;
 mod bitflags;
 
 pub mod dirs;
+pub mod state_notify;
 pub mod world;
 
 mod time;

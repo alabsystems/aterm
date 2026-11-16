@@ -42,12 +42,12 @@ impl Store for Changing {
         )
     }
 
-    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>> {
+    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<Kept>> {
         self.received.lock().unwrap().extend_from_slice(wires);
         if self.withdraw_on_receive {
             self.may_send.store(false, Ordering::Release);
         }
-        Ok(vec![true; wires.len()])
+        Ok(vec![Kept::Added; wires.len()])
     }
 }
 
@@ -91,9 +91,9 @@ fn responder_fetches_current_payloads_after_receiving_updates() {
             (sent, responder.join().unwrap())
         });
         let outgoing = usize::from(!withdraw);
-        let counts = |turn: &Turn| (turn.sent, turn.received, turn.deferred);
-        assert_eq!(counts(&sent), (1, outgoing, 0));
-        assert_eq!(counts(&answered), (outgoing, 1, 0));
+        let counts = |turn: &Turn| (turn.sent, turn.received, turn.deferred, turn.added);
+        assert_eq!(counts(&sent), (1, outgoing, 0, outgoing));
+        assert_eq!(counts(&answered), (outgoing, 1, 0, 1));
         assert_eq!(
             b.received.lock().unwrap().as_slice(),
             std::slice::from_ref(&a.outgoing)

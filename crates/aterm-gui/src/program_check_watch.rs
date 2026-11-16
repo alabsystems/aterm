@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
+use aterm_process_facts::program_check::{Daemon, Reading};
 use aterm_uds::program_check::Look;
-use aterm_vitals::program_check::{Daemon, Judge, Reading, State};
+use aterm_vitals::program_check::{Judge, State};
 
 use crate::harness_host::HostNote;
 

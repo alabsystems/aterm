@@ -14,6 +14,11 @@ type State = BTreeMap<&'static str, i64>;
 
 const GUARDS: [&str; 4] = ["token", "dst", "op", "nonce"];
 
+/// Test session `n`: the session whose ID is the tab ID with bits `n`.
+fn sid(n: u64) -> SessionId {
+    SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(n))
+}
+
 struct Presentation {
     table: EdgeTable,
     token: EdgeToken,
@@ -24,8 +29,8 @@ struct Presentation {
 
 fn presentation(holds: [bool; 4]) -> Presentation {
     let [token_known, dst_matches, op_matches, nonce_matches] = holds;
-    let src = SessionId::new("s-parent");
-    let target = SessionId::new("s-target");
+    let src = sid(1);
+    let target = sid(2);
     let nonce = LaunchNonce::from_bytes([5u8; 16]);
     let mut table = EdgeTable::new();
     let granted = table.grant(src, target.clone(), Op::WriteInput, nonce);
@@ -36,11 +41,7 @@ fn presentation(holds: [bool; 4]) -> Presentation {
         } else {
             EdgeToken::generate()
         },
-        dst: if dst_matches {
-            target
-        } else {
-            SessionId::new("s-other")
-        },
+        dst: if dst_matches { target } else { sid(3) },
         op: if op_matches {
             Op::WriteInput
         } else {

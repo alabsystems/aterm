@@ -16,8 +16,7 @@
 //! Reading fails closed: a file that is missing, not private, too large, or does not hold
 //! exactly one `level=` line naming a known level reads as Read Only ([`decode`]).
 
-use std::ffi::CStr;
-#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::path::Path;
 
 use aterm_types::fleet_access::FleetAccess;
@@ -25,9 +24,18 @@ use aterm_types::fleet_access::FleetAccess;
 /// The state file's name.
 pub const FILE: &str = aterm_types::fleet_access::FILE;
 
-/// The Darwin notification [`announce`] posts once the stored level changed: a running window
-/// reads the file again and repaints its lock.
-pub const CHANGED: &CStr = c"com.aterm.aterm.fleet-access.changed";
+/// The base of [`changed`]'s name.
+const CHANGED: &CStr = c"com.aterm.aterm.fleet-access.changed";
+
+/// The Darwin notification [`announce`] posts once the level stored under the state home
+/// `state` changed, which a running window reading its level from `state` hears, to read the
+/// file again and repaint its lock: `com.aterm.aterm.fleet-access.changed` named for `state`
+/// (`aterm_types::state_notify::name`), so a change under another home, a test's or a lab
+/// instance's, wakes no window of this one.
+#[must_use]
+pub fn changed(state: &Path) -> CString {
+    aterm_types::state_notify::name(CHANGED, state)
+}
 
 /// More than the three lines ever hold; a larger file is not this module's.
 #[cfg(unix)]
@@ -331,11 +339,12 @@ pub fn reset(state: &Path) -> std::io::Result<bool> {
     aterm_uds::private_file::remove_private(state, FILE)
 }
 
-/// Tell every running window on this machine that the stored level changed ([`CHANGED`]). Off
-/// macOS there is no such notification and nothing is posted; enforcement never depends on it,
-/// since each listener reads the file per request line.
-pub fn announce() {
-    let _ = aterm_sysprobe::notify::post(CHANGED);
+/// Tell every running window that reads its level from the state home `state` that the level
+/// stored there changed ([`changed`]); a window of another home hears nothing. Off macOS there
+/// is no such notification and nothing is posted; enforcement never depends on it, since each
+/// listener reads the file per request line.
+pub fn announce(state: &Path) {
+    let _ = aterm_sysprobe::notify::post(&changed(state));
 }
 
 /// Whether session `sid` is a worker another fleet Mac started here: the driven window's record

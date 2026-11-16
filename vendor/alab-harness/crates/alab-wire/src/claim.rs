@@ -341,6 +341,51 @@ impl ChildProcess {
     }
 }
 
+/// A native child identifier for the negotiated contract-3 child protocol.
+///
+/// Birth is exact epoch microseconds on macOS and raw process-start ticks on
+/// Linux or Android. It is separate from [`ChildProcess`]'s contract-4 epoch
+/// timestamp. This value is observed data: it proves neither current liveness,
+/// descent, executable identity nor custody, and grants no authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeChild {
+    pid: std::num::NonZeroU32,
+    birth: std::num::NonZeroU64,
+}
+
+impl NativeChild {
+    /// Validate a pid and an already-native birth scalar, without reading a
+    /// process or converting a timestamp. Birth must use this OS's native units.
+    /// Returns `None` for a pid outside `2..=i32::MAX` or a zero birth.
+    #[must_use]
+    pub fn from_native(pid: u32, birth: u64) -> Option<Self> {
+        if !(2..=i32::MAX as u32).contains(&pid) {
+            return None;
+        }
+        Some(Self {
+            pid: std::num::NonZeroU32::new(pid)?,
+            birth: std::num::NonZeroU64::new(birth)?,
+        })
+    }
+
+    /// The validated process id.
+    #[must_use]
+    pub const fn pid(self) -> u32 {
+        self.pid.get()
+    }
+
+    /// The exact birth scalar in this OS's native C3 units, without an age or
+    /// wall-clock conversion. On Linux or Android it is meaningful on this boot.
+    #[must_use]
+    pub const fn birth(self) -> u64 {
+        self.birth.get()
+    }
+}
+
+#[cfg(test)]
+#[path = "native_child_tests.rs"]
+mod native_child_tests;
+
 /// What a claim says about the child the harness runs now. Each word is sent
 /// again whenever it changes, and the whole claim after every child start
 /// ([`crate::link::Link::reannounce`]).

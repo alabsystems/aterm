@@ -50,12 +50,23 @@ pub fn digest(path: &Path) -> std::io::Result<String> {
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Read an identity from a child that exited successfully.
+/// Read a complete identity from a successful child while its output or process tree progresses.
+/// A minute of confirmed inactivity or a run ending stops the read; oversized stdout is refused.
 fn identity(program: &Path, root: &Path, args: &[&str]) -> std::io::Result<String> {
-    let out = aterm_uds::spawnfd::command(program)
-        .current_dir(root)
-        .args(args)
-        .output()?;
+    let mut command = aterm_uds::spawnfd::command(program);
+    command.current_dir(root).args(args);
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout_unless(
+        &mut command,
+        std::time::Duration::from_secs(60),
+        format!("test executable identity from {}", program.display()),
+        &mut crate::exec::ending,
+    )
+    .map_err(|error| {
+        std::io::Error::other(format!(
+            "test executable identity from {}: {error}",
+            program.display()
+        ))
+    })?;
     if !out.status.success() {
         return Err(std::io::Error::other(
             String::from_utf8_lossy(&out.stderr).into_owned(),

@@ -103,6 +103,7 @@ pub(crate) enum OpenRequest {
     Workers,
     Tables,
     Navigator { split: bool },
+    NavigatorDock,
     Settings(crate::native_settings::SettingsRoute),
     Markdown(String),
     Editor(String),
@@ -206,6 +207,7 @@ pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Workers => Ok(OpenRequest::Workers),
         WireOpenAppRequest::Tables => Ok(OpenRequest::Tables),
+        WireOpenAppRequest::NavigatorDock => Ok(OpenRequest::NavigatorDock),
         WireOpenAppRequest::Navigator { split } => Ok(OpenRequest::Navigator { split }),
         WireOpenAppRequest::Allocation { split } => Ok(OpenRequest::Allocation { split }),
         WireOpenAppRequest::Settings { route } => {
@@ -447,6 +449,18 @@ impl App {
                 }),
             OpenRequest::Workers => self.open_workers_tab().map(|()| "app workers".to_string()),
             OpenRequest::Tables => self.open_tables_tab().map(|()| "app tables".to_string()),
+            // A Show the window cannot hold (no room for the terminal's least grid beside the
+            // column, or no client while minimized) is refused in words and changes nothing.
+            OpenRequest::NavigatorDock => {
+                let wid = self
+                    .frontmost_window
+                    .ok_or_else(|| "no front window".to_string())?;
+                self.set_dock(wid, crate::app_window::DOCK_CELLS)
+                    .map_err(|refusal| refusal.to_string())?;
+                self.dock_view(wid)
+                    .map(|_| "app navigator dock".to_string())
+                    .ok_or_else(|| "navigator could not be shown".to_string())
+            }
             // The reply says what it did: a tab with no room for the list opens a tab.
             OpenRequest::Navigator { split } => self.open_navigator(split).map(|split| {
                 if split {
@@ -586,14 +600,18 @@ impl App {
             .windows
             .iter()
             .find_map(|(wid, ws)| {
-                ws.tab_set
-                    .tabs()
-                    .iter()
-                    .any(|tab| tab.root.contains(view))
-                    .then_some(*wid)
+                (ws.dock.view == Some(view)
+                    || ws.tab_set.tabs().iter().any(|tab| tab.root.contains(view)))
+                .then_some(*wid)
             })
             .ok_or_else(|| "native view is not attached to a window".to_string())?;
         Ok((window, native.instance))
+    }
+
+    /// The compiled page `inspect` reads for `view`: the compile glass shows where it answers for
+    /// the view's nodes, else the page compiled as it stands.
+    pub(crate) fn inspected_native_ui(&self, view: ViewId) -> Result<CompiledUi, String> {
+        self.compile_view(view).map(|inspected| inspected.compiled)
     }
 
     fn compile_view(&self, view: ViewId) -> Result<InspectedView, String> {
@@ -732,6 +750,31 @@ impl App {
         wid: WindowId,
         view: ViewId,
     ) -> Option<(CompiledUi, crate::app_native::NativeUiCompileStamp, bool)> {
+        if self.dock_view(wid) == Some(view) {
+            let host = self.dock_geometry(wid)?;
+            let View::Native(native) = self.view_store.get(view).copied()? else {
+                return None;
+            };
+            let current = self
+                .native_ui_compile_stamp_for(wid, native.instance, view, host.viewport)
+                .ok()?;
+            let cache = self.windows.get(&wid)?.leaf_render_cache.get(&view)?;
+            // Nodes it lists fell behind the model, and no frame comes for them: the page is
+            // compiled as it stands (`App::note_native_nodes_behind`).
+            if cache.native_nodes_behind {
+                return None;
+            }
+            let raster = cache.native.as_ref()?;
+            return ((raster.width, raster.height) == host.size
+                && raster.compiled.bounds == host.viewport)
+                .then(|| {
+                    (
+                        raster.compiled.clone(),
+                        raster.stamp,
+                        cache.native_tree_current(raster) && raster.stamp == current,
+                    )
+                });
+        }
         let plan = self.active_visible_leaf_plan(wid)?;
         let leaf = plan.leaf(view)?;
         let View::Native(native) = self.view_store.get(view).copied()? else {
@@ -752,6 +795,9 @@ impl App {
             .native_ui_compile_stamp_for(wid, native.instance, view, viewport)
             .ok()?;
         let cache = window.leaf_render_cache.get(&view)?;
+        if cache.native_nodes_behind {
+            return None;
+        }
         let retained = cache.native.as_ref()?;
         (retained.stamp.view == view
             && retained.stamp.instance == native.instance
@@ -788,6 +834,15 @@ impl App {
             .windows
             .get(&wid)
             .ok_or_else(|| "unknown window".to_string())?;
+        if self.dock_view(wid) == Some(view) {
+            let host = self.dock_geometry(wid).ok_or("dock has no geometry")?;
+            return Ok(LogicalRect::new(
+                0.0,
+                0.0,
+                host.size.0 as f32,
+                host.size.1 as f32,
+            ));
+        }
         let tab = ws
             .tab_set
             .tabs()

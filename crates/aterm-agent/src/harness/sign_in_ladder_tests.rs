@@ -1147,3 +1147,35 @@ fn begin_keeps_one_spacing_clock_for_the_mac_and_refuses_a_token_for_another_acc
         "every CLI's store shares the one sign-in lock, and with it this clock"
     );
 }
+
+/// A ROW'S RUNS ARE WAIVED FOR A SLEEP ONLY SO MANY TIMES IN A ROW ([`Ladder::run_ended`]): the
+/// first [`MOST_INTERRUPTED_RUNS`] runs a sleep interrupted are waived, the next is counted as
+/// it ended, and any run of the row that ends without a sleep starts the count again. A run a
+/// sleep spanned but did not interrupt (it made its login) neither counts nor resets, and one
+/// row's count is not another's.
+#[test]
+fn a_rows_runs_are_waived_for_a_sleep_twice_in_a_row_at_most() {
+    let mut ladder = Ladder::default();
+    assert_eq!(MOST_INTERRUPTED_RUNS, 2);
+    assert!(ladder.run_ended("w3", true, true));
+    assert!(ladder.run_ended("w3", true, true));
+    assert!(!ladder.run_ended("w3", true, true), "the third is counted");
+    assert!(!ladder.run_ended("w3", true, true), "and the one after");
+    assert!(
+        ladder.run_ended("w4", true, true),
+        "another row's own count"
+    );
+    // A run with no sleep resets the count, whatever it ended as.
+    assert!(!ladder.run_ended("w3", false, false));
+    assert!(ladder.run_ended("w3", true, true));
+    // One a sleep spanned that made its login is not waived, and changes no count.
+    assert!(!ladder.run_ended("w3", true, false));
+    assert!(ladder.run_ended("w3", true, true));
+    assert!(!ladder.run_ended("w3", true, true));
+    // The two words a run's end is read by.
+    assert!(slept_across(Some(INTERRUPTING_SLEEP)));
+    assert!(!slept_across(Some(
+        INTERRUPTING_SLEEP - Duration::from_secs(1)
+    )));
+    assert!(!slept_across(None));
+}

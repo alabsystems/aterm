@@ -366,13 +366,15 @@ pub enum Src {
     Mark,
     /// Reserved hook source.
     Hook,
+    /// A registered harness's record stream: what the session's own program says of itself. A claim (`conf=claim`, `by=<sid>`), never aterm's own engine ([`Actor::Harness`]).
+    Harness,
     /// A word this reader does not know.
     Unknown,
 }
 
 impl Src {
     /// All known [`Src`] variants.
-    pub const ALL: [Src; 12] = [
+    pub const ALL: [Src; 13] = [
         Src::Shell,
         Src::Status,
         Src::Screen,
@@ -385,6 +387,7 @@ impl Src {
         Src::Aterm,
         Src::Mark,
         Src::Hook,
+        Src::Harness,
     ];
 
     /// Wire token for this source.
@@ -404,6 +407,7 @@ impl Src {
             Src::Aterm => "aterm",
             Src::Mark => "mark",
             Src::Hook => "hook",
+            Src::Harness => "harness",
             Src::Unknown => UNKNOWN,
         }
     }
@@ -903,6 +907,8 @@ pub const WORD_WORDS: &[&str] = &{
         c.as_str(),
         "restart",
         "signal",
+        "stopped",
+        "wall",
     ]
 };
 

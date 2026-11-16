@@ -248,31 +248,39 @@ fn ensure_from(
 /// Take the nickname a person or a program wrote to this Mac's own `lab/machines` row from any
 /// Mac (the Tables page, `aterm file set lab/machines <row> nickname <word>`) into the name kept
 /// in `state` (tracker package FL-169), as a read that shows the name makes it (the menu bar's
-/// title, `aterm name`): the file is replaced only where [`followed`] moves it, judged again
-/// with the row read afresh under the name lock, so every process decides on the same files.
+/// title, `aterm name`): a live snapshot must match this Mac's own binding and number, and the
+/// current native source is admitted through the atomic name write. Retained display rows
+/// confer no naming authority. The name writer stays held through admission and persistence.
 /// The registry keeps who wrote the row and when; History records the change as
 /// [`Why::Registry`], with no author. An automatic write and an empty or conflicted cell are not
 /// followed, and a name whose row is none of this Mac's ([`registry::row_nick`]) is left as it
 /// is. Answers the name where the file changed.
 ///
 /// # Errors
-/// The file cannot be read, or the name lock taken or the file replaced ([`file::replace`]).
+/// The file cannot be read or replaced, its lock is held, or its native source refuses admission.
 pub fn follow_registry(state: &Path, now_ms: u64) -> io::Result<Option<MachineName>> {
     let Some(kept) = file::read(state)? else {
         return Ok(None);
     };
+    // Retained data may avoid work, but never authorize the write below.
     if row_followed(state, &kept, now_ms).is_none() {
         return Ok(None);
     }
-    let mut moved = None;
-    file::replace(state, |held| {
-        if let Some(next) = row_followed(state, held, now_ms) {
-            *held = next.clone();
-            moved = Some(next);
-        }
-        Ok(())
-    })?;
-    Ok(moved)
+    let Some(row) = registry::for_follow(state) else {
+        return Ok(None);
+    };
+    if !row.names(kept.num) || followed(&kept, row.nickname.as_ref(), now_ms).is_none() {
+        return Ok(None);
+    }
+    let mut writer = file::writer(state)?;
+    if !row.names(writer.name().num) {
+        return Ok(None);
+    }
+    let Some(next) = followed(writer.name(), row.nickname.as_ref(), now_ms) else {
+        return Ok(None);
+    };
+    row.with_admitted(|| writer.replace(next.clone()))?;
+    Ok(Some(next))
 }
 
 /// `held` once it has seen this Mac's row as `state`'s name reads it now ([`followed`]), or

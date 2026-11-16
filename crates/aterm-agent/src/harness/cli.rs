@@ -98,7 +98,6 @@ USAGE:
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
     aterm harness disk watch                    foreground automatic maintenance on macOS
                                                  report or reclaim stale build directories and caches
-    aterm harness disk why [--json]              which agent session was asked to free disk space, and why
     aterm harness disk free <path>... [--dry-run] [--json] | --dry-run [--json]
                                                  remove caches tools rebuild or download again, fenced
     aterm harness ledger [@<sid>] [<n>] [--json] supervisor approval ledger for a session
@@ -387,8 +386,15 @@ AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before eac
     default 1d) until free space reaches `warn` (when `short`, `floor + 5 GiB` if higher).
   - tier 3 (`short` or `await sys`, `disk.idle_build_dirs = true`): whole profiles of live
     checkouts idle past `disk.idle_build_days` (default 7d) with no running process or bin link.
+    Also at any state, hourly, one such dir whose `deps/` holds 100,000 entries or more.
   - tier 4 (`short`): recent profile caches (untouched for >=10m and unlocked) until free
     space reaches `floor + 5 GiB` or reclaimed bytes cover the shortfall.
+  - outside caches (`short` or projected, once the tiers above have nothing left): proven
+    caches of `~/.cache` and `~/Library/Caches` (a build or package tool's own by its name, or
+    a `~/.cache` folder its tool tagged with `CACHEDIR.TAG`) nothing used for
+    `disk.idle_build_days` (below 1: off), least recently used first, up to the pressure
+    target, each set aside, then removed through the fences of `disk free` with its ledger
+    rows. Any other folder stays.
 
 `--apply cargo-targets` takes tiers 0 and 4 (when `short`), tier 1 (when `low`) and tier 2 (at
 any free level); tier 3 (`idle_whole_up_to=`) is emptied only by an automatic pass.
@@ -413,25 +419,9 @@ WHO HOLDS THE DISK: a look that finds the volume below `floor`, or projected und
   and then on what was measured longest ago; `aterm pkg machine cache holders` measures and
   lists them on demand.
 
-ASKING AN AGENT (`rule disk-free@v1`):
-  When the home volume stays `short` or `emergency` and aterm's own freeing is done (a pass
-  ran every tier it may, `disk.auto_free_gib = 0`, or it is out of inodes), ONE Claude Code
-  session on the whole machine is asked to free space, at its turn break, by one line: the
-  volume, how full, the largest build directories left, what is safe to remove, and how to
-  confirm. Every aterm process steps one lease (`<state>/disk-ask.json`): each nominates its
-  best session (its checkout holds most of what is left; at a turn break first; Autopilot not
-  off; its task not done, and not found finished, landed or taskless at its last turn break)
-  for 150 s, and the best is elected. An elected session found unfit at its turn break is
-  released, which costs no election. A session that frees under 1 GiB in 20 minutes, ends,
-  or reaches no turn break in 30 hands the ask to one other session; after two lines (or four
-  elections) no more agents are asked and the owner's disk line says so. The episode ends
-  once free space is 5 GiB past the floor (and free inodes, where counted, 50,000 past their
-  line); no new one opens within 6 hours of the last line. `disk why` prints the lease and
-  its recent decisions (the `free-ask` rows of `<state>/disk.jsonl`); `--json` prints the
-  lease, then the rows.
-
-`disk free <path>...` is the one way aterm's disk-free worker removes anything. A path goes
-only when all of these hold:
+`disk free <path>...` removes a cache that tools rebuild or download again, for a person or an
+agent who names it; the window's own pass removes such caches behind the same fences. A path
+goes only when all of these hold:
   - it lies strictly under a cache root tools rebuild or download again: `~/Library/Caches`
     (not a `com.apple.*`, `com.aterm.*`, `aterm` or hidden child), `~/.cache` (not `aterm`),
     `~/.cargo/registry`, `~/.cargo/git`, `~/.npm`, `~/Library/Developer/Xcode/DerivedData`;
@@ -550,9 +540,8 @@ const HELP_LEDGER: &str = "\
 (`--json`: verbatim):
   - `ledger [@<sid>] [<n>]`: supervisor approval decisions (`<aterm state>/drive/<sid>.jsonl`;
     `self.jsonl` with neither `@<sid>` nor a parent session)
-  - `ledger disk [<n>]`: disk reports, removal intents, removals, refusals, and the
-    `free-ask` rows of `disk-free@v1` (`<state>/disk.jsonl`, always verbatim; `disk why`
-    reads the last)
+  - `ledger disk [<n>]`: disk reports, removal intents, removals and refusals
+    (`<state>/disk.jsonl`, always verbatim)
   - `ledger upgrade [<n>]`: live upgrade steps and owner requests (`<state>/upgrade/ledger.jsonl`)
   - `ledger accounts [<n>]`: account walls, samples, rotations, pins, and auth checks
     (`<state>/accounts/ledger.jsonl`)
@@ -1728,13 +1717,7 @@ pub enum Cmd {
     },
     /// Foreground automatic maintenance using the ordinary paged watch and config.
     DiskWatch,
-    /// `disk why`: which agent session the ask (`disk-free@v1`) chose and why
-    /// ([`run_disk_why`]).
-    DiskWhy {
-        /// The lease and the rows verbatim.
-        json: bool,
-    },
-    /// `disk free <path>...`: the disk-free worker's one removal, fenced (`disk::free`,
+    /// `disk free <path>...`: a named cache's removal, fenced (`disk::free`,
     /// [`run_disk_free`]).
     DiskFree {
         /// The paths to remove, as given.
@@ -2281,15 +2264,6 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             }
             Cmd::DiskWatch
         }
-        "disk" if rest.get(1) == Some(&"why") => {
-            if rest.len() > 2 || apply.is_some() {
-                return Err(format!(
-                    "disk why takes only --json (no operand or --apply), not {:?}",
-                    &rest[2..]
-                ));
-            }
-            Cmd::DiskWhy { json }
-        }
         "disk" if rest.get(1) == Some(&"free") => {
             if apply.is_some() {
                 return Err("disk free takes paths, --dry-run and --json, not --apply".to_string());
@@ -2306,6 +2280,17 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 dry_run,
                 json,
             }
+        }
+        // `disk why` printed the session the disk ask chose, and lines an earlier build typed
+        // name it still. The ask is gone; a report on a folder named `why` is not what those
+        // words meant, and that folder is `./why`.
+        "disk" if rest.get(1) == Some(&"why") => {
+            return Err(
+                "disk why went with the disk ask it reported on: the watch frees space \
+                 itself, and `aterm harness ledger disk` shows what it removed (a folder named \
+                 why is `./why`)"
+                    .to_string(),
+            );
         }
         "disk" => Cmd::Disk {
             targets: rest[1..].iter().map(PathBuf::from).collect(),
@@ -5353,6 +5338,7 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
         session_cwd_unknown: None,
         link_dirs: home.as_deref().map(default_link_dirs).unwrap_or_default(),
         budget: None,
+        entry_bound: None,
     }
 }
 
@@ -5536,7 +5522,8 @@ fn disk_read(text: &str, faults: &mut Vec<DiskFault>) -> DiskReading {
                     ("idle_build_days", T::Integer(n)) => {
                         if *n < 1 {
                             notes.push(
-                                "disk.idle_build_days is below 1, which turns tier 3 off"
+                                "disk.idle_build_days is below 1, which turns tier 3 and the \
+                                 outside caches' step off"
                                     .to_owned(),
                             );
                         }
@@ -5737,9 +5724,10 @@ fn disk_tables_below<'a>(
               nothing"
 )]
 pub enum DiskTick {
-    /// Free space is at or above the automatic floor, or unknown: nothing was scanned, journalled or removed.
+    /// Free space is at or above the automatic floor, or unknown, or a budget or entry-bound
+    /// look planned nothing: nothing was journalled or removed (such a look may have scanned).
     Plenty,
-    /// Below the floor: the report was journalled and the automatic grant applied ([`disk::apply_auto`]), with the largest build directories the pass left ([`disk::hogs_left`]).
+    /// Below the floor: the report was journalled and the automatic grant applied ([`disk::apply_auto`]), with the largest build directories the pass left ([`disk::hogs_left`]). Its `freed_bytes` also count the outside caches the pass removed once its tiers ran out ([`disk::free::pass`]), which are no row of `removed`; a step of those cut short is its `unfinished`.
     Reclaimed(disk::Applied, Vec<disk::Hog>),
 }
 
@@ -5776,7 +5764,7 @@ pub struct DiskLook<'a> {
     pub link_dirs: &'a [PathBuf],
 }
 
-/// One pass of the window's disk watch (design §5.5's timer, a look every minute, hosted by `aterm-gui`'s harness host): below the automatic floor ([`disk::Config::below_auto_floor`], `[disk] auto_free_gib`), survey the look's targets, journal the report into `<state>/disk.jsonl`, and reclaim what [`disk::auto_plan`] grants through `remove` ([`disk::remover`] is the real one: a profile's `incremental/`, under cargo's locks; every idle one, then recent ones least recently used first, `measure` read again before each of those and the pass stopped once free space is back at [`disk::Config::pressure_target_bytes`]), journalling an intent row before each removal and its outcome (bytes actually released, what went, what was skipped, every delete error) or a denial row after, each as it happens.
+/// One pass of the window's disk watch (design §5.5's timer, a look every minute, hosted by `aterm-gui`'s harness host): below the automatic floor ([`disk::Config::below_auto_floor`], `[disk] auto_free_gib`), survey the look's targets, journal the report into `<state>/disk.jsonl`, and reclaim what [`disk::auto_plan`] grants through `remove` ([`disk::remover`] is the real one: a profile's `incremental/`, under cargo's locks; every idle one, then recent ones least recently used first, `measure` read again before each of those and the pass stopped once free space is back at [`disk::Config::pressure_target_bytes`]), journalling an intent row before each removal and its outcome (bytes actually released, what went, what was skipped, every delete error) or a denial row after, each as it happens. Where those tiers ran out ([`disk::Applied::ran_out`]) and the look's home, on the measured volume, is still short of the pass's target, the pass then frees the cache folders of `~/Library/Caches` and `~/.cache` nothing wrote within `[disk] idle_build_days`, least recently used first, through the fences and the `disk-free` rows of `aterm harness disk free` ([`disk::free::pass`]): no session is asked for a path.
 #[must_use]
 pub fn disk_tick(
     look: &DiskLook<'_>,
@@ -5784,7 +5772,7 @@ pub fn disk_tick(
     remove: &mut disk::Remove<'_>,
     measure: &mut disk::Measure<'_>,
 ) -> DiskTick {
-    disk_tick_with(look, config, remove, measure, None, None).0
+    disk_tick_with(look, config, remove, measure, None, None, &Outside::SHIPPED).tick
 }
 
 /// An automatic watch's pass, advancing its discovery selection across looks. Explicitly
@@ -5798,7 +5786,16 @@ pub fn disk_tick_paged(
     measure: &mut disk::Measure<'_>,
     cursor: &mut disk::discover::Cursor,
 ) -> DiskTick {
-    disk_tick_with(look, config, remove, measure, Some(cursor), None).0
+    disk_tick_with(
+        look,
+        config,
+        remove,
+        measure,
+        Some(cursor),
+        None,
+        &Outside::SHIPPED,
+    )
+    .tick
 }
 
 /// One page of a budget pass ([`disk_tick_budget`]): the sizing it runs from, how far the
@@ -5894,13 +5891,14 @@ pub fn disk_tick_budget(
         took
     };
     let taking: &mut Take<'_> = &mut asked;
-    let (tick, ask) = disk_tick_with(
+    let Ticked { tick, ask, .. } = disk_tick_with(
         look,
         config,
         remove,
         measure,
         Some(cursor),
-        Some((budget, taking)),
+        Some((Admitted::Budget(budget), taking)),
+        &Outside::SHIPPED,
     );
     let end = match (&tick, refused) {
         (DiskTick::Reclaimed(done, _), None) => {
@@ -5992,6 +5990,30 @@ fn disk_cannot_meet(
     let mut sink = io::sink();
     let mut journal = Journal::open(Some(&path), None, &mut sink);
     journal.append_raw(&disk::cannot_meet_row(now, row), &mut sink)
+}
+
+/// What a tick's step over the outside caches reads ([`disk::free::pass`]), injected so a test
+/// drives it without the real process scan.
+struct Outside<'a> {
+    /// The running processes' uses of a path ([`disk::discover::scan_processes`]).
+    processes: disk::discover::Processes<'a>,
+    /// How the step dates a folder, how long it waits for a guarded first read, and the wall
+    /// clock it spends dating.
+    reads: disk::free::Reads<'a>,
+}
+
+impl Outside<'static> {
+    /// The product's: every process of this user, each guarded first read on a thread of its
+    /// own ([`disk::free::date_within`]) waited for [`disk::free::TOUCH_WAIT`], and
+    /// [`disk::free::PASS_WALL`] of dating.
+    const SHIPPED: Self = Outside {
+        processes: &disk::discover::scan_processes,
+        reads: disk::free::Reads {
+            dater: &disk::free::date_within,
+            wall: disk::free::PASS_WALL,
+            wait: disk::free::TOUCH_WAIT,
+        },
+    };
 }
 
 /// Where a pressure pass ran, as its emergency end reads it ([`disk_emergency_end`]).
@@ -6104,16 +6126,281 @@ pub fn disk_emergency_look(
     }
 }
 
-/// [`disk_tick`] and its kin: with `budget`, one page of the budget pass ([`disk_tick_budget`]),
-/// whose ask comes back beside the tick.
+/// One look of the entry-bound pass ([`disk_tick_bound`]): the live sessions it keeps the
+/// builds of, and the processes tier 3's clause 4b reads ([`disk::discover::scan_processes`] in
+/// the product).
+#[derive(Clone, Copy)]
+pub struct BoundLook<'a> {
+    /// The live sessions ([`disk::budget::Live`]).
+    pub live: &'a disk::budget::Live,
+    /// The processes ([`disk::discover::Processes`]).
+    pub processes: disk::discover::Processes<'a>,
+}
+
+/// What one look of the entry-bound pass did ([`disk_tick_bound`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundTick {
+    /// The look's tick: its report and every step journalled into `<state>/disk.jsonl` where it
+    /// planned a removal, else [`DiskTick::Plenty`].
+    pub tick: DiskTick,
+    /// How many build directories it found over the bound and not settled at their count.
+    pub over: usize,
+    /// The build directories it emptied whose `deps/` then read under the clear count: one the
+    /// remover stopped in, or a build wrote into again, stays and gets its row.
+    pub taken: Vec<PathBuf>,
+    /// How many `entry-bound` rows it wrote.
+    pub rows: usize,
+    /// The bytes its build caches' own sweep released.
+    pub swept: u64,
+    /// Why it stood down, when it did (the pass lock was not its): it wrote no memo and no row.
+    pub stood_down: Option<String>,
+}
+
+/// ONE LOOK OF THE ENTRY-BOUND PASS: a look of [`disk_tick_paged`]'s kind, at any `disk=` level,
+/// that counts each build directory's profile `deps/` entries and plans, of the directories over
+/// the bound ([`disk::over_bound`], [`disk::target::entry_bound`]) that no live session keeps
+/// ([`disk::budget::bound_ask`]), one removable tier 3 row, emptied whole under every check tier
+/// 3 makes. `take` is asked before anything is journalled, removed or written. A build cache over
+/// the bound gets its own sweep once a look (`sweep`, each of its removals behind `take`): it
+/// answers the bytes it released, or `None` where it ran none, and a row says a sweep ran only
+/// where one did, beside its reason and never in it. Each directory still over the clear count
+/// then gets one `entry-bound` row in `<state>/disk.jsonl`, written again only when its count is
+/// a step or more from the one that row stated or its reason changes ([`disk::BoundMemo`], saved
+/// before the rows; a directory the record cannot hold gets no row). A `deps/` whose count could
+/// not be read, but is not gone, keeps the record's entry as it stands. Nothing here refuses, holds or tells a build anything, and
+/// the row is a record.
+#[must_use]
+pub fn disk_tick_bound(
+    look: &DiskLook<'_>,
+    config: disk::Config,
+    bound: &BoundLook<'_>,
+    take: &mut Take<'_>,
+    remove: &mut disk::Remove<'_>,
+    cursor: &mut disk::discover::Cursor,
+    sweep: &mut dyn FnMut(&mut Take<'_>) -> Option<u64>,
+) -> BoundTick {
+    let (_, clear, step) = disk::target::entry_bound();
+    let memo = disk::BoundMemo::read(look.state);
+    let view = memo.view(look.now);
+    let refused: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+    let mut asked = || {
+        let took = take();
+        if let Err(why) = &took {
+            refused.set(Some(why.clone()));
+        }
+        took
+    };
+    let taking: &mut Take<'_> = &mut asked;
+    let mut unmeasured = || None::<u64>;
+    let admit = Admitted::EntryBound {
+        live: bound.live,
+        bound: &view,
+    };
+    let Ticked { tick, ask, over } = disk_tick_with(
+        look,
+        config,
+        remove,
+        &mut unmeasured,
+        Some(cursor),
+        Some((admit, &mut *taking)),
+        &Outside {
+            processes: bound.processes,
+            reads: Outside::SHIPPED.reads,
+        },
+    );
+    if let Some(why) = refused.take() {
+        return BoundTick {
+            tick,
+            over: over.len(),
+            taken: Vec::new(),
+            rows: 0,
+            swept: 0,
+            stood_down: Some(why),
+        };
+    }
+    let done = match &tick {
+        DiskTick::Reclaimed(done, _) => Some(done),
+        DiskTick::Plenty => None,
+    };
+    let denied = |dir: &Path| {
+        done.and_then(|d| d.denials.iter().find(|r| r.path() == Some(dir)))
+            .map(disk::Refusal::describe)
+    };
+    let removed = |dir: &Path| {
+        done.and_then(|d| d.removed.iter().find(|(row, _)| row.path == dir))
+            .map(|(_, removed)| removed)
+    };
+    let held = |dir: &Path| {
+        ask.as_ref()
+            .and_then(|ask| ask.held.iter().find(|(path, _)| path == dir))
+            .map(|(_, why)| why.clone())
+    };
+    // Each directory over the bound is emptied, stays (with why), or waits for a later look: the
+    // plan takes one a look, and one it did not reach is neither a row nor a change.
+    let mut staying: Vec<(&disk::OverBound, bool, String)> = Vec::new();
+    for o in &over {
+        let (emptied, why) = if let Some(why) = denied(&o.dir) {
+            (false, why)
+        } else if let Some(r) = removed(&o.dir) {
+            (true, bound_left(o, r))
+        } else if let Some(why) = held(&o.dir) {
+            (false, why)
+        } else if let Some(why) = &o.kept {
+            (false, why.clone())
+        } else {
+            continue;
+        };
+        staying.push((o, emptied, why));
+    }
+    // A build cache that stays gets its cache's own sweep: `None` where the host ran none (it
+    // is off there, or one was stamped within the hour).
+    let swept = staying
+        .iter()
+        .any(|(o, ..)| o.cache_custody)
+        .then(|| sweep(&mut *taking))
+        .flatten();
+    // A `deps/` that is gone or reads under the clear count leaves the record; one that could
+    // not be read keeps what the record says of it, so a passing read error neither ends its
+    // raised state nor writes its row again.
+    let count = |deps: &Path| match disk::target::deps_entries_of(deps) {
+        Ok(n) if n >= clear => Some(Some(n)),
+        Ok(_) => Some(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    };
+    let mut next = memo.clone();
+    let mut taken: Vec<PathBuf> = Vec::new();
+    let mut rows: Vec<disk::EntryBoundRow> = Vec::new();
+    for (o, emptied, why) in staying {
+        let entries = match count(&o.deps) {
+            Some(Some(entries)) => entries,
+            Some(None) => {
+                if emptied {
+                    taken.push(o.dir.clone());
+                }
+                next.set(&o.dir, None);
+                continue;
+            }
+            None => continue,
+        };
+        let row = disk::EntryBoundRow {
+            dir: o.dir.clone(),
+            deps: o.deps.clone(),
+            entries,
+            why: why.clone(),
+            swept: o.cache_custody && swept.is_some(),
+        };
+        let news = memo.news(&row, step);
+        // A row that is no news leaves the count its last row stated in the record: a count
+        // that drifts a few entries a look is then measured from that row, never from itself.
+        let said = memo
+            .of(&o.dir)
+            .filter(|_| !news)
+            .map_or(entries, |prev| prev.entries);
+        let entry = disk::BoundEntry {
+            dir: o.dir.clone(),
+            deps: o.deps.clone(),
+            entries: said,
+            why,
+            at: look.now,
+        };
+        if next.set(&o.dir, Some(entry)) && news {
+            rows.push(row);
+        }
+    }
+    // A directory the record holds that this look did not reach leaves it once its `deps/` is
+    // under the clear count or gone.
+    for f in &memo.folders {
+        if !over.iter().any(|o| o.dir == f.dir) && count(&f.deps) == Some(None) {
+            next.set(&f.dir, None);
+        }
+    }
+    if next != memo || !rows.is_empty() {
+        if let Err(why) = taking() {
+            return BoundTick {
+                tick,
+                over: over.len(),
+                taken,
+                rows: 0,
+                swept: swept.unwrap_or(0),
+                stood_down: Some(why),
+            };
+        }
+        if let Err(e) = next.save(look.state) {
+            aterm_log::warn!(
+                "harness disk watch: the entry-bound memo was not kept, so no entry-bound row is \
+                 written: {e}"
+            );
+            rows.clear();
+        }
+    }
+    let rows = rows
+        .iter()
+        .filter(|row| disk_ledger_append(look.state, &disk::entry_bound_row(look.now, row)))
+        .count();
+    BoundTick {
+        tick,
+        over: over.len(),
+        taken,
+        rows,
+        swept: swept.unwrap_or(0),
+        stood_down: None,
+    }
+}
+
+/// Why the build directory `o` still holds a `deps/` over the clear count after the remover
+/// emptied what it could of it (`removed`): what stopped the remover at that profile, else its
+/// first delete error, else that a build wrote into it again. What the remover left because it
+/// is not cargo's output is no reason.
+fn bound_left(o: &disk::OverBound, removed: &disk::Removed) -> String {
+    let profile = o.deps.parent();
+    removed
+        .skipped
+        .iter()
+        .find(|(path, _)| Some(path.as_path()) == profile)
+        .map(|(path, why)| format!("{why}: {}", path.display()))
+        .or_else(|| removed.trouble.first().cloned())
+        .unwrap_or_else(|| "a build wrote into it again as it was emptied".to_owned())
+}
+
+/// Which pass outside the pressure floor a look of [`disk_tick_with`] is.
+#[derive(Clone, Copy)]
+enum Admitted<'a> {
+    /// One page of the budget pass ([`disk_tick_budget`]).
+    Budget(&'a BudgetLook<'a>),
+    /// One look of the entry-bound pass ([`disk_tick_bound`]): the live sessions it keeps the
+    /// builds of, and its memo's view.
+    EntryBound {
+        live: &'a disk::budget::Live,
+        bound: &'a disk::EntryBound,
+    },
+}
+
+/// What one look of [`disk_tick_with`] did: its tick, the ask of a budget or entry-bound look,
+/// and the build directories an entry-bound look found over the bound.
+struct Ticked {
+    tick: DiskTick,
+    ask: Option<disk::budget::Ask>,
+    over: Vec<disk::OverBound>,
+}
+
+/// [`disk_tick`] and its kin: `admitted`, one page of the budget pass ([`disk_tick_budget`]) or
+/// one look of the entry-bound pass ([`disk_tick_bound`]), whose ask comes back beside the tick.
+/// `outside` is what its last step reads: once the tiers ran out on a pressure pass with the
+/// home volume still pressed (below its floor, or under a standing projection), the proven
+/// outside caches unused for the idle window go ([`disk::free::pass`]), up to the pressure
+/// target (the projected one under a projection), their bytes into the tick's `freed_bytes`.
+/// A budget page or an entry-bound look never runs that step. Tier 3's clause 4b reads the
+/// processes through `outside` too ([`disk::discover::Processes`]).
 fn disk_tick_with(
     look: &DiskLook<'_>,
     config: disk::Config,
     remove: &mut disk::Remove<'_>,
     measure: &mut disk::Measure<'_>,
     mut cursor: Option<&mut disk::discover::Cursor>,
-    budget: Option<(&BudgetLook<'_>, &mut Take<'_>)>,
-) -> (DiskTick, Option<disk::budget::Ask>) {
+    admitted: Option<(Admitted<'_>, &mut Take<'_>)>,
+    outside: &Outside<'_>,
+) -> Ticked {
     let DiskLook {
         state,
         volume,
@@ -6130,9 +6417,17 @@ fn disk_tick_with(
         session_cwd_unknown,
         link_dirs,
     } = *look;
-    let (budget, take) = match budget {
-        Some((budget, take)) => (Some(budget), Some(take)),
+    let (admit, take) = match admitted {
+        Some((admit, take)) => (Some(admit), Some(take)),
         None => (None, None),
+    };
+    let budget = match admit {
+        Some(Admitted::Budget(budget)) => Some(budget),
+        _ => None,
+    };
+    let bound = match admit {
+        Some(Admitted::EntryBound { live, bound }) => Some((live, bound)),
+        _ => None,
     };
     let free_target = budget.map(|b| b.over.free_target);
     let admitted = config.auto_free_gib > 0
@@ -6140,12 +6435,17 @@ fn disk_tick_with(
         && (config.below_warn(free)
             || demand.is_some()
             || projected.is_some()
-            || free_target.is_some());
+            || free_target.is_some()
+            || bound.is_some());
     if !admitted {
         if let Some(cursor) = cursor {
             cursor.reset_cycle();
         }
-        return (DiskTick::Plenty, None);
+        return Ticked {
+            tick: DiskTick::Plenty,
+            ask: None,
+            over: Vec::new(),
+        };
     }
     let paged = targets.is_empty() && discover.is_some() && cursor.is_some();
     if let Some(cursor) = cursor.as_deref_mut() {
@@ -6161,6 +6461,7 @@ fn disk_tick_with(
                 session_cwd_unknown,
                 link_dirs,
                 free_target,
+                bound.is_some(),
             ));
         } else {
             cursor.reset_cycle();
@@ -6206,7 +6507,8 @@ fn disk_tick_with(
             .and_then(|(home, t)| disk::discover::placing_of(home, t)),
         demand,
         projected,
-        idle_whole: config.idle_whole_on()
+        idle_whole: bound.is_none()
+            && config.idle_whole_on()
             && (config.pressed(free, projected.as_ref())
                 || demand.is_some()
                 || free_target.is_some()),
@@ -6214,12 +6516,40 @@ fn disk_tick_with(
         session_cwd_unknown: session_cwd_unknown.map(str::to_owned),
         link_dirs: link_dirs.to_vec(),
         budget: free_target,
+        entry_bound: bound.map(|(_, bound)| bound.clone()),
         ..disk::Roots::default()
     };
-    let mut survey = disk::scan(&roots, now, disk::Trigger::Tick, config, free);
+    let mut survey = disk::scan_with(
+        &roots,
+        now,
+        disk::Trigger::Tick,
+        config,
+        free,
+        outside.processes,
+    );
     survey.room = room;
     let mut rep = disk::report(&survey, config);
-    rep.budget = budget.map(|b| disk::budget::ask(&survey, b.live, b.over.free_target, table, now));
+    let mut over = Vec::new();
+    if let Some((live, bound)) = bound {
+        // An entry-bound look plans only the directories over the bound, by the budget's own
+        // eligibility; one with nothing to take journals nothing.
+        over = disk::over_bound(&survey, &rep, bound);
+        let dirs: BTreeSet<PathBuf> = over.iter().map(|o| o.dir.clone()).collect();
+        rep.budget = Some(disk::budget::bound_ask(&survey, &dirs, live, table, now));
+        if over.is_empty() || disk::pass_plan(&rep).is_none_or(|plan| plan.is_empty()) {
+            if paged && let Some(cursor) = cursor {
+                cursor.finish_page(rep.assessment_complete);
+            }
+            return Ticked {
+                tick: DiskTick::Plenty,
+                ask: rep.budget,
+                over,
+            };
+        }
+    } else {
+        rep.budget =
+            budget.map(|b| disk::budget::ask(&survey, b.live, b.over.free_target, table, now));
+    }
     let unfinished = if rep.assessment_complete {
         unfinished
     } else {
@@ -6235,7 +6565,11 @@ fn disk_tick_with(
             unfinished: Some(why),
             ..disk::Applied::default()
         };
-        return (DiskTick::Reclaimed(done, Vec::new()), rep.budget);
+        return Ticked {
+            tick: DiskTick::Reclaimed(done, Vec::new()),
+            ask: rep.budget,
+            over,
+        };
     }
     let path = state.join(DISK_LEDGER);
     let mut sink = io::sink();
@@ -6276,6 +6610,8 @@ fn disk_tick_with(
     let exhausted =
         rep.assessment_complete && applied.as_ref().is_some_and(|done| done.stops.is_empty());
     let complete = paged && cursor.is_some_and(|cursor| cursor.finish_page(exhausted));
+    // No plan (nothing admitted a pass) is not a pass that ran out.
+    let ran = applied.is_some();
     let done = applied.unwrap_or_default();
     let unfinished = if complete {
         None
@@ -6289,18 +6625,60 @@ fn disk_tick_with(
         partial: rep.seen.partial || found_cut || mid_cycle,
         ..rep.seen
     };
-    let done = disk::Applied {
+    let mut done = disk::Applied {
         unfinished,
         dangling,
         seen,
         waits: rep.waits.clone(),
         ..done
     };
+    // The pass's last step: where the tiers ran out and the home volume is still pressed (below
+    // its floor, or under a standing projection), the proven outside caches unused for the idle
+    // window go, by record, up to the pressure target and no further. A budget page, whose cap
+    // is no shortage, and an agent's need above that target never reach it: what goes outside
+    // aterm's own build output is taken only to end a shortage. Its rows carry no session: the
+    // pass is aterm's own.
+    let goal = (free_target.is_none()
+        && bound.is_none()
+        && config.pressed(free, roots.projected.as_ref()))
+    .then(|| {
+        roots.projected.as_ref().map_or_else(
+            || config.pressure_target_bytes(),
+            |p| config.projected_target(p),
+        )
+    });
+    if let (Some(goal), Some(home)) = (goal, roots.home.as_deref())
+        && ran
+        && done.ran_out()
+        && !on_volume(volume, &[home.to_path_buf()], &volume_id).is_empty()
+    {
+        let world = disk::free::World {
+            home,
+            processes: outside.processes,
+            mounts: table,
+            config,
+            now,
+            sid: "",
+        };
+        let passed = disk::free::pass(&world, goal, &outside.reads, measure, &mut |row| {
+            aterm_uds::progress::tick();
+            journal.append_raw(row, &mut io::sink())
+        });
+        done.freed_bytes = done.freed_bytes.saturating_add(passed.bytes);
+        // A step cut short has not run out: no budget page says `cannot-meet` on it.
+        if done.unfinished.is_none() {
+            done.unfinished = passed.cut;
+        }
+    }
     let there = |p: &Path| {
         !std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     };
     let hogs = disk::hogs_left(&survey, &rep, &done, &there);
-    (DiskTick::Reclaimed(done, hogs), rep.budget)
+    Ticked {
+        tick: DiskTick::Reclaimed(done, hogs),
+        ask: rep.budget,
+        over,
+    }
 }
 
 /// The rebuildable bytes on `volume` now, for the budget `aterm ctl sys disk` prints
@@ -6523,85 +6901,8 @@ pub fn disk_reserve_look(
     moved
 }
 
-/// Journal rows of the ask ([`disk::ask::row`], [`disk::ask::step_row`]) into `<state>/disk.jsonl`.
-pub fn disk_ask_journal(state: &Path, rows: &[String]) {
-    if rows.is_empty() {
-        return;
-    }
-    let path = state.join(DISK_LEDGER);
-    let mut sink = io::sink();
-    if std::fs::create_dir_all(state).is_ok() {
-        let mut journal = Journal::open(Some(&path), None, &mut sink);
-        for row in rows {
-            journal.append_raw(row, &mut sink);
-        }
-    }
-}
-
-/// The ledger rows `disk why` scans for the ask's own, and the most it prints.
-const DISK_WHY_SCAN: usize = 4096;
-const DISK_WHY_ROWS: usize = 24;
-
-/// `disk why`: the ask's lease ([`disk::ask::read`]) as it stands, and the newest of its
-/// ledger rows ([`disk::ask::why_lines`]), with what each worker removed counted over the whole
-/// scan, whose `disk-free` rows are not the rule's own; `--json` prints the lease, then the rows
-/// verbatim.
-fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    use aterm_codec::tty::write_line;
-
-    let path = env.disk_ledger();
-    let ledger = match tail_lines(&path, DISK_WHY_SCAN) {
-        Ok(rows) => rows,
-        Err(e) => {
-            let _ = write_line(
-                err,
-                format_args!("aterm harness disk why: {}: {e}", path.display()),
-            );
-            return ExitCode::from(1);
-        }
-    };
-    let mut rows: Vec<String> = ledger
-        .iter()
-        .filter(|r| disk::ask::row_line(r).is_some())
-        .cloned()
-        .collect();
-    rows.drain(..rows.len().saturating_sub(DISK_WHY_ROWS));
-    let lease = match disk::ask::read(&env.state) {
-        Ok(lease) => lease,
-        Err(e) => {
-            let path = env.state.join(disk::ask::LEASE_FILE);
-            let _ = write_line(
-                err,
-                format_args!("aterm harness disk why: {}: {e}", path.display()),
-            );
-            return ExitCode::from(1);
-        }
-    };
-    let written = (|| -> io::Result<()> {
-        if json {
-            writeln!(out, "{}", lease.encode())?;
-            for row in &rows {
-                writeln!(out, "{row}")?;
-            }
-        } else {
-            for line in disk::ask::why_lines(&lease, &rows, &ledger, env.now.saturating_mul(1000)) {
-                write_line(out, format_args!("{line}"))?;
-            }
-        }
-        out.flush()
-    })();
-    if let Err(error) = written {
-        let _ = write_line(
-            err,
-            format_args!("aterm harness disk why: could not write results: {error}"),
-        );
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
-}
-
-/// `disk free <path>...` ([`disk::free`]): the disk-free worker's one removal, its fences read
-/// against every process of this user and the mount table as they are now.
+/// `disk free <path>...` ([`disk::free`]): a named cache's removal, its fences read against
+/// every process of this user and the mount table as they are now.
 fn run_disk_free(
     env: &Env,
     paths: &[PathBuf],
@@ -6912,6 +7213,41 @@ pub struct WorktreeLook<'a> {
     /// worktree that stays gives back a build directory: a build started since the host read
     /// `starts` keeps it. `None`: the lines of `starts` stand.
     pub record: Option<&'a Path>,
+    /// The lines the look holds the home volume to ([`disk::Thresholds::lines`]): while it reads
+    /// under their emergency line the step pins and pushes nothing (DC-06d,
+    /// [`disk::worktree::Hooks::custody`]).
+    pub lines: aterm_capacity::floor::Lines,
+}
+
+/// Whether the volume holding `home`, read now through a fresh mount table, lets the worktree
+/// step's custody writes run under `lines` (`aterm_capacity::floor::custody_writes_wait`): `Err`
+/// with why they wait, where it reads under the emergency line or could not be read.
+///
+/// # Errors
+/// Why the custody writes wait.
+pub fn disk_custody_room(home: &Path, lines: &aterm_capacity::floor::Lines) -> Result<(), String> {
+    let read = disk::volume_of(home, &aterm_sysprobe::volumes::table()).ok();
+    let free = read.as_ref().map(|r| r.free);
+    let files_free = read.as_ref().and_then(|r| r.files_free);
+    if !aterm_capacity::floor::custody_writes_wait(free, files_free, lines) {
+        return Ok(());
+    }
+    Err(match (free, files_free) {
+        (None, _) => "its volume's free space could not be read, so its snapshot and its push \
+                      wait for a reading"
+            .to_owned(),
+        (Some(_), Some(files)) if files < lines.files_emergency => format!(
+            "its volume has {files} inodes free, under its {} emergency line, so its snapshot and \
+             its push wait until a look reads it above the line",
+            lines.files_emergency
+        ),
+        (Some(free), _) => format!(
+            "its volume has {} free, under its {} emergency line, so its snapshot and its push \
+             wait until a look reads it above the line",
+            disk::human_bytes(free),
+            disk::human_bytes(lines.emergency)
+        ),
+    })
 }
 
 /// A headless fixture's process probe, as atpkg's fenced removals take one.
@@ -7023,7 +7359,12 @@ impl StepFence<'_> {
 /// seven days and `disk.idle_build_days`, while `[disk]` lets an idle build directory go whole
 /// ([`disk::Config::idle_whole_on`]); the build-start record is read again just before
 /// (`look.record`), and a worktree whose build directory was judged and stays is not judged
-/// for it again for a day (`schedule`, [`disk::worktree::BUILD_DIR_EVERY`]).
+/// for it again for a day (`schedule`, [`disk::worktree::BUILD_DIR_EVERY`]). While the home
+/// volume reads under its emergency line (`look.lines`, [`disk_custody_room`]) nothing is pinned
+/// or pushed; a step that left such writes waiting is due again at the first look that reads
+/// the volume above the line ([`disk::worktree::Schedule::due`]), and stays so while each such
+/// run stops short ([`disk::worktree::Schedule::ran`]); one run before its hour while the volume
+/// still reads under the line judges nothing ([`disk::worktree::Schedule::stands_down`]).
 pub fn disk_worktree_step(
     look: &WorktreeLook<'_>,
     config: disk::Config,
@@ -7064,6 +7405,10 @@ fn disk_worktree_step_on(
         return disk::worktree::Done::default();
     }
     let started = std::time::Instant::now();
+    let custody = || disk_custody_room(look.home, &look.lines);
+    if schedule.stands_down(started, || custody().is_err()) {
+        return disk::worktree::Done::default();
+    }
     let found = disk::discover::linked_worktrees(look.home);
     let mut known: Vec<PathBuf> = found
         .iter()
@@ -7138,12 +7483,74 @@ fn disk_worktree_step_on(
                 Some(record) => atpkg::build_start::read(record),
                 None => look.starts.to_vec(),
             },
+            custody: &custody,
         },
     );
     let ended = std::time::Instant::now();
     schedule.rest(ended, &done.build_kept);
-    schedule.ran(ended, reached);
+    schedule.ran(ended, reached, done.waits());
     done
+}
+
+/// One run of the daily upkeep's branch-name step ([`disk::refs::step`]) over the main
+/// checkouts among `home`'s children (their worktree registrations whose folder is gone
+/// included, placed by `home`'s volume and the mount table read now), each pin and prune
+/// journalled into `<state>/disk.jsonl`
+/// before its ref changes, what its pushes owe recorded in `<state>/disk-owed.json` (which the
+/// worktree step's rounds retry), while `still_held` says the daily claim is this host's. The
+/// branches the open Claude Code sessions used are read off their transcripts
+/// ([`disk::refs::used_by`]); where one cannot be read, no local branch is judged. No name is
+/// judged after [`disk::refs::STEP_WALL`], and no git run outlives it by more than
+/// [`disk::refs::GIT_GRACE`].
+#[must_use]
+pub fn disk_refs_journalled(
+    state: &Path,
+    home: &Path,
+    now: i64,
+    still_held: &dyn Fn() -> bool,
+) -> disk::refs::Done {
+    let started = std::time::Instant::now();
+    let checkouts = disk::discover::main_checkouts(home);
+    if checkouts.is_empty() {
+        return disk::refs::Done::default();
+    }
+    let open = disk::worktree::open_sessions(home);
+    let used = disk::refs::used_by(&open);
+    let owed = state.join(disk::worktree::pins::OWED_FILE);
+    let facts = disk::refs::Facts {
+        checkouts: &checkouts,
+        used: used.as_deref(),
+        owed: &owed,
+    };
+    let until = started + disk::refs::STEP_WALL + disk::refs::GIT_GRACE;
+    let git = atpkg::build_cache::retired::GitUntil(until);
+    let agh = disk::worktree::pins::agh_until(until);
+    let placing = disk::discover::placing_now(home);
+    let drop_gone =
+        |checkout: &Path, custody: &mut dyn atpkg::build_cache::gone_entries::Custody| {
+            atpkg::build_cache::gone_entries::drop_gone(
+                &git,
+                checkout,
+                Some(home),
+                placing.as_ref(),
+                custody,
+            )
+        };
+    let mut journal = |row: &str| disk_ledger_append(state, row);
+    let now = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(now).unwrap_or(0));
+    disk::refs::step(
+        &git,
+        &facts,
+        now,
+        started + disk::refs::STEP_WALL,
+        disk::refs::Hooks {
+            still_held,
+            journal: &mut journal,
+            agh: &agh,
+            drop_gone: &drop_gone,
+        },
+    )
 }
 
 /// A managed-cache sweep with its write-ahead sizes and any journal refusal.
@@ -9890,9 +10297,10 @@ impl std::fmt::Display for RenewalFailure {
 /// its own: it waits at its paste prompt once its opener gives up (MEASURED,
 /// `docs/measured/mailbox-signin-cloudflare-2026-11-01.md`). So the run is an owned capture
 /// ([`super::align::capture_bounded_owned`]): `within` ends it, and so does every other way the
-/// wait for it stops, this process's own end included; on Unix, so does the failure its opener
-/// records in its outcome file ([`super::align::capture_bounded_owned_watching`]). A hosted OAuth
-/// code arrives through the same private channel and is written once to the waiting CLI's stdin.
+/// wait for it stops (on Unix this process's own end too; elsewhere nothing ties the run to this
+/// process, ATERM-KI-1115-62853), and so, on every platform, does the failure its opener records
+/// in its outcome file ([`super::align::capture_bounded_owned_watching`]). A hosted OAuth code
+/// arrives through the same private channel and is written once to the waiting CLI's stdin.
 pub(super) fn capture_unattended_renewal(
     cmd: aterm_uds::spawnfd::Command,
     within: std::time::Duration,
@@ -9909,7 +10317,6 @@ pub(super) fn capture_unattended_renewal_scoped(
     capture_unattended_renewal_for(cmd, within, Some(scope))
 }
 
-#[cfg(unix)]
 enum CaptureStop {
     Cancelled,
     Failed,
@@ -9923,64 +10330,49 @@ fn capture_unattended_renewal_for(
     if scope.is_some_and(super::account_work::Scope::cancelled) {
         return Err(RenewalFailure::cancelled());
     }
-    #[cfg(unix)]
     let mut stopped = None;
     let result = capture_unattended_renewal_with(cmd, |cmd, outcome| {
-        #[cfg(unix)]
-        {
-            if scope.is_none() && outcome.is_none() {
-                return super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT);
+        if scope.is_none() && outcome.is_none() {
+            return super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT);
+        }
+        let mut observed = None;
+        match super::align::capture_bounded_owned_watching(cmd, within, MAX_AUTH_STDOUT, |input| {
+            observed = if scope.is_some_and(super::account_work::Scope::cancelled) {
+                Some(CaptureStop::Cancelled)
+            } else {
+                outcome
+                    .and_then(super::open_url::read_terminal_outcome)
+                    .map(|_| CaptureStop::Failed)
+            };
+            if observed.is_some() {
+                return true;
             }
-            let mut observed = None;
-            match super::align::capture_bounded_owned_watching(
-                cmd,
-                within,
-                MAX_AUTH_STDOUT,
-                |input| {
-                    observed = if scope.is_some_and(super::account_work::Scope::cancelled) {
-                        Some(CaptureStop::Cancelled)
-                    } else {
-                        outcome
-                            .and_then(super::open_url::read_terminal_outcome)
-                            .map(|_| CaptureStop::Failed)
-                    };
-                    if observed.is_some() {
+            let Some(outcome) = outcome else {
+                return false;
+            };
+            match super::open_url::take_oauth_code(outcome.with_extension("code")) {
+                Ok(Some(mut code)) => {
+                    code.push('\n');
+                    let written = input.write_all(code.as_bytes(), || {
+                        scope.is_some_and(super::account_work::Scope::cancelled)
+                    });
+                    if scope.is_some_and(super::account_work::Scope::cancelled) {
+                        observed = Some(CaptureStop::Cancelled);
                         return true;
                     }
-                    let Some(outcome) = outcome else {
-                        return false;
-                    };
-                    match super::open_url::take_oauth_code(outcome.with_extension("code")) {
-                        Ok(Some(mut code)) => {
-                            code.push('\n');
-                            let written = input.write_all(code.as_bytes(), || {
-                                scope.is_some_and(super::account_work::Scope::cancelled)
-                            });
-                            if scope.is_some_and(super::account_work::Scope::cancelled) {
-                                observed = Some(CaptureStop::Cancelled);
-                                return true;
-                            }
-                            written.is_err()
-                        }
-                        Ok(None) => false,
-                        Err(_) => true,
-                    }
-                },
-            )? {
-                super::align::Ended::Exited(ran) => Ok(ran),
-                super::align::Ended::Stopped => {
-                    stopped = observed;
-                    Err(OPENER_STOPPED.into())
+                    written.is_err()
                 }
+                Ok(None) => false,
+                Err(_) => true,
+            }
+        })? {
+            super::align::Ended::Exited(ran) => Ok(ran),
+            super::align::Ended::Stopped => {
+                stopped = observed;
+                Err(OPENER_STOPPED.into())
             }
         }
-        #[cfg(not(unix))]
-        {
-            let _ = outcome;
-            super::align::capture_bounded_owned(cmd, within, MAX_AUTH_STDOUT)
-        }
     });
-    #[cfg(unix)]
     match stopped {
         Some(CaptureStop::Cancelled) => return Err(RenewalFailure::cancelled()),
         Some(CaptureStop::Failed) | None => {}
@@ -10036,18 +10428,11 @@ fn capture_status_scoped(
     if scope.cancelled() {
         return Err(RenewalFailure::cancelled().to_string());
     }
-    #[cfg(unix)]
-    {
-        match super::align::capture_bounded_owned_watching(cmd, budget, MAX_AUTH_STDOUT, |_| {
-            scope.cancelled()
-        })? {
-            super::align::Ended::Exited(ran) => Ok(ran),
-            super::align::Ended::Stopped => Err(RenewalFailure::cancelled().to_string()),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        super::align::capture_bounded_owned(cmd, budget, MAX_AUTH_STDOUT)
+    match super::align::capture_bounded_owned_watching(cmd, budget, MAX_AUTH_STDOUT, |_| {
+        scope.cancelled()
+    })? {
+        super::align::Ended::Exited(ran) => Ok(ran),
+        super::align::Ended::Stopped => Err(RenewalFailure::cancelled().to_string()),
     }
 }
 
@@ -10176,7 +10561,6 @@ fn login_flow_of(program: &std::ffi::OsStr, dir: Option<&str>) -> Result<i32, St
 
 /// Why a sign-in ended without its provider's own exit: its opener recorded a terminal failure
 /// ([`super::open_url::read_terminal_outcome`]), in a captured run.
-#[cfg(unix)]
 const OPENER_STOPPED: &str = "its browser opener stopped before authorization completed";
 
 /// One sign-in on this terminal, a person's, waited for as long as they take, as
@@ -21836,7 +22220,6 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
                 ExitCode::from(2)
             }
         }
-        Cmd::DiskWhy { json } => run_disk_why(env, *json, out, err),
         Cmd::DiskFree {
             paths,
             dry_run,

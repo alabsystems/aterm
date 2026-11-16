@@ -1976,9 +1976,9 @@ fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
         })
     };
     let reading = || {
-        Some(aterm_vitals::services::Reading {
+        Some(aterm_process_facts::services::Reading {
             total: 128 << 30,
-            ..aterm_vitals::services::Reading::default()
+            ..aterm_process_facts::services::Reading::default()
         })
     };
     let read_for = |text: &str, held: Option<Held>| {
@@ -2198,6 +2198,7 @@ fn sys_disk_held_gathers_its_rows_from_build_start_lines_and_the_walkers_board()
         low_disk: true,
         daily_days: Some(3),
         run_end: true,
+        outside_days: Some(7),
     };
     let mirror_path = PathBuf::from(abs(MIRROR));
     let kept_in_mirror = |m: &Path| m == mirror_path.as_path();
@@ -2463,6 +2464,7 @@ fn sys_disk_held_gathers_its_rows_from_build_start_lines_and_the_walkers_board()
         low_disk: false,
         daily_days: None,
         run_end: true,
+        outside_days: None,
     };
     let held_off = held_rows(
         &board,
@@ -2596,7 +2598,8 @@ fn a_holding_names_the_tab_and_program_of_its_nearest_claimer() {
 /// THE PASSES `sys disk held` NAMES FOLLOW aterm.toml: the tier pass while
 /// `disk.auto_free_gib` is above 0; the daily pass only on macOS, with the tier pass on and
 /// `disk.dead_build_dirs`, at the cache's stale days; a verify run's trim on macOS whatever the
-/// file says. NEGATIVE CONTROLS: each condition off turns its pass off.
+/// file says; the outside-cache step with the tier pass on and `disk.idle_build_days` at least
+/// 1, at those days, off Windows. NEGATIVE CONTROLS: each condition off turns its pass off.
 #[test]
 fn the_passes_sys_disk_names_follow_aterm_toml() {
     use aterm_agent::harness::disk::Config;
@@ -2606,10 +2609,12 @@ fn the_passes_sys_disk_names_follow_aterm_toml() {
         ..Config::default()
     };
     let days = atpkg::build_cache::RECLAIM_STALE.as_secs() / (24 * 60 * 60);
+    let idle = u64::try_from(on.idle_build_days).expect("a positive default");
     let all = Passes {
         low_disk: true,
         daily_days: Some(days),
         run_end: true,
+        outside_days: (!cfg!(windows)).then_some(idle),
     };
     assert_eq!(Passes::of(&on, true), all);
     let elsewhere = Passes {
@@ -2625,6 +2630,7 @@ fn the_passes_sys_disk_names_follow_aterm_toml() {
     let none = Passes {
         low_disk: false,
         daily_days: None,
+        outside_days: None,
         ..all
     };
     assert_eq!(Passes::of(&off, true), none, "CONTROL: cleanup off");
@@ -2640,6 +2646,19 @@ fn the_passes_sys_disk_names_follow_aterm_toml() {
         Passes::of(&kept, true),
         no_daily,
         "CONTROL: no dead build dirs"
+    );
+    let no_window = Config {
+        idle_build_days: 0,
+        ..on
+    };
+    let no_outside = Passes {
+        outside_days: None,
+        ..all
+    };
+    assert_eq!(
+        Passes::of(&no_window, true),
+        no_outside,
+        "CONTROL: no idle window, no outside-cache step"
     );
 }
 
@@ -2660,6 +2679,7 @@ fn a_held_read_demands_no_walk() {
             low_disk: true,
             daily_days: Some(3),
             run_end: true,
+            outside_days: Some(7),
         },
         kept: &|_: &Path| false,
         now,

@@ -2311,3 +2311,12 @@ fn a_session_that_owes_nothing_has_no_epoch() {
     assert!(epoch_lines(&conpty).is_empty());
     assert_ne!(conpty.render(), Render::DesyncRisk);
 }
+
+#[test]
+fn a_dock_site_has_its_own_wire_golden() {
+    let at: &'static Location<'static> = Location::caller();
+    assert_eq!(
+        wire_site(Site::caller(Cause::Dock, at)),
+        format!("site=dock at={}:{}", at.file(), at.line()),
+    );
+}

@@ -432,6 +432,36 @@ pub fn this_code() -> Result<Code, String> {
     })
 }
 
+/// Read macOS's current Local Network authorization without requesting it.
+/// `None` means no matching answered rule; unreadable records remain errors.
+///
+/// # Errors
+/// The code identity or system authorization record could not be read.
+pub fn authorization_here() -> Result<Option<bool>, String> {
+    let code = this_code()?;
+    let bytes = read_bounded(Path::new(NEHELPER_PLIST))?;
+    authorization(&bytes, &code)
+}
+
+/// The matching answered OS rule, independent of network reachability.
+///
+/// # Errors
+/// The archive or account's rules could not be read.
+pub fn authorization(bytes: &[u8], code: &Code) -> Result<Option<bool>, String> {
+    let archive = Archive::open(bytes)?;
+    if archive.controllers(&code.user).is_empty() {
+        return Ok(None);
+    }
+    let rules = archive.rules(&code.user)?;
+    if rules.iter().any(|rule| rule.names(code) && rule.allows()) {
+        return Ok(Some(true));
+    }
+    Ok(rules
+        .iter()
+        .find(|rule| rule.names(code) && rule.answered)
+        .map(|_| false))
+}
+
 /// `path`'s bytes, at most [`crate::bplist::MAX_BYTES`] and one more (which [`allowed`] refuses).
 ///
 /// # Errors

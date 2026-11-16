@@ -475,7 +475,7 @@ pub(super) fn ref_update_atomic(
         .check_atomic(permit, batch)?;
     let journal = readable_journal(w)?;
     if let Some(view) = journal.latest(WriteOp::RefUpdateAtomic, ATOMIC_KEY)?
-        && view.open
+        && journal.stops(&view)?
     {
         let id = view.intent.id;
         return Err(Error::new(

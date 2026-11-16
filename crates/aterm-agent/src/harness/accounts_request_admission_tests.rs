@@ -113,6 +113,7 @@ impl Fixture {
             shared: shared_renewal::Effects::default(),
             hosts: 0,
             tokens_here: |_, _, _, _| None,
+            live: None,
         };
         spawn_row_renewal(
             Cli::Claude,
@@ -464,6 +465,68 @@ fn queued_selection(superseded: bool) {
     assert_eq!(fixture.store.load(NOW).unwrap().0.pending_pin, latest);
     assert!(!guard.lock().unwrap().in_flight);
     assert!(fixture.store.signin_now().unwrap().is_some());
+}
+
+/// A SIGN-IN A PERSON STARTED IS NEVER WAIVED FOR A SLEEP (plan package FL-174). The run of a
+/// saved choice ends with no login after the Mac slept across it for 700 s: it is counted as
+/// it ended and its request is retired, exactly as the same run with no sleep is (CONTROL), so
+/// no later pass finds a pending choice to run again. Only the ladder's own run is waived for
+/// a sleep, under its count (`Ladder::run_ended`); a pending choice is resumed by every pass
+/// with no cooldown, so one waived would load a sign-in page at every wake of a Mac asleep
+/// with its lid shut.
+#[cfg(unix)]
+#[test]
+fn a_person_started_sign_in_a_sleep_spans_is_counted_and_its_request_retired() {
+    for sleeps in [true, false] {
+        let fixture = Fixture::new(Cli::Claude);
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        type Work = Box<dyn FnOnce() + Send>;
+        let queued: Arc<Mutex<Vec<Work>>> = Arc::default();
+        let into = Arc::clone(&queued);
+        let spawn = move |work| {
+            into.lock().unwrap().push(work);
+            Ok(())
+        };
+        let seam = crate::harness::wake_deadline::SleepSeam::hold();
+        let sleeper = seam.sleeper();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = Arc::clone(&calls);
+        assert_eq!(
+            fixture.queue_claude(
+                &guard,
+                &spawn,
+                Arc::new(move |_, _| {
+                    called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // The lid shuts over the run.
+                    if sleeps {
+                        sleeper.slept(std::time::Duration::from_secs(700));
+                    }
+                    super::super::cli::Renewal::AuthFailed
+                }),
+            ),
+            RenewalDispatch::Started,
+            "sleeps={sleeps}"
+        );
+        assert_eq!(
+            fixture.store.load(NOW).unwrap().0.pending_pin,
+            Some(fixture.request.clone().into()),
+            "sleeps={sleeps}: the choice is pending while its run is queued"
+        );
+        let work = queued.lock().unwrap().pop().unwrap();
+        work();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "sleeps={sleeps}"
+        );
+        assert_eq!(
+            fixture.store.load(NOW).unwrap().0.pending_pin,
+            None,
+            "sleeps={sleeps}: the request is retired, so no pass runs it again"
+        );
+        assert!(!guard.lock().unwrap().in_flight, "sleeps={sleeps}");
+        assert!(queued.lock().unwrap().is_empty(), "sleeps={sleeps}");
+    }
 }
 
 // Its Claude sign-in runs from a headless profile, which needs the opener only Unix links

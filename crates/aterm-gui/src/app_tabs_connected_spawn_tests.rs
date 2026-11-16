@@ -38,7 +38,10 @@ fn precheck_refuses_headless_window_and_dead_origins_but_allows_tabs() {
         "place=tab is headless-legal and lands beside the origin"
     );
     assert_eq!(
-        app.connected_spawn_precheck(ConnectedSpawnPlace::Tab, &SessionId::new("s-nope")),
+        app.connected_spawn_precheck(
+            ConnectedSpawnPlace::Tab,
+            &SessionId::parse("tqn5r6e0148").expect("a tab id")
+        ),
         Err("no such session".to_string())
     );
     app.store

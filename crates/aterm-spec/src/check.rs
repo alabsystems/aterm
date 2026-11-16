@@ -354,7 +354,7 @@ pub(crate) fn each_after<T: Sync, R: Send>(
 mod worker_executor_tests;
 
 /// aterm-spec-models, beside the running package under `crates/`: spec-check runs through
-/// `targo run -p aterm-models` (verify's spec row and every bundle's README), which names that
+/// `targo run -p aterm-spec-closure` (verify's spec row and every bundle's README), which names that
 /// package's directory when it starts the binary ([`aterm_tempfile::manifest_dir`]).
 fn spec_models() -> PathBuf {
     aterm_tempfile::manifest_dir().join("../aterm-spec-models")

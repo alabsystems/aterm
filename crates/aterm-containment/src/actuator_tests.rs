@@ -1635,6 +1635,87 @@ fn shell_compat_tool_set_runs_under_containment() {
     }
 }
 
+/// Proof 11b (job-server socket): under the full Containment profile two contained processes
+/// exchange a line over a socket at a job server's path in `$TMPDIR` (`tjs-<16 hex>/s`), and
+/// no other socket binds there: not another name in that folder, not `s` in a folder two
+/// digits longer, not a name beside the folder. The refused binds differ from the admitted one
+/// in the name alone, so the admitted one is their control.
+#[cfg(target_os = "macos")]
+#[test]
+fn enforcement_proof_only_a_job_server_socket_is_admitted() {
+    let Some(temp) = crate::sbpl::admitted_user_temp(&std::env::temp_dir()) else {
+        aterm_spec::host::could_not_run("$TMPDIR is not a per-user /private/var/folders/…/T here");
+    };
+    let profile = containment_profile();
+    // Sixteen digits no other run of this proof shares: this process and the clock.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()));
+    let folder = temp.join(format!(
+        "tjs-{:016x}",
+        (u64::from(std::process::id()) << 32) | nanos
+    ));
+    let longer = temp.join(format!(
+        "{}ff",
+        folder.file_name().unwrap().to_string_lossy()
+    ));
+    let beside = temp.join(format!("job-server-proof-{}", std::process::id()));
+    // A listener that could not bind has ended, so each wait is for the socket or that end.
+    let script = r#"d=$1; longer=$2; beside=$3
+mkdir -m 700 "$d" "$longer" || exit 3
+/usr/bin/nc -lU "$d/s" > "$d/got" 2> "$d/err" &
+while [ ! -S "$d/s" ] && kill -0 $! 2>/dev/null; do sleep 0.05; done
+echo ping | /usr/bin/nc -U "$d/s"; echo "client=$?"
+wait $!; echo "listener=$? got=$(cat "$d/got") $(cat "$d/err")"
+for bad in "$d/t" "$longer/s" "$beside"; do
+  /usr/bin/nc -lU "$bad" < /dev/null > /dev/null 2> "$d/err" &
+  while [ ! -S "$bad" ] && kill -0 $! 2>/dev/null; do sleep 0.05; done
+  if [ -S "$bad" ]; then echo "BOUND $bad"; kill $!; else echo "refused: $(cat "$d/err")"; fi
+  wait $! 2>/dev/null
+  rm -f "$bad"
+done
+rm -rf "$d" "$longer""#;
+    let mut cmd = sandbox_wrap(
+        &profile,
+        "/bin/sh",
+        &[
+            "-c",
+            script,
+            "sh",
+            folder.to_str().expect("a UTF-8 $TMPDIR"),
+            longer.to_str().expect("a UTF-8 $TMPDIR"),
+            beside.to_str().expect("a UTF-8 $TMPDIR"),
+        ],
+    );
+    let out = aterm_uds::deadline::output_until(&mut cmd, std::time::Instant::now() + TOOL_HANG)
+        .expect("the contained socket exchange ends");
+    for left in [&folder, &longer] {
+        let _ = std::fs::remove_dir_all(left);
+    }
+    let _ = std::fs::remove_file(&beside);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("client=0"),
+        "SHELL BROKEN: a contained process could not connect to a job-server socket: \
+         {stdout:?} {stderr:?}"
+    );
+    assert_eq!(
+        lines.get(1).map(|line| line.trim_end()),
+        Some("listener=0 got=ping"),
+        "SHELL BROKEN: a contained job-server socket did not bind, accept and read: \
+         {stdout:?} {stderr:?}"
+    );
+    assert_eq!(
+        &lines[2..],
+        ["refused: nc: Operation not permitted"; 3],
+        "DENY FAILED: a socket that is no job server's must not bind under Containment: \
+         {stdout:?} {stderr:?}"
+    );
+}
+
 /// Proof 12 (`open` and `osascript`): `open -W` of a background-only scratch
 /// app whose executable writes a marker outside the writable roots fails and
 /// writes nothing, and `osascript` sending Finder an Apple Event in raw four-char

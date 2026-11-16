@@ -37,9 +37,6 @@ pub(crate) struct TabStripMetadata {
     /// Who drives: the tab's team marks, `↳` before a worker's title and `⇉N` after a manager's
     /// ([`team_title`]).
     pub(crate) team: TabTeam,
-    /// The tab's load meter: its focused session's cores-worth on the machine's capacity in 255ths
-    /// ([`chip_load_step`]).
-    pub(crate) load: u8,
 }
 
 /// A tab's team marks indicating worker status and managed worker count.
@@ -113,7 +110,6 @@ impl TabStripMetadata {
             conn: presentation.conn,
             closable: presentation.closable,
             team: TabTeam::NONE,
-            load: 0,
         }
     }
 
@@ -167,37 +163,6 @@ impl TabStripMetadata {
             TabStatusKind::Connection => self.conn.is_some(),
         }
     }
-}
-
-/// Horizontal inset of a chip's load meter from each end of the pill, in points.
-pub(crate) const CHIP_LOAD_INSET_PT: f32 = 10.0;
-/// Distance above the pill's bottom for the load meter, in points.
-pub(crate) const CHIP_LOAD_LIFT_PT: f32 = 2.5;
-/// The meter's thickness, in points.
-pub(crate) const CHIP_LOAD_H_PT: f32 = 1.5;
-
-/// Compute a tab's load step from its cores-worth and the machine's capacity in cores.
-#[must_use]
-pub(crate) fn chip_load_step(cores: f32, capacity: f32) -> u8 {
-    if !(cores >= 0.1 && capacity > 0.0) {
-        return 0;
-    }
-    let share = (cores / capacity).clamp(0.0, 1.0);
-    (share * 255.0).round().clamp(1.0, 255.0) as u8
-}
-
-/// The load meter's length in points on a pill `pill_w_pt` wide.
-#[must_use]
-pub(crate) fn chip_load_len_pt(pill_w_pt: f32, load: u8) -> Option<f32> {
-    let track = pill_w_pt - 2.0 * CHIP_LOAD_INSET_PT;
-    if load == 0 || track.is_nan() || track < 4.0 {
-        return None;
-    }
-    Some(
-        (track * f32::from(load) / 255.0)
-            .round()
-            .clamp(1.0, track.floor()),
-    )
 }
 
 /// Horizontal centre for one status mark in a 16-unit design box.
@@ -835,7 +800,6 @@ const PLAIN_TAB: TabStripMetadata = TabStripMetadata {
     conn: None,
     team: TabTeam::NONE,
     closable: true,
-    load: 0,
 };
 
 /// Title/icon/status slots for one laid-out tab segment.
@@ -4055,35 +4019,6 @@ pub(crate) mod pixel_band {
                             }
                         }
                         drawn_tabs.push((seg.start_col, end, is_active || is_hovered, true));
-                    }
-                    if let Some(item) = item {
-                        let x0 = f32::from(seg.start_col).mul_add(cw, design.gap_h);
-                        let x1 = f32::from(end).mul_add(cw, -design.gap_h);
-                        if let Some(len) = chip_load_len_pt((x1 - x0) / scale, item.load) {
-                            let ground = if is_active {
-                                colors.active_bg
-                            } else {
-                                colors.band_bg
-                            };
-                            let inks =
-                                crate::stats_deck::cached_inks(ground, colors.fg, colors.accent);
-                            let fill = if is_active {
-                                rgba(inks.tab, 255)
-                            } else {
-                                rgba(inks.aterm, 178)
-                            };
-                            let h = (CHIP_LOAD_H_PT * scale).max(1.0);
-                            prims.push(DrawPrim::Panel {
-                                x: CHIP_LOAD_INSET_PT.mul_add(scale, x0).round(),
-                                y: (CHIP_LOAD_LIFT_PT + CHIP_LOAD_H_PT)
-                                    .mul_add(-scale, design.card_bot)
-                                    .round(),
-                                w: (len * scale).round().max(1.0),
-                                h,
-                                radius: h * 0.5,
-                                fill,
-                            });
-                        }
                     }
                     let (ink, face) = {
                         let ink = if is_active {

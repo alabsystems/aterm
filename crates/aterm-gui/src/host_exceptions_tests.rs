@@ -87,7 +87,6 @@ fn roster() -> Vec<Entry> {
             ));
         }
     }
-    all.push(mr::disk_low_entry(7, 20, &[], None));
     for feature in mr::REMOVED_FEATURES {
         all.push(mr::removed_setting_entry(feature, Some(12), &[]));
         all.push(mr::removed_setting_entry(feature, None, &[]));
@@ -112,7 +111,6 @@ fn roster() -> Vec<Entry> {
         crate::session_log_journal::Cause::Unsupported,
         crate::session_log_journal::Cause::Panic,
     ] {
-        all.push(mr::session_journal_paused_entry(cause.word()));
         all.push(mr::session_journal_stopped_entry(cause.word()));
     }
     let foreign = |n: usize| {
@@ -132,11 +130,6 @@ fn roster() -> Vec<Entry> {
             ));
         }
     }
-    all.push(mr::disk_low_cleanup_off_entry(2, 10));
-    all.push(mr::disk_low_cleanup_off_entry(
-        u64::MAX >> 30,
-        u64::MAX >> 30,
-    ));
     let note = format!(
         "/Users//someone/{}/aterm.toml: cannot be read (Permission denied (os error 13)), so \
          every removal is off (disk.apply false, auto_free_gib 0, dead_build_dirs false) until \
@@ -342,19 +335,6 @@ fn every_host_entry_passes_the_door_and_the_caps() {
             mr::worker_failed_record("s-1", "in tab 1", "x")
                 .key
                 .unwrap_or_default(),
-            mr::disk_worker_over_record(
-                "s-1",
-                "in tab 1",
-                &mr::DiskWorkerEnd {
-                    why: "finished",
-                    rose: 1,
-                    target_met: None,
-                    removed: 1,
-                    report: &[],
-                },
-            )
-            .key
-            .unwrap_or_default(),
             mr::disk_low_record(1, 2, &[]).key.unwrap_or_default(),
             mr::disk_low_cleanup_off_record(1, 2)
                 .key
@@ -863,50 +843,36 @@ fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
     assert!(app.messages.digest().is_empty(), "gone with the card");
 }
 
-/// Two 6 h passes that freed nothing are one `disk.low` line; the record names the figures and
-/// where the space is, and space coming back ends it.
+/// A volume aterm could not help is a record, not a line: two looks of an episode write one
+/// `system.disk.low` record, which names the figures and where the space is, and raise nothing
+/// in the digest; space coming back ends the episode, and the next one is recorded again.
 #[test]
-fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
+fn a_volume_aterm_could_not_help_is_one_record_and_no_line() {
     let mut app = App::headless_for_test();
     let hogs = vec![
         "$HOME/trust/build 94.0 GiB (x.py bootstrap; run scripts/slim_build.py)".to_owned(),
         "$HOME/trust/crates/target.noindex 49.0 GiB (cargo build output: deps/ and build/ are `targo clean`'s)".to_owned(),
         "~/x/target 1.0 GiB (cargo build output: deps/ and build/ are `targo clean`'s)".to_owned(),
     ];
-    app.note_harness_host(HostNote::DiskLow {
-        free_gib: 7,
+    let low = |free_gib| HostNote::DiskLow {
+        free_gib,
         floor_gib: 20,
         hogs: hogs.clone(),
-        asked: None,
-    });
-    app.note_harness_host(HostNote::DiskLow {
-        free_gib: 6,
-        floor_gib: 20,
-        hogs: hogs.clone(),
-        asked: None,
-    });
-    let keys: Vec<String> = app
-        .messages
-        .digest()
-        .entries
-        .iter()
-        .map(|e| e.key.clone())
-        .collect();
-    assert_eq!(keys, ["disk.low"]);
-    assert_eq!(
+    };
+    let records = |app: &App| {
         app.messages
             .log()
             .records()
             .filter(|r| !r.later && r.key.as_deref() == Some("system.disk.low"))
-            .count(),
-        1,
-        "one record per episode"
-    );
-    let detail = app.messages.digest().entries[0].detail.clone();
+            .count()
+    };
+    app.note_harness_host(low(7));
+    app.note_harness_host(low(6));
     assert!(
-        detail.iter().any(|l| l.contains(&hogs[0])) && detail.iter().any(|l| l.contains(&hogs[1])),
-        "{detail:?}"
+        app.messages.digest().is_empty(),
+        "no line asks anyone to act"
     );
+    assert_eq!(records(&app), 1, "one record per episode");
     let record = app
         .messages
         .log()
@@ -920,56 +886,73 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
         "{record:?}"
     );
     app.note_harness_host(HostNote::DiskPlenty);
-    assert!(app.messages.digest().is_empty());
     app.note_harness_host(HostNote::DiskPlenty);
+    app.note_harness_host(low(5));
+    assert_eq!(records(&app), 2, "a new episode is recorded again");
+    assert!(app.messages.digest().is_empty());
 }
 
-/// What a pass freed is one `disk.freed` digest line; a volume the look left at its emergency is
-/// the one standing alert (`system.disk.full`), restated in place and ended out of its emergency.
+/// What a pass freed is one `system.disk.freed` record, no line, and it ends a freed-space line
+/// an earlier build raised; a volume the look left at its emergency is one `system.disk.full`
+/// record an episode, never a message on the glass, and an episode after space came back is
+/// recorded again. NEGATIVE CONTROL: the earlier build's line stands until that news.
 #[test]
-fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
+fn a_full_disk_is_one_record_an_episode_and_no_alert() {
     let mut app = App::headless_for_test();
+    let earlier = Entry::new(
+        Family::Disk,
+        "",
+        "freed",
+        "aterm freed disk space",
+        aterm_messages::need::Why::Spent {
+            tried: aterm_messages::need::Reason::new("freed 1 GiB of rebuildable build caches"),
+            reason: aterm_messages::need::Reason::new("the home volume ran short"),
+        },
+        aterm_messages::need::Then::step("Read aterm harness disk for what went"),
+    );
+    app.except(&earlier);
+    assert_eq!(
+        app.messages.digest().len(),
+        1,
+        "PREMISE: the earlier line stands"
+    );
     app.note_harness_host(HostNote::DiskFreed {
         bytes: 31 << 30,
         went: vec!["31.0 GiB ~/Library/Caches/aterm/cargo-build.noindex/x/.cargo-build".into()],
     });
-    let keys: Vec<String> = app
-        .messages
-        .digest()
-        .entries
-        .iter()
-        .map(|e| e.key.clone())
-        .collect();
-    assert_eq!(keys, ["disk.freed"]);
-    assert!(
+    assert!(app.messages.digest().is_empty(), "a record, no line");
+    assert_eq!(
         app.messages
-            .live_by_key(crate::message_reporters::DISK_FULL_KEY)
-            .is_none(),
-        "a fact is not on the glass"
+            .log()
+            .records()
+            .filter(|r| !r.later && r.key.as_deref() == Some("system.disk.freed"))
+            .count(),
+        1
     );
     let full = || HostNote::DiskFull {
         free: Some(1 << 20),
         freed: 31 << 30,
         hogs: vec!["$HOME/trust/build 94.0 GiB (x.py bootstrap)".into()],
         cause: crate::message_reporters::DiskFullCause::Spent,
-        thresholds: aterm_agent::harness::disk::Config::default().thresholds(None),
-        asked: None,
+    };
+    let records = |app: &App| {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| !r.later && r.key.as_deref() == Some(mr::DISK_FULL_KEY))
+            .count()
     };
     app.note_harness_host(full());
     app.note_harness_host(full());
     assert!(
-        app.messages
-            .live_by_key(crate::message_reporters::DISK_FULL_KEY)
-            .is_some(),
-        "the alert stands"
+        app.messages.live_by_key(mr::DISK_FULL_KEY).is_none(),
+        "nothing on the glass"
     );
+    assert_eq!(records(&app), 1, "one record an episode");
     app.note_harness_host(HostNote::DiskFullOver);
-    assert!(
-        app.messages
-            .live_by_key(crate::message_reporters::DISK_FULL_KEY)
-            .is_none(),
-        "space back ends it"
-    );
+    app.note_harness_host(full());
+    assert_eq!(records(&app), 2, "the next episode is recorded again");
+    assert!(app.messages.digest().is_empty(), "no line");
 }
 
 /// The Developer Tools list is never a line of its own: a `not_granted` reading posts nothing and
@@ -988,7 +971,9 @@ fn a_developer_tools_reading_posts_nothing() {
 }
 
 /// An unreadable `[disk]` setting that turned cleanup off is one `disk.settings` line until a
-/// look reads the settings; a short volume meanwhile is its own `disk.low-cleanup-off` line.
+/// look reads the settings; a short volume meanwhile is a record, not a second line for the
+/// same fault, and a `disk.low-cleanup-off` line an earlier build raised ends with the settings
+/// read.
 #[test]
 fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     let mut app = App::headless_for_test();
@@ -1015,7 +1000,6 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     let short = HostNote::DiskLowCleanupOff {
         free_gib: 2,
         floor_gib: 10,
-        asked: None,
     };
     for _ in 0..2 {
         app.note_harness_host(HostNote::DiskSettingsOff {
@@ -1023,10 +1007,7 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
         });
         app.note_harness_host(short.clone());
     }
-    assert_eq!(
-        keys(&app),
-        [mr::DISK_LOW_CLEANUP_OFF_KEY, mr::DISK_SETTINGS_KEY]
-    );
+    assert_eq!(keys(&app), [mr::DISK_SETTINGS_KEY]);
     assert_eq!(records(&app), 1, "one record per episode");
     let settings = app
         .messages
@@ -1062,24 +1043,32 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
         free_gib: 2,
         floor_gib: 10,
         hogs: Vec::new(),
-        asked: None,
     });
     app.note_harness_host(HostNote::DiskSettingsRead);
-    assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
-    app.note_harness_host(HostNote::DiskPlenty);
-    assert!(app.messages.digest().is_empty());
+    assert!(app.messages.digest().is_empty(), "a low volume is a record");
 
     let mut app = App::headless_for_test();
-    app.except(&mr::disk_low_cleanup_off_entry(2, 10));
+    app.except(&Entry::new(
+        Family::Disk,
+        "",
+        "low-cleanup-off",
+        "Disk space is low",
+        aterm_messages::need::Why::YourAction(aterm_messages::need::Reason::new(
+            "an earlier build asked",
+        )),
+        aterm_messages::need::Then::step("Fix aterm.toml"),
+    ));
+    assert_eq!(keys(&app), [mr::DISK_LOW_CLEANUP_OFF_KEY], "PREMISE");
     assert!(app.host_noted.is_empty());
     app.note_harness_host(HostNote::DiskSettingsRead);
     assert!(app.messages.digest().is_empty(), "{:?}", keys(&app));
 }
 
-/// A short volume is one low-disk line in the form last told (cleanup-off or the passes'), each
-/// form recorded once; a change of form keeps what the owner filed until space is back.
+/// A short volume is one record per form a look told (the passes' or cleanup-off's) and no line:
+/// the cleanup-off form's fault is the settings line's to say. A low-disk line a build before
+/// this one raised ends at the passes' news or at space coming back.
 #[test]
-fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
+fn a_short_volume_is_a_record_and_no_line() {
     let mut app = App::headless_for_test();
     let keys = |app: &App| -> Vec<String> {
         app.messages
@@ -1093,20 +1082,18 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
         free_gib: 3,
         floor_gib: 10,
         hogs: Vec::new(),
-        asked: None,
     };
     let off = HostNote::DiskLowCleanupOff {
         free_gib: 2,
         floor_gib: 10,
-        asked: None,
     };
     app.note_harness_host(passes.clone());
-    assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
+    assert!(keys(&app).is_empty());
     app.note_harness_host(off.clone());
-    assert_eq!(keys(&app), [mr::DISK_LOW_CLEANUP_OFF_KEY]);
+    assert!(keys(&app).is_empty(), "{:?}", keys(&app));
     app.note_harness_host(off.clone());
     app.note_harness_host(passes.clone());
-    assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
+    assert!(keys(&app).is_empty(), "{:?}", keys(&app));
     assert_eq!(
         app.messages
             .log()
@@ -1117,22 +1104,31 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
         "each form once"
     );
 
+    // An earlier build's line, carried over by the log: the passes' news ends it.
+    let earlier = || {
+        Entry::new(
+            Family::Disk,
+            "",
+            "low",
+            "Disk space is low",
+            aterm_messages::need::Why::OnlyYou(aterm_messages::need::Reason::new(
+                "an earlier build asked",
+            )),
+            aterm_messages::need::Then::step("Free up space on the home volume"),
+        )
+    };
     let mut app = App::headless_for_test();
-    app.note_harness_host(passes.clone());
-    assert_eq!(app.dismiss_exceptions(), 1);
-    app.note_harness_host(off);
-    assert_eq!(keys(&app), [mr::DISK_LOW_CLEANUP_OFF_KEY]);
-    app.note_harness_host(HostNote::DiskSettingsRead);
-    assert!(app.messages.digest().is_empty(), "{:?}", keys(&app));
-    app.note_harness_host(passes.clone());
-    assert!(
-        app.messages.digest().is_empty(),
-        "{:?}: the owner's filing holds",
-        keys(&app)
-    );
-    app.note_harness_host(HostNote::DiskPlenty);
+    app.except(&earlier());
+    assert_eq!(keys(&app), [mr::RETIRED_DISK_LOW_KEY]);
     app.note_harness_host(passes);
-    assert_eq!(keys(&app), [mr::DISK_LOW_KEY]);
+    assert!(keys(&app).is_empty(), "{:?}", keys(&app));
+    // NEGATIVE CONTROL: without the news the earlier line stands.
+    let mut app = App::headless_for_test();
+    app.except(&earlier());
+    app.note_harness_host(HostNote::DiskSettingsRead);
+    assert_eq!(keys(&app), [mr::RETIRED_DISK_LOW_KEY]);
+    app.note_harness_host(HostNote::DiskPlenty);
+    assert!(keys(&app).is_empty(), "{:?}", keys(&app));
 }
 
 /// An upgrade that cannot run is one `harness.upgrade-host.cannot-run` line, ended when the last
@@ -2174,7 +2170,7 @@ fn front_tab_sid(app: &mut App) -> String {
         .focused_session_id(crate::WindowId(0))
         .expect("the front session");
     let mut handle = crate::session_store::test_handle(local);
-    handle.sid = aterm_session::SessionId::new(REAL_SID);
+    handle.sid = aterm_session::SessionId::parse(REAL_SID).expect("a legacy tab id");
     app.store
         .write()
         .unwrap_or_else(|p| p.into_inner())
@@ -3615,7 +3611,16 @@ fn the_ends_of_the_event_families_end_lines_an_earlier_process_raised() {
     let mut app = App::headless_for_test();
     let spot = &places()[0];
     let (session, sid) = session_with_open_epoch(&mut app, 43);
-    app.except(&mr::disk_low_entry(7, 20, &[], None));
+    app.except(&Entry::new(
+        Family::Disk,
+        "",
+        "low",
+        "Disk space is low",
+        aterm_messages::need::Why::OnlyYou(aterm_messages::need::Reason::new(
+            "an earlier build asked",
+        )),
+        aterm_messages::need::Then::step("Free up space on the home volume"),
+    ));
     app.except(&mr::disk_settings_entry(&[
         "disk.apply is not read".to_string()
     ]));
@@ -4850,7 +4855,8 @@ fn a_land_hold_is_only_a_diagnostic() {
 fn a_dismissed_service_alert_holds_for_its_process_across_a_relaunch() {
     use crate::messages_host::wall_stamp_now;
     use aterm_messages::{LogLine, MessageLog};
-    use aterm_vitals::services::{FSEVENTSD, Seen, Service, Size, Told};
+    use aterm_process_facts::services::Service;
+    use aterm_vitals::services::{FSEVENTSD, Seen, Size, Told};
     let seen = |pid: u32, held: bool| Seen {
         service: Service {
             coalition: 7,
@@ -4954,7 +4960,8 @@ fn a_dismissed_service_alert_holds_for_its_process_across_a_relaunch() {
 }
 
 fn fseventsd_seen(held: bool, footprint: u64) -> aterm_vitals::services::Seen {
-    use aterm_vitals::services::{FSEVENTSD, Seen, Service};
+    use aterm_process_facts::services::Service;
+    use aterm_vitals::services::{FSEVENTSD, Seen};
     Seen {
         service: Service {
             coalition: 7,
@@ -5262,13 +5269,13 @@ fn a_failed_worker_of_a_manager_that_closed_is_a_later_fact_and_an_unknown_one_i
 }
 
 /// A MANAGER'S OR A SCRIPT'S OFF IS NO PERSON'S OWN ACT: it is told, in words that do not say a
-/// person did it, where a person's stays a record alone. A worker with its own report of its end has
-/// only that: no generic record and no fact, whichever word ended it.
+/// person did it, where a person's stays a record alone. A disk worker an earlier build left
+/// gets no generic record and no fact when its record fails (it ends in aterm's own name,
+/// `task_record::reports_its_own_end`). NEGATIVE CONTROL (in the test): a worker trusted to any
+/// other folder that fails the same way gets the generic record.
 #[test]
 fn an_off_by_a_manager_is_told_and_a_worker_with_its_own_report_has_only_that() {
-    use crate::task_record::{
-        TaskMark, TaskRecord, TaskState, WHY_OFF, WHY_OFF_CTL, mark_session_task, seed_carried,
-    };
+    use crate::task_record::{TaskMark, TaskState, WHY_OFF, WHY_OFF_CTL, mark_session_task};
     let failed = |why| TaskMark {
         why: Some(why),
         ..TaskMark::new(TaskState::Failed)
@@ -5304,36 +5311,40 @@ fn an_off_by_a_manager_is_told_and_a_worker_with_its_own_report_has_only_that() 
     assert!(app.messages.digest().is_empty(), "their own act");
     assert!(records(&app, &sid)[0].contains("a person"));
 
-    let mut app = App::headless_for_test();
-    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
-    let ctx = app.pool.get(local).expect("its session").ctx.clone();
-    let sid = ctx.self_id.as_str().to_string();
-    let mut working: TaskRecord = TaskMark::new(TaskState::Working)
-        .apply(None, &Default::default(), std::time::Instant::now(), 1_000)
-        .0;
-    working.trusted_cwd = Some(format!(
-        "/state/aterm/{}/{}",
-        aterm_agent::harness::cli::HARNESS,
-        aterm_agent::harness::disk::fence::WORKER_FOLDER
-    ));
-    seed_carried(&ctx, Some(&working.carry_row(std::time::Instant::now())));
-    assert!(
+    // A live worker trusted to `folder` whose record fails: the records its end is told in.
+    let failed_in = |folder: String| {
+        let mut app = App::headless_for_test();
+        let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+        let ctx = app.pool.get(local).expect("its session").ctx.clone();
+        let sid = ctx.self_id.as_str().to_string();
+        mark_session_task(&ctx, local, &TaskMark::new(TaskState::Working)).expect("unfenced");
         ctx.timeline
             .lock()
             .unwrap()
-            .task()
-            .is_some_and(|r| r.trusted_cwd.is_some()),
-        "PRECONDITION: its folder"
+            .set_task_worker(aterm_phase::Program::Claude, Some(folder));
+        mark_session_task(
+            &ctx,
+            local,
+            &failed(crate::task_record::WHY_COULD_NOT_FINISH),
+        )
+        .expect("unfenced");
+        app.note_worker_conclusion(local);
+        (records(&app, &sid).len(), app.messages.digest().is_empty())
+    };
+    let disk = format!(
+        "/state/aterm/{}/disk-worker",
+        aterm_agent::harness::cli::HARNESS
     );
-    mark_session_task(
-        &ctx,
-        local,
-        &failed(crate::task_record::WHY_COULD_NOT_FINISH),
-    )
-    .expect("unfenced");
-    app.note_worker_conclusion(local);
-    assert!(records(&app, &sid).is_empty(), "its own record says so");
-    assert!(app.messages.digest().is_empty(), "no look-at item");
+    assert_eq!(
+        failed_in(disk),
+        (0, true),
+        "no generic record, no look-at item"
+    );
+    assert_eq!(
+        failed_in("/Users//me/project".to_owned()).0,
+        1,
+        "CONTROL: another worker's failure is told"
+    );
 }
 
 /// A CREDIT CLAIM WORKER'S END IS ITS OWN RECORD, ONCE, EITHER WAY: a failure says how, and its
@@ -5441,153 +5452,6 @@ fn a_claim_workers_end_is_its_own_record_once_either_way() {
         said[0].0.contains("finished") && said[0].1.contains("CLAIMED the $50 credit"),
         "the record keeps the claim's outcome past its tab: {said:?}"
     );
-}
-
-/// A STALLED DISK WORKER RUNS OUT OF ITS TIME TOO: the lease runs it through the stall (a stall is
-/// no end), and its expiry ends its record `failed why=expired` and takes down the deadline's ask it
-/// raised, which nobody owes an answer now. CONTROL: an expiry that finds the worker already
-/// concluded leaves its record as it stands.
-#[test]
-fn a_stalled_disk_worker_that_runs_out_of_its_time_ends_failed_expired() {
-    use crate::task_record::{AttentionEdit, TaskMark, TaskState, mark_session_task_with};
-    let mut app = App::headless_for_test();
-    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
-    let ctx = app.pool.get(local).expect("its session").ctx.clone();
-    let sid = ctx.self_id.as_str().to_string();
-    let ask = format!("{}a box", aterm_agent::supervise::HELD_HEAD);
-    let stalled = TaskMark {
-        why: Some("held"),
-        ..TaskMark::new(TaskState::Stalled)
-    };
-    mark_session_task_with(
-        &ctx,
-        local,
-        Some(&stalled),
-        AttentionEdit::Raise(&ask),
-        Duration::ZERO,
-        |_, _| true,
-    )
-    .expect("unfenced");
-    let attention = || {
-        ctx.meta
-            .lock()
-            .unwrap()
-            .attention_owners
-            .get(crate::harness_host::ATTENTION_OWNER)
-            .map(str::to_owned)
-    };
-    assert_eq!(attention().as_deref(), Some(ask.as_str()), "PRECONDITION");
-    let record = || {
-        ctx.timeline
-            .lock()
-            .unwrap()
-            .task()
-            .cloned()
-            .expect("its record")
-    };
-    app.note_harness_host(HostNote::DiskWorkerExpired { sid: sid.clone() });
-    let after = record();
-    assert_eq!(
-        (after.state, after.why),
-        (TaskState::Failed, Some(crate::task_record::WHY_EXPIRED))
-    );
-    assert_eq!(attention(), None, "the deadline's ask went with it");
-
-    let mut app = App::headless_for_test();
-    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
-    let ctx = app.pool.get(local).expect("its session").ctx.clone();
-    let sid = ctx.self_id.as_str().to_string();
-    let done = TaskMark {
-        why: Some(crate::task_record::WHY_LANDED),
-        ..TaskMark::new(TaskState::Done)
-    };
-    crate::task_record::mark_session_task(&ctx, local, &done).expect("unfenced");
-    app.note_harness_host(HostNote::DiskWorkerExpired { sid });
-    let after = ctx
-        .timeline
-        .lock()
-        .unwrap()
-        .task()
-        .cloned()
-        .expect("its record");
-    assert_eq!(after.state, TaskState::Done, "a landing stands");
-}
-
-/// A DISK WORKER WITH NO SID (ONE THAT NEVER STARTED) STILL GETS ITS RECORD, keyed by its volume and
-/// placed nowhere.
-#[test]
-fn a_disk_worker_that_never_started_gets_its_record_by_its_volume() {
-    use crate::harness_host::HostNote;
-    let mut app = App::headless_for_test();
-    app.note_harness_host(HostNote::DiskWorkerOver {
-        sid: None,
-        volume: "dev:7".to_string(),
-        why: "spawn:no-folder".to_string(),
-        rose: 0,
-        target_met: None,
-        removed: 0,
-        report: Vec::new(),
-    });
-    let record = app
-        .messages
-        .log()
-        .records()
-        .find(|r| r.key.as_deref() == Some("harness.host.disk-worker.dev:7"))
-        .expect("the record");
-    assert!(record.title.contains("did not finish"), "{}", record.title);
-    assert!(app.messages.digest().is_empty());
-}
-
-/// A DISK WORKER'S END IS READ IN MESSAGES EITHER WAY: how it ended, what it removed itself and the
-/// rise beside it, whose words say the rise is not what it removed, and the target.
-#[test]
-fn a_disk_workers_end_says_how_it_ended_and_both_figures() {
-    use crate::harness_host::HostNote;
-    let mut app = App::headless_for_test();
-    app.note_harness_host(HostNote::DiskWorkerOver {
-        sid: Some("w-1".to_string()),
-        volume: "dev:1".to_string(),
-        why: "failed:could-not-finish".to_string(),
-        rose: 3 << 30,
-        target_met: Some(false),
-        removed: 2 << 30,
-        report: vec!["disk-free owner-only: the VM images".to_string()],
-    });
-    let record = app
-        .messages
-        .log()
-        .records()
-        .find(|r| r.key.as_deref() == Some("harness.host.disk-worker.w-1"))
-        .expect("the record");
-    assert!(record.title.contains("did not finish"), "{}", record.title);
-    let body = record.detail.join("\n");
-    for said in [
-        "It said it could not finish",
-        "It removed 2.0 GiB",
-        "free space rose 3.0 GiB",
-        "whoever freed it",
-        "did not reach its target",
-        "disk-free owner-only: the VM images",
-    ] {
-        assert!(body.contains(said), "{said}: {body}");
-    }
-    assert!(app.messages.digest().is_empty(), "no later fact, no alert");
-    app.note_harness_host(HostNote::DiskWorkerOver {
-        sid: Some("w-2".to_string()),
-        volume: "dev:1".to_string(),
-        why: "finished".to_string(),
-        rose: 1 << 30,
-        target_met: Some(true),
-        removed: 1 << 30,
-        report: Vec::new(),
-    });
-    let record = app
-        .messages
-        .log()
-        .records()
-        .find(|r| r.key.as_deref() == Some("harness.host.disk-worker.w-2"))
-        .expect("the record");
-    assert!(record.title.contains("finished"), "{}", record.title);
 }
 
 /// A FAILED WORKER'S FACT ENDS WHEN ITS TAB IS GONE: its row would show a tab no longer there.

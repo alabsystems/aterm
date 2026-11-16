@@ -29,54 +29,48 @@ const HANG: Duration = Duration::from_secs(60);
 const QUALIFY_IMAGE: &str = "--aterm-resource-fixture-qualified";
 const QUALIFIED_IMAGE: &[u8] = b"actual resource fixture image ran\n";
 
+/// Proves the image at `path`, a copy at a new path and so a first exec, by running it in
+/// qualification mode ([`qualification`]): it writes [`QUALIFIED_IMAGE`] and exits 0. The witness
+/// follows aterm-uds' first-exec contract ([`aterm_uds::deadline::prints`]): its window is
+/// [`FIRST_EXEC_HANG`](aterm_uds::deadline::FIRST_EXEC_HANG) without the child's progress, and a
+/// child macOS's program check still holds when it ends makes the test COULD NOT RUN, not red.
+/// Once the witness is read the child has nothing left but its exit, held to [`HANG`].
+///
+/// # Panics
+/// When the image does not start, writes something else, or does not exit 0.
 pub(crate) fn qualify_image(path: &Path) {
-    use aterm_uds::deadline::{ChildOutput, stream_until_stopped_observing_exit};
-    use std::cell::Cell;
+    use aterm_uds::deadline::{FIRST_EXEC_HANG, prints};
+    use aterm_uds::spawnfd::Stdio;
 
-    let mut command = spawnfd::command(path);
-    command.arg(QUALIFY_IMAGE).env_clear();
-    let pid = Cell::new(None);
-    let exited = Cell::new(None);
-    let mut stdout = Vec::with_capacity(QUALIFIED_IMAGE.len());
-    // Record process creation, witness bytes and natural exit on the owning waiter,
-    // including failures before complete output EOF.
-    let result = stream_until_stopped_observing_exit(
-        &mut command,
-        Some(Instant::now() + HANG),
-        |child| {
-            pid.set(Some(child));
-            eprintln!("qualification started: {} pid={child}", path.display());
-        },
-        |stream, bytes| match stream {
-            ChildOutput::Stdout => {
-                if bytes.len() > QUALIFIED_IMAGE.len() - stdout.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "qualification stdout exceeds its exact witness",
-                    ));
-                }
-                stdout.extend_from_slice(bytes);
-                Ok(())
-            }
-            ChildOutput::Stderr => io::stderr().write_all(bytes),
-        },
-        || false,
-        |status| exited.set(Some(status)),
-    );
-    let status = match result {
-        Ok(Some(status)) => status,
-        other => panic!(
-            "qualifying {}: {other:?}; pid={:?} natural_exit={:?} stdout={stdout:?}",
+    let mut child = spawnfd::command(path)
+        .arg(QUALIFY_IMAGE)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("qualifying {}: {e}", path.display()));
+    let witness = std::str::from_utf8(QUALIFIED_IMAGE)
+        .unwrap()
+        .trim_end_matches('\n');
+    prints(&mut child, witness, FIRST_EXEC_HANG);
+    let ran = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            ran.elapsed() < HANG,
+            "qualifying {}: pid={} wrote its witness and did not exit within {HANG:?}",
             path.display(),
-            pid.get(),
-            exited.get(),
-        ),
+            child.id(),
+        );
+        std::thread::sleep(Duration::from_millis(5));
     };
     assert!(
-        status.success() && stdout == QUALIFIED_IMAGE,
-        "qualifying {}: pid={:?} status={status:?} stdout={stdout:?}",
+        status.success(),
+        "qualifying {}: pid={} status={status:?}",
         path.display(),
-        pid.get(),
+        child.id(),
     );
 }
 

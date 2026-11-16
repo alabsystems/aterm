@@ -1512,7 +1512,7 @@ pub fn never_ran(code: i32) -> bool {
 }
 
 /// The `CltEpisode` actions the record does not perform, named where the whole-source closure
-/// (aterm-models' `spec_xref_closure`) collects them: the askers' processes ending, aterm's quit
+/// (aterm-spec-closure's `spec_xref_closure`) collects them: the askers' processes ending, aterm's quit
 /// and time passing, which the conformance's rig does, and the model's `Buggy=1` mutants, which
 /// its negative control plants in this code (`Defect`).
 #[cfg_attr(

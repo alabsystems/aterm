@@ -3,12 +3,13 @@
 
 use super::*;
 
+/// Test session `n`: the session whose ID is the tab ID with bits `n`.
+fn sid(n: u64) -> SessionId {
+    SessionId::from_tab(aterm_types::tab_id::TabId::from_bits(n))
+}
+
 fn ids() -> (SessionId, SessionId, LaunchNonce) {
-    (
-        SessionId::new("s-a"),
-        SessionId::new("s-b"),
-        LaunchNonce::from_bytes([7u8; 16]),
-    )
+    (sid(0xa), sid(0xb), LaunchNonce::from_bytes([7u8; 16]))
 }
 
 #[test]
@@ -112,7 +113,7 @@ fn authorize_returns_op_for_a_live_edge_else_none() {
     let mut tbl = EdgeTable::new();
     let tok = tbl.grant(a, b.clone(), Op::ReadScreen, nonce);
     assert_eq!(tbl.authorize(&tok, &b, &nonce), Some(Op::ReadScreen));
-    assert_eq!(tbl.authorize(&tok, &SessionId::new("s-x"), &nonce), None);
+    assert_eq!(tbl.authorize(&tok, &sid(0xf), &nonce), None);
     assert_eq!(
         tbl.authorize(&tok, &b, &LaunchNonce::from_bytes([0u8; 16])),
         None
@@ -179,8 +180,8 @@ fn edge_of_reads_the_row_identity_without_the_token() {
 
 #[test]
 fn authority_does_not_flow_along_a_cycle_or_self_loop() {
-    let a = SessionId::new("s-a");
-    let b = SessionId::new("s-b");
+    let a = sid(0xa);
+    let b = sid(0xb);
     let na = LaunchNonce::from_bytes([1u8; 16]);
     let nb = LaunchNonce::from_bytes([2u8; 16]);
 
@@ -204,7 +205,7 @@ fn authority_does_not_flow_along_a_cycle_or_self_loop() {
 #[test]
 fn revoke_src_sweeps_exactly_the_matching_source() {
     let (a, b, nonce) = ids();
-    let c = SessionId::new("s-c");
+    let c = sid(0xc);
     let mut tbl = EdgeTable::new();
     let t1 = tbl.grant(a.clone(), b.clone(), Op::ReadScreen, nonce);
     let t2 = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);
@@ -228,7 +229,7 @@ fn revoke_src_sweeps_exactly_the_matching_source() {
 #[test]
 fn revoke_src_ops_filters_by_op() {
     let (a, b, nonce) = ids();
-    let c = SessionId::new("s-c");
+    let c = sid(0xc);
     let mut tbl = EdgeTable::new();
     let read = tbl.grant(a.clone(), b.clone(), Op::ReadScreen, nonce);
     let write = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);

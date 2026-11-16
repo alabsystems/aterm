@@ -299,13 +299,21 @@ impl Handoff {
                 "history handoff was read under another observation's history",
             ));
         }
-        // A batch's history checked the current membership when it was leased.
+        // A batch's history checked the current membership when it was leased. An observation
+        // no longer current, or a vault writer holding the state lock while that is judged
+        // (`VaultBusy`, kept), is no finding about the handoff; one of another trust, or one that
+        // names another recipient than this binding and device, never opens here.
+        if history.is_none() && !access.is_current_observed(journal)? {
+            return Err(Error::new(
+                "history handoff requires its exact current recipient",
+            ));
+        }
         if self.trust != journal.trust()
-            || (history.is_none() && !access.is_current(journal))
             || &self.recipient != access.local().binding()
             || self.recipient.recipient() != identity.recipient()
         {
-            return Err(Error::new(
+            return Err(Error::of_kind(
+                crate::ErrorKind::HistoryUnopened,
                 "history handoff requires its exact current recipient",
             ));
         }
@@ -338,7 +346,8 @@ impl Handoff {
             .iter()
             .all(|binding| issuance.members().iter().any(|m| m.binding() == *binding))
         {
-            return Err(Error::new(
+            return Err(Error::of_kind(
+                crate::ErrorKind::HistoryUnopened,
                 "history handoff issuer or recipient was not admitted",
             ));
         }

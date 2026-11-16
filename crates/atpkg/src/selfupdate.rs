@@ -76,6 +76,27 @@ pub enum Decline<'a> {
 /// most once; `install stable` and a version target are declined by name.
 #[must_use]
 pub fn classify<'a>(row: &VendorSpec, args: &'a [String]) -> Verdict<'a> {
+    classify_among(row.self_update_verbs, args)
+}
+
+/// [`classify`] of a launch the harness that leads the program's word hands to `__selfupdate`
+/// (kimi-alab's `run` hands over `kimi upgrade` and `kimi update`, HX-09b): that harness reads
+/// the vendor's self-update verbs itself, and the word's twin intercepts none (its row names
+/// none), so the first word handed over is the verb, sorted as [`classify`] sorts a row's. Only a
+/// plain word ([`is_shell_safe_verb`]) can be one: a flag or anything else passes through.
+#[must_use]
+pub fn classify_handed(args: &[String]) -> Verdict<'_> {
+    let handed: Vec<&str> = args
+        .first()
+        .map(String::as_str)
+        .filter(|word| is_shell_safe_verb(word))
+        .into_iter()
+        .collect();
+    classify_among(&handed, args)
+}
+
+/// [`classify`] against `verbs`.
+fn classify_among<'a>(verbs: &[&str], args: &'a [String]) -> Verdict<'a> {
     if args
         .iter()
         .take_while(|a| a.as_str() != "--")
@@ -87,7 +108,7 @@ pub fn classify<'a>(row: &VendorSpec, args: &'a [String]) -> Verdict<'a> {
         return Verdict::PassThrough;
     };
     let verb = verb.as_str();
-    if !row.self_update_verbs.contains(&verb) {
+    if !verbs.contains(&verb) {
         return Verdict::PassThrough;
     }
     if verb != "install" {

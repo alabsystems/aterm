@@ -1822,10 +1822,14 @@ fn draft_step(
 }
 
 /// THE TAPE'S WITNESS: the waits at rest a tape's text ([`text::render`]) shows carrying
-/// `autopilot=<word>` and answered `OK autopilot <word>`, in its order.
+/// `autopilot=<word>` and answered `OK autopilot <word>`, in its order. An answer that names the
+/// word the loop stored then (its last `meta` read's, or the last answer's) is no switch: an Off
+/// park's first wait carries another word to learn whether the host answers it (ATERM-KI-1108-2),
+/// and such a host names the stored word back.
 #[must_use]
 pub fn woke_of(text: &str) -> Vec<Woke> {
     let mut out = Vec::new();
+    let mut stored: Option<&str> = None;
     let mut lines = text.lines().peekable();
     while let Some(head) = lines.next() {
         let Some(head) = head.strip_prefix("exchange ctl") else {
@@ -1847,16 +1851,30 @@ pub fn woke_of(text: &str) -> Vec<Woke> {
             }
         }
         let Some(i) = args.iter().position(|a| *a == "await") else {
+            if args.last() == Some(&"meta")
+                && let Some(word) = reply.and_then(|r| {
+                    r.split_whitespace()
+                        .find_map(|w| w.strip_prefix("autopilot="))
+                })
+            {
+                stored = Some(word);
+            }
             continue;
         };
         let carried = args.iter().find(|a| a.starts_with("autopilot="));
         match (carried, reply) {
-            (Some(c), Some(r)) if r.starts_with("OK autopilot") => out.push(Woke {
-                at,
-                form: args.get(i + 1).copied().unwrap_or("?").to_string(),
-                carried: (*c).to_string(),
-                answered: r.trim().to_string(),
-            }),
+            (Some(c), Some(r)) if r.starts_with("OK autopilot") => {
+                let word = r.split_whitespace().nth(2).unwrap_or("-");
+                if stored != Some(word) {
+                    out.push(Woke {
+                        at,
+                        form: args.get(i + 1).copied().unwrap_or("?").to_string(),
+                        carried: (*c).to_string(),
+                        answered: r.trim().to_string(),
+                    });
+                }
+                stored = Some(word);
+            }
             _ => {}
         }
     }

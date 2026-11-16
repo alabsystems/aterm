@@ -2385,20 +2385,25 @@ fn two_concurrent_refutations_of_a_later_schema_read_split_and_one_seat_settles_
 }
 
 /// A SEAT WHOSE TURN PASSES HANDS THE SETTLE ON: m7's verification and m22's refutation split the
-/// pair, and the writer with the lower seat never settles it (off the LAN, asleep, or on a build
-/// with no settle). Its turn lasts [`crate::claude_token::SETTLE_TURN_SECS`] from the split: then
-/// the other writer's turn begins, and the first reads `Theirs` naming it; a turn later m40's, a
-/// Mac that wrote nothing, which settles it there. Every Mac then reads one draft.
+/// pair, and the writer with the lower seat sees it in its turn but never settles it (off the LAN,
+/// asleep, or on a build with no settle). Its turn lasts [`crate::claude_token::SETTLE_TURN_SECS`]
+/// from each Mac's first sighting of the split: then the other writer's turn begins, and the first
+/// reads `Theirs` naming it; a turn later m40's, a Mac that wrote nothing, which settles it there.
+/// Every Mac then reads one draft.
 #[test]
 fn a_seat_whose_turn_passes_hands_the_settle_on() {
     use crate::claude_token::{SETTLE_TURN_SECS, Settled};
     let lab = Lab::new().minted_by(Some(MintedBy::Window));
     let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
-    // Read after both drafts, so no turn below is measured from before the split.
     let now = aterm_time::unix_secs().unwrap();
     let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
         unreachable!()
     };
+    assert_eq!(
+        owner_at(&lab, first, now),
+        first,
+        "the first seat sees the split in its own turn, and lets it pass"
+    );
     for (at, turn) in [(now, first), (now + SETTLE_TURN_SECS, second)] {
         for label in ["m22", "m7", "m40"]
             .into_iter()
@@ -2433,11 +2438,321 @@ fn a_seat_whose_turn_passes_hands_the_settle_on() {
     lab.macs.server.stop();
 }
 
+/// Whose turn the Mac labelled `label` reads it is at `now` (its own clock) to settle the pair,
+/// with no write: its own label where it would write, else the seat it names. Its first look
+/// records its sighting of the split, as a settle's does.
+fn owner_at(lab: &Lab, label: &str, now: u64) -> String {
+    use crate::claude_token::{Plan, Settled};
+    match crate::claude_token::plan(lab.named(label), &key(), now, soon()).unwrap() {
+        Plan::Write(_) => label.to_owned(),
+        Plan::Done(Settled::Theirs(owner)) => owner,
+        Plan::Done(other) => panic!("{label} at {now}: {other:?}"),
+    }
+}
+
+/// MACS WHOSE CLOCKS DIFFER BY MINUTES READ ONE TURN AT A TIME (ATERM-KI-1115-134): m7's
+/// verification and m22's refutation split the pair, and every Mac first looks at it at the same
+/// moment, m7's clock seven minutes ahead of m22's and m40's four minutes behind. Stepping a
+/// minute at a time across three turns, all three Macs name the same seat at every step, so no
+/// two would write at once, and each of the three seats holds exactly one turn of thirty steps,
+/// in the turns' order. The seat whose turn it is then settles, and every Mac reads one draft.
+/// NEGATIVE CONTROL (by hand, then restored): with the turns measured from the latest sibling's
+/// `authored_ms` (the writer's clock) rather than each Mac's sighting, m7, seven minutes ahead,
+/// reads the second turn from the 23rd minute: "every Mac names one seat at +23 min: [("m22",
+/// "m7"), ("m7", "m22"), ("m40", "m7")]" (m7's seat first in that run, so for those minutes
+/// neither writer writes; with m22's first, both would).
+#[test]
+fn macs_whose_clocks_differ_by_minutes_read_one_turn_at_a_time() {
+    use crate::claude_token::{SETTLE_TURN_SECS, Settled};
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    let real = aterm_time::unix_secs().unwrap();
+    let clocks: [(&str, i64); 3] = [("m22", 0), ("m7", 7 * 60), ("m40", -4 * 60)];
+    let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    let step = 60;
+    let steps = 3 * SETTLE_TURN_SECS / step;
+    let mut owners = Vec::new();
+    for at in 0..steps {
+        let views: Vec<(&str, String)> = clocks
+            .iter()
+            .map(|(label, ahead)| {
+                let now = (real + at * step).saturating_add_signed(*ahead);
+                (*label, owner_at(&lab, label, now))
+            })
+            .collect();
+        let writing = views.iter().filter(|(label, owner)| label == owner).count();
+        assert!(writing <= 1, "two Macs write at +{at} min: {views:?}");
+        assert_eq!(
+            views
+                .iter()
+                .map(|(_, owner)| owner.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "every Mac names one seat at +{at} min: {views:?}"
+        );
+        owners.push(views[0].1.clone());
+    }
+    let turns = SETTLE_TURN_SECS / step;
+    let want: Vec<String> = (0..steps)
+        .map(|at| [first, second, "m40"][usize::try_from(at / turns).unwrap()].to_owned())
+        .collect();
+    assert_eq!(owners, want, "one turn each, in the turns' order");
+    let settler = owners[0].as_str();
+    let (_, ahead) = clocks.iter().find(|(label, _)| *label == settler).unwrap();
+    assert_eq!(
+        settle_at(lab.named(settler), real.saturating_add_signed(*ahead)),
+        Settled::Written(MemberWritten::Posted),
+        "the seat whose turn it is settles"
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        assert_eq!(standing_of(paths).check, Check::Mismatched(Mismatch::Value));
+        assert_eq!(held_value(paths, &key().entry()).as_deref(), Some(TOKEN));
+    }
+    lab.macs.server.stop();
+}
+
+/// A WRITER WHOSE CLOCK RUNS AN HOUR AHEAD HOLDS NO MAC PAST ONE TURN (ATERM-KI-1115-134): m7's
+/// verification and m22's refutation split the pair, drafted by the test's clock, while every Mac
+/// settles by a clock an hour behind it, so each sibling's `authored_ms` lies an hour ahead of
+/// every Mac's `now`. Every Mac sees the split at once; the first seat lets its turn pass, and one
+/// turn of local time later every Mac reads the second seat's turn, which settles it. NEGATIVE
+/// CONTROL (by hand, then restored): with the turns measured from the latest sibling's
+/// `authored_ms`, every Mac reads the first turn for an hour and more: "m7 one turn after its
+/// sighting, left: "m7", right: "m22"" (m7's seat first in that run).
+#[test]
+fn a_writer_clock_an_hour_ahead_holds_no_mac_past_one_turn() {
+    use crate::claude_token::{SETTLE_TURN_SECS, Settled};
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    let behind = aterm_time::unix_secs().unwrap() - 3_600;
+    let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    for label in ["m22", "m7", "m40"] {
+        assert_eq!(
+            owner_at(&lab, label, behind),
+            first,
+            "{label} sees the split"
+        );
+    }
+    let later = behind + SETTLE_TURN_SECS;
+    for label in ["m22", "m7", "m40"]
+        .into_iter()
+        .filter(|label| *label != second)
+    {
+        assert_eq!(
+            owner_at(&lab, label, later),
+            second,
+            "{label} one turn after its sighting"
+        );
+    }
+    assert_eq!(
+        settle_at(lab.named(second), later),
+        Settled::Written(MemberWritten::Posted),
+        "the second seat settles it, an hour before the writer's clock is reached"
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        assert_eq!(standing_of(paths).check, Check::Mismatched(Mismatch::Value));
+    }
+    lab.macs.server.stop();
+}
+
+/// A CLOCK SET BACK RUNS THE TURNS ON FROM WHERE IT STANDS (ATERM-KI-1115-134): a Mac that saw the
+/// split and whose clock is then set back twenty minutes, more than
+/// [`crate::claude_token::CLOCK_SLACK_SECS`], records its sighting again at the earlier time, so
+/// one turn after that it reads the second seat's turn, rather than holding the first for the
+/// twenty minutes as well. The sighting is kept on the Mac: a later look at the same split reads
+/// it back, and once the split is settled a look at the whole pair drops it. NEGATIVE CONTROLS (by
+/// hand, then restored): with a sighting kept however far the clock went back, "one turn after the
+/// clock went back, left: "m7", right: "m22"" (m7's seat first in that run); with the settle that
+/// finds the pair whole dropping no row (`forget_settled` cut), "the settled split's row is
+/// dropped: {"schema":1,"sighted":[{"at":…,"key":"…","split":"e884…"}]}".
+#[test]
+fn a_clock_set_back_runs_the_turns_on_from_where_it_stands() {
+    use crate::claude_token::SETTLE_TURN_SECS;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    let now = aterm_time::unix_secs().unwrap();
+    let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    let sightings = lab.m40.dir.join("claude-token-sightings.json");
+    assert_eq!(owner_at(&lab, "m40", now), first);
+    let kept = std::fs::read(&sightings).expect("m40 keeps its sighting");
+    assert_eq!(owner_at(&lab, "m40", now + 60), first);
+    assert_eq!(
+        std::fs::read(&sightings).unwrap(),
+        kept,
+        "a later look reads it back"
+    );
+    let back = now - 2 * crate::claude_token::CLOCK_SLACK_SECS;
+    assert_eq!(owner_at(&lab, "m40", back), first);
+    assert_eq!(
+        owner_at(&lab, second, back),
+        first,
+        "the second seat sees it"
+    );
+    assert_eq!(
+        owner_at(&lab, "m40", back + SETTLE_TURN_SECS),
+        second,
+        "one turn after the clock went back"
+    );
+    assert_eq!(
+        settle_at(lab.named(second), back + SETTLE_TURN_SECS),
+        crate::claude_token::Settled::Written(MemberWritten::Posted)
+    );
+    lab.sync_all();
+    assert_eq!(
+        settle_at(&lab.m40, now),
+        crate::claude_token::Settled::Nothing
+    );
+    let left = std::fs::read_to_string(&sightings).unwrap();
+    assert!(
+        !left.contains(key().as_str()),
+        "the settled split's row is dropped: {left}"
+    );
+    lab.macs.server.stop();
+}
+
+/// A SEAT THAT LOOKS FIRST AFTER ITS TURN WRITES NOTHING BESIDE THE NEXT (ATERM-KI-1115-134,
+/// review): m7's verification and m22's refutation split the pair, the second seat and m40 see it
+/// at once, and the first seat looks first forty-five minutes later (asleep, aterm closed, its
+/// upkeep not yet run), in the second seat's turn by the other Macs' clocks, which agree with the
+/// writers'. Its sighting, later than the split's draft by more than
+/// [`crate::claude_token::CLOCK_SLACK_SECS`], is a late look, so it reads the turn the other Macs
+/// read and writes nothing, rather than taking a first turn of its own and writing beside the
+/// second seat; the second seat settles. NEGATIVE CONTROL (by hand, then restored): with
+/// `turns_since` returning the sighting alone, "every Mac reads the second seat's turn at +45
+/// min: left: [("m7", "m7"), ("m22", "m22"), ("m40", "m22")], right: [("m7", "m22"), ("m22",
+/// "m22"), ("m40", "m22")]" (m7's seat first in that run).
+#[test]
+fn a_seat_that_looks_first_after_its_turn_writes_nothing_beside_the_next() {
+    use crate::claude_token::{SETTLE_TURN_SECS, Settled};
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    let now = aterm_time::unix_secs().unwrap();
+    let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    for label in [second, "m40"] {
+        assert_eq!(owner_at(&lab, label, now), first, "{label} sees the split");
+    }
+    let late = now + SETTLE_TURN_SECS * 3 / 2;
+    let views: Vec<(&str, String)> = [first, second, "m40"]
+        .into_iter()
+        .map(|label| (label, owner_at(&lab, label, late)))
+        .collect();
+    assert_eq!(
+        views,
+        [first, second, "m40"]
+            .into_iter()
+            .map(|label| (label, second.to_owned()))
+            .collect::<Vec<_>>(),
+        "every Mac reads the second seat's turn at +45 min"
+    );
+    assert_eq!(
+        settle_at(lab.named(second), late),
+        Settled::Written(MemberWritten::Posted),
+        "the second seat settles it"
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        assert_eq!(standing_of(paths).check, Check::Mismatched(Mismatch::Value));
+    }
+    lab.macs.server.stop();
+}
+
+/// A CALLER'S MOMENT READ A LITTLE BEFORE THE SIGHTING LEAVES IT WHERE IT IS (ATERM-KI-1115-134,
+/// review): m40's accounts upkeep records its sighting of the split, and a reading's tap whose
+/// moment was read thirty seconds before (the tap holds the moment it began, `AccountSeat::now`)
+/// settles after it. That look reads the first turn and leaves the sighting as it was, so m40's
+/// turns still run with the second seat's: fifteen seconds before the turn ends both still read
+/// the first seat's. NEGATIVE CONTROL (by hand, then restored): with any `now` before the
+/// sighting taken as a clock set back (the read back filtered by `row.at <= now`), "a stale moment
+/// leaves the sighting as it was, left: "{…"at":1794815249,…}", right: "{…"at":1794815279,…}"" (the
+/// sighting moved thirty seconds back), and without that assertion "m40 reads the turn the second
+/// seat reads, left: "m7", right: "m22"" (m7's seat second in that run).
+#[test]
+fn a_callers_moment_read_before_the_sighting_leaves_it_where_it_is() {
+    use crate::claude_token::SETTLE_TURN_SECS;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    let now = aterm_time::unix_secs().unwrap();
+    let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    let sightings = lab.m40.dir.join("claude-token-sightings.json");
+    assert_eq!(owner_at(&lab, "m40", now), first, "the upkeep's look");
+    assert_eq!(
+        owner_at(&lab, second, now),
+        first,
+        "the second seat sees it"
+    );
+    let kept = std::fs::read_to_string(&sightings).expect("m40 keeps its sighting");
+    assert_eq!(owner_at(&lab, "m40", now - 30), first, "the tap's look");
+    assert_eq!(
+        std::fs::read_to_string(&sightings).unwrap(),
+        kept,
+        "a stale moment leaves the sighting as it was"
+    );
+    let end = now + SETTLE_TURN_SECS - 15;
+    assert_eq!(owner_at(&lab, second, end), first);
+    assert_eq!(
+        owner_at(&lab, "m40", end),
+        first,
+        "m40 reads the turn the second seat reads"
+    );
+    lab.macs.server.stop();
+}
+
+/// A SIGHTINGS LOCK THAT CANNOT BE TAKEN IS AN ERROR, AND ONLY A BUSY ONE HOLDS THE SETTLE
+/// (ATERM-KI-1115-134, review): with another writer holding the sightings lock past `by`, m40's
+/// settle reads `Held`, and the next reading settles; with a folder where the lock file goes,
+/// which no wait frees, the settle returns the lock's error naming its path, as `# Errors`
+/// promises and `note_refused` does, rather than reading `Held` at every turn, unseen, for good.
+/// NEGATIVE CONTROL (by hand, then restored): with every error taking the lock read as held, "a
+/// lock that cannot be taken is an error: Held("this Mac's sighting of the split could not be
+/// recorded just now")".
+#[test]
+fn a_sightings_lock_that_cannot_be_taken_is_an_error() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    let now = aterm_time::unix_secs().unwrap();
+    let lock = lab.m40.dir.join("claude-token-sightings.lock");
+    {
+        let _held = aterm_uds::file_lock::LockFile::take(&lock, soon(), "the test holds it")
+            .expect("the test takes the lock");
+        assert_eq!(
+            crate::claude_token::settle(&lab.m40, &key(), now, std::time::Instant::now()).unwrap(),
+            Settled::Held("this Mac's sighting of the split could not be recorded just now".into()),
+            "a busy lock holds the settle"
+        );
+    }
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    match crate::claude_token::settle(&lab.m40, &key(), now, soon()) {
+        Err(e) => assert!(
+            e.to_string().contains("claude-token-sightings.lock")
+                && e.to_string().contains("no regular file"),
+            "the error names the lock: {e}"
+        ),
+        Ok(settled) => panic!("a lock that cannot be taken is an error: {settled:?}"),
+    }
+    lab.macs.server.stop();
+}
+
 /// TURNS ARE SEATS, NEVER LABELS: the order a settle's turns take is the token winner's writer
 /// (where named), then the other writers, then every other seat, each group in seat order, each
-/// turn [`crate::claude_token::SETTLE_TURN_SECS`] long from the split, round and round. Two seats
-/// are two turns whatever their labels (two Macs that both took `m40-3fa2` stay two seats), so
-/// one seat settles at a time. A clock behind the split reads the first turn; no seat, none.
+/// turn [`crate::claude_token::SETTLE_TURN_SECS`] long from this Mac's sighting of the split,
+/// round and round. Two seats are two turns whatever their labels (two Macs that both took
+/// `m40-3fa2` stay two seats), so one seat settles at a time. A clock behind the sighting reads
+/// the first turn; no seat, none.
 #[test]
 fn settle_turns_are_seats_in_order_never_labels() {
     use crate::claude_token::{SETTLE_TURN_SECS, settle_turn};
@@ -2482,7 +2797,7 @@ fn settle_turns_are_seats_in_order_never_labels() {
     assert_eq!(
         settle_turn(None, &writers, &members, split, split - 3_600),
         Some(seat(2)),
-        "a clock behind the split reads the first turn"
+        "a clock behind the sighting reads the first turn"
     );
     assert_eq!(
         settle_turn(None, &BTreeSet::new(), &BTreeSet::new(), split, split),

@@ -484,8 +484,58 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
         return items;
     }
     let needs = |row: &RowView| row.managed && row.standing == Some(Standing::NeedsYou);
+    let password_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            needs(row)
+                && matches!(
+                    row.subject,
+                    Subject::Access(
+                        Access::NameRule | Access::SpotlightScope | Access::NetworkHelper
+                    )
+                )
+        })
+        .collect();
+    if password_rows.len() > 1 {
+        let reason = password_rows
+            .iter()
+            .map(|row| {
+                row.note
+                    .clone()
+                    .unwrap_or_else(|| row.subject.name().into())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut item = CardItem::new(
+            "mac-password",
+            Mark::NeedsYou,
+            "Finish setup with your Mac password",
+        )
+        .reason(Some(reason))
+        .for_row(password_rows[0].subject);
+        item = if matches!(
+            status.mac_setup,
+            Some(super::ToolsInstall::Password | super::ToolsInstall::Recovered)
+        ) {
+            item.button(super::GO_TO_TOOLS_TAB, "Go to tab: Mac Setup", "Go to tab")
+        } else {
+            item.button(
+                super::FINISH_MAC_SETUP,
+                "Finish setup… with your Mac password",
+                "Finish setup…",
+            )
+        };
+        items.push(item);
+    }
     for row in rows.iter().filter(|row| needs(row)) {
         let subject = row.subject;
+        if password_rows.len() > 1
+            && password_rows
+                .iter()
+                .any(|password| password.subject == subject)
+        {
+            continue;
+        }
         let slug = super::row_slug(subject);
         if items.iter().any(|item| item.subject == Some(subject)) {
             continue;
@@ -500,10 +550,28 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
             {
                 continue;
             }
+            Subject::Access(Access::NetworkAuth) => CardItem::new(
+                slug,
+                Mark::NeedsYou,
+                "Authorize this Mac on the ALab network",
+            )
+            .reason(row.note.clone())
+            .for_row(subject)
+            .button(
+                "system-state/row/network-auth/open",
+                "Show authorization in Secrets & identity",
+                "Show authorization",
+            ),
             Subject::Access(access) => {
-                let mut item =
-                    CardItem::new(slug, Mark::NeedsYou, format!("Turn on {}", access.name()))
-                        .reason(row.note.clone());
+                let title = if matches!(
+                    access,
+                    Access::NameRule | Access::SpotlightScope | Access::NetworkHelper
+                ) {
+                    format!("Finish {} with your Mac password", access.name())
+                } else {
+                    format!("Turn on {}", access.name())
+                };
+                let mut item = CardItem::new(slug, Mark::NeedsYou, title).reason(row.note.clone());
                 if let Some(walk) = status.walk.filter(|walk| walk.access == access) {
                     item.step = Some(format!("Step {} of {}", walk.at, walk.of));
                     let next: Vec<&str> = rows
@@ -517,12 +585,43 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                     item.next = (!next.is_empty()).then(|| format!("Next: {}", next.join(", ")));
                 }
                 item = item.for_row(subject);
-                if row.open.is_some() {
+                if matches!(
+                    access,
+                    Access::NameRule | Access::SpotlightScope | Access::NetworkHelper
+                ) && matches!(
+                    status.mac_setup,
+                    Some(super::ToolsInstall::Password | super::ToolsInstall::Recovered)
+                ) {
+                    item = item.button_at(
+                        &format!("system-state/card/{slug}/go-to-tab"),
+                        super::GO_TO_TOOLS_TAB,
+                        "Go to tab: Mac Setup password prompt",
+                        "Go to tab",
+                    );
+                } else if row.open.is_some() {
                     let key = format!("system-state/row/{slug}/open");
                     item = item.button(
                         &key,
-                        format!("{OPEN_SETTINGS} for {}", access.name()),
-                        OPEN_SETTINGS,
+                        format!(
+                            "{} for {}",
+                            if matches!(
+                                access,
+                                Access::NameRule | Access::SpotlightScope | Access::NetworkHelper
+                            ) {
+                                "Finish setup…"
+                            } else {
+                                OPEN_SETTINGS
+                            },
+                            access.name()
+                        ),
+                        if matches!(
+                            access,
+                            Access::NameRule | Access::SpotlightScope | Access::NetworkHelper
+                        ) {
+                            "Finish setup…"
+                        } else {
+                            OPEN_SETTINGS
+                        },
                     );
                 }
                 item

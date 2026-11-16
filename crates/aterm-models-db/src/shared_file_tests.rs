@@ -347,3 +347,43 @@ fn a_peer_that_replaced_this_macs_record_leaves_its_intent_published_not_held() 
         assert_eq!(enabled(&mutant, &replaced, &PUBLISHER), ["Done"], "{dial}");
     }
 }
+
+/// An input of the projection that moves with no record of the table arriving (a handoff, a
+/// Remove that makes a cutoff count, a membership or build change) is taken up by the next pass
+/// of live custody, though its frontier is the snapshot's; a refresh view taken before the
+/// input moved records the older input, as a view taken before a record arrived does, and the
+/// pass after it takes the input up.
+/// NEGATIVE CONTROL: mutant 17, a pass whose frontier is the snapshot's projecting nothing
+/// again, leaves the live snapshot at the input before it moved, and only LiveIsCurrent falls.
+#[test]
+fn an_input_that_moves_with_no_record_is_taken_up_by_the_next_live_pass() {
+    let model = shared_file_model();
+    let steps = ["ChooseRead", "Materialize", "Unrecorded", "Materialize"];
+    let current = walk(&model, &steps);
+    assert_eq!(
+        (
+            current["sinp"],
+            current["inp"],
+            current["word"],
+            current["stale"]
+        ),
+        (1, 1, 1, 0)
+    );
+    let older = walk(
+        &model,
+        &["ChooseRead", "RefreshLook", "Unrecorded", "RefreshWrite"],
+    );
+    assert_eq!((older["sinp"], older["inp"], older["word"]), (0, 1, 1));
+    assert_eq!(broken(&model, &older), [] as [&str; 0]);
+    let mut taken = older;
+    assert!(model.fire("Materialize", &mut taken));
+    assert_eq!(taken["sinp"], 1);
+
+    let mutant = interp::with_buggy(&model, 17);
+    let skipped = walk(&mutant, &steps);
+    assert_eq!(
+        (skipped["sinp"], skipped["inp"], skipped["word"]),
+        (0, 1, 1)
+    );
+    assert_eq!(broken(&mutant, &skipped), ["LiveIsCurrent"]);
+}

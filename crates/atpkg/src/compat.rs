@@ -985,6 +985,8 @@ struct TrustShim {
     shim: PathBuf,
     target: PathBuf,
     env: crate::shim_env::ShimEnv,
+    // Read only by `inspect`'s unix arm (the routed-render comparison).
+    #[cfg(unix)]
     body: Option<String>,
 }
 
@@ -1003,6 +1005,7 @@ fn trust_shims(layout: &Layout) -> std::collections::BTreeMap<u64, Vec<TrustShim
                     shim,
                     target,
                     env: read.env,
+                    #[cfg(unix)]
                     body: read.body,
                 });
             }

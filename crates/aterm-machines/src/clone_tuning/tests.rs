@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::items::defaults::tests::{ctx, user};
+use crate::items::github::GitExecution;
 use crate::port::{Fake, Live};
 use aterm_converge::Outcome;
 use std::cell::Cell;
@@ -37,7 +38,7 @@ impl World {
         Self::with_program(Some(feature_git()))
     }
 
-    fn with_program(git: Option<PathBuf>) -> Self {
+    fn with_program(git: Option<GitExecution>) -> Self {
         let off = match git {
             None => crate::items::github::need_native_git_barring_lazy_fetch(),
             // git 2.56 or later ([`feature_git`]) takes the option.
@@ -60,17 +61,20 @@ impl World {
         if let Some(git) = git {
             // Select the admitted managed tool for both the subject and controls,
             // while all Git configuration and repositories stay in the fixture home.
-            let prefix = feature_prefix();
+            let prefix = git
+                .entry
+                .as_deref()
+                .expect("admitted managed Git entry")
+                .parent()
+                .and_then(Path::parent)
+                .expect("package bin/git");
             let config = world.home.path().join(".config/aterm/aterm.toml");
             std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-            let store = prefix.join("store/git");
             let prefix = aterm_toml::Value::String(prefix.to_string_lossy().into_owned());
             std::fs::write(config, format!("[packages]\nprefix = {prefix}\n")).unwrap();
-            // Since FL-165 setup starts the admitted build's own git, never its PATH entry.
-            let program = checkout::git(&world.sys, &world.who, None).program;
-            assert!(
-                program.starts_with(&store) && program.ends_with("bin/git"),
-                "the build's own git under {store:?}, admitted by its entry {git:?}: {program:?}"
+            assert_eq!(
+                checkout::git(&world.sys, &world.who, None).program,
+                git.program
             );
         }
         world.global("");
@@ -1922,47 +1926,36 @@ fn record_read(run: &Cmd) -> bool {
         || has("for-each-ref")
 }
 
-/// This host's tool home, whose managed Git the named-hook and config-lock controls run.
-fn feature_home() -> PathBuf {
-    aterm_uds::host::tool_home().unwrap_or_else(|| {
-        aterm_uds::host::could_not_run("no tool home for the managed Git controls")
-    })
-}
-
-/// The atpkg prefix of [`feature_home`], which a fixture's `[packages] prefix` names so that its
-/// account selects the same managed build ([`World::with_program`]).
-fn feature_prefix() -> PathBuf {
-    aterm_toolchain::atpkg_prefix(&feature_home(), None)
-}
-
-/// The installed Git 2.56 control for named config hooks and config-lock waiting: the managed
-/// build's own git that setup starts for [`feature_home`]'s account
-/// ([`crate::items::github::installed_git_for`], `store/git/<build>/bin/git`), never the PATH
-/// entry atpkg laid for it, as [`checkout::git`] starts it.
+/// The installed Git 2.56 control for named config hooks and config-lock waiting.
 /// Native Git remains the other fixtures' baseline; an older one need not have these features.
-fn feature_git() -> PathBuf {
-    let store = feature_prefix().join("store");
-    let git = crate::items::github::installed_git_for(&Live::new(), Some(&feature_home()))
-        .filter(|git| git.starts_with(&store))
+fn feature_git() -> GitExecution {
+    let home = aterm_uds::host::tool_home().unwrap_or_else(|| {
+        aterm_uds::host::could_not_run("no tool home for the managed Git controls")
+    });
+    let sys = Live::new();
+    let git = crate::items::github::installed_git_execution_for(&sys, Some(&home))
+        .filter(|git| git.entry.is_some())
         .unwrap_or_else(|| {
-            aterm_uds::host::could_not_run(format!(
-                "no managed Git build under {}, needed for named-hook and config-lock controls",
-                store.display()
-            ))
+            aterm_uds::host::could_not_run(
+                "no admitted managed Git for the named-hook and config-lock controls",
+            )
         });
-    let version = Live::new()
-        .run_complete_stdout(&Cmd::new(&git).arg("--version"))
+    let version = sys
+        .run_complete_stdout(&Cmd::new(&git.program).arg("--version"))
         .ok()
         .map(|ran| stdout(&ran))
         .unwrap_or_default();
-    let minor = version
-        .strip_prefix("git version 2.")
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|minor| minor.parse::<u32>().ok());
-    if !minor.is_some_and(|minor| minor >= 56) {
+    let release = version.strip_prefix("git version ").and_then(|rest| {
+        let mut components = rest.split('.');
+        Some((
+            components.next()?.parse::<u32>().ok()?,
+            components.next()?.parse::<u32>().ok()?,
+        ))
+    });
+    if !release.is_some_and(|release| release >= (2, 56)) {
         aterm_uds::host::could_not_run(format!(
             "no git 2.56 or later at {} ({version:?}), needed for named-hook and config-lock controls",
-            git.display()
+            git.program.display()
         ));
     }
     git
@@ -1985,7 +1978,7 @@ fn a_write_never_waits_on_a_config_lock() {
     std::thread::spawn(move || {
         let sys = Live::new();
         let mut quiet = quiet(&sys, Git { user: &who, off }, &at).unwrap();
-        quiet.program = git;
+        quiet.program = git.program;
         tx.send(write(
             &sys,
             &quiet,

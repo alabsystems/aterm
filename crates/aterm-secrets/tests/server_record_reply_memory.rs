@@ -19,7 +19,6 @@ use aterm_secrets::{
     text::{Audience, Entry},
     transport::{NO_WAIT_HEADER, RECORDS_BOOT_HEADER, RECORDS_NEED_HEADER},
 };
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -27,47 +26,10 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-thread_local! {
-    static ACTIVE: Cell<bool> = const { Cell::new(false) };
-    static LIVE: Cell<usize> = const { Cell::new(0) };
-    static PEAK: Cell<usize> = const { Cell::new(0) };
-}
+#[path = "memory_alloc/net_peak.rs"]
+mod net_peak;
 
-struct Counting;
-
-// SAFETY: pointer/layout pairs are forwarded unchanged to System. Constant TLS
-// counters allocate nothing; default realloc counts both blocks during growth.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forward the caller's valid layout unchanged.
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            let _ = ACTIVE.try_with(|active| {
-                if active.get() {
-                    let _ = LIVE.try_with(|live| {
-                        let next = live.get() + layout.size();
-                        live.set(next);
-                        let _ = PEAK.try_with(|peak| peak.set(peak.get().max(next)));
-                    });
-                }
-            });
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        let _ = ACTIVE.try_with(|active| {
-            if active.get() {
-                let _ = LIVE.try_with(|live| live.set(live.get() - layout.size()));
-            }
-        });
-        // SAFETY: forward the matching pointer and layout unchanged.
-        unsafe { System.dealloc(pointer, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
+use net_peak::{ACTIVE, LIVE, PEAK};
 
 struct Measuring;
 

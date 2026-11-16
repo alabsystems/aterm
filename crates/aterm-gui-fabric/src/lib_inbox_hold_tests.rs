@@ -7269,3 +7269,127 @@ fn mail_from_a_tab_is_an_agents_in_either_form() {
         "{shown:?}"
     );
 }
+
+/// A HELD TAB'S `await inbox since=0 kinds=hold` WHOSE CALLER CLOSES ANSWERS `ERR hangup`, though
+/// its own timeout is ten minutes: the supervised tab's park on its Inbox condvar arms the
+/// hang-up bell on the served connection, and the bell's notify wakes it. The test's lane gives
+/// the armed park one wait for all that is left (the shipped lane caps it at ARMED_POLL), and the
+/// caller closes only once the park waits (it called its bell lane under the Inbox lock, which
+/// the test then takes), so only the ring can end that wait within the hang detector; the lane's
+/// sliced half is never asked.
+/// NEGATIVE CONTROLS: arming the bell to notify a condvar that is not the Inbox's leaves the park
+/// waiting past the hang detector; with the arm skipped, the park never waits by its bell lane
+/// and the hang detector fires before the close.
+#[cfg(unix)]
+#[test]
+fn a_held_tabs_await_for_a_hold_whose_caller_closes_answers_hangup() {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    static BELLED: AtomicUsize = AtomicUsize::new(0);
+    static SLICED: AtomicUsize = AtomicUsize::new(0);
+    fn belled(left: Duration) -> Duration {
+        BELLED.fetch_add(1, Ordering::SeqCst);
+        left
+    }
+    fn sliced(left: Duration) -> Duration {
+        SLICED.fetch_add(1, Ordering::SeqCst);
+        aterm_control::hangup::hangup_park(left)
+    }
+
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    assert_eq!(
+        bridge_hold(&store, &format!("{sid} on reason=x")),
+        "OK hold=1\n"
+    );
+    let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
+    let waiter = {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+            TEST_INBOX_LANE.with(|lane| {
+                lane.set(Some(aterm_control::park::Lane {
+                    slice: sliced,
+                    hung_up: aterm_control::hangup::caller_hung_up,
+                    bell: Some(aterm_control::park::BellLane {
+                        bell: aterm_uds::hangup::Bell::process,
+                        slice: belled,
+                    }),
+                }));
+            });
+            cmd_await_inbox(&ctx, &["since=0", "kinds=hold"], 600_000)
+        })
+    };
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the held tab's await to park armed",
+        || (BELLED.load(Ordering::SeqCst) >= 1).then_some(()),
+    );
+    drop(ctx.fabric.lock());
+    drop(client);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the parked await to hear its caller hang up",
+        || waiter.is_finished().then_some(()),
+    );
+    assert_eq!(
+        waiter.join().expect("the waiter"),
+        aterm_control::hangup::HUNG_UP_REPLY
+    );
+    assert_eq!(
+        SLICED.load(Ordering::SeqCst),
+        0,
+        "the armed park is never sliced"
+    );
+}
+
+/// A HELD TAB'S `await inbox since=0 kinds=hold` ARMS THE PROCESS'S HANG-UP BELL ON ITS SHIPPED
+/// LANE: with no lane of the test's own ([`inbox_lane`] as shipped), its park on the Inbox
+/// condvar arms `Bell::process()` on the served connection while it waits, and a caller that then
+/// closes is answered `ERR hangup`, though its own timeout is ten minutes. The arm is the sign:
+/// a shipped lane that armed no bell would hear the close too, by its HANGUP_POLL slices, so only
+/// the arm tells the bell's lane from the sliced one.
+/// NEGATIVE CONTROL: an [`inbox_lane`] whose `Lane::SERVED` carries no bell lane never arms, and
+/// the hang detector fires before the close.
+#[cfg(unix)]
+#[test]
+fn a_held_tabs_await_for_a_hold_arms_the_process_bell_on_its_shipped_lane() {
+    use std::os::fd::AsRawFd as _;
+
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    assert_eq!(
+        bridge_hold(&store, &format!("{sid} on reason=x")),
+        "OK hold=1\n"
+    );
+    let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
+    let served = server.as_raw_fd();
+    let waiter = {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+            cmd_await_inbox(&ctx, &["since=0", "kinds=hold"], 600_000)
+        })
+    };
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the held tab's await to arm the process bell on its connection",
+        || {
+            aterm_uds::hangup::Bell::process()
+                .armed_for_test(served)
+                .then_some(())
+        },
+    );
+    drop(client);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the parked await to hear its caller hang up",
+        || waiter.is_finished().then_some(()),
+    );
+    assert_eq!(
+        waiter.join().expect("the waiter"),
+        aterm_control::hangup::HUNG_UP_REPLY
+    );
+}

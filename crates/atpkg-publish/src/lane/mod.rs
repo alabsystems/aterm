@@ -173,16 +173,29 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
 
 fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     let mut log = Vec::new();
-    let result = run_lane_inner(ctx, kind, flags, &mut log);
+    let (outcome, result) =
+        run_lane_inner(ctx, kind, flags, &mut log).unwrap_or_else(|e| (None, Err(e)));
     if flags.json {
-        let report = outcome_report(flags, &result, log);
+        let report = outcome_report(flags, outcome.as_ref(), &result, log);
         println!(
             "{}",
             aterm_json::to_string(&report)
                 .map_err(|e| Error::refused(format!("encode lane outcome: {e}")))?
         );
     }
-    result.map(|_| ())
+    result
+}
+
+/// What a run did, and how it ended: a run that ends red may still say what it did (a tip pass
+/// that queued its other candidates and met a program it cannot qualify).
+type Ran = (Option<Summary>, Result<()>);
+
+/// A run that says what it did only when it ends green.
+fn ended<T: Into<Summary>>(result: Result<T>) -> Ran {
+    match result {
+        Ok(outcome) => (Some(outcome.into()), Ok(())),
+        Err(e) => (None, Err(e)),
+    }
 }
 
 /// What a run did, as the typed `--json` outcome reports it, whichever lane ran.
@@ -234,6 +247,8 @@ impl From<ready::Outcome> for Summary {
 }
 
 impl From<tip::Outcome> for Summary {
+    /// A candidate that failed to qualify, and one whose repository declares no qualification
+    /// list, is held: neither moves until its repository changes.
     fn from(o: tip::Outcome) -> Self {
         Self {
             covered: o.covered,
@@ -249,19 +264,19 @@ impl From<tip::Outcome> for Summary {
 
 fn outcome_report<'a>(
     flags: &RunFlags,
-    result: &'a Result<Option<Summary>>,
+    outcome: Option<&'a Summary>,
+    result: &'a Result<()>,
     log: Vec<String>,
 ) -> RunReport<'a> {
-    let outcome = result.as_ref().ok().and_then(Option::as_ref);
     RunReport {
         schema: "atpkg.lane.outcome.v1",
-        status: match &result {
-            Err(_) => "refused",
-            Ok(Some(value)) if value.covered => "covered",
-            Ok(Some(value)) if value.idle => "idle",
-            Ok(_) if flags.dry_run => "planned",
-            Ok(Some(value)) if value.published.is_some() => "published",
-            Ok(_) => "completed",
+        status: match (result, outcome) {
+            (Err(_), _) => "refused",
+            (Ok(()), Some(value)) if value.covered => "covered",
+            (Ok(()), Some(value)) if value.idle => "idle",
+            (Ok(()), _) if flags.dry_run => "planned",
+            (Ok(()), Some(value)) if value.published.is_some() => "published",
+            (Ok(()), _) => "completed",
         },
         exit: result.as_ref().err().map_or(0, Error::exit_code),
         head: outcome.and_then(|value| value.head),
@@ -293,7 +308,7 @@ fn run_lane_inner(
     kind: LaneKind,
     flags: &RunFlags,
     log: &mut Vec<String>,
-) -> Result<Option<Summary>> {
+) -> Result<Ran> {
     let exe = std::env::current_exe().map_err(|e| Error::io("find this binary's own path", &e))?;
     // A tip dry run writes nothing, this mark included.
     if !(flags.dry_run && kind == LaneKind::Tip) {
@@ -326,20 +341,22 @@ fn run_lane_inner(
             ctx.shown(&exe)
         ),
     });
-    let result = run_with_production_deps(ctx, kind, flags, &tx);
+    let (outcome, result) =
+        run_with_production_deps(ctx, kind, flags, &tx).unwrap_or_else(|e| (None, Err(e)));
     if let Err(e) = &result {
         tx.say(format!("{e}"));
     }
     *log = tx.lines();
-    result
+    Ok((outcome, result))
 }
 
+/// Run the lane: `Err` when it could not start on this machine.
 fn run_with_production_deps(
     ctx: &Ctx,
     kind: LaneKind,
     flags: &RunFlags,
     tx: &report::Transcript,
-) -> Result<Option<Summary>> {
+) -> Result<Ran> {
     let packer = crate::artifact::pack::Pack;
     let indexer = crate::channel::index::Index;
     match kind {
@@ -358,7 +375,7 @@ fn run_with_production_deps(
                 notifier: &notifier,
             };
             let opts = ready::Options::new(ctx, flags.dry_run, flags.queued, host);
-            ready::dispatch(ctx, &opts, &deps, tx).map(|o| Some(o.into()))
+            Ok(ended(ready::dispatch(ctx, &opts, &deps, tx)))
         }
         LaneKind::Tip => {
             let host = Triple::host()
@@ -373,8 +390,11 @@ fn run_with_production_deps(
                 backend: &backend,
                 notifier: &notifier,
             };
-            tip::run(ctx, &tip::Options::new(ctx, flags.dry_run, host), &deps, tx)
-                .map(|o| Some(o.into()))
+            // A pass that ends red still says what it queued and what it holds.
+            let mut outcome = tip::Outcome::default();
+            let opts = tip::Options::new(ctx, flags.dry_run, host);
+            let result = tip::run_into(ctx, &opts, &deps, tx, &mut outcome);
+            Ok((Some(outcome.into()), result))
         }
         LaneKind::Alab => {
             if !cfg!(target_os = "macos") {
@@ -389,7 +409,8 @@ fn run_with_production_deps(
                 notifier: &notifier,
                 pin_commit: &alab::installed_pin_commit,
             };
-            alab::run(ctx, &alab::Options::new(ctx, flags.dry_run), &deps, tx).map(|_| None)
+            let result = alab::run(ctx, &alab::Options::new(ctx, flags.dry_run), &deps, tx);
+            Ok((None, result.map(|_| ())))
         }
         LaneKind::Linux => {
             let host = Triple::host().ok_or_else(|| {
@@ -407,7 +428,7 @@ fn run_with_production_deps(
                 builder: &builder,
                 switch: &linux::live_switch,
             };
-            linux::run(ctx, &opts, &deps, tx).map(|o| Some(o.into()))
+            Ok(ended(linux::run(ctx, &opts, &deps, tx)))
         }
     }
 }

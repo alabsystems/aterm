@@ -703,3 +703,968 @@ fn an_older_snapshot_put_back_under_acknowledged_history_is_unavailable() {
         "CONTROL: the acknowledged snapshot back reads"
     );
 }
+
+/// A Mac from before retained-history receipts, as an older build left it: it applied a value
+/// from its membership log, its state names that log's heads digest, and no receipt was ever
+/// enrolled. The vault has since moved on without it.
+struct PreReceipt {
+    lab: log_entries_tests::TwoMacs,
+    reader: Paths,
+    /// The reader's records before the admin signed anything more: a valid snapshot strictly
+    /// inside the graph it applied.
+    older: Vec<u8>,
+    /// Where the applied envelope is stamped ([`PreReceipt::stamped`]), the records the reader
+    /// held when it applied that envelope: every record its stamp names, and not the put the
+    /// reader applied from its log afterwards. Otherwise `older`.
+    stamp_held: Vec<u8>,
+    /// The store it last applied from.
+    applied: crate::membership_log::Store,
+    /// The admin's records once it signed `newer`: `applied`'s and the put after them.
+    newer: Vec<u8>,
+    /// A record another Mac signed over the log it held before any of that, concurrent with it,
+    /// chosen so a reload of [`PreReceipt::grown`] sorts it among the applied records: the
+    /// applied graph is then no prefix of the order the store holds.
+    concurrent: crate::membership_log::Record,
+    _answering: ServersAnswering,
+}
+
+impl PreReceipt {
+    /// A Mac the log let in, which holds no envelope locker: nothing it applied is stamped.
+    fn build() -> Self {
+        Self::build_as(false)
+    }
+
+    /// A Mac with a locker: it applied `new` from an envelope stamped with the log's heads, then
+    /// `mid` from its log alone, so the stamp names records short of the log it applied.
+    fn stamped() -> Self {
+        Self::build_as(true)
+    }
+
+    fn build_as(stamped: bool) -> Self {
+        let answering = ServersAnswering::set();
+        let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
+        let (m8, request, allowed) = log_entries_tests::newcomer(lab.root.path(), &lab.m22, "m8");
+        let (bundle, logged) = log_entries_tests::hand(&lab.m22, &request, &allowed, true);
+        assert!(logged);
+        admit::write_from_log_bundle(&m8, &bundle).unwrap();
+        let (reader, other) = if stamped {
+            (lab.m7.clone(), m8)
+        } else {
+            (m8, lab.m7.clone())
+        };
+        let older = load_records(&reader).unwrap().encode();
+        let base = load_records(&other).unwrap().log().unwrap().clone();
+        let (peer, peer_key, incarnation) = log_entries::open_local_member_signer(&other, &base)
+            .unwrap()
+            .unwrap();
+        let publish = |value: &[u8]| {
+            let admin = admin_open(&lab.m22).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.set_entry(&Audience::Everyone, "shared", value).unwrap();
+            admin_publish(&lab.m22, &admin, &doc).unwrap();
+            load_records(&lab.m22).unwrap().encode()
+        };
+        save_records(&reader, &publish(b"new")).unwrap();
+        let (stamp_held, value) = if stamped {
+            sync(&reader, None).unwrap();
+            assert_eq!(
+                stored(&reader, "shared").as_deref(),
+                Some(b"new".as_slice())
+            );
+            assert!(
+                log_entries::applied_version_names_log(&reader).unwrap(),
+                "FIXTURE: the applied envelope is stamped"
+            );
+            let held = load_records(&reader).unwrap().encode();
+            save_records(&reader, &publish(b"mid")).unwrap();
+            (held, b"mid".as_slice())
+        } else {
+            (older.clone(), b"new".as_slice())
+        };
+        let mut this = Self {
+            applied: load_records(&reader).unwrap(),
+            newer: Vec::new(),
+            concurrent: base.genesis().clone(),
+            lab,
+            reader,
+            older,
+            stamp_held,
+            _answering: answering,
+        };
+        assert!(matches!(this.apply().unwrap(), SyncOutcome::Applied { .. }));
+        assert_eq!(this.value().as_deref(), Some(value));
+        assert_eq!(
+            log_entries::applied_version_names_log(&this.reader).unwrap(),
+            stamped,
+            "FIXTURE: an apply from the log alone keeps the envelope"
+        );
+        this.forget_receipts();
+        let admin = admin_open(&this.lab.m22).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, "shared", b"newer")
+            .unwrap();
+        admin_publish(&this.lab.m22, &admin, &doc).unwrap();
+        this.newer = load_records(&this.lab.m22).unwrap().encode();
+        let applied_heads = heads_of(&this.applied);
+        // A record's id is a hash, and a reload orders concurrent records by id: sign records
+        // until one sorts among the applied ones.
+        this.concurrent = (0..64_u64)
+            .map(|n| {
+                peer_key
+                    .with_seed(|seed| {
+                        base.draft(
+                            &peer,
+                            7_000 + n,
+                            crate::membership_log::Body::Name {
+                                name: format!("offline-{n}"),
+                            },
+                        )
+                        .sign(seed, incarnation)
+                    })
+                    .unwrap()
+            })
+            .find(|record| {
+                let mut grown = this.applied.clone();
+                grown.ingest(&this.newer).unwrap();
+                assert!(grown.insert(record.clone()).unwrap());
+                let reloaded = crate::membership_log::Store::with_compiled(Some(
+                    *this.applied.log().unwrap().network(),
+                ))
+                .recovering(&grown.encode());
+                !heads_of_a_prefix(reloaded.log().unwrap(), &applied_heads)
+            })
+            .expect("FIXTURE: no concurrent record sorts among the applied ones");
+        this
+    }
+
+    /// The store an older build left: the applied digest and values stay, no receipt does.
+    fn forget_receipts(&self) {
+        for entry in std::fs::read_dir(&self.reader.dir).unwrap() {
+            let entry = entry.unwrap();
+            if receipt_file(&entry.file_name().to_string_lossy()) {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+
+    /// The names of the receipt files this Mac's vault folder holds.
+    fn receipt_files(&self) -> Vec<String> {
+        std::fs::read_dir(&self.reader.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| receipt_file(name))
+            .collect()
+    }
+
+    /// `applied` with every record made since: the admin's `newer` and m7's concurrent record.
+    fn grown(&self) -> crate::membership_log::Store {
+        let mut grown = self.applied.clone();
+        grown.ingest(&self.newer).unwrap();
+        assert!(grown.insert(self.concurrent.clone()).unwrap());
+        grown
+    }
+
+    /// Make the records file hold `store` as an older build's intake did: no state lock taken,
+    /// so no writer of this build has seen it. Returns the store a read of the file loads.
+    fn put(&self, store: &[u8]) -> crate::membership_log::Store {
+        fsx::write_atomic(&self.reader.records_data_file().unwrap(), store, 0o600).unwrap();
+        load_records(&self.reader).unwrap()
+    }
+
+    fn apply(&self) -> crate::Result<SyncOutcome> {
+        apply_response_until(
+            &self.reader,
+            configured(&self.reader).unwrap(),
+            load_state(&self.reader).unwrap(),
+            Err(Error::new("offline")),
+            None,
+            None,
+            true,
+        )
+    }
+
+    fn value(&self) -> Option<Vec<u8>> {
+        crate::client::stored(&self.reader, "shared")
+    }
+
+    /// The lock-free authority read every reader makes.
+    fn read(&self) -> crate::Result<Option<log_entries::ConfiguredLog>> {
+        log_entries::trusted_configured_log(&self.reader, &configured(&self.reader).unwrap())
+    }
+
+    fn applied_digest(&self) -> Option<[u8; 32]> {
+        load_state(&self.reader).unwrap().records_digest
+    }
+}
+
+fn receipt_file(name: &str) -> bool {
+    name == "records.frontiers" || name.starts_with("frontiers.")
+}
+
+/// Whether `heads` are the heads of the first records of `log`, for some count of them, in the
+/// order it holds them.
+fn heads_of_a_prefix(
+    log: &crate::membership_log::Log,
+    heads: &[crate::membership_log::RecordId],
+) -> bool {
+    let mut open = std::collections::BTreeSet::new();
+    log.records().any(|record| {
+        for parent in record.parents() {
+            open.remove(parent);
+        }
+        open.insert(*record.id());
+        open.iter().eq(heads)
+    })
+}
+
+/// The bug of 2026-11-15: records landed after this Mac's last apply and before its first
+/// receipt, so its applied digest named a strict part of what it held, no enrollment matched it,
+/// and every read was refused until a person repaired it. The store holds the applied graph
+/// whole, which the applied heads show: the first writer enrolls it and the pass applies.
+#[test]
+fn a_pre_receipt_mac_whose_records_grew_past_its_applied_log_enrolls_without_repair() {
+    let mac = PreReceipt::build();
+    let grown = mac.put(&mac.grown().encode());
+    let (grown_heads, grown_digest) = (heads_of(&grown), grown.heads_digest().unwrap());
+    assert_ne!(
+        mac.applied_digest(),
+        Some(grown_digest),
+        "FIXTURE: the store grew past the applied log"
+    );
+    assert_eq!(
+        mac.applied_digest(),
+        mac.applied.heads_digest(),
+        "FIXTURE: the state names the log it applied"
+    );
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        None,
+        "FIXTURE: no receipt was ever enrolled"
+    );
+    assert!(
+        !heads_of_a_prefix(grown.log().unwrap(), &heads_of(&mac.applied)),
+        "FIXTURE: the applied graph is no prefix of the order a reload holds"
+    );
+
+    // Before any writer: a reader refuses, and writes nothing.
+    let refused = mac.read().err().expect("a reader enrolls nothing");
+    assert_eq!(
+        refused.kind(),
+        crate::ErrorKind::MembershipHistoryUnavailable
+    );
+    assert_history_unavailable(&mac.reader, "before a writer");
+    assert_eq!(
+        mac.receipt_files(),
+        Vec::<String>::new(),
+        "a lock-free read wrote a receipt"
+    );
+
+    // One exclusive take, which every vault pass makes.
+    drop(StateLock::take(&mac.reader).unwrap());
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(true),
+        "the first writer enrolls a store that holds the applied graph"
+    );
+    assert_eq!(mac.read().unwrap().expect("a log").log.heads(), grown_heads);
+    assert!(matches!(mac.apply().unwrap(), SyncOutcome::Applied { .. }));
+    assert_eq!(mac.value().as_deref(), Some(b"newer".as_slice()));
+    assert_eq!(mac.applied_digest(), Some(grown_digest));
+    assert!(
+        refused.to_string().contains("aterm secrets sync"),
+        "the refusal names the pass that ends it: {refused}"
+    );
+    mac.lab.server.stop();
+}
+
+impl PreReceipt {
+    /// One exclusive take of the state, as every vault pass makes; whether a receipt is ready
+    /// after it.
+    fn writer_pass(&self) -> bool {
+        drop(StateLock::take(&self.reader).unwrap());
+        retained_history::claim_ready(&self.reader).unwrap() == Some(true)
+    }
+
+    /// The genesis alone: a verified store short of every record the applied envelope names.
+    fn genesis_only(&self) -> Vec<u8> {
+        let log = self.applied.log().unwrap();
+        let mut store = crate::membership_log::Store::with_compiled(Some(*log.network()));
+        assert!(store.insert(log.genesis().clone()).unwrap());
+        store.encode()
+    }
+
+    /// What the records on disk are to the log this Mac applied, as `VaultFirstEnrollment` names
+    /// it: 1 that log, 2 that log and more, 3 short of it but not of the records the applied
+    /// envelope was written at, 0 short of those too.
+    fn raw(&self) -> i64 {
+        let held = load_records(&self.reader).unwrap();
+        let log = held.log().unwrap();
+        let applied = heads_of(&self.applied);
+        if log.heads() == applied {
+            1
+        } else if retained_frontier::covers(log, log.network(), &applied) {
+            2
+        } else if self.covers_applied_stamp(&held) {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// Records that are `raw` to the applied log ([`Self::raw`]).
+    fn records_at(&self, raw: i64) -> Vec<u8> {
+        match raw {
+            0 => self.genesis_only(),
+            1 => self.applied.encode(),
+            2 => self.grown().encode(),
+            _ => self.stamp_held.clone(),
+        }
+    }
+
+    fn covers_applied_stamp(&self, store: &crate::membership_log::Store) -> bool {
+        log_entries::covers_applied_stamp(
+            &super::Reads::new(&self.reader),
+            &configured(&self.reader).unwrap(),
+            store.log().unwrap(),
+        )
+        .unwrap()
+    }
+}
+
+/// Records that lack part of the log this Mac applied are never enrolled, whatever else they
+/// hold. The snapshot this Mac held when it applied its envelope holds every record the stamp
+/// names and lacks only the put applied from the log afterwards, so a check of the stamp alone
+/// would enroll it and the next apply would write the older value back; the same with a valid
+/// record of another branch beside it; a snapshot from before the envelope and the genesis alone
+/// are short of the stamp too, and are refused with nothing hashed.
+#[test]
+fn pre_receipt_records_that_lack_part_of_the_applied_log_are_never_enrolled() {
+    let mac = PreReceipt::stamped();
+    let network = *mac.applied.log().unwrap().network();
+    let recover =
+        |bytes: &[u8]| crate::membership_log::Store::with_compiled(Some(network)).recovering(bytes);
+    let stamp_held = recover(&mac.stamp_held);
+    assert!(
+        mac.covers_applied_stamp(&stamp_held),
+        "FIXTURE: it holds the stamp's records, so only the applied heads refuse it"
+    );
+    assert!(
+        !retained_frontier::covers(stamp_held.log().unwrap(), &network, &heads_of(&mac.applied)),
+        "FIXTURE: it lacks the put applied after the envelope"
+    );
+    let mut beside = stamp_held.clone();
+    assert!(beside.insert(mac.concurrent.clone()).unwrap());
+    for short in [mac.older.clone(), mac.genesis_only()] {
+        assert!(
+            !mac.covers_applied_stamp(&recover(&short)),
+            "FIXTURE: short of the stamp"
+        );
+    }
+    for (what, store, searched) in [
+        ("the stamp's records", mac.stamp_held.clone(), 1),
+        ("the stamp's records and another branch", beside.encode(), 1),
+        ("a snapshot from before the envelope", mac.older.clone(), 0),
+        ("the genesis alone", mac.genesis_only(), 0),
+    ] {
+        mac.put(&store);
+        let before = log_entries::WITNESS_SEARCHES.get();
+        assert!(!mac.writer_pass(), "{what}: enrolled");
+        assert_eq!(
+            log_entries::WITNESS_SEARCHES.get() - before,
+            searched,
+            "{what}: searches of the held records"
+        );
+        assert_eq!(mac.receipt_files(), Vec::<String>::new(), "{what}");
+        let refused = mac.read().err().unwrap_or_else(|| panic!("{what}: read"));
+        assert_eq!(
+            refused.kind(),
+            crate::ErrorKind::MembershipHistoryUnavailable,
+            "{what}"
+        );
+        // What ends the refusal: the explicit repair only where it would accept these records.
+        assert_eq!(
+            refused.to_string().contains("aterm secrets repair"),
+            searched == 1,
+            "{what}: {refused}"
+        );
+        assert!(
+            !matches!(mac.apply(), Ok(SyncOutcome::Applied { .. })),
+            "{what}: applied"
+        );
+        assert_eq!(mac.value(), None, "{what}: a value read");
+        assert_eq!(
+            mac.applied_digest(),
+            mac.applied.heads_digest(),
+            "{what}: the applied log moved"
+        );
+        assert_eq!(mac.receipt_files(), Vec::<String>::new(), "{what}");
+    }
+    // CONTROL: the same Mac, the same passes, records that hold the applied log.
+    mac.put(&mac.grown().encode());
+    assert!(mac.writer_pass());
+    assert!(matches!(mac.apply().unwrap(), SyncOutcome::Applied { .. }));
+    assert_eq!(mac.value().as_deref(), Some(b"newer".as_slice()));
+    mac.lab.server.stop();
+}
+
+/// A search that ends at its budget proves nothing, so nothing is enrolled, and its answer is
+/// kept: the next pass over the same records hashes nothing again, in this process (which
+/// remembers it) and in the next (which reads it beside the state), and a reader makes no take
+/// for records a search already refused. A kept answer that does not read is no answer: the
+/// pass searches again and fails nothing. A search under another budget is another search, and
+/// with the budget back it finds the applied heads.
+///
+/// NEGATIVE CONTROL (2026-11-16): with [`log_entries::legacy_applied_held`] keeping no miss
+/// beside the state, `a second process searched again` fails, 2 searches for 1.
+#[test]
+fn pre_receipt_search_past_its_budget_is_refused_and_remembered() {
+    let mac = PreReceipt::build();
+    mac.put(&mac.grown().encode());
+    let misses = mac.reader.dir.join("records.frontier-misses");
+    log_entries::TEST_WITNESS_BUDGET.set(Some(0));
+    let before = log_entries::WITNESS_SEARCHES.get();
+    let searches = || log_entries::WITNESS_SEARCHES.get() - before;
+    assert!(!misses.exists(), "FIXTURE: no search ran yet");
+    assert!(!mac.writer_pass(), "a search of no work found the heads");
+    assert_eq!(searches(), 1);
+    let refused = mac.read().err().expect("unenrolled");
+    assert_eq!(
+        refused.kind(),
+        crate::ErrorKind::MembershipHistoryUnavailable
+    );
+    assert!(
+        refused.to_string().contains("bounded search")
+            && refused.to_string().contains("may lack records it applied"),
+        "the refusal says the search was cut short, and what the repair it names accepts: \
+         {refused}"
+    );
+    // The same process: the answer is the remembered one.
+    assert!(!mac.writer_pass());
+    assert_eq!(searches(), 1, "a pass over the same records searched again");
+    // Another process remembers nothing and reads the miss kept beside the state.
+    log_entries::forget_witnesses();
+    assert!(!mac.writer_pass());
+    assert_eq!(searches(), 1, "a second process searched again");
+    log_entries::forget_witnesses();
+    let again = mac.read().err().expect("unenrolled");
+    assert_eq!(
+        again.to_string(),
+        refused.to_string(),
+        "a reader of a second process says what the search found"
+    );
+    // A reader makes no take while that answer stands.
+    log_entries::forget_witnesses();
+    let minute = || Instant::now() + Duration::from_secs(60);
+    assert!(
+        !StateLock::first_enrollment_due(&mac.reader, &again, minute()),
+        "a read made the take a kept miss already answered"
+    );
+    assert_eq!(searches(), 1);
+
+    // A kept answer that does not read is no answer, and no refusal of its own.
+    for damaged in [&b"not a misses file"[..], &[0; 4096][..]] {
+        fsx::write_atomic(&misses, damaged, 0o600).unwrap();
+        log_entries::forget_witnesses();
+        let searched = searches();
+        assert!(
+            StateLock::first_enrollment_due(&mac.reader, &again, minute()),
+            "CONTROL: with no answer kept, the read makes the take"
+        );
+        assert_eq!(searches(), searched + 1, "the take searched");
+        log_entries::forget_witnesses();
+        assert!(!mac.writer_pass());
+        assert_eq!(searches(), searched + 1, "the search's miss was kept again");
+    }
+    assert_eq!(mac.receipt_files(), Vec::<String>::new());
+
+    // The budget back: another key, so the search runs, finds the heads and enrolls.
+    log_entries::TEST_WITNESS_BUDGET.set(None);
+    log_entries::forget_witnesses();
+    let searched = searches();
+    assert!(
+        mac.writer_pass(),
+        "a miss under another budget was believed"
+    );
+    assert_eq!(searches(), searched + 1);
+    mac.lab.server.stop();
+}
+
+/// A kept answer refuses and never enrolls: `Held` is shown by a search in each process. A
+/// file beside the state that claims the applied log is held (the byte no build writes), or
+/// that claims a miss, leaves records that lack part of the applied log unenrolled, and a
+/// claimed miss costs records that hold it only until the claim is gone.
+#[test]
+fn pre_receipt_kept_answer_never_enrolls_and_a_false_miss_only_refuses() {
+    let mac = PreReceipt::stamped();
+    let short = mac.put(&mac.stamp_held);
+    for claim in [0, 1, 2, 3] {
+        log_entries::forget_witnesses();
+        log_entries::forge_kept_answer(&mac.reader, short.log().unwrap(), claim);
+        assert!(!mac.writer_pass(), "a kept answer {claim} enrolled");
+        assert_eq!(mac.receipt_files(), Vec::<String>::new(), "{claim}");
+        assert!(mac.read().is_err(), "{claim}");
+    }
+    // A false miss for records that hold the applied log: refused, with no search and no take.
+    let grown = mac.put(&mac.grown().encode());
+    log_entries::forget_witnesses();
+    log_entries::forge_kept_answer(&mac.reader, grown.log().unwrap(), 1);
+    let before = log_entries::WITNESS_SEARCHES.get();
+    assert!(!mac.writer_pass(), "FIXTURE: the kept miss is believed");
+    assert_eq!(log_entries::WITNESS_SEARCHES.get(), before);
+    std::fs::remove_file(mac.reader.dir.join("records.frontier-misses")).unwrap();
+    log_entries::forget_witnesses();
+    assert!(
+        mac.writer_pass(),
+        "CONTROL: with the claim gone a search enrolls"
+    );
+    mac.lab.server.stop();
+}
+
+/// A store put back to an older snapshot is refused, and heals by itself once intake brings the
+/// records back: the write enrolls what it made durable, and the pass applies the newest value.
+#[test]
+fn pre_receipt_rollback_then_intake_of_the_full_store_heals_to_the_newest_value() {
+    let mac = PreReceipt::build();
+    mac.put(&mac.older);
+    assert!(!mac.writer_pass());
+    assert!(mac.read().is_err());
+    let grown = mac.grown();
+    save_records(&mac.reader, &grown.encode()).unwrap();
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(true),
+        "the intake that restored the applied log enrolled it"
+    );
+    assert!(matches!(mac.apply().unwrap(), SyncOutcome::Applied { .. }));
+    assert_eq!(mac.value().as_deref(), Some(b"newer".as_slice()));
+    assert_eq!(mac.applied_digest(), grown.heads_digest());
+    mac.lab.server.stop();
+}
+
+/// The explicit repair accepts the records this Mac holds only where they hold what the applied
+/// envelope was written at: a store short of the stamp is refused with the state as it was, since
+/// a reader after the repair checks the digest alone. CONTROL: the records the stamp names,
+/// short of a later put, are accepted, the prior state kept beside the new one.
+#[test]
+fn pre_receipt_repair_refuses_records_short_of_the_applied_stamp() {
+    let mac = PreReceipt::stamped();
+    let state = std::fs::read(mac.reader.state_file()).unwrap();
+    let backup = mac.reader.dir.join("state.before-frontier-repair");
+    for short in [mac.older.clone(), mac.genesis_only()] {
+        let short = mac.put(&short);
+        assert!(
+            !mac.covers_applied_stamp(&short),
+            "FIXTURE: short of the stamp"
+        );
+        let refused = repair_legacy_frontier(&mac.reader, Instant::now() + Duration::from_secs(60))
+            .expect_err("a store short of the stamp was accepted");
+        assert_eq!(
+            refused.kind(),
+            crate::ErrorKind::MembershipHistoryUnavailable
+        );
+        assert_eq!(std::fs::read(mac.reader.state_file()).unwrap(), state);
+        assert!(!backup.exists(), "a refused repair kept a state");
+        assert_eq!(mac.receipt_files(), Vec::<String>::new());
+    }
+
+    let held = mac.put(&mac.stamp_held);
+    assert!(mac.covers_applied_stamp(&held));
+    assert_ne!(mac.applied_digest(), held.heads_digest());
+    assert!(
+        repair_legacy_frontier(&mac.reader, Instant::now() + Duration::from_secs(60)).unwrap(),
+        "CONTROL: the explicit door accepts records that hold the stamp's"
+    );
+    assert_eq!(mac.applied_digest(), held.heads_digest());
+    assert_eq!(std::fs::read(&backup).unwrap(), state);
+    mac.lab.server.stop();
+}
+
+/// End to end: the first subscriber pass over the grown store enrolls it and applies, with no
+/// refusal for its log.
+#[test]
+fn pre_receipt_first_subscriber_pass_over_grown_records_applies() {
+    let mac = PreReceipt::build();
+    let grown = mac.put(&mac.grown().encode());
+    assert!(mac.read().is_err(), "FIXTURE: refused before the pass");
+    let (_, outcome) = subscriber_pass(&mac.reader, &mut None, &FOUND_NONE)
+        .unwrap_or_else(|refusal| panic!("the pass logs a refusal: {refusal}"));
+    assert!(
+        matches!(outcome, SyncOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(true)
+    );
+    assert_eq!(mac.value().as_deref(), Some(b"newer".as_slice()));
+    assert!(
+        retained_frontier::covers(
+            load_acknowledged_records(&mac.reader)
+                .unwrap()
+                .log()
+                .unwrap(),
+            grown.log().unwrap().network(),
+            &heads_of(&grown),
+        ),
+        "the pass acknowledged every record the store held"
+    );
+    mac.lab.server.stop();
+}
+
+/// With no subscriber running, a person's read is the pass: `aterm secrets get` and git's
+/// credential helper read through [`read_in_place`], which enrolls and applies before it
+/// answers. A store that lacks part of the applied log gets no such pass: the read refuses and
+/// writes no receipt.
+#[test]
+fn pre_receipt_read_in_place_enrolls_and_applies_with_no_writer_running() {
+    let mac = PreReceipt::build();
+    mac.put(&mac.older);
+    let refused = read_in_place(&mac.reader, "shared").expect_err("a rollback read");
+    assert_eq!(
+        refused.kind(),
+        crate::ErrorKind::MembershipHistoryUnavailable
+    );
+    assert_eq!(mac.receipt_files(), Vec::<String>::new());
+
+    let grown = mac.put(&mac.grown().encode());
+    assert_eq!(
+        read_in_place(&mac.reader, "shared")
+            .unwrap()
+            .as_ref()
+            .map(SecretBytes::as_slice),
+        Some(b"newer".as_slice())
+    );
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(true)
+    );
+    assert!(retained_frontier::covers(
+        load_acknowledged_records(&mac.reader)
+            .unwrap()
+            .log()
+            .unwrap(),
+        grown.log().unwrap().network(),
+        &heads_of(&grown),
+    ));
+    mac.lab.server.stop();
+}
+
+/// Every in-place entry read that takes its own observation is that pass, not `read_in_place`
+/// alone: the waiting reads ([`read_verified_entry_until`], [`read_verified_set`]) and the ones
+/// that wait for no writer ([`read_verified_entry`], [`observe_verified_entry`]).
+#[test]
+fn pre_receipt_entry_reads_enroll_with_no_writer_running() {
+    let mac = PreReceipt::build();
+    let config = configured(&mac.reader).unwrap();
+    let value = |entry: VerifiedEntry| entry.value().as_slice().to_vec();
+    let enrolls = |reader: &str, read: &dyn Fn() -> crate::Result<Option<Vec<u8>>>| {
+        mac.forget_receipts();
+        mac.put(&mac.grown().encode());
+        assert_eq!(
+            retained_history::claim_ready(&mac.reader).unwrap(),
+            None,
+            "FIXTURE {reader}: no receipt"
+        );
+        assert!(mac.read().is_err(), "FIXTURE {reader}: refused unenrolled");
+        assert_eq!(
+            read().unwrap().as_deref(),
+            Some(b"newer".as_slice()),
+            "{reader}"
+        );
+        assert_eq!(
+            retained_history::claim_ready(&mac.reader).unwrap(),
+            Some(true),
+            "{reader}: the read enrolled"
+        );
+    };
+    enrolls("read_verified_entry", &|| {
+        Ok(read_verified_entry(&mac.reader, &config, "shared")?.map(value))
+    });
+    enrolls("read_verified_entry_until", &|| {
+        let minute = Instant::now() + Duration::from_secs(60);
+        Ok(read_verified_entry_until(&mac.reader, &config, "shared", minute)?.map(value))
+    });
+    enrolls("read_verified_set", &|| {
+        Ok(read_verified_set(&mac.reader, &config, &["shared"])?
+            .and_then(|mut set| set.pop())
+            .map(value))
+    });
+    enrolls("observe_verified_entry", &|| {
+        Ok(observe_verified_entry(&mac.reader, &config, "shared")?
+            .and_then(|seen| seen.entry)
+            .map(value))
+    });
+    // The authority read a writer makes under its own lock takes none and enrolls nothing.
+    mac.forget_receipts();
+    mac.put(&mac.grown().encode());
+    assert_history_unavailable(&mac.reader, "the lock-free authority read");
+    assert_eq!(mac.receipt_files(), Vec::<String>::new());
+    mac.lab.server.stop();
+}
+
+/// A first enrollment cut after its pending claim and before its receipt is recovered by a read
+/// as by a vault pass: the claim stands over an empty journal, every reader is refused, and
+/// the read's take finishes the enrollment.
+///
+/// NEGATIVE CONTROL (2026-11-16): with a read's take due only where no claim stands, the read
+/// is refused.
+#[test]
+fn pre_receipt_read_in_place_recovers_a_first_enrollment_cut_before_its_receipt() {
+    let mac = PreReceipt::build();
+    mac.put(&mac.grown().encode());
+    retained_history::cut_first_enrollment(&mac.reader);
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(false),
+        "FIXTURE: a pending claim"
+    );
+    assert_history_unavailable(&mac.reader, "a pending claim over no receipt");
+    assert_eq!(
+        read_in_place(&mac.reader, "shared")
+            .unwrap()
+            .as_ref()
+            .map(SecretBytes::as_slice),
+        Some(b"newer".as_slice())
+    );
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(true)
+    );
+    mac.lab.server.stop();
+}
+
+/// A read's take waits out another reader: an observation held as the take first tries the lock
+/// and dropped while it waits costs the read nothing.
+///
+/// NEGATIVE CONTROL (2026-11-16): with the take tried once and any busy lock read as a writer's
+/// (`first_enrollment_due` as it was first written), the read is refused, with no pass running
+/// and nothing wrong.
+#[test]
+fn pre_receipt_read_in_place_waits_out_a_passing_observer() {
+    let mac = PreReceipt::build();
+    mac.put(&mac.grown().encode());
+    let observer = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        StateLock::observe(&mac.reader)
+            .unwrap()
+            .expect("an observation"),
+    )));
+    let blocked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (held, counted) = (std::rc::Rc::clone(&observer), std::rc::Rc::clone(&blocked));
+    // A minute is the hang detector of the take's wait and the read's, never reached.
+    let read = with_current_wait(Duration::from_secs(60), || {
+        while_take_blocked(
+            move || {
+                counted.set(counted.get() + 1);
+                drop(held.borrow_mut().take());
+            },
+            || read_in_place(&mac.reader, "shared"),
+        )
+    });
+    assert_eq!(
+        read.unwrap().as_ref().map(SecretBytes::as_slice),
+        Some(b"newer".as_slice())
+    );
+    assert_eq!(blocked.get(), 1, "FIXTURE: the take found the observation");
+    assert_eq!(
+        retained_history::claim_ready(&mac.reader).unwrap(),
+        Some(true)
+    );
+    mac.lab.server.stop();
+}
+
+/// What a read's take does with a lock still held at the end of its wait. Observers alone
+/// enroll nothing, so the refusal stands and the read is not made again; a writer's own take
+/// enrolled, so the read is made again and waits for it; and a thread that observes the state
+/// across its reads makes no take at all.
+#[test]
+fn pre_receipt_read_take_tells_an_observer_from_a_writer_at_the_end_of_its_wait() {
+    let mac = PreReceipt::build();
+    mac.put(&mac.grown().encode());
+    let refused = mac.read().err().expect("FIXTURE: refused unenrolled");
+    let now = Instant::now;
+
+    // Under this thread's own observation across reads: no take, and no wait for one.
+    let observing = Observing::new(
+        StateLock::observe(&mac.reader)
+            .unwrap()
+            .expect("an observation"),
+        &mac.reader,
+    );
+    let takes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = std::rc::Rc::clone(&takes);
+    assert!(!while_take_blocked(
+        move || counted.set(counted.get() + 1),
+        || StateLock::first_enrollment_due(&mac.reader, &refused, now() + Duration::from_secs(60))
+    ));
+    assert_eq!(
+        takes.get(),
+        0,
+        "a take was tried under this thread's observation"
+    );
+    drop(observing);
+
+    // An observer that outlasts the wait: the first refusal is the answer.
+    let observer = StateLock::observe(&mac.reader)
+        .unwrap()
+        .expect("an observation");
+    let read = with_current_wait(Duration::ZERO, || read_in_place(&mac.reader, "shared"));
+    assert_eq!(
+        read.err().map(|refused| refused.kind()),
+        Some(crate::ErrorKind::MembershipHistoryUnavailable)
+    );
+    assert_eq!(mac.receipt_files(), Vec::<String>::new());
+
+    // A writer that takes the lock while the read's take waits, and holds it past the wait:
+    // the read is made again, and finds the state busy rather than its records refused.
+    let observer = std::rc::Rc::new(std::cell::RefCell::new(Some(observer)));
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let (held, taken, paths) = (
+        std::rc::Rc::clone(&observer),
+        std::rc::Rc::clone(&writer),
+        mac.reader.clone(),
+    );
+    let read = with_current_wait(Duration::ZERO, || {
+        while_take_blocked(
+            move || {
+                drop(held.borrow_mut().take());
+                *taken.borrow_mut() = Some(StateLock::take(&paths).unwrap());
+            },
+            || read_in_place(&mac.reader, "shared"),
+        )
+    });
+    let busy = read.expect_err("the writer still held the state");
+    assert_ne!(
+        busy.kind(),
+        crate::ErrorKind::MembershipHistoryUnavailable,
+        "{busy}"
+    );
+    assert!(busy.to_string().contains("stayed busy"), "{busy}");
+    drop(
+        writer
+            .borrow_mut()
+            .take()
+            .expect("FIXTURE: the writer took"),
+    );
+    assert_eq!(
+        read_in_place(&mac.reader, "shared")
+            .unwrap()
+            .as_ref()
+            .map(SecretBytes::as_slice),
+        Some(b"newer".as_slice()),
+        "the writer's take enrolled"
+    );
+    mac.lab.server.stop();
+}
+
+/// One step of `VaultFirstEnrollment` on a real Mac: its receipts and records set as `state`
+/// says, then `action` (a writer's exclusive take for `Enroll`, the records file rewritten for
+/// the environment's), then what the files show.
+fn first_enrollment_transition(
+    mac: &PreReceipt,
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    mac.forget_receipts();
+    if state["enrolled"] == 1 {
+        mac.put(&mac.records_at(1));
+        assert!(mac.writer_pass(), "FIXTURE: the applied log itself enrolls");
+    }
+    mac.put(&mac.records_at(state["raw"]));
+    assert_eq!(mac.raw(), state["raw"], "FIXTURE: the records `raw` names");
+    let mut next = state.clone();
+    match action {
+        "Intake" | "Restore" => drop(mac.put(&mac.records_at(2))),
+        "Rollback" => drop(mac.put(&mac.records_at(0))),
+        "Truncate" => drop(mac.put(&mac.records_at(3))),
+        "Enroll" => {
+            let enrolled = mac.writer_pass();
+            if state["raw"] == 2 && !enrolled {
+                next.insert("refused", 1);
+            }
+        }
+        _ => panic!("unknown first enrollment action {action}"),
+    }
+    let enrolled = retained_history::claim_ready(&mac.reader).unwrap() == Some(true);
+    let floor = if enrolled {
+        let acknowledged = retained_history::project_store(
+            &super::Reads::new(&mac.reader),
+            &configured(&mac.reader).unwrap(),
+            mac.grown(),
+        )
+        .unwrap();
+        let log = acknowledged.log().unwrap();
+        if retained_frontier::covers(log, log.network(), &heads_of(&mac.applied)) {
+            1
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+    next.insert("raw", mac.raw());
+    next.insert("enrolled", i64::from(enrolled));
+    next.insert("floor", floor);
+    next
+}
+
+#[test]
+fn pre_receipt_first_enrollment_model_conforms_to_a_real_writer_and_signed_records() {
+    let model = aterm_models_swarm::first_enrollment_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
+    assert_eq!(
+        aterm_spec::verify::audit_liveness(
+            &model,
+            &aterm_models_swarm::first_enrollment_liveness()
+        ),
+        Ok(1)
+    );
+    let mac = PreReceipt::stamped();
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let actual = first_enrollment_transition(&mac, &state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&actual),
+                    "{action:?}: {state:?} -> {actual:?}"
+                );
+            }
+        }
+    }
+    // NEGATIVE CONTROLS: each mutant's step is one the real writer does not take. Over records
+    // short of the applied log it enrolls nothing, where the mutants acknowledge a floor that
+    // lacks part of it; over records that hold it and more it enrolls, where the equality rule
+    // refuses.
+    let mutant = aterm_spec::interp::with_buggy(&model, 1);
+    for (raw, action) in [(3, "EnrollByStamp"), (0, "EnrollAny")] {
+        let mut short = model.init_state();
+        short.insert("raw", raw);
+        assert!(!model.action_enabled("Enroll", &short));
+        let actual = first_enrollment_transition(&mac, &short, "Enroll");
+        assert_eq!(
+            actual, short,
+            "{action}: a writer enrolled records short of the log"
+        );
+        let stepped = mutant.successors(action, &short);
+        assert!(
+            !stepped.is_empty() && !stepped.contains(&actual),
+            "{action}"
+        );
+        for wrong in &stepped {
+            assert!(
+                !model.check_invariant("FloorHoldsApplied", wrong),
+                "{action}"
+            );
+        }
+    }
+    let mut ahead = model.init_state();
+    ahead.insert("raw", 2);
+    let actual = first_enrollment_transition(&mac, &ahead, "Enroll");
+    assert_eq!((actual["enrolled"], actual["floor"]), (1, 1));
+    let stepped = mutant.successors("RefuseGrown", &ahead);
+    assert!(!stepped.is_empty() && !stepped.contains(&actual));
+    for wrong in &stepped {
+        assert!(!model.check_invariant("AHeldLogIsNeverRefused", wrong));
+    }
+    mac.lab.server.stop();
+}

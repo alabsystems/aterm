@@ -5,7 +5,7 @@ use aterm_spec::derive::Model;
 
 /// Each law of `SharedFile` with the one mutant that breaks it, in the order of the design's
 /// table (docs/DESIGN-shared-files-2026-11-11.md §8): the mutant at index `i` is `Buggy == i + 1`.
-pub const SHARED_FILE_LAWS: [(&str, &str); 16] = [
+pub const SHARED_FILE_LAWS: [(&str, &str); 17] = [
     ("ReadTotal", "ReadOpensCustody"),
     ("SnapshotMonotone", "RefreshTakesOlder"),
     ("HeldNeverLive", "HeldReadAsLive"),
@@ -22,6 +22,7 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 16] = [
     ("LinkNeverLimits", "LinkLimitsPool"),
     ("LimitsByReset", "ClockOrdersReadings"),
     ("NoSecretMaterialized", "SecretInSnapshot"),
+    ("LiveIsCurrent", "SkipOnFrontier"),
 ];
 
 /// One shared file on one Mac, with a peer Mac writing beside it
@@ -53,6 +54,16 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 16] = [
 ///    answered, `opens` the custody steps a read took. A record holding a credential-shaped
 ///    value can reach the replica (`PeerSecret`, `rsecret`); `ssecret` is one in the snapshot or
 ///    the face. `authored` is a record or receipt written from a materializer's open.
+///
+///    **What moves with no record.** A projection reads more than the table's records: whether
+///    a carried record authenticates (a handoff this Mac imports), which records count (a
+///    Remove that makes a cutoff count), whether this Mac is a member, and this build's rules.
+///    `inp` is such an input, which moves once with no record of the table arriving
+///    (`Unrecorded`); `sinp` is its value where the snapshot was projected, and `vinp` where a
+///    refresh view was taken. A pass of live custody that records leaves a snapshot projected
+///    at the inputs as they are then, a refresh at the inputs of its view (an older view is
+///    legitimately older, as one taken before a record arrived is); `stale` records one that
+///    did not. LiveIsCurrent: none did.
 ///
 ///    **The unsettled open.** While its succession was complete the successor could author
 ///    and take peers' records (`Grow` at `era` 1), none of which its fenced original holds.
@@ -113,7 +124,8 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 16] = [
 /// column, 10 a Birth cell shows beside an Owner candidate, 11 a write after birth changes the
 /// provider or realm, 12 a watcher publishes a file write, 13 a row missing from a committed
 /// face is retired, 14 the pool is the linked accounts only, 15 the fold takes the reading
-/// whose clock read last, 16 a credential-shaped value is projected.
+/// whose clock read last, 16 a credential-shaped value is projected, 17 a pass whose frontier
+/// is the snapshot's projects nothing again, whatever else its projection reads has moved.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn shared_file_model() -> Model {
@@ -126,6 +138,7 @@ pub fn shared_file_model() -> Model {
             var custody = 0; var era = 0;
             var rfr = 0; var ofr = 0; var sera = 0; var sfr = 0; var word = 0; var src = 0;
             var hera = 0; var hfr = 0; var older = 0; var lacks = 0;
+            var inp = 0; var sinp = 0; var vinp = 0; var stale = 0;
             var look = 0; var vera = 0; var vfr = 0; var vsrc = 0; var vlacks = 0;
             var reads = 0; var answered = 0; var opens = 0; var authored = 0;
             var rsecret = 0; var ssecret = 0;
@@ -168,6 +181,7 @@ pub fn shared_file_model() -> Model {
             // records too. At an unsettled home `ofr` is what the successor added.
             action Grow when (area == 1 && custody == 0 && 1 > rfr) { rfr = rfr + 1; }
             action PeerSecret when (area == 1 && rsecret == 0) { rsecret = 1; }
+            action Unrecorded when (area == 1 && custody == 0 && inp == 0) { inp = 1; }
             action Materialize when (area == 1 && custody <= 3) {
                 sera = if custody <= 2
                     && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {era}
@@ -183,6 +197,16 @@ pub fn shared_file_model() -> Model {
                     && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {
                     if Buggy == 16 {rsecret} else {0}
                 } else {ssecret};
+                // Mutant 17 skips the projection where the frontier is the snapshot's.
+                sinp = if custody <= 2
+                    && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {
+                    if Buggy == 17 && era == sera && sfr == rfr {sinp} else {inp}
+                } else {sinp};
+                stale = if custody == 0
+                    && (era > sera || (era == sera && sfr <= rfr) || Buggy == 2) {
+                    if Buggy == 17 && era == sera && sfr == rfr
+                        && (sinp > inp || inp > sinp) {1} else {stale}
+                } else {if custody == 0 && (sinp > inp || inp > sinp) {1} else {stale}};
                 hera = if custody <= 2 && era > hera {era} else {hera};
                 hfr = if custody <= 2 && era > hera {rfr}
                     else {if custody <= 2 && era == hera && rfr > hfr {rfr} else {hfr}};
@@ -192,13 +216,13 @@ pub fn shared_file_model() -> Model {
                 look = if look == 1 {2} else {look};
             }
             action RefreshLook when (area == 1 && custody <= 3 && look == 0) {
-                look = 1; vsrc = custody;
+                look = 1; vsrc = custody; vinp = inp;
                 vera = if custody <= 2 {era} else {0};
                 vfr = if custody <= 2 {rfr} else {0};
                 vlacks = if custody == 2 && ofr > 0 {1} else {0};
             }
             action RefreshWrite when (area == 1 && look > 0) {
-                look = 0; vera = 0; vfr = 0; vsrc = 0; vlacks = 0;
+                look = 0; vera = 0; vfr = 0; vsrc = 0; vlacks = 0; vinp = 0;
                 sera = if vsrc <= 2
                     && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
                         || Buggy == 2) {vera} else {sera};
@@ -211,6 +235,15 @@ pub fn shared_file_model() -> Model {
                 ssecret = if vsrc <= 2
                     && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
                         || Buggy == 2) {if Buggy == 16 {rsecret} else {0}} else {ssecret};
+                sinp = if vsrc <= 2
+                    && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
+                        || Buggy == 2) {vinp} else {sinp};
+                stale = if vsrc == 0 && (look == 1 || Buggy == 2) {
+                    if vsrc <= 2
+                        && ((look == 1 && (vera > sera || (vera == sera && sfr <= vfr)))
+                            || Buggy == 2) {stale}
+                    else {if sinp > vinp || vinp > sinp {1} else {stale}}
+                } else {stale};
                 hera = if vsrc <= 2 && (look == 1 || Buggy == 2) && vera > hera {vera}
                     else {hera};
                 hfr = if vsrc <= 2 && (look == 1 || Buggy == 2) && vera > hera {vfr}
@@ -327,6 +360,7 @@ pub fn shared_file_model() -> Model {
             invariant LinkNeverLimits: built == 0 || held == 0 || inpool == 1;
             invariant LimitsByReset: fr1 == fr2 && fp1 == fp2;
             invariant NoSecretMaterialized: ssecret == 0;
+            invariant LiveIsCurrent: stale == 0;
             bound OutboxWithinCap: q <= Cap;
             bound LogWithinKeep: logrows <= Keep;
         }

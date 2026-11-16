@@ -310,6 +310,18 @@ pub struct Accounts {
     /// default on every machine the fleet lists
     /// ([`crate::harness::accounts_sync::syncs_by_default`]).
     pub walls_measured_on: Option<&'static str>,
+    /// The CLI build whose own usage panel `lab claude-wall-panel` measured over a standing wall:
+    /// `/usage` typed on the composer at the wall left the composer, sent one usage read and no
+    /// turn, and opened the Usage tab, which drew the session's and the week's windows at the lab's
+    /// figures from the wall turn's answer headers; the transcript's standing wall read as before,
+    /// and one Escape closed the tab with the wall and the CLI's own continuation as they were.
+    /// The lab's jail refuses that usage read (the CLI sends it to its fixed claude.ai base), so
+    /// the tab it measured read `refused` ("Could not refresh usage data"): what the tab draws
+    /// once the account's body arrives over a wall (a `Settled` read, each model's week) is
+    /// unmeasured. `None` until that verb passes with the panel open; a build it does not name is
+    /// unmeasured. It says nothing of a wall where the CLI's usage-limit dialog stands: the verb
+    /// presses nothing into one. The lab verb writes this line.
+    pub wall_panel_measured_on: Option<&'static str>,
     /// How the harness signs one of its logins in by itself; `None` for Claude Code, whose
     /// renewal is its own (`claude auth login` through the argv0 opener), or where
     /// a native pool adapter has not been integrated.
@@ -652,6 +664,7 @@ pub const CLAUDE_ACCOUNTS: Accounts = Accounts {
     measured: true,
     measured_on: None,
     walls_measured_on: Some("Claude Code's anchored wall rows"),
+    wall_panel_measured_on: Some("2.1.325"),
     signin: None,
 };
 
@@ -838,6 +851,7 @@ pub const CODEX_ACCOUNTS: Accounts = Accounts {
     measured: true,
     measured_on: Some("codex-alab from 355ba0a940 (CODEX_AUTH_PATH)"),
     walls_measured_on: Some("codex rollouts' rate_limits"),
+    wall_panel_measured_on: None,
     signin: Some(CODEX_SIGNIN),
 };
 
@@ -955,6 +969,7 @@ pub const GROK_ACCOUNTS: Accounts = Accounts {
     measured: true,
     measured_on: Some("grok 1.0.67"),
     walls_measured_on: None,
+    wall_panel_measured_on: None,
     signin: Some(GROK_SIGNIN),
 };
 
@@ -1044,6 +1059,7 @@ pub const KIMI_ACCOUNTS: Accounts = Accounts {
     // OpenAI-compatible stub (docs/measured/kimi-forever-2026-10-29.md §"The usage-limit wall
     // and the auth failure").
     walls_measured_on: Some("kimi 2.4.0's measured 429 quota and 401 authentication walls"),
+    wall_panel_measured_on: None,
     signin: Some(KIMI_SIGNIN),
 };
 
@@ -1171,6 +1187,7 @@ pub const AGY_ACCOUNTS: Accounts = Accounts {
     measured: false,
     measured_on: None,
     walls_measured_on: None,
+    wall_panel_measured_on: None,
     signin: Some(AGY_SIGNIN),
 };
 

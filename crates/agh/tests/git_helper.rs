@@ -1245,6 +1245,86 @@ fn authenticated_exact_ref_reads_use_no_rest_and_do_not_return_prefix_matches() 
     assert!(world.fake.seen().is_empty());
 }
 
+/// RL-46: an authenticated read names an annotated tag's peeled commit on that tag's row, and a
+/// lightweight tag, a branch and HEAD carry no `peeled`. An exact `--ref` returns its row
+/// alone (no prefix neighbour, no `^{}` row), `--ref HEAD` answers the default branch's commit,
+/// and nothing reaches REST. CONTROL: before RL-46 the read ran `ls-remote --refs`, whose
+/// advertisement has no `^{}` line, so the tag row had no `peeled`, and `--ref HEAD` was a
+/// usage error.
+#[test]
+fn repo_refs_report_the_peeled_target_of_an_annotated_tag() {
+    let world = World::canonical("helper-peeled-refs");
+    let bare = crate::git_runner::bare_repo(world.root.path(), "app");
+    let commit = crate::git_runner::host_git(&bare, &["rev-parse", "HEAD"]);
+    let commit = commit.trim();
+    crate::git_runner::host_git(
+        &bare,
+        &[
+            "-c",
+            "user.name=Andrew Yates",
+            "-c",
+            "user.email=test@example.com",
+            "tag",
+            "-a",
+            "v1",
+            "-m",
+            "tag",
+        ],
+    );
+    crate::git_runner::host_git(&bare, &["tag", "v1-light"]);
+    let tag = crate::git_runner::host_git(&bare, &["rev-parse", "refs/tags/v1"]);
+    let tag = tag.trim();
+    assert_ne!(tag, commit, "the fixture's v1 is an annotated tag object");
+    world.fake.clear_seen();
+    let read = |extra: &[&str]| {
+        let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+        let mut ctx = ctx
+            .with_git_helper(common::helper())
+            .with_git_remote("fixture-dev/app", &bare);
+        let mut args = vec!["repo", "refs", "fixture-dev/app"];
+        args.extend(extra);
+        assert_eq!(
+            common::run_cli(&mut ctx, &args),
+            0,
+            "{extra:?}: {}",
+            captured.stderr_text()
+        );
+        common::stdout_json(&captured)
+    };
+    assert_eq!(
+        read(&["--ref", "refs/tags/v1"]),
+        aterm_json::json!([{"ref":"refs/tags/v1", "oid":tag, "peeled":commit}])
+    );
+    assert_eq!(
+        read(&["--ref", "refs/tags/v1-light"]),
+        aterm_json::json!([{"ref":"refs/tags/v1-light", "oid":commit}])
+    );
+    assert_eq!(
+        read(&["--ref", "HEAD"]),
+        aterm_json::json!([{"ref":"HEAD", "oid":commit}])
+    );
+    let all = read(&[]);
+    let rows = all.as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| !row["ref"].as_str().unwrap().ends_with("^{}")),
+        "{all}"
+    );
+    let peeled: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("peeled").is_some())
+        .collect();
+    assert_eq!(
+        peeled,
+        [&aterm_json::json!({"ref":"refs/tags/v1", "oid":tag, "peeled":commit})],
+        "{all}"
+    );
+    assert!(
+        world.fake.seen().is_empty(),
+        "native authenticated ref reads spend no REST quota"
+    );
+}
+
 #[test]
 fn public_refs_include_peeled_tags_without_rest_or_writer_identity() {
     let world = World::canonical("helper-public-refs");

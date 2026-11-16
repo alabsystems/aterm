@@ -10311,7 +10311,8 @@ fn html_selects(selector: &str, name: &str, tag: &str) -> bool {
 }
 
 /// Whether `selector` is one simple selector [`html_selects`] reads.
-#[cfg(test)]
+// Read only by `headless_oauth_human_check_tests`, mounted `all(test, unix)`.
+#[cfg(all(test, unix))]
 pub(super) fn html_selector_supported(selector: &str) -> bool {
     let selector = selector.trim();
     let split = selector.find(['[', '.', '#']).unwrap_or(selector.len());

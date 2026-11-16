@@ -180,6 +180,55 @@ impl WakeDeadline {
     }
 }
 
+/// A WATCH ON WHETHER THE MACHINE SLEPT ACROSS A RUN: the clock that stops in sleep and the one
+/// that counts through it, both read at the start ([`SleepWatch::start`]) and again at the end
+/// ([`SleepWatch::slept`]). What a run that spanned a sleep met (its deadline, a page that went
+/// away, a mailbox wait that found nothing) says nothing of the work, so its caller takes it as
+/// interrupted (`sign_in_ladder::interrupted_by_sleep`).
+#[derive(Clone, Copy, Debug)]
+pub struct SleepWatch {
+    awake: Instant,
+    through_sleep: Option<u64>,
+    #[cfg(all(test, unix))]
+    seam: Option<&'static AtomicU64>,
+}
+
+impl SleepWatch {
+    /// Starts the watch now.
+    #[must_use]
+    pub fn start() -> Self {
+        #[cfg(all(test, unix))]
+        {
+            let seam = SEAM.get();
+            Self {
+                awake: Instant::now(),
+                through_sleep: through_sleep_now(seam),
+                seam,
+            }
+        }
+        #[cfg(not(all(test, unix)))]
+        {
+            Self {
+                awake: Instant::now(),
+                through_sleep: through_sleep_now(),
+            }
+        }
+    }
+
+    /// How long the machine slept since the start: what the clock that counts through sleep
+    /// ran ahead of the one that stops in it. `None` where no clock here counts sleep, which
+    /// then shows none.
+    #[must_use]
+    pub fn slept(self) -> Option<Duration> {
+        #[cfg(all(test, unix))]
+        let now = through_sleep_now(self.seam)?;
+        #[cfg(not(all(test, unix)))]
+        let now = through_sleep_now()?;
+        let through = Duration::from_nanos(now.saturating_sub(self.through_sleep?));
+        Some(through.saturating_sub(self.awake.elapsed()))
+    }
+}
+
 fn nanos(span: Duration) -> u64 {
     u64::try_from(span.as_nanos()).unwrap_or(u64::MAX)
 }

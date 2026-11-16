@@ -330,6 +330,8 @@ pub struct FakeTools {
     pub answer: Answer,
     /// Whether two Mach-Os are one program unsigned.
     pub same_unsigned: bool,
+    /// Model a code signature whose identifier depends on the file name.
+    pub resign_by_name: bool,
     /// The relocator's refusal, when it should refuse.
     pub relocate_refusal: Option<String>,
     /// A run whose arguments carry this word never ends: it answers as a child ended at its
@@ -348,6 +350,7 @@ impl FakeTools {
             default_version: Some(version_text(COMMIT, host)),
             answer: Box::new(|_| None),
             same_unsigned: false,
+            resign_by_name: false,
             relocate_refusal: None,
             overruns: None,
             log: Mutex::new(Vec::new()),
@@ -455,6 +458,17 @@ impl Tools for FakeTools {
 
     fn resign(&self, file: &Path) -> Result<(), String> {
         self.note(format!("resign {}", file.display()));
+        if self.resign_by_name {
+            let mut bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+            bytes.extend(
+                format!(
+                    " signature:{}",
+                    file.file_name().expect("file name").to_string_lossy()
+                )
+                .as_bytes(),
+            );
+            std::fs::write(file, bytes).map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 

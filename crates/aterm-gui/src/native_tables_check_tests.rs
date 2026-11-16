@@ -127,7 +127,7 @@ fn check_lists_each_finding_and_the_stores_state() {
         );
         assert_ne!(said_words, line.kind, "{words}");
         for pk in &line.pks {
-            assert!(place.contains(pk.as_str()), "{words}");
+            assert!(!place.contains(pk.as_str()), "a row by its words: {words}");
         }
     }
     let conflict = reported
@@ -137,7 +137,7 @@ fn check_lists_each_finding_and_the_stores_state() {
     assert_eq!(
         said(&ui, &format!("tables/check/finding/{conflict}")).unwrap(),
         format!(
-            "{}: Machines \u{b7} {MC} \u{b7} nickname",
+            "{}: Machines \u{b7} m9 \u{b7} nickname",
             aterm_db::typed::check::said("conflict")
         )
     );
@@ -146,7 +146,7 @@ fn check_lists_each_finding_and_the_stores_state() {
     let compiled = handle.compiled();
     let quota_spent = view.quota.spent.get(&usage.actor).copied().unwrap_or(0);
     let store = |key: &str| said(&ui, &format!("tables/check/store/{key}")).unwrap();
-    assert_eq!(store("write"), "This Mac can write the registry");
+    assert_eq!(store("write"), "This machine can write the registry");
     assert_eq!(store("history"), "Its history is complete here");
     assert_eq!(
         store("records"),
@@ -156,14 +156,14 @@ fn check_lists_each_finding_and_the_stores_state() {
     assert_eq!(
         store("mine"),
         format!(
-            "This Mac's records: {} of 4,096 one writer may hold",
+            "This machine's records: {} of 4,096 one writer may hold",
             usage.mine_records
         )
     );
     assert_eq!(
         store("quota"),
         format!(
-            "This Mac's automatic records: {quota_spent} of its quota of {}",
+            "This machine's automatic records: {quota_spent} of its quota of {}",
             compiled.table.self_quota
         )
     );
@@ -173,7 +173,7 @@ fn check_lists_each_finding_and_the_stores_state() {
         store("generation"),
         format!("Generation {} ({})", compiled.generation, compiled.name())
     );
-    assert_eq!(store("writers"), "2 Macs have written it");
+    assert_eq!(store("writers"), "2 machines have written it");
     assert_eq!(store("roll"), "Check asks for no roll");
 
     // A finding selected shows the rows it names, each with the way to it.
@@ -190,9 +190,10 @@ fn check_lists_each_finding_and_the_stores_state() {
     let names = &reported[ambiguous].pks;
     assert_eq!(names.len(), 2, "{names:?}");
     let show = format!("tables/check/row/{ambiguous}/1");
+    let label = if names[1] == MC { "m9" } else { "m55" };
     assert_eq!(
         said(&ui, &show),
-        Some(format!("Show row {} in Machines", names[1]))
+        Some(format!("Show row {label} in Machines"))
     );
     act(&mut app, &show, None);
     let ui = render(&app);
@@ -202,5 +203,109 @@ fn check_lists_each_finding_and_the_stores_state() {
     assert!(
         said(&ui, &format!("tables/cell/{}/label", names[1])).is_some(),
         "the row is listed"
+    );
+}
+
+/// Check says each row a finding names by the words its row is known by (a machine by its
+/// label, as a reference to it reads), in the list and in the selected finding's pane, never by
+/// its key; and heads the selected finding with a few words in sentence case, the kind word
+/// `check --tsv` prints under it.
+/// NEGATIVE CONTROL, observed: with `where_words` joining the finding's keys, the list says them:
+/// `` a row by its words: A machine's label is another live machine's alias, so it names two
+/// machines: Machines · mc-0000000000000009, mc-000000000000000b ``; with the pane heading the
+/// finding by `found.kind`, `` left: Some("label-ambiguous") right: Some("Label names two
+/// machines") ``; with no line under the heading saying the finding's word, `` left: None right:
+/// Some("label-ambiguous") ``.
+#[test]
+fn check_names_each_row_by_its_words_and_heads_each_finding() {
+    let lab = two_macs();
+    let here = Registry::at(lab.paths[0].clone());
+    here.write(vec![vec![
+        put_in(&MACHINE, OTHER, "label", json!("m55")),
+        put_in(&MACHINE, OTHER, "status", json!("active")),
+        put_in(&MACHINE, OTHER, "row", json!("live")),
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: OTHER,
+                col: "aliases",
+                elem: Some("m9"),
+            },
+            &CellValue::owner(MACHINE.version, json!(true)),
+        )
+        .unwrap(),
+    ]])
+    .unwrap();
+    repair_commons(&lab, 4);
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    act(&mut app, crate::native_tables_check::OPEN, None);
+    settle(&mut app);
+    let ui = render(&app);
+    let sentence = aterm_db::typed::check::said("label-ambiguous");
+    let n = (0..)
+        .map_while(|n| said(&ui, &format!("tables/check/finding/{n}")))
+        .position(|line| line.starts_with(sentence))
+        .expect("the label is found ambiguous");
+    let line = said(&ui, &format!("tables/check/finding/{n}")).unwrap();
+    let place = line.strip_prefix(&format!("{sentence}: ")).unwrap();
+    let mut rows: Vec<&str> = place
+        .strip_prefix("Machines \u{b7} ")
+        .unwrap()
+        .split(", ")
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(rows, ["m55", "m9"], "a row by its words: {line}");
+
+    act(&mut app, &format!("tables/check/finding/{n}"), None);
+    let ui = render(&app);
+    assert_eq!(
+        said(&ui, "tables/pane/title").as_deref(),
+        Some("Label names two machines")
+    );
+    assert_eq!(
+        said(&ui, "tables/pane/kind").as_deref(),
+        Some("label-ambiguous"),
+        "the word `check --tsv` says it by"
+    );
+    let mut named: Vec<String> = (0..2)
+        .map(|m| said(&ui, &format!("tables/pane/row/{m}/key")).unwrap())
+        .collect();
+    named.sort_unstable();
+    assert_eq!(named, ["m55 \u{b7} Machines", "m9 \u{b7} Machines"]);
+    // A kind no heading is written for still reads as words.
+    assert_eq!(
+        aterm_db::typed::check::headed("some-new-kind"),
+        "Some new kind"
+    );
+}
+
+/// Two rows a finding names that read the same (two enrollments of one machine, each known by
+/// its machine's label) each say their key beside their words, so the finding never reads as
+/// naming one row twice; rows that read apart, or of different tables, keep their words alone.
+/// NEGATIVE CONTROL, observed: with `apart` returning `rows` as given, `` left: [(Some
+/// ("machine-facts"), "m1"), (Some("machine-facts"), "m1"), …] right: [(Some("machine-facts"),
+/// "m1 (0123)"), …] ``.
+#[test]
+fn two_rows_that_read_the_same_say_their_keys() {
+    let pks: Vec<String> = ["0123", "4567", "mc-1", "mc-2"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let rows = vec![
+        (Some("machine-facts"), "m1".to_owned()),
+        (Some("machine-facts"), "m1".to_owned()),
+        (Some("machine"), "m1".to_owned()),
+        (None, "mc-2".to_owned()),
+    ];
+    assert_eq!(
+        crate::native_tables_check::apart(rows, &pks),
+        [
+            (Some("machine-facts"), "m1 (0123)".to_owned()),
+            (Some("machine-facts"), "m1 (4567)".to_owned()),
+            (Some("machine"), "m1".to_owned()),
+            (None, "mc-2".to_owned()),
+        ]
     );
 }

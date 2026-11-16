@@ -438,6 +438,12 @@ pub struct Report {
     pub conflicts_sent: usize,
     /// Accepted local conflict ingests, whether or not receipts reach the peer.
     pub conflicts_received: usize,
+    /// Of the records this side's batches accepted ([`Self::received`],
+    /// [`Self::conflicts_received`]), those its store did not hold before, operations and
+    /// conflict proofs alike: by how much those ingests grew the store's witnessed count. A
+    /// record another of this Mac's rounds, a command or another process put in the store after
+    /// this round read its inventory counts in those and not here.
+    pub added: usize,
 }
 /// Why a completed table round could not exchange an inventory. This is a
 /// local observation; an unavailable peer inventory carries no remote cause.
@@ -484,12 +490,45 @@ impl BatchDeferral {
 /// cached lists newer by returning after another round.
 #[derive(Clone, Debug)]
 pub(crate) struct Listing {
+    /// When this side began reading its lists: no store a look first found after it can be
+    /// known to be in them ([`Self::takes`]).
     at: Instant,
-    tables: BTreeSet<Digest>,
+    /// The tables this side listed. At most [`MAX_TABLES`].
+    listed: BTreeSet<Digest>,
+    /// Of those, the ones the peer did not list.
+    unlisted: BTreeSet<Digest>,
 }
 impl Listing {
-    pub(crate) fn contains(&self, table: &Digest) -> bool {
-        self.tables.contains(table)
+    /// Whether, as far as these lists tell, a round led to `table` may give the peer some of
+    /// it, a write here to a store this side has held since `held` (none: no write here is
+    /// known, as where a store holds only what rounds brought). Where both sides listed the
+    /// table, it may. Where this side listed it and the peer did not, it may not: the peer then
+    /// held none of it, or could not take it, and what it subscribes to since is its own rounds'
+    /// to take up. Where this side did not list it, it may only if this side's store is younger
+    /// than these lists (one this side created or took up since, or one whose policy may select
+    /// it again since: `crate::runtime::moved::Look::held_since`), which could say nothing of it;
+    /// a table this side held then and did not list (its policy excludes it, it is a ring table
+    /// past its window, it is a recovery store) is no table of this side's rounds, which never
+    /// take it with any peer, until a round lists it.
+    pub(crate) fn takes(&self, table: &Digest, held: Option<Instant>) -> bool {
+        if self.listed.contains(table) {
+            return !self.unlisted.contains(table);
+        }
+        #[cfg(test)]
+        if TAKES_ANY_UNLISTED.with(std::cell::Cell::get) {
+            return true;
+        }
+        #[cfg(test)]
+        if TAKES_ONLY_LISTED.with(std::cell::Cell::get) {
+            return false;
+        }
+        held.is_some_and(|held| held > self.at)
+    }
+
+    /// Whether these lists showed both sides listing `table`: a round led to it may give the
+    /// peer some of it, whatever this side's store of it ([`Self::takes`]).
+    pub(crate) fn shares(&self, table: &Digest) -> bool {
+        self.listed.contains(table) && !self.unlisted.contains(table)
     }
 
     pub(crate) fn newer_than(&self, earlier: &Self) -> bool {
@@ -501,7 +540,7 @@ impl Listing {
     }
 
     pub(crate) fn same_tables(&self, other: &Self) -> bool {
-        self.tables == other.tables
+        self.listed == other.listed && self.unlisted == other.unlisted
     }
 }
 
@@ -537,10 +576,11 @@ pub struct Repair {
     /// peer's answer replaces the set, so nothing that must outlive an ask is kept here
     /// ([`Self::lead`]).
     differing: BTreeSet<Digest>,
-    /// The tables this side's scheduler named for this peer ([`Self::lead`]), at most
-    /// [`MAX_TABLES`]: each with whether a round this side initiated has already found it
-    /// outside the tables both sides list ([`Self::led`]).
-    lead: BTreeMap<Digest, bool>,
+    /// The led tables for the rounds this side initiates with this peer: those this side's
+    /// scheduler named ([`Self::lead`]) and those a round led because the lists newly share
+    /// them ([`Self::take_up`]), at most [`MAX_TABLES`] of each, with what rounds left of each
+    /// ([`Lead`]).
+    lead: BTreeMap<Digest, Lead>,
     /// The led table a round last took: the next is the first led one after it, so a table led
     /// again each round does not keep the other led tables waiting.
     lead_after: Option<Digest>,
@@ -555,21 +595,44 @@ pub struct Repair {
     /// How many tables both sides listed in the last round this side initiated since
     /// [`Self::restart_cycle`]; none before one.
     common: Option<usize>,
-    /// The tables both sides listed in the last round with this peer that traded table lists,
-    /// whichever side began it ([`Self::listed`]); none before one. At most [`MAX_TABLES`].
+    /// What the last round with this peer that traded table lists, whichever side began it,
+    /// showed of both sides' tables ([`Listing::takes`]); none before one.
     listed: Option<Listing>,
+}
+
+/// What the rounds this side initiated left of one led table ([`Repair::lead`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Lead {
+    /// This side's scheduler named it ([`Repair::lead`]): it goes before the tables led only
+    /// because the lists newly share them ([`Repair::take_up`]).
+    named: bool,
+    /// A round found it outside the tables both sides list ([`Repair::led`]).
+    absent: bool,
+    /// A round chose it. The end of that round's exchange of it removes the lead, so this stays
+    /// set only where the round broke off first, and the next round to choose the table spends
+    /// the lead ([`Repair::chose`]).
+    tried: bool,
 }
 
 impl Repair {
     /// Name `table` for the rounds this side initiates with this peer: each repairs a led table
     /// both sides list, after a push's table and a follow-up and before any backfill hint or
-    /// regular turn, and a table leaves as a round this side initiated selects it, however it
-    /// was chosen. Led tables are taken in turn, each after the one last taken, and the
-    /// [`TABLE_BURST`]th led round in a row yields the next round to the regular turn, so the
-    /// scan's place stays its own and it still gets one round in `TABLE_BURST + 1`. A led table the lists do not share waits one such round, in which the peer
-    /// can take it up (a ring table it lacked), and is dropped by the next that still lacks it,
-    /// so a lead is never owed for longer than that. False where [`MAX_TABLES`] other tables are
-    /// already led: the lead is not kept, and the scan reaches the table at its turn.
+    /// regular turn. A table this side's scheduler named goes before those a round led only
+    /// because the lists newly share them ([`Self::take_up`]), so a write here is not queued
+    /// behind a catalog's worth of them. A table leaves once a round this side initiated has
+    /// exchanged it, however it was chosen. A round that breaks off before its exchange of the
+    /// table ends leaves it led once, since it may have carried none of it and a lead nothing
+    /// else names again (a table the lists newly share) would otherwise wait for the scan's turn
+    /// or an audit; the next round to choose the table spends the lead whatever that round's
+    /// exchange does ([`Self::chose`]), so a table whose exchange fails each time is owed nothing
+    /// after its second try, and leaves no work pending ([`Self::pending`]) unless the scheduler
+    /// names it again. Led tables are taken in turn, each after the one last taken,
+    /// and the [`TABLE_BURST`]th led round in a row yields the next round to the regular turn,
+    /// so the scan's place stays its own and it still gets one round in `TABLE_BURST + 1`. A
+    /// led table the lists do not share waits one such round, in which the peer can take it up
+    /// (a ring table it lacked), and is dropped by the next that still lacks it. False where
+    /// this side's scheduler already named [`MAX_TABLES`] other tables: the lead is not kept,
+    /// and the scan reaches the table at its turn.
     ///
     /// A lead is a volatile order hint as the rest of this state is: it grants nothing, and the
     /// round's own lists and inventories still decide what is repaired.
@@ -579,33 +642,81 @@ impl Repair {
             self.differing.insert(table);
             return true;
         }
-        if !self.lead.contains_key(&table) && self.lead.len() >= MAX_TABLES {
+        let named = |lead: &Lead| lead.named;
+        if !self.lead.get(&table).is_some_and(named)
+            && self.lead.values().filter(|lead| named(lead)).count() >= MAX_TABLES
+        {
             return false;
         }
-        self.lead.entry(table).or_insert(false);
+        self.lead.entry(table).or_default().named = true;
         true
     }
 
-    /// The led table of `common` a round this side initiates takes next: the first after the
-    /// one last taken. A led table outside `common` stays for one such round and goes in the
-    /// next that still lacks it.
+    /// Lead `table`, which the lists of the round this side began newly share: after every table
+    /// this side's scheduler named ([`Self::lead`]), and not where [`MAX_TABLES`] such tables
+    /// are led already. One led already stays as it is.
+    fn take_up(&mut self, table: Digest) {
+        if !self.lead.contains_key(&table)
+            && self.lead.values().filter(|lead| !lead.named).count() < MAX_TABLES
+        {
+            self.lead.insert(table, Lead::default());
+        }
+    }
+
+    /// A round this side initiates chose `table`, by whatever turn. A lead of it that an earlier
+    /// round broke off on is spent now, and any other is marked so: the exchange's end removes it
+    /// either way, and a round that breaks off before then leaves it for one more round.
+    fn chose(&mut self, table: Digest) {
+        #[cfg(test)]
+        let (spent, unspent) = (
+            LEAD_SPENT_ON_SELECTION.with(std::cell::Cell::get),
+            LEAD_OUTLIVES_EVERY_BREAK.with(std::cell::Cell::get),
+        );
+        #[cfg(not(test))]
+        let (spent, unspent) = (false, false);
+        let Some(lead) = self.lead.get_mut(&table) else {
+            return;
+        };
+        if spent || (lead.tried && !unspent) {
+            self.lead.remove(&table);
+        } else {
+            lead.tried = true;
+        }
+    }
+
+    /// The led table of `common` a round this side initiates takes next: of those this side's
+    /// scheduler named, if any is in `common`, else of all, the first after the one last taken.
+    /// A led table outside `common` stays for one such round and goes in the next that still
+    /// lacks it.
     fn led(&mut self, common: &BTreeSet<Digest>) -> Option<Digest> {
         #[cfg(test)]
-        let waits = !LEAD_NEEDS_COMMON.with(std::cell::Cell::get);
+        let (waits, unranked) = (
+            !LEAD_NEEDS_COMMON.with(std::cell::Cell::get),
+            LEADS_UNRANKED.with(std::cell::Cell::get),
+        );
         #[cfg(not(test))]
-        let waits = true;
-        self.lead.retain(|table, absent| {
+        let (waits, unranked) = (true, false);
+        self.lead.retain(|table, lead| {
             if common.contains(table) {
-                *absent = false;
+                lead.absent = false;
                 true
             } else {
-                waits && !std::mem::replace(absent, true)
+                waits && !std::mem::replace(&mut lead.absent, true)
             }
         });
-        let led: BTreeSet<Digest> = self.lead.keys().copied().collect();
-        cycle(&led, self.lead_after)
-            .find(|table| common.contains(*table))
-            .copied()
+        let first = |named: bool| {
+            let led: BTreeSet<Digest> = self
+                .lead
+                .iter()
+                .filter(|(table, lead)| common.contains(*table) && (lead.named || !named))
+                .map(|(table, _)| *table)
+                .collect();
+            cycle(&led, self.lead_after).next().copied()
+        };
+        if unranked {
+            return first(false);
+        }
+        first(true).or_else(|| first(false))
     }
 
     /// Make the next round this side initiates with this peer an audit: it asks which tables
@@ -657,23 +768,31 @@ impl Repair {
         self.common = None;
     }
 
-    /// The last completed exchange's common tables and when it read them, whichever side began
-    /// it; none before one. A cached copy keeps that exchange time.
+    /// What the last completed exchange showed of both sides' tables ([`Listing::takes`]) and
+    /// when it read them, whichever side began it; none before one. A cached copy keeps that
+    /// exchange time.
     pub(crate) fn listed(&self) -> Option<&Listing> {
         self.listed.as_ref()
     }
 
-    /// This state once a round's lists named `tables` as the ones both sides list (tests).
+    /// This state once a round that read its lists at `at` found this side listing `listed` and
+    /// the peer leaving out `left_out` of them ([`Self::listed`]) (tests).
     #[cfg(test)]
-    pub(crate) fn listing(&mut self, tables: impl IntoIterator<Item = Digest>) {
-        self.listing_at(tables, Instant::now());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn listing_at(&mut self, tables: impl IntoIterator<Item = Digest>, at: Instant) {
+    pub(crate) fn listing_at(
+        &mut self,
+        listed: impl IntoIterator<Item = Digest>,
+        left_out: impl IntoIterator<Item = Digest>,
+        at: Instant,
+    ) {
+        let listed: BTreeSet<Digest> = listed.into_iter().collect();
+        let unlisted = left_out
+            .into_iter()
+            .filter(|table| listed.contains(table))
+            .collect();
         self.listed = Some(Listing {
             at,
-            tables: tables.into_iter().collect(),
+            listed,
+            unlisted,
         });
     }
 
@@ -2857,6 +2976,7 @@ impl Round<'_> {
         repair: &mut Repair,
         report: &mut Report,
     ) -> Result<()> {
+        let read = Instant::now();
         self.keys(stream, peer, side, repair, report)?;
         self.select_tables(Some(peer), report)?;
         repair.records.retain(|id, _| self.tables.contains_key(id));
@@ -2957,12 +3077,40 @@ impl Round<'_> {
             };
         }
         let common: BTreeSet<_> = local.intersection(&remote).copied().collect();
-        // Control's per-actor lease spans its call here, including local enumeration above:
-        // another control round with this actor cannot read newer lists before this point.
-        // Its worker can still be joined first, so this time travels with the snapshot.
+        // A table both sides list that the last round to trade lists did not find both listing
+        // was taken up since by one side (as a Mac enrolls a table its peer published once a
+        // round brings the declaration), which may hold none of it yet: a round this side begins
+        // leads it ([`Repair::lead`]). Nothing else brings it sooner: the scan reaches it only
+        // when its place comes round, and a pair at rest takes no scan turn before its audit.
+        // Only the first round to find it newly shared leads it, since that round's lists are
+        // the next one's last; before any lists traded, the first rounds' own sweep reaches it.
+        // The lead outlives one round that breaks off before its exchange of the table ends
+        // ([`Repair::lead`]), whose lists, saved here, leave it shared for the next. It goes
+        // after every table the scheduler named ([`Repair::take_up`]).
+        #[cfg(test)]
+        let unled = TAKEN_UP_UNLED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unled = false;
+        if side == Side::Initiator
+            && !unled
+            && let Some(last) = &repair.listed
+        {
+            let taken_up: Vec<Digest> = common
+                .iter()
+                .filter(|table| !last.listed.contains(*table) || last.unlisted.contains(*table))
+                .copied()
+                .collect();
+            for table in taken_up {
+                repair.take_up(table);
+            }
+        }
+        // Control's per-actor lease spans this call from `read`, before this side's tables were
+        // read: another control round with this actor cannot read newer lists in between. Its
+        // worker can still be joined first, so this time travels with the snapshot.
         repair.listed = Some(Listing {
-            at: Instant::now(),
-            tables: common.clone(),
+            at: read,
+            unlisted: local.difference(&remote).copied().collect(),
+            listed: local.clone(),
         });
         if side == Side::Initiator {
             if let Some(salt) = salt
@@ -3016,7 +3164,8 @@ impl Round<'_> {
         let follow_up = follow_up.filter(|(id, _)| pushed.is_none_or(|first| first == *id));
         // A led table ([`Repair::lead`]) comes after a follow-up, which ends by itself within
         // `TABLE_BURST` rounds and would be dropped, not delayed, by a table chosen over it; the
-        // lead stays until a round selects it. It is no witness answer's to erase (`differing`).
+        // lead stays until a round exchanges its table, or a second round chooses it where the
+        // first broke off ([`Repair::chose`]). It is no witness answer's to erase (`differing`).
         // An audit's yield ([`Repair::audit`]) does not hold it back: what moved goes in the
         // audit's round, and the regular turn in the round after. Only the yield that ends a run
         // of led rounds does ([`Repair::lead_yield`]).
@@ -3063,7 +3212,7 @@ impl Round<'_> {
                 });
                 if let Some(id) = chosen {
                     repair.differing.remove(&id);
-                    repair.lead.remove(&id);
+                    repair.chose(id);
                 }
                 self.local(peer, |_| Ok(()))?;
                 control::send_frame(stream, chosen.as_ref().map_or(&[][..], |id| id.as_slice()))?;
@@ -3143,6 +3292,11 @@ impl Round<'_> {
         report.regular = regular;
         let deferred = report.deferred;
         self.table(stream, peer, side, id, repair, report)?;
+        // The exchange ended, so a led table leaves ([`Repair::lead`]); every return above left
+        // it led, once ([`Repair::chose`]).
+        if side == Side::Initiator {
+            repair.lead.remove(&id);
+        }
         report.table_deferred = report.deferred > deferred;
         if regular {
             repair.turns = repair.turns.saturating_add(1);
@@ -3933,7 +4087,10 @@ impl Round<'_> {
             BatchKind::Operation => "operations",
             BatchKind::Conflict => "conflicts",
         };
+        #[cfg(test)]
+        before_ingest(id, &wires)?;
         let mut refusal = None;
+        let mut added = 0;
         #[cfg(test)]
         let mut retained_after = None;
         let verdicts = self.local_write(peer, |session| {
@@ -3944,6 +4101,9 @@ impl Round<'_> {
                     return Ok(vec![false; n]);
                 }
             };
+            // An ingest of a record the store already holds returns its receipt and appends
+            // nothing: what the witness grew by is what this batch brought that was new here.
+            let witnessed = store.witnessed();
             // An operation batch commits as one checkpoint group ([`Store::ingest_batch`]):
             // one permit, journal commit and custody witness for the batch, where each record's
             // own append flushed the journal and the witness (16 records took 100 ms of a
@@ -3960,6 +4120,8 @@ impl Round<'_> {
                         .zip(&wires)
                         .all(|(receipt, (record, _))| receipt.id == *record)
                 {
+                    added =
+                        usize::try_from(store.witnessed().saturating_sub(witnessed)).unwrap_or(n);
                     #[cfg(test)]
                     {
                         retained_after = store.inventory(session).ok().map(Iterator::count);
@@ -3999,6 +4161,7 @@ impl Round<'_> {
                     }
                 })
                 .collect::<Vec<_>>();
+            added = usize::try_from(store.witnessed().saturating_sub(witnessed)).unwrap_or(n);
             #[cfg(test)]
             {
                 retained_after = matches!(kind, BatchKind::Operation)
@@ -4017,6 +4180,7 @@ impl Round<'_> {
         }
         // Ingestion completed before these receipts. Preserve all observed
         // verdicts even when current authority or the return channel now fails.
+        report.added += added;
         for accepted in &verdicts {
             if *accepted {
                 match kind {
@@ -4089,6 +4253,51 @@ thread_local! {
     pub(crate) static ASK_BY_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Mutant (tests): an audit asks and leaves a saved follow-up its table.
     pub(crate) static AUDIT_FOLLOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a table this side did not list in a round's lists may be taken whatever
+    /// the age of its store here ([`Listing::takes`]), so one it holds and never lists is offered
+    /// to the peer at every write.
+    pub(crate) static TAKES_ANY_UNLISTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a table this side did not list in a round's lists is never taken
+    /// ([`Listing::takes`]), so one it took up since reaches the peer only at an audit.
+    pub(crate) static TAKES_ONLY_LISTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a table the lists newly share is left to the scan's turn.
+    pub(crate) static TAKEN_UP_UNLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a led table leaves as a round selects it ([`Repair::chose`]), so a round
+    /// that breaks off before its exchange of the table ends spends the lead.
+    pub(crate) static LEAD_SPENT_ON_SELECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a led table outlives every round that breaks off on it ([`Repair::chose`]),
+    /// so one whose exchange fails each time stays pending for good.
+    pub(crate) static LEAD_OUTLIVES_EVERY_BREAK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): the tables the scheduler named take no precedence over those led because
+    /// the lists newly share them ([`Repair::led`]).
+    pub(crate) static LEADS_UNRANKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A [`BEFORE_INGEST`] hook: it is handed the batch's records, each with its digest. An error
+/// breaks the receive there, as a stream that failed would, and nothing of the batch is ingested.
+#[cfg(test)]
+pub(crate) type IngestHook = Box<dyn FnOnce(&[(Digest, Vec<u8>)]) -> Result<()> + Send>;
+
+/// Seam (tests): what runs on whichever thread receives a non-empty batch of the table each
+/// names, once the batch has arrived and before any of its records is ingested
+/// ([`Round::receive_batch`]), as another round's ingest of the same records may come in
+/// between, or as the round may break off. Each runs once; the table's digest keys it, so tests
+/// that run beside each other on their own tables never meet.
+#[cfg(test)]
+pub(crate) static BEFORE_INGEST: std::sync::Mutex<Vec<(Digest, IngestHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run the [`BEFORE_INGEST`] hook kept for `table`, if one is, on the batch `wires`.
+#[cfg(test)]
+fn before_ingest(table: Digest, wires: &[(Digest, Vec<u8>)]) -> Result<()> {
+    let hook = {
+        let mut hooks = BEFORE_INGEST.lock().unwrap_or_else(|p| p.into_inner());
+        hooks
+            .iter()
+            .position(|(held, _)| *held == table)
+            .map(|at| hooks.swap_remove(at).1)
+    };
+    hook.map_or(Ok(()), |hook| hook(wires))
 }
 
 /// `local` with the clock mark of `wall` (ms) where one is given and the list has room for it

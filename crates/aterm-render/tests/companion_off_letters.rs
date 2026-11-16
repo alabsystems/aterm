@@ -713,11 +713,14 @@ const TYPING_FROM: u64 = 1_000;
 /// can reach in the ease and past a stand the writing carries on
 /// ([`OldPath::LookAheadAtTopSpeed`]; reverted alone, under words 24 cells apart, the first 24
 /// cells in, the cat speeding up off the first keys meets `efgh` before its sink is done, r24
-/// K7-1), and once drawn down the body stays down across a gap wider than that
+/// K7-1; on a face where it does not, under the first of words 26 to 32 cells apart, as far in,
+/// where it does: under Windows' Iosevka Term NL's 11 x 28 px cells none at 24, 2 frames at 26,
+/// Windows x64, 2026-11-15), and once drawn down the body stays down across a gap wider than that
 /// ([`OldPath::HeadHeldAcrossGaps`]; reverted alone, under words 24 cells apart it rises whole
 /// in the gap, its box past the prompt row's top, and is drawn down again at the next word).
-/// Each look ahead's scene is replayed with every law kept as well, and there no frame's box
-/// meets a glyph's cell in the row above. Review9fix round 3's review: 13 of 211 frames on the
+/// Every look ahead's scene (words 24 to 32 cells apart for the top speed's, whichever of them
+/// its control bites in) is replayed with every law kept as well, and in none does a frame's box
+/// meet a glyph's cell in the row above. Review9fix round 3's review: 13 of 211 frames on the
 /// row above's letters, at its columns 10-12, 20 and 30-32.
 #[test]
 fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
@@ -737,7 +740,10 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
     );
     let wide = words_apart(0, &["abcd", "efgh", "ijkl"], 24);
     let gapped = words_apart(2 * gap, &words, gap);
-    let wide_gapped = words_apart(24, &["efgh", "ijkl"], 24);
+    let wide_gapped: Vec<String> = (24..=32)
+        .step_by(2)
+        .map(|cells| words_apart(cells, &["efgh", "ijkl"], cells))
+        .collect();
     let from = 600;
     for rows in [
         (gj.as_str(), ""),
@@ -786,29 +792,43 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
         rises_past_the_row(&held, from, 4, ch, line_end(&wide)) > 0,
         "negative control (the hold): the box never rose past the row once held"
     );
-    for (scene, law, what) in [
-        (&gapped, OldPath::HeadLooksAhead, "the look ahead"),
+    for (scenes, law, what) in [
         (
-            &wide_gapped,
+            std::slice::from_ref(&gapped),
+            OldPath::HeadLooksAhead,
+            "the look ahead",
+        ),
+        (
+            &wide_gapped[..],
             OldPath::LookAheadAtTopSpeed,
             "the look ahead at the run's top speed",
         ),
     ] {
-        let boxed = |old: &[OldPath]| {
+        let boxed = |scene: &str, old: &[OldPath]| {
             let (judged, _) =
                 typed_under_a_lettered_row("rainbow + cat", DARK, 4, (scene, ""), old, false);
             (boxes_on_glyphs(&judged, from, 3..=3), sum(&judged, from))
         };
-        let (kept, s) = boxed(&[]);
-        assert_eq!(
-            kept, 0,
-            "{what}'s scene under {scene:?}, every law kept: frames whose box meets a glyph's \
-             cell in the row above: {s:?}"
-        );
-        let (old, s) = boxed(&[law]);
+        // The law holds in every scene, the one its control bites in among them.
+        for scene in scenes {
+            let (kept, s) = boxed(scene, &[]);
+            assert_eq!(
+                kept, 0,
+                "{what}'s scene under {scene:?}, every law kept: frames whose box meets a \
+                 glyph's cell in the row above: {s:?}"
+            );
+        }
+        // The law reverted alone meets the next word's letters in at least one of them.
+        let mut missed = Vec::new();
+        let bites = scenes.iter().any(|scene| {
+            let (old, s) = boxed(scene, &[law]);
+            missed.push(format!("under {scene:?}: {s:?}"));
+            old > 0
+        });
         assert!(
-            old > 0,
-            "negative control ({what}): the box never met the next word's letters: {s:?}"
+            bites,
+            "negative control ({what}): the box never met the next word's letters: {}",
+            missed.join("; ")
         );
     }
 }

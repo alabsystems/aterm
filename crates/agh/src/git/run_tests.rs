@@ -341,6 +341,7 @@ fn a_push_s_unnamed_exit_may_have_been_sent() {
     let read = super::GitOp::LsRemote {
         reference: None,
         anonymous: false,
+        peeled: false,
     };
     let hung = ChildOut {
         code: Some(128),

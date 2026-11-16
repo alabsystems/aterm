@@ -29,7 +29,7 @@ fn client(pid: u32) -> Who {
 /// Tab `local` names a typist `tab-<local>`, `s-<local>` at facts; the
 /// edge's session is tab 3.
 fn named(who: &Who, shells: &[(u64, i32)]) -> Named {
-    let sid = SessionId::new("s-0123456789abcdef");
+    let sid = SessionId::parse("tqn5r6e0148").expect("a tab id");
     name(who, shells, &|s| (*s == sid).then_some(3), &|local| {
         Some(Named {
             words: format!("tab-{local}"),
@@ -116,10 +116,10 @@ fn a_drivers_typing_is_kept_past_aterms_own() {
 #[test]
 fn an_edge_is_who_presented_it_on_its_tab() {
     let edge = |sid: &str, client: Who| Who::Edge {
-        src: SessionId::new(sid),
+        src: SessionId::parse(sid).expect("a tab id"),
         client: Box::new(client),
     };
-    let here = "s-0123456789abcdef";
+    let here = "tqn5r6e0148";
     let own = named(&edge(here, client(900)), &[(3, 700)]);
     assert_eq!(own.words, "tab-3", "the edge's own tab typed");
     assert_eq!(own.facts.as_deref(), Some("s-3"));
@@ -131,13 +131,13 @@ fn an_edge_is_who_presented_it_on_its_tab() {
         "python3 (pid 900) on tab-3's edge"
     );
     assert_eq!(
-        named(&edge("s-fedcba9876543210", client(900)), &[]).words,
-        "python3 (pid 900) on s-fedc's edge"
+        named(&edge("tfedcba9876", client(900)), &[]).words,
+        "python3 (pid 900) on tfedc's edge"
     );
     let unread = Who::client_with(None, 42, &parent, &group, &comm);
     assert_eq!(
         Caller::new(edge(here, unread)).words(),
-        "a script on s-0123's edge",
+        "a script on tqn5r's edge",
         "unnamed"
     );
     assert_eq!(named(&Who::Bridge, &[(5, 700)]).words, "the message bus");

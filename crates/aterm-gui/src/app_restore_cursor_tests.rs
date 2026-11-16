@@ -83,6 +83,7 @@ fn record(root: restore::RestoredSplitTree) -> restore::RestoredTab {
 
 fn window(tabs: Vec<restore::RestoredTab>) -> restore::WindowLayout {
     restore::WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

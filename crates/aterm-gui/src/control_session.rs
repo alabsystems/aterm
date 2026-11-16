@@ -556,7 +556,10 @@ pub(crate) fn cmd_edges_json(ctx: &SessionCtx) -> String {
 pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &str) -> String {
     let target_sid = match rest.trim() {
         "" => ctx.self_id.clone(),
-        s => SessionId::new(s),
+        s => match SessionId::parse(s) {
+            Some(sid) => sid,
+            None => return "ERR no such session\n".to_string(),
+        },
     };
     let snapshot = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -998,8 +1001,10 @@ fn autopilot_moved(ctx: &SessionCtx, read: Option<&str>) -> Option<String> {
     (stored != read).then(|| format!("OK autopilot {stored}\n"))
 }
 
-const AGENT_WORDS: [&str; 7] = [
-    "busy", "prompt", "question", "idle", "survey", "unknown", "-",
+/// The agent words `await agent` takes beside `wall` and `wall:<kind>`. `stopped` is the word
+/// aterm publishes for a job-control stop it reads from the kernel, never from a record.
+const AGENT_WORDS: [&str; 8] = [
+    "busy", "prompt", "question", "idle", "survey", "unknown", "stopped", "-",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1012,7 +1017,9 @@ impl AgentWord {
     fn matches(&self, word: &str) -> bool {
         match self {
             Self::Verdict(w) => *w == word,
-            Self::Wall(None) => word.starts_with("wall:"),
+            // Every wall: one of a kind, and the bare `wall` a `walled` state reads as while
+            // nothing names its kind.
+            Self::Wall(None) => word == "wall" || word.starts_with("wall:"),
             Self::Wall(Some(kind)) => word.strip_prefix("wall:") == Some(kind.as_str()),
         }
     }
@@ -2217,6 +2224,7 @@ impl<'a> Park<'a> {
             belled: crate::park::Lane {
                 slice: unsliced,
                 hung_up: super::caller_hung_up,
+                bell: None,
             },
             #[cfg(unix)]
             bell: aterm_uds::hangup::Bell::process(),
@@ -6112,7 +6120,9 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     if let Some(refusal) = reserved_src(src) {
         return refusal;
     }
-    let src = SessionId::new(src);
+    let Some(src) = SessionId::parse(src) else {
+        return "ERR usage: grant <src-id> <op>\n".to_string();
+    };
     let tok = {
         let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
         edges.grant(src.clone(), ctx.self_id.clone(), op, ctx.nonce)
@@ -6170,10 +6180,9 @@ pub(crate) fn cmd_revoke_with_closed(
 fn revoke_in(edges: &Mutex<EdgeTable>, dst: &SessionId, rest: &str) -> String {
     let rest = rest.trim();
     if let Some(src) = rest.strip_prefix("src=") {
-        if src.is_empty() {
+        let Some(src) = SessionId::parse(src) else {
             return "ERR usage: revoke <edge-hex> | revoke src=<sid>\n".to_string();
-        }
-        let src = SessionId::new(src);
+        };
         let removed = edges
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -6205,19 +6214,24 @@ fn revoke_in(edges: &Mutex<EdgeTable>, dst: &SessionId, rest: &str) -> String {
     "OK\n".to_string()
 }
 
-fn parse_connection_args(rest: &str) -> Result<(SessionId, SessionId, Option<ConnectionKind>), ()> {
+const CONNECT_USAGE: &str = "ERR usage: connect dst=<sid> src=<sid> [kind=pull|push|both]\n";
+const DISCONNECT_USAGE: &str = "ERR usage: disconnect dst=<sid> src=<sid> [kind=pull|push|both]\n";
+
+/// `dst=<sid> src=<sid> [kind=…]` as the line spells them: each id's text, which the verb reads
+/// as a session ([`SessionId::parse`]) once it has refused a reserved `src=` word by name.
+fn parse_connection_args(rest: &str) -> Result<(&str, &str, Option<ConnectionKind>), ()> {
     let (mut dst, mut src, mut kind) = (None, None, None);
     for tok in rest.split_whitespace() {
         if let Some(v) = tok.strip_prefix("dst=") {
             if v.is_empty() {
                 return Err(());
             }
-            dst = Some(SessionId::new(v));
+            dst = Some(v);
         } else if let Some(v) = tok.strip_prefix("src=") {
             if v.is_empty() {
                 return Err(());
             }
-            src = Some(SessionId::new(v));
+            src = Some(v);
         } else if let Some(v) = tok.strip_prefix("kind=") {
             kind = Some(match v {
                 "pull" => ConnectionKind::Pull,
@@ -6251,11 +6265,14 @@ pub(crate) fn cmd_connect_in(
         return "ERR denied\n".to_string();
     }
     let Ok((dst, src, kind)) = parse_connection_args(rest) else {
-        return "ERR usage: connect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
+        return CONNECT_USAGE.to_string();
     };
-    if let Some(refusal) = reserved_src(src.as_str()) {
+    if let Some(refusal) = reserved_src(src) {
         return refusal;
     }
+    let (Some(dst), Some(src)) = (SessionId::parse(dst), SessionId::parse(src)) else {
+        return CONNECT_USAGE.to_string();
+    };
     let kind = kind.unwrap_or(ConnectionKind::Both);
     if src == dst {
         return "ERR self-loop\n".to_string();
@@ -6310,7 +6327,10 @@ pub(crate) fn cmd_disconnect_in(
         return "ERR denied\n".to_string();
     }
     let Ok((dst, src, kind)) = parse_connection_args(rest) else {
-        return "ERR usage: disconnect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
+        return DISCONNECT_USAGE.to_string();
+    };
+    let (Some(dst), Some(src)) = (SessionId::parse(dst), SessionId::parse(src)) else {
+        return DISCONNECT_USAGE.to_string();
     };
     if src == dst {
         return "ERR self-loop\n".to_string();
@@ -6384,7 +6404,7 @@ pub(super) fn raise_target(store: &Store, rest: &str) -> Result<u64, String> {
         return Err("ERR usage: raise <sid>\n".to_string());
     };
     let g = store.read().unwrap_or_else(|p| p.into_inner());
-    match g.by_sid(&SessionId::new(sid)) {
+    match SessionId::parse(sid).and_then(|sid| g.by_sid(&sid)) {
         Some(h) => Ok(h.local_id),
         None => Err("ERR no such session\n".to_string()),
     }
@@ -6411,7 +6431,7 @@ pub(crate) fn cmd_raise(
     }
 }
 
-/// `exits [<n>] [since=<id>]` -> the machine's ended sessions, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n|-> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|fleet:…|-> left=<n|->` line per row of the machine's session table ([`crate::session_table`]), which outlives a quit — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater). `<id>` is the row's id (its end's unix µs), `t=` its end's wall ms, `local=` the local id it had where this process wrote the row and `-` where another did. `left=` is what the leftover view's record of that close (`closed`, [`exits_closed`]) says the tab left running that `end` takes, and `-` where the view keeps no record of it. `ERR session table loading` past the launch's load's wait.
+/// `exits [<n>] [since=<id>]` -> the machine's ended sessions, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n|-> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|fleet:…|-> left=<n|->` line per row of the machine's session table ([`crate::session_table`]), which outlives a quit — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater). `<id>` is the row's id (an ordering cursor: the end's unix µs or one above the highest id held), `t=` its end's wall ms, `local=` the local id it had where this process wrote the row and `-` where another did. `left=` is what the leftover view's record of that close (`closed`, [`exits_closed`]) says the tab left running that `end` takes, and `-` where the view keeps no record of it. `ERR session table loading` past the launch's load's wait.
 pub(crate) fn cmd_exits(
     store: &Store,
     rest: &str,

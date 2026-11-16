@@ -1197,7 +1197,7 @@ pub(crate) fn read_root_steps() -> bool {
                     || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
                     || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
                 );
-                let spotlight = aterm_types::macos_setup::spotlight_scope::owed_here();
+                let spotlight = aterm_types::macos_setup::spotlight_scope::automatic_owed_here();
                 let owed =
                     root_steps_owed_by(debugger.mode, member, rule, refused, broker, spotlight);
                 aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed:?}");
@@ -1381,12 +1381,13 @@ impl App {
         generation: u64,
         origin: crate::tab_spawn::MenuOrigin,
     ) {
-        let session = self
-            .store
-            .read()
-            .unwrap_or_else(|why| why.into_inner())
-            .by_sid(&aterm_session::SessionId::new(sid))
-            .map(|handle| handle.local_id);
+        let session = aterm_session::SessionId::parse(sid).and_then(|sid| {
+            self.store
+                .read()
+                .unwrap_or_else(|why| why.into_inner())
+                .by_sid(&sid)
+                .map(|handle| handle.local_id)
+        });
         let session = session.filter(|session| {
             self.pool.get(*session).is_some_and(|child| {
                 child.pid == child.shell_identity.pid && child.ctx.self_id.as_str() == sid
@@ -1422,12 +1423,13 @@ impl App {
     /// [`Mark`], whose claim goes to the tab's program ([`Mark::hand`]) and into the recovery
     /// record, so a launch that adopts the live tab records its end as this one would.
     fn start_developer_tools_install(&mut self, sid: &str, spent: bool) {
-        let session = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(&aterm_session::SessionId::new(sid))
-            .map(|handle| handle.local_id);
+        let session = aterm_session::SessionId::parse(sid).and_then(|sid| {
+            self.store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .by_sid(&sid)
+                .map(|handle| handle.local_id)
+        });
         let Some(session) = session else {
             return;
         };
@@ -1697,6 +1699,25 @@ impl App {
         self.incoming_handoff_pending = false;
     }
 
+    /// The page needs installer evidence only for its repository wait or a Mac Setup tab it
+    /// owns. Unrelated publications must not probe this Mac's installers; a dispatch boundary
+    /// already read those before deciding whether its tab could land.
+    pub(crate) fn developer_tools_page_step(
+        &mut self,
+        status: &crate::SetupStatus,
+    ) -> Option<ToolsInstall> {
+        if status.repositories_tools_wait().is_none()
+            && !self
+                .workstation_setup
+                .developer_tools_session
+                .iter()
+                .any(|terminal| terminal.tools() && !terminal.ended)
+        {
+            return None;
+        }
+        self.developer_tools_install_step(status)
+    }
+
     /// Where an install of Apple's Command Line Tools stands for System State's page (design
     /// §3.3), with `status` the reading the page is about to show: an install running (or this
     /// tab's program outliving one it saw, or the tab saying the tools are installed while the
@@ -1942,10 +1963,19 @@ impl App {
             "System State: Install… starts the Mac Setup tab (`aterm {}`)",
             ARGS.join(" ")
         );
+        let mut command = tab_command(&exe, self.developer_mode_is_theirs());
+        command.insert(
+            2,
+            format!(
+                "{}=1",
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_EXPLICIT
+            )
+            .into(),
+        );
         let ask = crate::tab_spawn::SpawnAsk {
             unasked: true,
             // The program waits for its go line, which only the landing types.
-            exec_command: Some(tab_command(&exe, self.developer_mode_is_theirs())),
+            exec_command: Some(command),
             ..crate::tab_spawn::SpawnAsk::default()
         };
         Some((ask, pressed_tab_then()))

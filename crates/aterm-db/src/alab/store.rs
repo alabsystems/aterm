@@ -30,9 +30,12 @@ use std::{collections::BTreeSet, path::Path};
 
 #[path = "source.rs"]
 mod source;
+#[cfg(any(test, debug_assertions))]
+pub use source::add_admission_counts_for_test;
 pub use source::{
-    CatalogAbsenceRead, CatalogAbsenceRevision, LocalSourceRead, LocalSourceRevision,
-    ProjectionRead, ProjectionRevision, SourceRead, SourceRevision,
+    AdmissionCounts, CatalogAbsenceRead, CatalogAbsenceRevision, LocalSourceRead,
+    LocalSourceRevision, ProjectionRead, ProjectionRevision, SourceRead, SourceRevision,
+    admission_counts,
 };
 
 /// The SHA-256 fingerprint of the registry operations a [`LabView`] was projected from
@@ -657,7 +660,7 @@ impl Registry {
                 let mut seeded = Seeded::default();
                 let mut log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
-                let mut view = View::read(compiled.table, session, &log);
+                let mut view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
                     return Err(Error::new(
                         "the registry's history here is incomplete; seeds wait for a complete scan",
@@ -686,7 +689,7 @@ impl Registry {
                     if index + 1 < packed_len {
                         // Re-read before admitting another append (`Log::append_records_bound`).
                         log = Log::read_with(session, store, scope, decode)?;
-                        view = View::read(compiled.table, session, &log);
+                        view = View::read(compiled.table, session, &log)?;
                     }
                 }
                 Ok(seeded)
@@ -808,7 +811,7 @@ impl Registry {
                 session.writer()?;
                 let mut log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
-                let mut view = View::read(compiled.table, session, &log);
+                let mut view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
                     return Ok(quiet(Outcome::Incomplete));
                 }
@@ -832,7 +835,7 @@ impl Registry {
                             application::append(session, store, &command.encode()?)?;
                             migrated += 1;
                             log = Log::read_with(session, store, scope, decode)?;
-                            view = View::read(compiled.table, session, &log);
+                            view = View::read(compiled.table, session, &log)?;
                         }
                     }
                 }
@@ -913,7 +916,7 @@ impl Registry {
                 session.writer()?;
                 let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
-                let view = View::read(compiled.table, session, &log);
+                let view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
                     return Ok(quiet(discover::Outcome::Incomplete));
                 }
@@ -1006,7 +1009,7 @@ impl Registry {
                 session.writer()?;
                 let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
-                let view = View::read(compiled.table, session, &log);
+                let view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
                     return Ok(quiet("incomplete"));
                 }
@@ -1076,7 +1079,7 @@ impl Registry {
             descriptor(compiled),
             |session, store, scope| {
                 let log = Log::read_with(session, store, scope, decode)?;
-                let view = View::read(compiled.table, session, &log);
+                let view = View::read(compiled.table, session, &log)?;
                 if !view.complete {
                     return Ok(quiet(Outcome::Incomplete));
                 }
@@ -1112,7 +1115,7 @@ impl Registry {
             descriptor(compiled),
             |session, store, scope| {
                 let log = Log::read_with(session, store, scope, decode)?;
-                let view = View::read(compiled.table, session, &log);
+                let view = View::read(compiled.table, session, &log)?;
                 let inventory = || {
                     let ids: BTreeSet<Digest> = view.ops.iter().map(|op| op.id).collect();
                     Inventory(crate::replica::InventorySummary::of(&ids).fingerprint)

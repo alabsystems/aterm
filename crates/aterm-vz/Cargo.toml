@@ -16,6 +16,7 @@ description = "The Linux lane's own VM (docs/DESIGN-vz-guest-2026-10-23.md): Ubu
 [[bin]]
 name = "aterm-vz-host"
 path = "src/bin/aterm-vz-host/main.rs"
+test = false
 
 [dependencies]
 # The image pins' provider rows (`host::TOOLS`' `ubuntu-root` and
@@ -68,9 +69,6 @@ libc = { workspace = true }
 aterm-objc = { workspace = true }
 
 [dev-dependencies]
-# The tooling cache's reclaim, which the tests hold to keeping a row the lane
-# reads at every bring-up (`build_cache::tooling::plan`).
-atpkg = { workspace = true }
 # The lifecycle model and its interpreter, which `tests/conformance_lifecycle.rs` binds the
 # helper, its client and the layers to.
 aterm-models-misc = { workspace = true }

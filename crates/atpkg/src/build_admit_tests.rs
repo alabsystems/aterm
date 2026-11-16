@@ -928,6 +928,31 @@ fn plain_front(
     (got, dir)
 }
 
+/// A FRONT HANDS ITS HOLDER THE BUILD DIRECTORY ITS PLACEMENT NAMES (DC-12d, `Held::build_dir`):
+/// a plain build whose shim placement names a target directory is admitted with that target's
+/// quiet build folder as the directory its holder takes the receipts of and trims at the build's
+/// end ([`hold::receipt_leaf`], [`hold::Words::of`]). NEGATIVE CONTROL: a build whose placement
+/// names none is admitted with none.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_front_hands_its_holder_the_build_directory_its_placement_names() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let target = scratch.path().join("w/target");
+    let quiet = target.join(crate::build_cache::target_build_relative());
+    std::fs::create_dir_all(&quiet).expect("the quiet build folder");
+    for (at, handed) in [(Some(target), Some(quiet)), (None, None)] {
+        let (mut disk, _reads, _asks) = counted_hold(None, false);
+        disk.at = at;
+        let (got, dir) = plain_front(&mut disk, &|| None, Admit::Wait);
+        let Admission::Claimed(held) = got else {
+            panic!("expected a claim, got {got:?}");
+        };
+        assert_eq!(held.build_dir, handed);
+        assert_eq!(hold::Words::of(&held, 4242, 7).leaf, handed);
+        drop((held, dir));
+    }
+}
+
 /// A PLAIN BUILD STARTED BELOW ITS VOLUME'S EMERGENCY LINE IS HELD FOR ONE PASS, THEN STARTS
 /// (DC-06b): in an aterm tab, its build directory's volume 3 GiB free below its 5 GiB emergency
 /// line, the front asks the window's disk watch once, for the emergency line, while it holds no
@@ -2031,6 +2056,8 @@ fn an_ended_builds_claim_goes_before_its_peak_is_kept() {
         own: Some(file.join("targo-memory.json")),
         #[cfg(unix)]
         cohort: false,
+        #[cfg(target_os = "macos")]
+        build_dir: None,
     };
     let mut said = Vec::new();
     assert_eq!(
@@ -2113,6 +2140,8 @@ fn an_ended_build_writes_its_row_after_its_peak_book() {
         own: Some(file.join("targo-memory.json")),
         #[cfg(unix)]
         cohort: false,
+        #[cfg(target_os = "macos")]
+        build_dir: None,
     };
     let mut written = 0;
     let mut said = Vec::new();

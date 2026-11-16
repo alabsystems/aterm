@@ -2,12 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Pressure-pass cadence shared by the GUI and standalone automatic watches.
+//!
+//! A pass that freed nothing is not run again hot. `low` and `short` are one family: each pass in
+//! it that frees nothing doubles the wait before the next one, whichever of the two it ran at, up
+//! to the level's cap, so free space wandering across the floor never calls a pass a look. A pass
+//! that freed something, or free space that fell by [`EMERGENCY_DROP`] since the last pass,
+//! brings the level's base interval back. Between passes, a fall of a quarter of the volume's
+//! room (at `short` at least [`EMERGENCY_DROP`]) calls one at once, and so do a move from `low`
+//! to `short` and an agent's poke while the passes are not backing off; a move from `short` to
+//! `low` never does. An emergency pass that freed nothing waits for free space to fall by
+//! [`EMERGENCY_DROP`] or for [`PASS_EVERY`] (and, where it wrote `cannot-meet`, for
+//! [`Emergency::due`]).
 
 use std::time::{Duration, Instant};
 
 use super::{Held, Level, Waits};
 
-/// Ordinary pressure-pass interval.
+/// Ordinary pressure-pass interval, and a `short` volume's base interval.
 pub const PASS_EVERY: Duration = Duration::from_secs(10 * 60);
 /// A fresh emergency drop that permits another otherwise fruitless pass.
 pub const EMERGENCY_DROP: u64 = 512 << 20;
@@ -15,6 +26,8 @@ pub const EMERGENCY_DROP: u64 = 512 << 20;
 pub const LOW_EVERY: Duration = Duration::from_secs(3600);
 /// Maximum low-volume interval.
 pub const LOW_EVERY_MAX: Duration = Duration::from_secs(8 * 3600);
+/// Maximum interval for a `short` volume whose passes free nothing.
+pub const SHORT_EVERY_MAX: Duration = Duration::from_secs(2 * 3600);
 /// The most build locks a pass keeps to probe for their release: each probe takes a lock a
 /// moment, so the count bounds what a watch's tick does while it waits.
 pub const HELD_PROBES: usize = 16;
@@ -30,8 +43,22 @@ pub struct Pass {
     pub fruitless: bool,
     /// Its measured level.
     pub level: Level,
-    /// Its low-volume retry interval.
-    pub low_every: Duration,
+    /// The wait before the next pass ([`every`]): at `low` and `short` it doubles while passes
+    /// free nothing.
+    pub every: Duration,
+}
+
+/// Whether `level` is one of the backing-off family, `low` and `short`.
+const fn backs_off(level: Level) -> bool {
+    matches!(level, Level::Low | Level::Short)
+}
+
+/// The base and the cap of a backing-off level's wait.
+const fn waits(level: Level) -> (Duration, Duration) {
+    match level {
+        Level::Low => (LOW_EVERY, LOW_EVERY_MAX),
+        _ => (PASS_EVERY, SHORT_EVERY_MAX),
+    }
 }
 
 /// Whether the current real reading calls for a pressure pass.
@@ -54,28 +81,47 @@ pub fn due(
         pass.fruitless = false;
     }
     let since = now.saturating_duration_since(pass.at);
-    if level == Level::Low {
-        let fell =
-            matches!((pass.free, free), (Some(was), Some(is)) if is.saturating_add(room / 4) < was);
-        return poked || pass.level != Level::Low || fell || since >= pass.low_every;
+    let fell_by = |drop: u64| matches!((pass.free, free), (Some(was), Some(is)) if is.saturating_add(drop) < was);
+    if backs_off(level) && backs_off(pass.level) {
+        // A poke, or a move from `low` to `short`, calls a pass at once only while the passes
+        // are not backing off: one that freed nothing finds nothing new because a session ran
+        // short or the floor was crossed by a few bytes. A move to `low` calls none.
+        let backing = pass.every > waits(pass.level).0;
+        let drop = if level == Level::Short {
+            EMERGENCY_DROP.max(room / 4)
+        } else {
+            room / 4
+        };
+        return since >= pass.every.min(waits(level).1)
+            || fell_by(drop)
+            || (!backing && (poked || level > pass.level));
     }
     if since >= PASS_EVERY {
         return true;
     }
     if pass.fruitless {
-        return matches!((pass.free, free), (Some(was), Some(is)) if is.saturating_add(EMERGENCY_DROP) < was);
+        return fell_by(EMERGENCY_DROP);
     }
     poked || level == Level::Emergency || pass.level < Level::Short
 }
 
-/// The next retry interval after this pass.
+/// The wait after a pass at `level` that measured `free` bytes before it and `freed` something
+/// or not, the last one `before`: at `low` and `short`, twice the last wait, kept between the
+/// level's base and cap ([`LOW_EVERY`] to [`LOW_EVERY_MAX`], [`PASS_EVERY`] to
+/// [`SHORT_EVERY_MAX`]), where the last pass was at `low` or `short` too, this one freed nothing
+/// and free space did not fall by [`EMERGENCY_DROP`] since the last; else the level's base.
 #[must_use]
-pub fn low_every(level: Level, freed: bool, before: Option<&Pass>) -> Duration {
+pub fn every(level: Level, freed: bool, before: Option<&Pass>, free: Option<u64>) -> Duration {
+    if !backs_off(level) {
+        return PASS_EVERY;
+    }
+    let (base, max) = waits(level);
+    let fell = |last: &Pass| matches!((last.free, free), (Some(was), Some(is)) if is.saturating_add(EMERGENCY_DROP) <= was);
     match before {
-        Some(last) if level == Level::Low && !freed && last.level == Level::Low => {
-            last.low_every.saturating_mul(2).min(LOW_EVERY_MAX)
+        Some(last) if !freed && backs_off(last.level) && !fell(last) => {
+            last.every.saturating_mul(2).clamp(base, max)
         }
-        _ => LOW_EVERY,
+        _ => base,
     }
 }
 
@@ -88,13 +134,13 @@ pub fn ran(
     level: Level,
     freed: bool,
 ) {
-    let low_every = low_every(level, freed, last.as_ref());
+    let every = every(level, freed, last.as_ref(), free);
     *last = Some(Pass {
         at,
         free,
         fruitless,
         level,
-        low_every,
+        every,
     });
 }
 
@@ -238,3 +284,7 @@ impl Emergency {
         *self = Self::NONE;
     }
 }
+
+#[cfg(test)]
+#[path = "disk_cadence_tests.rs"]
+mod tests;

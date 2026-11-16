@@ -238,6 +238,39 @@ fn a_table_whose_command_name_is_not_utf8_is_judged_by_its_state() {
     );
 }
 
+/// A process's executable is its `exe` link's target, and a link that does not read names an
+/// exit only once the `stat` read through the same open shows one: reaped (no `stat`, or no
+/// directory) or a lone zombie, never a zombie leader whose other threads run or a live task
+/// with no image (a kernel thread). NEGATIVE CONTROL: name every `exe` that does not read an
+/// exit, as `exe_of` did, and the zombie leader and the kernel thread are `Exited`.
+#[test]
+fn a_processs_executable_names_an_exit_only_once_its_stat_shows_one() {
+    use super::super::Exe;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let proc = tmp.path().join("proc");
+    let no_fds: &[(u32, &str)] = &[];
+    for (pid, state, threads) in [(401, 'S', 1), (402, 'Z', 1), (403, 'Z', 3), (404, 'I', 1)] {
+        process(&proc, pid, state, threads, Some(no_fds), &proc);
+    }
+    symlink("/usr/bin/cat", proc.join("401").join("exe")).unwrap();
+    std::fs::create_dir(proc.join("405")).unwrap();
+    let exe = |pid| super::exe_in(&proc, pid);
+    assert_eq!(
+        exe(401),
+        Exe::At(PathBuf::from("/usr/bin/cat")),
+        "a live process's image"
+    );
+    assert_eq!(exe(402), Exe::Exited, "a lone zombie");
+    assert_eq!(
+        exe(403),
+        Exe::Unnamed,
+        "a zombie leader whose other threads run"
+    );
+    assert_eq!(exe(404), Exe::Unnamed, "a live task with no image");
+    assert_eq!(exe(405), Exe::Exited, "reaped by the stat read");
+    assert_eq!(exe(406), Exe::Exited, "reaped by the directory's open");
+}
+
 /// A `stat` read that answers `ESRCH`, a process reaped between the open and the read, is a
 /// reaped process, as a `stat` gone by its open (`ENOENT`) is, and no `status` is read for
 /// either; any other failed read is unknown. NEGATIVE CONTROL: judge only `ENOENT` gone, and

@@ -472,7 +472,7 @@ pub trait Host: Sync + std::fmt::Debug {
     }
     /// Whether `d`'s pool reads full, and how many of this user's held programs forked at or
     /// after `since_us`, its start ([`Backlog`]); both unread, the default.
-    fn backlog(&self, _d: aterm_uds::program_check::Daemon, _since_us: u64) -> Backlog {
+    fn backlog(&self, _d: aterm_process_facts::program_check::Daemon, _since_us: u64) -> Backlog {
         Backlog::default()
     }
 }
@@ -543,9 +543,13 @@ impl Host for LiveHost {
     }
 
     #[cfg(target_os = "macos")]
-    fn backlog(&self, d: aterm_uds::program_check::Daemon, since_us: u64) -> Backlog {
+    fn backlog(&self, d: aterm_process_facts::program_check::Daemon, since_us: u64) -> Backlog {
         use aterm_uds::program_check::{Look, PS_HANG, look};
-        type Kept = Option<(Instant, (aterm_uds::program_check::Daemon, u64), Backlog)>;
+        type Kept = Option<(
+            Instant,
+            (aterm_process_facts::program_check::Daemon, u64),
+            Backlog,
+        )>;
         static KEPT: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
         start::kept(&KEPT, (d, since_us), || Backlog {
             pool_full: match look(PS_HANG) {

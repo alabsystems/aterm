@@ -8583,7 +8583,7 @@ fn advanced_effect_of(key: &str) -> Option<AdvancedEffectPath> {
         prefs::EDIT_COLUMNS | prefs::EDIT_LINES | prefs::EDIT_TAB_STRIP_ROWS => {
             Some(Effect::WindowRuntime)
         }
-        prefs::EDIT_SHOW_BUILD_BADGE => Some(Effect::WindowRuntime),
+        prefs::EDIT_SHOW_BUILD_BADGE | prefs::EDIT_NAVIGATOR_DOCK => Some(Effect::WindowRuntime),
         prefs::EDIT_TAB_STATUS
         | prefs::EDIT_TAB_STATUS_QUIET_AFTER_MS
         | prefs::EDIT_TAB_STATUS_DWELL_MS

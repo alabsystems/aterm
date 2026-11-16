@@ -68,7 +68,7 @@ impl Bench {
         }
     }
 
-    fn fx(&self) -> UpkeepEffects<'_> {
+    pub(super) fn fx(&self) -> UpkeepEffects<'_> {
         let logged = Arc::clone(&self.logged);
         let handed = Arc::clone(&self.handed);
         let ends = self.ends;
@@ -122,7 +122,7 @@ impl Bench {
 
 /// A session here runs on `label`, and its login is signed out here: the upkeep's door for a
 /// sign-in (`upkeep_sign_in`, `DESIGN-alab-one-mesh-2026-11-05.md` §4.15 rule 4).
-fn runs_signed_out(desk: &Desk, label: &str, at: i64) {
+pub(super) fn runs_signed_out(desk: &Desk, label: &str, at: i64) {
     desk.store()
         .transact(at, &mut None, |state| {
             let mut events = accounts::note_session(state, &format!("s-{label}"), label, None, at);

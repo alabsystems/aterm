@@ -119,7 +119,7 @@ pub(crate) fn repo_push(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         if w.dry {
             let journal = super::dry_run::readable_journal(&w)?;
             if let Some(view) = journal.latest(WriteOp::RefUpdateAtomic, ATOMIC_KEY)?
-                && view.open
+                && journal.stops(&view)?
             {
                 let id = view.intent.id;
                 return Err(Error::new(
@@ -137,17 +137,28 @@ pub(crate) fn repo_push(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         }
         let journal = w.gh.journal(&w.slug)?;
         let before = latest_intent(&journal, WriteOp::RefUpdateAtomic, ATOMIC_KEY);
-        let outcome = refs
-            .push_atomic(&permit, &dir, &batch, &journal)
-            .map_err(|e| {
-                naming_intent(
-                    report,
-                    &journal,
-                    WriteOp::RefUpdateAtomic,
-                    before.as_ref(),
-                    e,
-                )
-            })?;
+        // Native preparation may keep making progress for longer than a loaded machine's
+        // wall bound. An explicit request timeout keeps its cap; otherwise every native child
+        // uses the ordinary process inactivity window, including source object preparation.
+        let outcome = match inv.global.timeout {
+            Some(budget) => refs.push_atomic_with_budget(&permit, &dir, &batch, &journal, budget),
+            None => refs.push_atomic_with_progress_window(
+                &permit,
+                &dir,
+                &batch,
+                &journal,
+                std::time::Duration::from_secs(60),
+            ),
+        }
+        .map_err(|e| {
+            naming_intent(
+                report,
+                &journal,
+                WriteOp::RefUpdateAtomic,
+                before.as_ref(),
+                e,
+            )
+        })?;
         Ok(one_shot_answer(
             report,
             WriteOp::RefUpdateAtomic,
@@ -544,13 +555,18 @@ pub(crate) fn repo_refs(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named) = inv.repo(gh.router())?;
     let reference = inv.flag("--ref");
-    if reference.is_some_and(|name| !name.starts_with("refs/") || !crate::path::ref_name_ok(name)) {
-        return Err(inv.usage("--ref requires an exact full Git ref"));
+    if reference.is_some_and(|name| {
+        name != "HEAD" && (!name.starts_with("refs/") || !crate::path::ref_name_ok(name))
+    }) {
+        return Err(inv.usage("--ref requires an exact full Git ref or HEAD"));
     }
-    let out = gh.run_git(&GitRun::ls_remote(&slug, reference).with_named(named))?;
-    let items = crate::git::advertised_refs(&out.stdout, reference)?
+    let out = gh.run_git(&GitRun::advertisement(&slug, reference).with_named(named))?;
+    let items = crate::git::advertised_ref_rows(&out.stdout, reference)?
         .into_iter()
-        .map(|(name, oid)| aterm_json::json!({"ref":name,"oid":oid}))
+        .map(|row| match row.peeled {
+            Some(peeled) => aterm_json::json!({"ref":row.name,"oid":row.oid,"peeled":peeled}),
+            None => aterm_json::json!({"ref":row.name,"oid":row.oid}),
+        })
         .collect();
     Ok(Outcome {
         answer: Answer::Items {

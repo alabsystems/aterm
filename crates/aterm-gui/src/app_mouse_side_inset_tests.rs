@@ -12,7 +12,7 @@ fn fixture() -> App {
     let ws = &app.windows[&WID];
     let frame = app.window_frame_px_for(WID, ws.rows, ws.cols);
     let (cw, _) = app.win_cell_size(WID);
-    app.set_side_inset_cells(WID, 4);
+    app.set_side_inset_for_test(WID, 4);
     app.windows.get_mut(&WID).unwrap().win_px = Some(PhysicalSize::new(
         frame.width + (4 * cw) as u32,
         frame.height,
@@ -160,25 +160,42 @@ fn side_inset_strip_drag_clamps_like_a_remainder_band() {
     assert_eq!(app.strip_col_at_with(WID, geom, 1.0, y), Some(0));
 }
 
+/// The product setter, [`App::set_dock_at`] (Show Navigator, `open app navigator dock` and the
+/// waiting Hide all enter it), remaps a pointer that did not move: a press right after Show or
+/// Hide reads the cell now under the pointer, not the one the frame held there before.
 #[test]
 fn side_inset_setter_remaps_a_still_pointer_before_a_press() {
-    let mut app = fixture();
-    app.set_side_inset_cells(WID, 0);
-    let at = app.cell_centre_px(WID, 0, 12).unwrap();
+    let mut app = App::headless_for_test();
+    let size = app.window_frame_px_for(WID, 24, 140);
+    app.windows.get_mut(&WID).unwrap().win_px = Some(size);
+    app.on_resize(WID, size);
+    let at = app.cell_centre_px(WID, 0, 60).unwrap();
     app.on_cursor_moved(WID, at.0, at.1);
     let before = app.windows[&WID].last_mouse_cell;
-    app.set_side_inset_cells(WID, 4);
+    let now = std::time::Instant::now();
+    app.set_dock_at(WID, 30, now)
+        .expect("the window has room for the dock");
     let wanted = app.pixel_to_cell(WID, at.0, at.1);
-    assert_ne!(wanted, before);
+    assert_ne!(
+        wanted, before,
+        "positive control: Show moved the frame under the pointer"
+    );
     assert_eq!(app.windows[&WID].last_mouse_cell, wanted);
     app.on_mouse_input(WID, ElementState::Pressed, WinitMouseButton::Left);
     assert_eq!(app.windows[&WID].last_mouse_cell, wanted);
+    app.on_mouse_input(WID, ElementState::Released, WinitMouseButton::Left);
+    app.set_dock_at(WID, 0, now + std::time::Duration::from_secs(1))
+        .expect("the hide commits after the regrow floor");
+    assert_eq!(app.windows[&WID].dock.cells, 0);
+    let back = app.pixel_to_cell(WID, at.0, at.1);
+    assert_eq!(back, before, "Hide gives the frame its place back");
+    assert_eq!(app.windows[&WID].last_mouse_cell, back);
 }
 
 #[test]
 fn side_inset_overlap_keeps_visible_frame_pixels_interactive() {
     let mut app = fixture();
-    app.set_side_inset_cells(WID, 10);
+    app.set_side_inset_for_test(WID, 10);
     let ws = &app.windows[&WID];
     let frame = app.frame_px(ws.rows + app.chrome_rows(WID), ws.cols);
     app.windows.get_mut(&WID).unwrap().win_px = Some(PhysicalSize::new(frame.width, frame.height));
@@ -201,7 +218,7 @@ fn side_inset_overlap_keeps_visible_frame_pixels_interactive() {
 fn side_inset_pending_backend_geometry_uses_the_seed_cell() {
     let mut app = App::headless_for_test();
     let expected = 3 * crate::seed_cell_px(app.windows[&WID].metrics.font_px).0;
-    app.windows.get_mut(&WID).unwrap().side_inset_cells = 3;
+    app.windows.get_mut(&WID).unwrap().dock.cells = 3;
     let ready = std::mem::replace(&mut app.backend, crate::BackendSlot::Pending(None));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_eq!(app.win_side_inset_px(WID), expected);

@@ -65,6 +65,7 @@ fn counted_enter(shared: &Arc<Shared>) -> Option<Scope> {
         shared: shared.clone(),
         epoch: state.epoch.clone(),
         status: Arc::new(Status::default()),
+        parent: None,
         #[cfg(test)]
         dropping: None,
     })))
@@ -108,6 +109,10 @@ struct Operation {
     shared: Arc<Shared>,
     epoch: Arc<Epoch>,
     status: Arc<Status>,
+    /// The operation this one was entered under ([`Scope::child`]): cancelling that one, or its
+    /// epoch, cancels this one too, and it stays counted for as long as this one lives.
+    /// Cancelling this one leaves it running.
+    parent: Option<Scope>,
     #[cfg(test)]
     dropping: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -186,13 +191,47 @@ impl Scope {
             owner: Arc::downgrade(&self.0.shared),
             epoch: self.0.epoch.clone(),
             status: self.0.status.clone(),
+            under: self
+                .0
+                .parent
+                .as_ref()
+                .map(|parent| Box::new(parent.cancellation())),
         }
     }
 
-    /// Whether this operation or its original admission epoch has been cancelled.
+    /// Whether this operation, its original admission epoch, or an operation it was entered
+    /// under ([`Self::child`]) has been cancelled.
     pub fn cancelled(&self) -> bool {
         self.0.status.cancelled.load(Ordering::Acquire)
             || self.0.epoch.cancelled.load(Ordering::Acquire)
+            || self.0.parent.as_ref().is_some_and(Scope::cancelled)
+    }
+
+    /// ONE PIECE OF THIS OPERATION'S WORK AS AN OPERATION OF ITS OWN: counted in the same
+    /// lifetime and admission epoch, stopped by everything that stops this one (its
+    /// cancellation, its epoch's pause), and cancellable by itself, which stops nothing else
+    /// this operation started. This operation stays counted while the child lives, so a pause
+    /// waits for both. `None` only where the count cannot grow.
+    ///
+    /// A sign-in the upkeep's ladder starts runs under one, so ending that one sign-in
+    /// (`accounts_sync::supersede_unattended`) leaves the rest of its upkeep pass running.
+    #[must_use]
+    pub fn child(&self) -> Option<Scope> {
+        let mut state = self
+            .0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.operations = state.operations.checked_add(1)?;
+        Some(Scope(Arc::new(Operation {
+            shared: self.0.shared.clone(),
+            epoch: self.0.epoch.clone(),
+            status: Arc::new(Status::default()),
+            parent: Some(self.clone()),
+            #[cfg(test)]
+            dropping: None,
+        })))
     }
 
     /// Counts release-only cleanup against this exact admitted epoch. It may
@@ -227,13 +266,17 @@ pub struct Cancellation {
     owner: Weak<Shared>,
     epoch: Arc<Epoch>,
     status: Arc<Status>,
+    /// The handle of the operation this one was entered under ([`Scope::child`]).
+    under: Option<Box<Cancellation>>,
 }
 
 impl Cancellation {
-    /// Whether this original operation stopped or has already retired.
+    /// Whether this original operation stopped or has already retired, or an operation it was
+    /// entered under ([`Scope::child`]) did.
     pub fn cancelled(&self) -> bool {
         self.status.cancelled.load(Ordering::Acquire)
             || self.epoch.cancelled.load(Ordering::Acquire)
+            || self.under.as_deref().is_some_and(Cancellation::cancelled)
     }
     /// Lifetime namespace only, independent of whether the operation has retired.
     pub fn owned_by(&self, lifetime: &Lifetime) -> bool {

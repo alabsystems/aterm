@@ -31,7 +31,7 @@
 //! 2. **Archive.** Each owned row a reader projects (machine facts, mailbox observations) is
 //!    carried as the signed record that wrote it (`registry::ARCHIVED`), still sealed under the
 //!    old table's scope, so its signer and operation digest are its own: a reader authenticates
-//!    it and applies the owned rule exactly as before (`att::archived_ops`). A Mac's own row in
+//!    it and applies the owned rule exactly as before (`att::carried`). A Mac's own row in
 //!    the new generation outranks its archived one.
 //! 3. **History.** Each entry of the old generation's history this Mac holds and the new one
 //!    does not carry yet goes in as a `history` row, a secret's value withheld, newest first
@@ -941,7 +941,8 @@ pub struct Rolled {
 /// is unknown, so it is never released unread.
 ///
 /// # Errors
-/// A table's storage cannot be read.
+/// A table's storage cannot be read, or the retired generation's view's resolution refuses (as
+/// [`att::Resolved::read`]).
 pub(crate) fn covered(
     session: &Session<'_>,
     directory: &Directory,
@@ -969,7 +970,7 @@ pub(crate) fn covered(
                     let entry = held.entry(actor).or_default();
                     *entry = (*entry).max(last);
                 }
-                let view = View::read(from.table, session, &log);
+                let view = View::read(from.table, session, &log)?;
                 let Ok((entries, _)) =
                     history::owed(session, from.table, from.generation, log, &view)
                 else {
@@ -992,7 +993,7 @@ pub(crate) fn covered(
         to.table,
         session,
         &Log::read_with(session, &new, next, decode)?,
-    );
+    )?;
     let resolve = owned::commons::historical(session);
     Ok(within(&held, &covers(&view, &resolve, from.generation))
         && history::uncarried(&owed, &history::carried(&view, &resolve, None)).is_empty())
@@ -1057,7 +1058,7 @@ fn judge(
         if !log.awaited(session.actor()).is_empty() {
             return Ok(Judged::Unjudged);
         }
-        let view = View::read(compiled.table, session, &log);
+        let view = View::read(compiled.table, session, &log)?;
         if covers(
             &view,
             owned::commons::historical(session),
@@ -1250,7 +1251,7 @@ impl Registry {
                 "this Mac's history of the registry is incomplete; a roll waits for a complete scan",
             ));
         }
-        let old_view = View::read(from.table, &session, &old_log);
+        let old_view = View::read(from.table, &session, &old_log)?;
         old_view.require_roll_source(from.table)?;
         let old_claims = old_view.claim_provenance(from.table)?;
         let old_snapshot = old_log.snapshot();
@@ -1289,17 +1290,15 @@ impl Registry {
                              roll waits for a complete scan",
                                 ));
                             }
-                            let view = View::read(to.table, &session, &log);
+                            let resolved = att::Resolved::read(to.table, &session, &log)?;
+                            let view = View::of(to.table, &log, &resolved);
                             let carried =
                                 carried_origins(log.eligible_iter().map(|(_, command)| command));
                             // What is carried already is each record that authenticates, wherever
                             // it was written: a cell some other writer put at a record's key first
                             // must not keep that record from being carried.
                             let archived: BTreeSet<Digest> =
-                                att::archived_ops(to.table, &session, &view.ops)
-                                    .into_iter()
-                                    .map(|op| op.id)
-                                    .collect();
+                                resolved.carried.keys().copied().collect();
                             let rolls = view.project(&ROLL);
                             let claims = view.claim_provenance(to.table)?;
                             // This Mac's own rows count too: a roll cut short after its history and
@@ -1530,7 +1529,7 @@ impl Registry {
             }
             for changes in pack(att::schema_rows(
                 to.table,
-                &View::read(to.table, &session, &log),
+                &View::read(to.table, &session, &log)?,
             ))? {
                 let request = typed::request_id(APPLICATION, to.table.role, &changes)?;
                 let command = Command::Write { request, changes };

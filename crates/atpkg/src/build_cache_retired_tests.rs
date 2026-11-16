@@ -275,24 +275,16 @@ fn the_gates_leftovers_go_once_unused() {
     drop(g.dir);
 }
 
-/// An actually running image keeps a retired snapshot, from its tree or from git's entry for it.
-/// The child proves execution before any removal can touch its image; after it is reaped, the same
-/// leftover can go. The cells lane and the lock share one arm of a pass, and the kernel reader
-/// matches an image by path prefix whichever root holds it, so
-/// [`used_or_unknown_ownership_keeps_retired_leftovers`] holds those two with a stated holder. The
-/// gap: a kernel read that misses an image only under those two path shapes.
+/// A file this process maps keeps a retired snapshot, from its tree or from git's entry for it,
+/// as the production kernel reader sees it; once unmapped, the same leftover can go. The cells
+/// lane and the lock share one arm of a pass, and the kernel reader matches a holder by path
+/// prefix whichever root holds it, so [`used_or_unknown_ownership_keeps_retired_leftovers`]
+/// holds those two with a stated holder. The gap: a kernel read that misses a holder only under
+/// those two path shapes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn running_images_keep_a_retired_snapshot_until_reaped() {
-    use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes, kill_within};
-    use aterm_uds::spawnfd::{Child, Stdio};
-
-    struct Running(Child);
-    impl Drop for Running {
-        fn drop(&mut self) {
-            kill_within(&mut self.0, Duration::from_secs(60));
-        }
-    }
+fn mapped_files_keep_a_retired_snapshot_until_unmapped() {
+    use std::os::fd::AsFd as _;
 
     let mut outcomes = Vec::new();
     for route in [0, 3] {
@@ -309,26 +301,29 @@ fn running_images_keep_a_retired_snapshot_until_reaped() {
             )
             .unwrap(),
         ];
-        let image = paths[route].join("target/bin/cat");
+        let image = paths[route].join("target/bin/mapped");
         let Gate { dir, roots, now } = g;
-        let mut custody = KeptUntilRan::new(dir.keep());
         std::fs::create_dir_all(image.parent().unwrap()).unwrap();
-        ad_hoc_copy(Path::new("/bin/cat"), &image);
-        let child = aterm_uds::spawnfd::command(&image)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut running = Running(child);
-        let input = cat_echoes(&mut running.0);
-        custody.ran();
-        let pid = running.0.id();
-        // Exercise the production kernel reader, with only this proven fixture child
-        // determining the verdict rather than unrelated processes on the owner's machine.
+        std::fs::write(&image, vec![0x71; aterm_uds::shm::PAGE]).unwrap();
+        let file = std::fs::File::open(&image).unwrap();
+        // SAFETY: this private file has exactly PAGE bytes and nothing writes, resizes or
+        // removes it while the region lives: the first pass is asserted to keep it, and the
+        // region is dropped before the pass that may remove it.
+        let region =
+            unsafe { aterm_uds::shm::Region::map_readonly(file.as_fd(), aterm_uds::shm::PAGE) }
+                .unwrap();
+        drop(file);
+        let mut byte = [0];
+        region.read_into(0, &mut byte).unwrap();
+        assert_eq!(byte, [0x71]);
+        let me = std::process::id();
+        // Exercise the production kernel reader, which ignores this process's own
+        // descriptors but not its mappings, with only this process determining the verdict
+        // rather than unrelated processes on the owner's machine.
         let processes = |dirs: &[PathBuf], skip: &[u32]| {
             let mut scan = super::super::fence::live(dirs, skip)?;
-            scan.users.retain(|user| user.pid == pid);
-            scan.unreadable.retain(|(user, _)| *user == pid);
+            scan.users.retain(|user| user.pid == me);
+            scan.unreadable.retain(|(user, _)| *user == me);
             Ok(scan)
         };
         let fence = super::super::fence::Fence::new(&processes);
@@ -344,22 +339,18 @@ fn running_images_keep_a_retired_snapshot_until_reaped() {
                 .run(&checkout, &["worktree", "list", "--porcelain"])
                 .out
                 .contains(&*paths[0].to_string_lossy());
-        kill_within(&mut running.0, Duration::from_secs(60));
-        assert!(
-            running.0.try_wait().unwrap().is_some(),
-            "the child was reaped"
-        );
-        drop(input);
+        drop(region);
         let clear = super::retire_on(&roots, now, &GitCli, &fence);
         let reclaimed = clear.iter().all(|(_, result)| result.is_ok())
             && paths.iter().all(|path| !path.exists());
         outcomes.push((route, held, snapshot_unchanged, reclaimed));
+        drop(dir);
     }
     assert!(
         outcomes
             .iter()
             .all(|(_, held, unchanged, reclaimed)| *held && *unchanged && *reclaimed),
-        "live images retain their route, and released images permit reclaim: {outcomes:?}"
+        "mapped files retain their route, and unmapped ones permit reclaim: {outcomes:?}"
     );
 }
 

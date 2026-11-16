@@ -6,6 +6,28 @@ use aterm_vitals::model::{
     ClusterSpec, GpuSample, MemSample, Pressure, ProcSample, Sample, TabRoot, Ticks, VolumeSample,
 };
 
+#[test]
+fn reported_cpu_rates_do_not_draw_a_share_of_machine_ticks() {
+    let mut snap = snapshot();
+    let cpu = &mut snap.resources[Resource::Cpu.index()];
+    cpu.heat_now = Some(0.1);
+    cpu.aterm.now = Some(100.0);
+    cpu.tabs = vec![(
+        7,
+        ScopeFig {
+            now: Some(80.0),
+            unread: 1,
+            ..ScopeFig::default()
+        },
+    )];
+    let view = snap.resource(Resource::Cpu, &[7]);
+    let bar = bar_fill(Resource::Cpu, &view, &snap, &[7]).expect("machine tick bar");
+    assert_eq!(bar.global, Some(0.1));
+    assert_eq!((bar.aterm, bar.tab), (None, None));
+    assert_eq!(view.aterm.now, Some(100.0));
+    assert_eq!(view.tab.now, Some(80.0));
+}
+
 #[cfg(unix)]
 #[test]
 fn place_only_changes_rekey_and_repaint_the_deck_from_one_captured_caption() {
@@ -1008,9 +1030,9 @@ pub(crate) fn split_tab_running(a: u64, b: u64, names: [&str; 2]) -> Snapshot {
     v.absorb(&mk(12))
 }
 
-/// The deck of a split tab, focused on pane 8, reads the whole tab: each scoped row's "this
-/// tab" share is both panes', inside all tabs, and its words say so. CONTROL: the focused
-/// pane alone is less.
+/// The deck of a split tab, focused on pane 8, reads both panes. CPU retains their reported
+/// growth separately from the machine's tick fill; other scoped bars and the words sum both
+/// panes. CONTROL: the focused pane alone is less.
 #[test]
 fn a_split_tabs_deck_reads_every_pane() {
     let snap = split_tab(7, 8);
@@ -1029,9 +1051,31 @@ fn a_split_tabs_deck_reads_every_pane() {
             .expect("a scoped row's bar")
     };
     let near = |a: Option<f32>, b: f64| a.is_some_and(|a| (f64::from(a) - b).abs() < 1e-4);
+    let whole_cpu = snap.resource(Resource::Cpu, &[8, 7]);
+    let focused_cpu = snap.resource(Resource::Cpu, &[8]);
+    assert!(
+        whole_cpu
+            .tab
+            .now
+            .is_some_and(|rate| (rate - 3.0).abs() < 1e-4)
+    );
+    assert!(
+        focused_cpu
+            .tab
+            .now
+            .is_some_and(|rate| (rate - 2.0).abs() < 1e-4)
+    );
+    assert_eq!(
+        whole_cpu.tab.cpu_accounting,
+        Some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS)
+    );
+    let cpu_bar = bar(&deck(vec![8, 7]), Resource::Cpu);
+    assert!(near(cpu_bar.global, 0.5));
+    assert_eq!((cpu_bar.aterm, cpu_bar.tab), (None, None));
+    assert_eq!(bar(&deck(vec![8]), Resource::Cpu), cpu_bar);
+    assert_eq!(bar(&deck(vec![7, 8]), Resource::Cpu), cpu_bar);
     let gib = (32u64 << 30) as f64;
     for (res, tab, focused) in [
-        (Resource::Cpu, 0.3, 0.2),
         (
             Resource::Memory,
             (1010u64 << 20) as f64 / gib,
@@ -1052,12 +1096,12 @@ fn a_split_tabs_deck_reads_every_pane() {
     let cpu =
         |panes: &[u64]| words::row_sentence(Resource::Cpu, &snap, panes, &input(&snap).locale);
     assert!(
-        cpu(&[8, 7]).contains("Tab 1 3.0 cores."),
+        cpu(&[8, 7]).contains("Tab 1 3.0 reported cores."),
         "{}",
         cpu(&[8, 7])
     );
     assert!(
-        cpu(&[8]).contains("Tab 1 2.0 cores."),
+        cpu(&[8]).contains("Tab 1 2.0 reported cores."),
         "CONTROL: {}",
         cpu(&[8])
     );
@@ -2171,22 +2215,37 @@ fn a11y_meters() {
         assert_eq!(m.words, words::row_sentence(res, &calm, &[FRONT], &MAC));
     }
     assert_eq!(g.meters[0].value, Some(98.0));
+    let cpu_words = &g.meters[0].words;
+    assert!(cpu_words.contains("17.7 of 18 cores"));
+    assert!(cpu_words.contains("aterm 6.8 reported cores"));
+    assert!(cpu_words.contains("Tab 2 0.1 reported cores"));
+    assert!(cpu_words.contains(words::CPU_CHARGE_NOTE));
+    assert!(cpu_words.contains("Largest reported CPU:") && cpu_words.contains("rustc"));
+    assert!(cpu_words.contains("5.9 cores"));
+    assert!(!cpu_words.contains('≥') && !cpu_words.contains("Why:"));
+    let mut incomplete = calm.clone();
+    let figures = &mut incomplete.resources[Resource::Cpu.index()];
+    figures.aterm.unread = 1;
+    for (_, figure) in &mut figures.tabs {
+        figure.unread = 1;
+    }
     assert_eq!(
-        g.meters[0].words,
-        "CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1 cores. \
-         Rose from about 49 percent. Over capacity 6 of the last 10 minutes. 8 waiting for \
-         a core, load 25.7 on 18 cores. Busiest rustc, 9 processes in Tab 3, 5.9 cores."
+        meter(&incomplete, Resource::Cpu).words,
+        *cpu_words,
+        "ownership coverage cannot promote published rates into physical CPU bounds"
     );
-    let trouble = scene(Scene::Trouble);
+    let mut trouble = scene(Scene::Trouble);
     let cpu = meter(&trouble, Resource::Cpu);
     assert_eq!(
         cpu.words,
         words::row_sentence(Resource::Cpu, &trouble, &[FRONT], &MAC)
     );
-    assert!(
-        cpu.words.contains(" Why: Spotlight, after start-up. "),
-        "{}",
-        cpu.words
+    assert!(!cpu.words.contains("Why:") && !cpu.words.contains("Spotlight"));
+    trouble.why = None;
+    assert_eq!(
+        cpu.words,
+        meter(&trouble, Resource::Cpu).words,
+        "retained CPU causes do not qualify an execution window in the accessible meter"
     );
     assert_eq!(g.cores_name, "18 CPU cores");
     assert_eq!(g.cores.len(), 18);

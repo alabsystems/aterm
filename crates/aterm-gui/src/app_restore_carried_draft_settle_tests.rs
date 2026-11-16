@@ -21,6 +21,7 @@ fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
         })
         .collect();
     WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

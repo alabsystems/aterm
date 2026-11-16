@@ -3573,51 +3573,6 @@ pub(crate) fn credit_claim_not_ready_record(why: &str) -> Message {
     .key(CREDIT_CLAIM_NOT_READY_KEY)
 }
 
-/// How a disk worker ended, as the record in Messages says it ([`disk_worker_over_record`]).
-pub(crate) struct DiskWorkerEnd<'a> {
-    /// Its end word ([`aterm_agent::harness::disk::ask::WorkerState::Over`]).
-    pub(crate) why: &'a str,
-    /// The rise in free space while it ran, whoever freed it.
-    pub(crate) rose: u64,
-    /// Whether the volume reached the free space it was told to reach, where that is known.
-    pub(crate) target_met: Option<bool>,
-    /// The bytes its own `aterm harness disk free` removals released, by the disk ledger.
-    pub(crate) removed: u64,
-    /// The `disk-free filling:` and `disk-free owner-only:` lines of its report.
-    pub(crate) report: &'a [String],
-}
-
-/// The record in Messages of a disk worker's end, either way: how it ended, what it removed itself
-/// and how far free space rose (two figures that differ, since anything on the volume moves the
-/// second), whether the volume reached its target, and what its report named.
-pub(crate) fn disk_worker_over_record(sid: &str, place: &str, end: &DiskWorkerEnd<'_>) -> Message {
-    use aterm_agent::harness::disk::{ask, human_bytes};
-    let (finished, words) = ask::worker_end_words(end.why);
-    let (severity, head) = if finished {
-        (Severity::Info, "Disk worker finished")
-    } else {
-        (Severity::Warn, "Disk worker did not finish")
-    };
-    let line =
-        |text: &str| atpkg::progress::sanitize_for_tty(text, aterm_messages::DETAIL_LINE_CAP);
-    let target = match end.target_met {
-        Some(true) => "; the volume reached its target",
-        Some(false) => "; the volume did not reach its target",
-        None => "",
-    };
-    let mut message = Message::new(tags::HARNESS, severity, fitted_title(head, place))
-        .line(line(&capitalized_first(&words)))
-        .line(line(&format!(
-            "It removed {}; free space rose {} while it ran, whoever freed it{target}",
-            human_bytes(end.removed),
-            human_bytes(end.rose)
-        )));
-    for said in end.report {
-        message = message.line(line(said));
-    }
-    message.record().key(&host_record_key("disk-worker", sid))
-}
-
 /// `text` with its first letter capitalized.
 fn capitalized_first(text: &str) -> String {
     let mut chars = text.chars();
@@ -4028,15 +3983,17 @@ pub(crate) fn survey_key(sid: &str) -> String {
     )
 }
 
-pub(crate) const DISK_LOW_KEY: &str = "disk.low";
+/// The digest key of the low-disk line builds before this one raised, which asked a person to
+/// free space: no build raises it now, and a look's low-disk news or space coming back ends
+/// one a log carried over ([`crate::App::note_harness_host`]).
+pub(crate) const RETIRED_DISK_LOW_KEY: &str = "disk.low";
 
-const LARGEST: &str = "Largest it cannot reclaim: ";
-const AND_MORE: &str = " more, and aterm harness disk lists what is left now";
+/// The head of each holder line of the low-disk record ([`disk_low_record`]).
+const CANNOT_RECLAIM: &str = "aterm cannot reclaim: ";
 
-pub(crate) const DISK_LOW_HOG_CHARS: usize =
-    aterm_messages::DETAIL_LINE_CAP - LARGEST.len() - "; 9".len() - AND_MORE.len();
-
-const _: () = assert!(aterm_agent::harness::disk::MAX_HOGS - 2 < 10);
+/// The most characters of a holder's line ([`aterm_agent::harness::disk::Hog::line_within`]) a
+/// low-disk record's line holds after its head.
+pub(crate) const DISK_LOW_HOG_CHARS: usize = aterm_messages::DETAIL_LINE_CAP - CANNOT_RECLAIM.len();
 
 /// Builds the warning log record when the home volume stays below the free-space floor after cleanup.
 pub(crate) fn disk_low_record(free_gib: u64, floor_gib: u64, hogs: &[String]) -> Message {
@@ -4045,72 +4002,31 @@ pub(crate) fn disk_low_record(free_gib: u64, floor_gib: u64, hogs: &[String]) ->
             "{free_gib} GiB free on the home volume, below the {floor_gib} GiB floor after \
              two passes of aterm reclaiming what it may"
         ))
-        .lines(hogs.iter().map(|h| format!("aterm cannot reclaim: {h}")))
+        .lines(hogs.iter().map(|h| format!("{CANNOT_RECLAIM}{h}")))
         .record()
         .key("system.disk.low")
 }
 
-/// Builds the exceptions digest entry when the home volume remains low after automatic cleanup;
-/// `asked`, what the ask to free space (`disk-free@v1`) did, is its last line, with one holder
-/// fewer so the entry's lines (`MORE_LINES`) keep that sentence.
-pub(crate) fn disk_low_entry(
-    free_gib: u64,
-    floor_gib: u64,
-    hogs: &[String],
-    asked: Option<&str>,
-) -> Entry {
-    let shown = if asked.is_some() { 1 } else { 2 };
-    let mut entry = Entry::new(
-        Family::Disk,
-        "",
-        "low",
-        "Disk space is low",
-        Why::OnlyYou(Reason::new(
-            "aterm reclaimed what it may in two passes and the home volume is still short",
-        )),
-        Then::step("Free up space on the home volume"),
-    )
-    .severity(Severity::Warn)
-    .resurface(Resurface::WAIT)
-    .more(format!(
-        "{free_gib} GiB free; aterm reclaims below {floor_gib} GiB"
-    ));
-    let rest = hogs.len().saturating_sub(shown);
-    for (i, hog) in hogs.iter().take(shown).enumerate() {
-        entry = entry.more(if i + 1 == shown && rest > 0 {
-            format!("{LARGEST}{hog}; {rest}{AND_MORE}")
-        } else {
-            format!("{LARGEST}{hog}")
-        });
-    }
-    if let Some(asked) = asked {
-        entry = entry.more(asked);
-    }
-    entry.log_line(format!(
-        "disk-low free_gib={free_gib} floor_gib={floor_gib} hogs={}",
-        hogs.len()
-    ))
-}
-
+/// The digest key of the paused-journal line builds before this one raised, which asked a
+/// person to free space: none raises it now ([`session_journal_paused_record`]).
 pub(crate) const SESSION_JOURNAL_PAUSED_KEY: &str = "disk.session-journal-paused";
 
-/// Builds the exceptions digest entry when the session journal is paused due to disk errors.
-pub(crate) fn session_journal_paused_entry(why: &str) -> Entry {
-    Entry::new(
-        Family::Disk,
-        "",
-        "session-journal-paused",
+/// Builds the log record of the session journal pausing on disk errors: what sessions do is
+/// counted, not written, until the journal can write again. A record, not a request: the
+/// disk watch's own passes free space, and the journal resumes by itself. A line a build
+/// before this one raised under [`SESSION_JOURNAL_PAUSED_KEY`] ends with the next news.
+pub(crate) fn session_journal_paused_record(why: &str) -> Message {
+    Message::new(
+        tags::SYSTEM,
+        Severity::Warn,
         "The session journal is paused",
-        Why::OnlyYou(Reason::new(
-            "only you can free space on the volume; until then what sessions do is counted, \
-             not written",
-        )),
-        Then::step("Free up space on the home volume"),
     )
-    .severity(Severity::Warn)
-    .resurface(Resurface::WAIT)
-    .more(format!("It paused because {why}"))
-    .log_line(format!("session-journal paused: {why}"))
+    .line(format!(
+        "It paused because {why}; until it can write again what sessions do is counted, not \
+         written"
+    ))
+    .record()
+    .key("system.session-journal.paused")
 }
 
 /// Builds the exceptions digest entry when the session journal stops for the current run.
@@ -4133,6 +4049,9 @@ pub(crate) fn session_journal_stopped_entry(why: &str) -> Entry {
     .log_line(format!("session-journal stopped: {why}"))
 }
 
+/// The digest key of the cleanup-off line builds before this one raised beside the settings
+/// line ([`disk_settings_entry`]), which says the same fault: none raises it now, and the
+/// settings read again, space coming back or the passes' news end one a log carried over.
 pub(crate) const DISK_LOW_CLEANUP_OFF_KEY: &str = "disk.low-cleanup-off";
 
 /// Builds the warning log record when disk space is low while automatic cleanup is disabled.
@@ -4146,149 +4065,25 @@ pub(crate) fn disk_low_cleanup_off_record(free_gib: u64, floor_gib: u64) -> Mess
         .key("system.disk.low")
 }
 
-/// Builds the exceptions digest entry when disk space is low and automatic cleanup was disabled by a config fault.
-pub(crate) fn disk_low_cleanup_off_entry(free_gib: u64, floor_gib: u64) -> Entry {
-    Entry::new(
-        Family::Disk,
-        "",
-        "low-cleanup-off",
-        "Disk space is low",
-        Why::YourAction(Reason::new(
-            "no cleanup ran: aterm frees nothing until it can read the [disk] settings in \
-             aterm.toml",
-        )),
-        Then::press(Mover::open_config_editor(None), "Fix aterm.toml"),
-    )
-    .severity(Severity::Warn)
-    .resurface(Resurface::WAIT)
-    .more(format!(
-        "{free_gib} GiB free, below the {floor_gib} GiB cleanup floor"
-    ))
-    .log_line(format!(
-        "disk-low-cleanup-off free_gib={free_gib} floor_gib={floor_gib}"
-    ))
-}
+/// The digest key of the freed-space line builds before this one raised: an FYI that asked
+/// nothing. None raises it now ([`disk_freed_record`]); the next disk news ends one carried over.
+pub(crate) const RETIRED_DISK_FREED_KEY: &str = "disk.freed";
 
-/// Builds the digest entry reporting bytes reclaimed by an automatic disk-watch pass.
-pub(crate) fn disk_freed_entry(bytes: u64, went: &[String]) -> Entry {
+/// Builds the log record of the bytes an automatic disk-watch pass reclaimed: a record, never a
+/// line, since nothing in it asks anyone to act.
+pub(crate) fn disk_freed_record(bytes: u64, went: &[String]) -> Message {
     let freed = aterm_agent::harness::disk::human_bytes(bytes);
-    let mut entry = Entry::new(
-        Family::Disk,
-        "",
-        "freed",
-        "aterm freed disk space",
-        Why::Spent {
-            tried: Reason::new(format!("freed {freed} of rebuildable build caches")),
-            reason: Reason::new("the home volume ran short; the next build rebuilds them"),
-        },
-        Then::step("Read aterm harness disk for what went and what is left"),
-    )
-    .severity(Severity::Info)
-    .resurface(Resurface::WAIT);
-    for w in went.iter().take(2) {
-        entry = entry.more(format!("Went: {w}"));
-    }
-    entry.log_line(format!("disk-freed bytes={bytes} rows={}", went.len()))
-}
-
-/// The standing alert when only the owner can still act on a filling or short home volume.
-pub(crate) const DISK_FILLING_KEY: &str = "system.disk.filling";
-
-/// The exceptions entry while a crossing of the floor is projected (`Family::Disk`, `filling`).
-pub(crate) const DISK_FILLING_ENTRY_KEY: &str = "disk.filling";
-
-/// What a filling volume reads, in one clause: `under its 47.0 GiB floor in ~13 min at
-/// 130.8 GiB/h`, or below it.
-fn disk_fill_words(free: u64, floor: u64, rate_bps: Option<u64>, eta_s: Option<i64>) -> String {
-    let floor_words = aterm_agent::harness::disk::human_bytes(floor);
-    let rate = rate_bps.map(|r| {
-        format!(
-            "{}/h",
-            aterm_agent::harness::disk::human_bytes(r.saturating_mul(3_600))
-        )
-    });
-    match (rate, eta_s) {
-        (Some(rate), Some(eta)) if free >= floor => format!(
-            "under its {floor_words} floor in {} at {rate}",
-            aterm_vitals::words::duration_approx(eta as f64)
-        ),
-        (Some(rate), _) => format!("below its {floor_words} floor and falling {rate}"),
-        (None, _) => format!("below its {floor_words} floor"),
-    }
-}
-
-/// The alert when only the owner can still act on the home volume (the disk-free design's §8.5):
-/// aterm's cleanup is done, and no agent can act, or none can finish before it fills.
-pub(crate) fn disk_filling(
-    free: u64,
-    floor: u64,
-    rate_bps: Option<u64>,
-    eta_s: Option<i64>,
-    said: Option<&str>,
-) -> Message {
-    let why = StandingWhy::Spent {
-        tried: Reason::new("removed every build cache it may and asked its agents"),
-        reason: Reason::new(format!(
-            "the home volume is {}",
-            disk_fill_words(free, floor, rate_bps, eta_s)
-        )),
-    };
-    let then = Then::step("Free up space on the home volume");
-    let cause_words = Why::from(why.clone()).words();
-    let message = Message::new(tags::SYSTEM, Severity::Error, "The disk is filling")
-        .line(then.words())
-        .line(cause_words)
-        .now(Ask::standing(why, then))
+    Message::new(tags::SYSTEM, Severity::Info, "aterm freed disk space")
         .line(format!(
-            "{} free. aterm harness disk why says what aterm, the asked sessions and its disk \
-             worker did.",
-            aterm_agent::harness::disk::human_bytes(free)
-        ));
-    match said {
-        Some(said) => message.line(said),
-        None => message,
-    }
-    .key(DISK_FILLING_KEY)
-}
-
-/// The exceptions entry while a crossing of the floor is projected and the volume is not short:
-/// a fact for later, with what the ask and the worker are doing.
-pub(crate) fn disk_filling_entry(
-    free: u64,
-    floor: u64,
-    rate_bps: Option<u64>,
-    eta_s: Option<i64>,
-    said: Option<&str>,
-) -> Entry {
-    let mut entry = Entry::new(
-        Family::Disk,
-        "",
-        "filling",
-        "The disk is filling",
-        Why::Spent {
-            tried: Reason::new("ran its cleanup on the fill's cadence and asked one agent"),
-            reason: Reason::new(format!(
-                "the home volume is {}",
-                disk_fill_words(free, floor, rate_bps, eta_s)
-            )),
-        },
-        Then::step("Read aterm harness disk why for what fills it"),
-    )
-    .severity(Severity::Info)
-    .resurface(Resurface::WAIT);
-    if let Some(said) = said {
-        entry = entry.more(said);
-    }
-    entry.log_line(format!(
-        "disk-filling free={free} floor={floor} rate_bps={} eta_s={}",
-        rate_bps.unwrap_or(0),
-        eta_s.unwrap_or(-1)
-    ))
+            "freed {freed} of rebuildable build caches: the home volume ran short, and the next \
+             build rebuilds them"
+        ))
+        .lines(went.iter().take(2).map(|w| format!("Went: {w}")))
+        .record()
+        .key("system.disk.freed")
 }
 
 pub(crate) const DISK_FULL_KEY: &str = "system.disk.full";
-
-const DISK_FULL_SENTENCE: usize = 3;
 
 /// Reason the home volume remains full after or without an automatic disk-cleanup pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4332,111 +4127,28 @@ impl DiskFullCause {
             Self::Private(rule) => rule.why(),
         }
     }
-
-    fn ask(self, free: Option<u64>, freed: u64, hogs: bool) -> (StandingWhy, Then) {
-        let human = aterm_agent::harness::disk::human_bytes;
-        let left = free.map_or_else(
-            || "little space left".to_owned(),
-            |f| format!("{} left", human(f)),
-        );
-        let reason = match self {
-            Self::Spent if freed > 0 => format!(
-                "{left}; aterm already deleted every unused build cache ({})",
-                human(freed)
-            ),
-            Self::Spent => format!("{left}; aterm found no unused build cache to delete"),
-            Self::Unrecorded if freed > 0 => format!(
-                "{left}; aterm removed {}, then could not log a removal on the full disk",
-                human(freed)
-            ),
-            Self::Unrecorded => {
-                format!(
-                    "{left}; aterm removed nothing: it could not log a removal on the full disk"
-                )
-            }
-            Self::Unsupervised { whole: true } => format!(
-                "{left}; aterm removes only its own build cache while no session is supervised"
-            ),
-            Self::Unsupervised { whole: false } => {
-                format!("{left}; aterm.toml keeps aterm from removing build caches")
-            }
-            Self::CleanupOff { fault: false } => {
-                format!("{left}; automatic cleanup is off in aterm.toml")
-            }
-            Self::CleanupOff { fault: true } => {
-                format!("{left}; a disk setting aterm cannot read turned cleanup off")
-            }
-            Self::Inodes => {
-                "the home volume has room for no more files: it is out of inodes, not bytes"
-                    .to_owned()
-            }
-            Self::Private(rule) => match rule {
-                DiskPrivate::StateRoot | DiskPrivate::ScratchHome => {
-                    format!("{left}; a private aterm like this one removes nothing")
-                }
-                DiskPrivate::DeviceUnnamed => {
-                    format!("{left}; aterm cannot identify this home's disk, so it removes nothing")
-                }
-                DiskPrivate::NoAccountHome => {
-                    format!("{left}; aterm cannot read your account's home, so it removes nothing")
-                }
-            },
-        };
-        let why = StandingWhy::OnlyYou(Reason::new(reason));
-        let then = if self == Self::Inodes {
-            "Delete folders full of small files you no longer need"
-        } else if hogs {
-            "Free up space, starting with the largest folder in Details"
-        } else {
-            "Free up space: aterm harness disk lists what fills it"
-        };
-        (why, Then::step(then))
-    }
-
-    fn expect(self, thresholds: &aterm_agent::harness::disk::Thresholds) -> String {
-        let free = if self == Self::Inodes {
-            format!(
-                "there is room for {} more files",
-                grouped(thresholds.files_emergency)
-            )
-        } else {
-            format!(
-                "{} is free",
-                aterm_agent::harness::disk::human_bytes(thresholds.emergency)
-            )
-        };
-        format!("Once {free}, this alert ends and aterm resumes the tabs the full disk stopped.")
-    }
 }
 
-fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Builds the on-screen alert when the home volume is critically full.
-pub(crate) fn disk_full(
+/// Builds the log record of a home volume at its emergency line that aterm could free no further:
+/// what is left, what aterm freed in the episode, why it could free no more, and the largest
+/// folders left. A record, not a request: nothing in it asks anyone to act, and the watch's own
+/// passes go on.
+pub(crate) fn disk_full_record(
     free: Option<u64>,
     freed: u64,
     hogs: &[String],
     cause: DiskFullCause,
-    thresholds: &aterm_agent::harness::disk::Thresholds,
 ) -> Message {
-    let (why, then) = cause.ask(free, freed, !hogs.is_empty());
-    let cause_words = Why::from(why.clone()).words();
+    let human = aterm_agent::harness::disk::human_bytes;
+    let left = free.map_or_else(|| "little space".to_owned(), human);
     Message::new(tags::SYSTEM, Severity::Error, "Disk full")
-        .line(then.words())
-        .line(cause_words)
-        .line(cause.expect(thresholds))
-        .now(Ask::standing(why, then))
+        .line(format!(
+            "{left} free on the home volume, at its emergency line; aterm freed {} and {}",
+            human(freed),
+            cause.log_words()
+        ))
         .lines(hogs.iter().take(3).map(|h| format!("Largest: {h}")))
+        .record()
         .key(DISK_FULL_KEY)
 }
 
@@ -4475,7 +4187,7 @@ pub(crate) fn program_check_stuck(workers: u64, limit: Option<u64>) -> Message {
 /// episode ([`service_memory_alert_key`]).
 pub(crate) const SERVICE_MEMORY_KEY: &str = "system.service-memory";
 
-/// The alert's key for the episode `episode` ([`aterm_vitals::services::Service::episode`]):
+/// The alert's key for the episode `episode` ([`aterm_process_facts::services::Service::episode`]):
 /// its process, so a dismissal holds for that process however often aterm relaunches, and a
 /// new process in its place asks anew.
 pub(crate) fn service_memory_alert_key(episode: &str) -> String {
@@ -6885,9 +6597,6 @@ pub(crate) fn sentence_lines(key: Option<&str>, detail: &[String]) -> usize {
     }
     if key.is_some_and(is_notice_key) {
         return detail.len().max(1);
-    }
-    if key == Some(DISK_FULL_KEY) {
-        return DISK_FULL_SENTENCE.min(detail.len()).max(1);
     }
     if key == Some(PROGRAM_CHECK_STUCK_KEY) {
         return PROGRAM_CHECK_SENTENCE.min(detail.len()).max(1);

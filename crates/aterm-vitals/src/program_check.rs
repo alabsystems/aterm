@@ -3,48 +3,7 @@
 
 //! Tracks whether macOS `syspolicyd` is stuck at its workqueue thread limit.
 
-/// Identity of a `syspolicyd` process by PID and start timestamp.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Daemon {
-    /// Its pid.
-    pub pid: u32,
-    /// When it started: unix seconds.
-    pub start_s: u64,
-    /// The microseconds within [`Self::start_s`].
-    pub start_us: u32,
-}
-
-impl Daemon {
-    /// When it started: microseconds since the epoch, the clock a process's fork time is read on
-    /// (`aterm_sysprobe::jobs::StartFacts::start_us`); saturating.
-    #[must_use]
-    pub const fn started_us(&self) -> u64 {
-        self.start_s
-            .saturating_mul(1_000_000)
-            .saturating_add(self.start_us as u64)
-    }
-}
-
-/// Snapshot of `syspolicyd` workqueue thread-pool state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reading {
-    /// The daemon read.
-    pub daemon: Daemon,
-    /// Total workqueue threads of all kinds (`wq`).
-    pub workers: u64,
-    /// Whether the kernel flagged a workqueue limit (`wql` `C` or `T`).
-    pub at_limit: bool,
-    /// Constrained thread limit (`kern.wq_max_constrained_threads`), if read.
-    pub limit: Option<u64>,
-}
-
-impl Reading {
-    /// Returns whether the kernel flagged the workqueue pool as at its limit.
-    #[must_use]
-    pub const fn full(&self) -> bool {
-        self.at_limit
-    }
-}
+use aterm_process_facts::program_check::{Daemon, Reading};
 
 /// Duration a `syspolicyd` pool must remain full before [`State::Stuck`] is reported.
 pub const STUCK_AFTER_MS: u64 = 5 * 60_000;

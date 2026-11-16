@@ -469,9 +469,10 @@ pub fn with_append_sink<T>(sink: impl Fn(&Appended<'_>) + 'static, run: impl FnO
 }
 
 /// Hand `record` to this thread's sink or the process's. A store grew, too: the Commons owner's
-/// next upkeep tick materializes the shared files.
+/// shared-files thread, where it waits for growth, wakes and materializes the files once the burst
+/// settles (`crate::file::growth`).
 fn appended(record: &Appended<'_>) {
-    crate::file::grew();
+    crate::file::growth::GROWTH.grew();
     #[cfg(any(test, debug_assertions))]
     if let Some(sink) = THREAD_SINK.with(|slot| slot.borrow().clone()) {
         sink(record);
@@ -1594,8 +1595,8 @@ impl Store {
         let adopted: Vec<_> = replay
             .entries
             .iter()
-            .filter(|entry| entry.receipt.offset >= acknowledged.count)
-            .map(|entry| (entry.receipt.offset, entry.conflict, entry.wire.clone()))
+            .filter(|entry| entry.offset >= acknowledged.count)
+            .map(|entry| (entry.offset, entry.conflict, entry.wire.clone()))
             .collect();
         #[cfg(test)]
         {
@@ -1609,11 +1610,8 @@ impl Store {
             let mut causal = ReplayIndex::new(INDEX_CAPACITY);
             sources.with_store_replay(scope, replay.entries.len(), |batch| {
                 for entry in replay.entries {
-                    let replay::Entry {
-                        receipt,
-                        wire,
-                        conflict,
-                    } = entry;
+                    let receipt = entry.receipt();
+                    let replay::Entry { wire, conflict, .. } = entry;
                     if conflict {
                         let conflict = Conflict::restore(session, scope, wire.wire())?;
                         store.admit_proof(&conflict)?;
@@ -2892,10 +2890,17 @@ impl Store {
     /// signers of its effective `Remove`s). [`Self::catalog_projection`] counts each remover's
     /// newest of them ([`Self::newest_cuts`]), a removed remover's only inside its own allowed
     /// prefix. Off under the `table-cutoffs-off` negative control.
-    fn removal_cuts(&self, session: &Session<'_>, withheld: &BTreeSet<Digest>) -> Vec<CountedCut> {
+    ///
+    /// # Errors
+    /// The session's membership log does not read ([`Session::removers_of`]).
+    fn removal_cuts(
+        &self,
+        session: &Session<'_>,
+        withheld: &BTreeSet<Digest>,
+    ) -> Result<Vec<CountedCut>> {
         #[cfg(any(test, debug_assertions))]
         if super::table_cutoffs_off() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let candidates: Vec<_> = self
             .records
@@ -2908,14 +2913,14 @@ impl Store {
             })
             .collect();
         if candidates.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let removers = session.removers_of(
             candidates
                 .iter()
                 .flat_map(|(_, signer, _, cut)| [cut.actor, *signer]),
-        );
-        candidates
+        )?;
+        Ok(candidates
             .into_iter()
             .filter(|(_, signer, _, cut)| {
                 removers
@@ -2929,7 +2934,7 @@ impl Store {
                 cut,
                 signer_removed: removers.contains_key(&signer),
             })
-            .collect()
+            .collect())
     }
 
     /// Of `cuts`, each signer's newest cutoff of each writer: what a reader counts, so a cutoff
@@ -3159,7 +3164,7 @@ impl Store {
         // cutoffs of its own removers bound, themselves perhaps removed: walk to a fixpoint, each
         // round counting each signer's newest standing cutoff, so a removed Mac's later cutoff
         // neither cuts nor un-cuts anyone. Bounded by one round per cutoff.
-        let cuts = self.removal_cuts(session, &withheld);
+        let cuts = self.removal_cuts(session, &withheld)?;
         let mut standing = Self::newest_cuts(cuts.iter().filter(|cut| !cut.signer_removed));
         let mut removals = Self::cut_frontiers(&standing);
         let mut allowed = constraints.catalog_with(table, index, &removals);
@@ -3199,27 +3204,38 @@ impl Store {
             })
             .chain(removals.keys().copied())
             .collect();
-        let mut excluded: BTreeSet<_> = self
-            .records
-            .iter()
-            .filter(|(id, stored)| {
-                withheld.contains(*id)
-                    || stored.payload.quarantine().is_some()
-                    || !allowed.permits(id)
-                    || by_epoch.contains(*id)
-                    || !(writers.contains(&stored.header.actor)
-                        || cutoffs.contains(&stored.header.actor)
-                        || (is_log_backed
-                            && super::envelope_roster(&stored.wire).is_some_and(|roster| {
-                                *historical
-                                    .entry((roster, stored.header.actor))
-                                    .or_insert_with(|| {
-                                        session.historical_writer_in(&roster, &stored.header.actor)
-                                    })
-                            })))
-            })
-            .map(|(id, _)| *id)
-            .collect();
+        let mut excluded: BTreeSet<Digest> = BTreeSet::new();
+        for (id, stored) in &self.records {
+            let actor = stored.header.actor;
+            if withheld.contains(id)
+                || stored.payload.quarantine().is_some()
+                || !allowed.permits(id)
+                || by_epoch.contains(id)
+            {
+                excluded.insert(*id);
+                continue;
+            }
+            if writers.contains(&actor) || cutoffs.contains(&actor) {
+                continue;
+            }
+            // A writer that is no member now keeps the records its roster's grant names; whether
+            // it held one is asked once per roster and writer, and a history that did not read
+            // refuses the projection ([`Session::historical_writer_in`]).
+            let granted = match (is_log_backed, super::envelope_roster(&stored.wire)) {
+                (true, Some(roster)) => match historical.get(&(roster, actor)) {
+                    Some(granted) => *granted,
+                    None => {
+                        let granted = session.historical_writer_in(&roster, &actor)?;
+                        historical.insert((roster, actor), granted);
+                        granted
+                    }
+                },
+                _ => false,
+            };
+            if !granted {
+                excluded.insert(*id);
+            }
+        }
         excluded.extend(withheld);
         // Keep all witnessed fork evidence restrictive. Filtering the cutoff
         // input must not make a conflicting selected writer valid again.
@@ -3503,6 +3519,12 @@ impl Store {
     /// admitted or read from the network since (`Round::store`'s).
     pub(crate) fn inventory_unchecked(&self) -> impl ExactSizeIterator<Item = &Digest> {
         self.records.keys()
+    }
+    /// How many records this store's custody witness counts, operations and conflict proofs
+    /// alike: what [`held_lengths`] reads of its claim, and what each append through this handle
+    /// grows by one. An ingest of a record the store already held appends nothing.
+    pub(crate) fn witnessed(&self) -> u64 {
+        self.witness.count
     }
     /// Retained positive operations from an actor, including withheld records.
     /// Application admission limits must not reset when projection hides data.

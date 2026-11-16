@@ -265,6 +265,51 @@ pub fn rl_dir_in(state: &Path) -> PathBuf {
     state.join("rl")
 }
 
+/// One reading file as [`readings_in`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Kept {
+    /// The file's stem (`<sid>-<pid>`).
+    pub(super) stem: String,
+    /// What it holds.
+    pub(super) reading: Reading,
+    /// When the file was last written (Unix seconds), read of the file that was opened: a live
+    /// tap moves it every [`TAP_REFRESH_S`] seconds, rewriting or not ([`heard_again`]), so a
+    /// file whose process ended, or that its process stopped writing, stays at its last run.
+    pub(super) written_at: i64,
+}
+
+/// EVERY READING `dir` HOLDS, each with its file's stem (`<sid>-<pid>`) and when the file was
+/// last written, for a reader that looks at no tab and no process
+/// (`login_adoption::Witnesses`): the first `most` regular files, in name order, that read as a
+/// reading of the tab and process their own name says. A file that does not read, whose text
+/// names another tab or process than its name, or whose time cannot be read tells nothing.
+#[must_use]
+pub(super) fn readings_in(dir: &Path, most: usize) -> Vec<Kept> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let (text, written_at) = read_regular_dated(&dir.join(&name))?;
+            let written_at = written_at?;
+            let reading = Reading::of_json(&text)?;
+            (file_name(&reading.sid, reading.pid).as_deref() == Some(name.as_str())).then(|| Kept {
+                stem: name.trim_end_matches(".json").to_owned(),
+                reading,
+                written_at,
+            })
+        })
+        .take(most)
+        .collect()
+}
+
 /// The file of process `pid` in tab `sid`.
 #[must_use]
 pub fn file_name(sid: &str, pid: u32) -> Option<String> {
@@ -319,6 +364,52 @@ impl Row {
     }
 }
 
+/// How the process a run of the tap is of authenticates, as the tap's own environment says it
+/// ([`Reading::route`], `"route": "stored" | "token" | "outside"`): the tap is Claude Code's
+/// child, so it holds the variables its process was started with and the ones its settings'
+/// `env` block set, which no exec-time reading of that process shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// On the stored login of its login place: no credential, profile or route variable is set.
+    Stored,
+    /// On its account's vault token, served by aterm's wrapper.
+    Token,
+    /// Anything else: an environment token, an API key, a provider route.
+    Outside,
+}
+
+impl Route {
+    /// Its word in the file.
+    const fn key(self) -> &'static str {
+        match self {
+            Route::Stored => "stored",
+            Route::Token => "token",
+            Route::Outside => "outside",
+        }
+    }
+
+    /// The route a file's word names; `None` for any other word, which a later build may write.
+    fn of_key(key: &str) -> Option<Route> {
+        match key {
+            "stored" => Some(Route::Stored),
+            "token" => Some(Route::Token),
+            "outside" => Some(Route::Outside),
+            _ => None,
+        }
+    }
+
+    /// The route the environment `env` gives a Claude Code process
+    /// ([`accounts::ProcessLogin::of_env`]). It names variables and never keeps a value.
+    #[must_use]
+    pub fn of_env<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>) -> Route {
+        match accounts::ProcessLogin::of_env(env).route {
+            accounts::AuthRoute::Stored => Route::Stored,
+            accounts::AuthRoute::VaultToken { .. } => Route::Token,
+            accounts::AuthRoute::Outside => Route::Outside,
+        }
+    }
+}
+
 /// One run of the tap, as its file holds it (format [`FORMAT_V`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
@@ -366,6 +457,11 @@ pub struct Reading {
     /// recorded ([`Self::of_stdin`]), a file written before the key, or a word this build does
     /// not know. Only [`Row::Own`] is claimable ([`Self::claimable`]).
     pub row: Option<Row>,
+    /// How its process authenticates, as the tap's environment says it ([`Route`]): what a
+    /// reader with no look at the process itself takes a reading of the stored login by
+    /// (`login_adoption::live_login_here`). `None` from a file written before the key, a word
+    /// this build does not know, or a run whose variables were not read from a process.
+    pub route: Option<Route>,
 }
 
 /// What the tap reads of its environment ([`run`]).
@@ -379,18 +475,45 @@ pub struct TapVars {
     pub login: Option<String>,
     /// [`accounts::HOME_ENV`].
     pub home: Option<String>,
+    /// How the process authenticates, by every variable of the tap's environment
+    /// ([`Route::of_env`]); `None` where no process's environment was read.
+    pub route: Option<Route>,
 }
 
 impl TapVars {
-    /// The four variables of this process's environment.
+    /// The four variables of this process's environment, and the route every variable of it
+    /// gives its process.
     #[must_use]
     pub fn from_process() -> TapVars {
         let get = |key: &str| std::env::var(key).ok();
+        // A variable whose name or value is not Unicode cannot be judged: it reads as a route
+        // of its own, so nothing takes the reading for the stored login's.
+        let mut unread = false;
+        let env: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(
+                |(name, value)| match (name.into_string(), value.into_string()) {
+                    (Ok(name), Ok(value)) => Some((name, value)),
+                    _ => {
+                        unread = true;
+                        None
+                    }
+                },
+            )
+            .collect();
+        let route = if unread {
+            Route::Outside
+        } else {
+            Route::of_env(
+                env.iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+        };
         TapVars {
             sid: get("ATERM_PARENT_SESSION_ID"),
             pid: get("CLAUDE_PID"),
             login: get(accounts::LOGIN_ENV),
             home: get(accounts::HOME_ENV),
+            route: Some(route),
         }
     }
 }
@@ -500,6 +623,7 @@ impl Reading {
                 .and_then(|pct| u8::try_from(pct).ok()),
             dur_us: 0,
             row: None,
+            route: vars.route,
         })
     }
 
@@ -586,6 +710,11 @@ impl Reading {
             "row".to_owned(),
             Value::from(self.row.map(|row| row.key().to_owned())),
         );
+        // Written only where a process's environment was read, so a reading made without one
+        // (and every file an earlier build wrote) keeps the text it had.
+        if let Some(route) = self.route {
+            o.insert("route".to_owned(), Value::from(route.key().to_owned()));
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
     }
 
@@ -658,6 +787,10 @@ impl Reading {
             },
             dur_us: doc.get("dur_us").and_then(Value::as_u64).unwrap_or(0),
             row: doc.get("row").and_then(Value::as_str).and_then(Row::of_key),
+            route: doc
+                .get("route")
+                .and_then(Value::as_str)
+                .and_then(Route::of_key),
         })
     }
 
@@ -773,6 +906,13 @@ fn file_mtime(path: &Path) -> Option<i64> {
 /// The text of the regular file at `path`, opened without following a
 /// symlink, at most [`FILE_MAX`] bytes.
 fn read_regular(path: &Path) -> Option<String> {
+    read_regular_dated(path).map(|(text, _)| text)
+}
+
+/// [`read_regular`] with when the file it opened was last written (Unix seconds; `None` where
+/// that time does not read), both of the one open file, so the text and the time are of the
+/// same file whatever is renamed over the path meanwhile.
+fn read_regular_dated(path: &Path) -> Option<(String, Option<i64>)> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
@@ -785,10 +925,15 @@ fn read_regular(path: &Path) -> Option<String> {
     if !meta.is_file() || meta.len() > FILE_MAX {
         return None;
     }
+    let written_at = meta
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|at| i64::try_from(at.as_secs()).ok());
     let mut text =
         String::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
     file.take(FILE_MAX + 1).read_to_string(&mut text).ok()?;
-    (text.len() as u64 <= FILE_MAX).then_some(text)
+    (text.len() as u64 <= FILE_MAX).then_some((text, written_at))
 }
 
 /// Write `text` to `dir/name`: the directory made 0700, a temp file of mode

@@ -34,6 +34,8 @@ pub(super) fn start(
     if ARGS.set(Arc::clone(&args)).is_err() {
         return;
     }
+    // Each worker waits on the process's wake, which the watchdog's retirements nudge.
+    WATCH.wake_on_retire(&crate::check_wake::SYSTEM_WOKE);
     let generation = WATCH.register(crate::linux_notice::PASS_SECS);
     launch(&WATCH, generation, || spawn(generation, args));
 }

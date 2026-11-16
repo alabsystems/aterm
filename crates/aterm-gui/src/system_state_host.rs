@@ -13,6 +13,7 @@ use aterm_types::macos_setup::{Access, Plan, Selection, Setting};
 use crate::native_app::{AppKind, NativeApp};
 use crate::system_state::{
     Admission, PasswordAcceptance, SetupOperation, SetupStatus, SetupStatusRow, SystemStateAction,
+    ToolsInstall,
 };
 use crate::workstation_setup::{Request, WorkstationSetupDecision};
 use crate::{App, Wake};
@@ -1331,7 +1332,17 @@ impl App {
             || host.asking_long != host.asking_long_at(now)
     }
 
-    pub(crate) fn publish_system_state(&mut self, mut status: SetupStatus) {
+    pub(crate) fn publish_system_state(&mut self, status: SetupStatus) {
+        self.publish_system_state_with_tools_step(status, None);
+    }
+
+    /// A republish reuses the installer step it just compared, including a read of no step.
+    /// Both page fields describe that same observation, rather than probing again mid-publish.
+    fn publish_system_state_with_tools_step(
+        &mut self,
+        mut status: SetupStatus,
+        tools_step: Option<Option<ToolsInstall>>,
+    ) {
         self.system_state_host.status_shown = true;
         if !self.system_state_host.showing_fixture() {
             self.system_state_host.track(&status, Instant::now());
@@ -1341,8 +1352,10 @@ impl App {
         if !self.system_state_host.showing_fixture() {
             self.settle_missing_tools_exception();
             status.tools_owed = self.developer_tools_owed(status.repositories_reading());
+            let step = tools_step.unwrap_or_else(|| self.developer_tools_page_step(&status));
+            status.mac_setup = step;
             if status.repositories_tools_wait().is_some() {
-                status.developer_tools = self.developer_tools_install_step(&status);
+                status.developer_tools = step;
             }
         }
         self.system_state_host.latest_status = status.clone();
@@ -1437,13 +1450,16 @@ impl App {
         if self.system_state_host.showing_fixture() || !self.system_state_host.status_shown {
             return;
         }
-        let latest = self.system_state_host.latest_status.clone();
+        let mut latest = self.system_state_host.latest_status.clone();
         // Republished where the tools' typed reading moved, or where, owed, the install's step
         // did.
         let owed = self.developer_tools_owed(latest.repositories_reading());
-        if latest.tools_owed == owed
-            && (latest.repositories_tools_wait().is_none()
-                || latest.developer_tools == self.developer_tools_install_step(&latest))
+        let owed_changed = latest.tools_owed != owed;
+        latest.tools_owed = owed;
+        let step = self.developer_tools_page_step(&latest);
+        if latest.mac_setup == step
+            && !owed_changed
+            && (latest.repositories_tools_wait().is_none() || latest.developer_tools == step)
         {
             return;
         }
@@ -1451,7 +1467,7 @@ impl App {
             self.system_state_host.status_in_flight,
             self.system_state_host.next_status,
         );
-        self.publish_system_state(self.system_state_host.latest_status.clone());
+        self.publish_system_state_with_tools_step(latest, Some(step));
         self.system_state_host.status_in_flight = in_flight;
         self.system_state_host.next_status = next;
     }

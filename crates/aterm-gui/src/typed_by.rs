@@ -143,7 +143,7 @@ impl Who {
             Self::Edge { src, client } => format!(
                 "{} on {}'s edge",
                 client.own_words(),
-                aterm_messages::presence::short_sid(src.as_str())
+                crate::presence::short_sid(src.as_str())
             ),
             Self::Process {
                 pid,
@@ -412,7 +412,7 @@ pub(crate) fn name(
                 return by;
             }
             let on = src_tab.and_then(tab_of).map_or_else(
-                || aterm_messages::presence::short_sid(src.as_str()),
+                || crate::presence::short_sid(src.as_str()),
                 |named| named.words,
             );
             Named {
@@ -439,7 +439,7 @@ pub(crate) fn tab_named(ctx: &SessionCtx) -> Named {
             meta.presentation_value("title").as_deref().and_then(set),
         )
     };
-    let sid = aterm_messages::presence::short_sid(ctx.self_id.as_str());
+    let sid = crate::presence::short_sid(ctx.self_id.as_str());
     match (role, pin) {
         (Some(role), _) => Named {
             facts: Some(role.clone()),

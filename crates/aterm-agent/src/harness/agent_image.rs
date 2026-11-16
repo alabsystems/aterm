@@ -227,9 +227,8 @@ macro_rules! lanes {
             /// THE RULING's exemption (2026-10-27): whether this lane may type into an agent the
             /// host has not confirmed. The ruling holds a relaunch after the agent exits, the
             /// live upgrade and the codex-alab, agy and Muse Code drives safe on the agent's own
-            /// session record. The disk lanes are none of them: their lines are owed from what
-            /// the screen showed (an `ENOSPC` while the volume measured full) and from the seat
-            /// rule, never from a record.
+            /// session record. The disk resume is none of them: its line is owed from what the
+            /// screen showed (an `ENOSPC` while the volume measured full), never from a record.
             #[must_use]
             pub const fn exempt(self) -> bool {
                 match self {
@@ -244,9 +243,6 @@ lanes! {
     /// The disk resume (`disk-resume@v1`): the carry-on typed into a session whose screen said
     /// the disk was full, once space is back.
     DiskResume => "disk-resume", exempt: false;
-    /// The ask to free space (`disk-free@v1`): the line typed into the session the seat rule
-    /// seats.
-    DiskFree => "disk-free", exempt: false;
     /// A relaunch after the agent exits (or a restart ends it): the relaunch line and its
     /// continuation.
     Relaunch => "relaunch", exempt: true;

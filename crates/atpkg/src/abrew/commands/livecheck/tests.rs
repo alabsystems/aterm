@@ -82,6 +82,27 @@ fn plist_fields_and_item_versions() {
     assert_eq!(item(None, None), None);
 }
 
+#[test]
+fn binary_plist_utf16_fields_preserve_surrogate_pairs() {
+    let mut bytes = b"bplist00".to_vec();
+    // Three objects: a one-entry dictionary, its ASCII key, and three UTF-16 units.
+    bytes.extend([
+        0xd1, 1, 2, 0x51, b'K', 0x63, 0x00, 0xe9, 0xd8, 0x3d, 0xde, 0x00,
+    ]);
+    let offsets_at = bytes.len() as u64;
+    bytes.extend([8, 11, 13]);
+    let mut trailer = [0u8; 32];
+    trailer[6] = 1;
+    trailer[7] = 1;
+    trailer[8..16].copy_from_slice(&3u64.to_be_bytes());
+    trailer[24..32].copy_from_slice(&offsets_at.to_be_bytes());
+    bytes.extend(trailer);
+    assert_eq!(
+        plist_string_fields(&bytes),
+        Some(vec![("K".into(), "é😀".into())])
+    );
+}
+
 /// r402: GitHub API failures take brew's raised texts
 /// (bare exception class for 404s, prefixed HTTP
 /// explanation otherwise).
@@ -172,6 +193,350 @@ fn debug_matched_dedupes_in_discovery_order() {
     assert_eq!(debug_matched(&[]), "");
 }
 
+/// r413: API core records carry the bare leaf as
+/// `full_name` and must read as from-API (the
+/// agreement gate); tap-loaded records are qualified.
+#[test]
+fn formula_from_api_discriminates() {
+    let mk = |full: &str| {
+        let mut f = crate::abrew::formula::Formula::default();
+        f.name = "immich-cli".to_string();
+        f.full_name = full.to_string();
+        f
+    };
+    assert!(formula_from_api(&mk("immich-cli")));
+    assert!(formula_from_api(&mk("homebrew/core/immich-cli")));
+    assert!(!formula_from_api(&mk("homebrew/cask/immich-cli")));
+    assert!(!formula_from_api(&mk("probeuser/probe/immich-cli")));
+}
+
+/// r418: a lazy capture group takes the SHORTEST
+/// feasible split (Ruby order) — Hackage's derived
+/// `(.*?)/?` must leave a trailing slash to the
+/// suffix (shelltestrunner reported `1.11/` before).
+#[test]
+fn lazy_group_split_is_shortest() {
+    let re = lc_regex("<h3>shelltestrunner-(.*?)/?</h3>", "i").unwrap();
+    assert_eq!(
+        scan_versions(
+            &re,
+            "<h3>shelltestrunner-1.11/</h3><h3>shelltestrunner-1.10</h3>"
+        ),
+        ["1.11", "1.10"]
+    );
+    // Greedy groups are unaffected.
+    let greedy = lc_regex(r"v(\d+(?:\.\d+)*)\.tar", "").unwrap();
+    assert_eq!(scan_versions(&greedy, "v1.2.3.tar"), ["1.2.3"]);
+}
+
+/// r418: Hackage match/values, pinned against the
+/// oracle over every haskell.org URL in
+/// homebrew-core (75/75, 73 matching).
+#[test]
+fn hackage_match_and_values_oracle() {
+    assert!(hackage_match(
+        "https://downloads.haskell.org/~ghc/9.12.2/ghc-9.12.2-src.tar.xz"
+    ));
+    assert_eq!(
+        hackage_values("https://hackage.haskell.org/package/happy-2.1.7/happy-2.1.7.tar.gz"),
+        Some((
+            "https://hackage.haskell.org/package/happy/src/".to_string(),
+            "<h3>happy-(.*?)/?</h3>".to_string()
+        ))
+    );
+    assert!(!hackage_match(
+        "https://hackage.haskell.org/package/git-annex"
+    ));
+    assert_eq!(
+        hackage_values("https://hackage.haskell.org/package/git-annex"),
+        None
+    );
+    assert!(!hackage_match("https://example.com/package/foo-1.0.tar.gz"));
+}
+
+/// r417: crate package/index derivation, pinned
+/// against the oracle's `generate_input_values`
+/// over every static.crates.io URL in homebrew-core
+/// (31/31), incl. the sparse-index shard rules.
+#[test]
+fn crate_package_and_index_url() {
+    assert_eq!(
+        crate_package("https://static.crates.io/crates/serde/serde-1.0.219.crate").as_deref(),
+        Some("serde")
+    );
+    assert_eq!(
+        crate_package("https://static.crates.io/crates/serde/"),
+        None
+    );
+    assert_eq!(
+        crate_package("https://example.com/crates/serde/serde-1.0.crate"),
+        None
+    );
+    assert_eq!(crate_index_url("ab"), "https://index.crates.io/2/ab");
+    assert_eq!(crate_index_url("abc"), "https://index.crates.io/3/a/abc");
+    assert_eq!(
+        crate_index_url("serde"),
+        "https://index.crates.io/se/rd/serde"
+    );
+    assert_eq!(
+        crate_index_url("Tokio"),
+        "https://index.crates.io/to/ki/tokio"
+    );
+}
+
+/// r416: Cpan values, pinned against the oracle's
+/// own `generate_input_values` over every
+/// cpan.metacpan.org / www.cpan.org URL in
+/// homebrew-core (457/457, 455 matching).
+#[test]
+fn cpan_values_match_oracle() {
+    assert_eq!(
+        cpan_values("https://cpan.metacpan.org/authors/id/A/AM/AMBS/btparse/btparse-0.35.tar.gz"),
+        Some((
+            "https://www.cpan.org/authors/id/A/AM/AMBS/btparse/".to_string(),
+            r"href=.*?btparse[._-]v?(\d+(?:\.\d+)*)\.t".to_string()
+        ))
+    );
+    assert_eq!(
+        cpan_values("https://cpan.metacpan.org/authors/id/R/RJ/RJBS/App-Cmd-0.340.tar.gz")
+            .map(|(u, _)| u)
+            .as_deref(),
+        Some("https://www.cpan.org/authors/id/R/RJ/RJBS/")
+    );
+    assert_eq!(
+        cpan_values("https://www.cpan.org/src/5.0/perl-5.44.0.tar.xz"),
+        None
+    );
+    assert_eq!(
+        cpan_values("https://example.com/authors/id/A/AB/ABC/x-1.0.tar.gz"),
+        None
+    );
+}
+
+/// r415: Xorg match/values, pinned against the
+/// oracle over every x.org-ish URL in homebrew-core
+/// (291/291, 78 matching). Generated values exist
+/// for non-matching URLs too (explicit `:xorg`).
+#[test]
+fn xorg_match_and_values_oracle() {
+    assert!(xorg_match("https://archive.mesa3d.org/mesa-26.2.6.tar.xz"));
+    assert_eq!(
+        xorg_values("https://archive.mesa3d.org/mesa-26.2.6.tar.xz"),
+        Some((
+            "https://archive.mesa3d.org/".to_string(),
+            r"href=.*?mesa[._-]v?(\d+(?:\.\d+)+)\.t".to_string()
+        ))
+    );
+    assert!(xorg_match(
+        "https://www.x.org/archive/individual/lib/libX11-1.8.12.tar.xz"
+    ));
+    assert_eq!(
+        xorg_values("https://www.x.org/pub/individual/lib/libX11-1.8.12.tar.xz")
+            .map(|(u, _)| u)
+            .as_deref(),
+        Some("https://www.x.org/archive/individual/lib/")
+    );
+    // freedesktop /releases/ does not derive-match,
+    // but values still generate for explicit use.
+    assert!(!xorg_match(
+        "https://xorg.freedesktop.org/releases/individual/util/imake-1.0.11.tar.xz"
+    ));
+    assert!(
+        xorg_values("https://xorg.freedesktop.org/releases/individual/util/imake-1.0.11.tar.xz")
+            .is_some()
+    );
+    assert!(!xorg_match("https://example.com/mesa-1.2.tar.xz"));
+}
+
+/// r414: Gnome package derivation (106/106 vs the
+/// oracle generator) and the old-scheme unstable
+/// filter rule (rows confirmed against brew's own
+/// Version comparisons).
+#[test]
+fn gnome_package_and_stable_filter() {
+    assert_eq!(
+        gnome_package("https://download.gnome.org/sources/glib/2.86/glib-2.86.3.tar.xz").as_deref(),
+        Some("glib")
+    );
+    assert_eq!(
+        gnome_package("https://download.gnome.org/sources/glib"),
+        None
+    );
+    assert_eq!(
+        gnome_package("https://example.com/sources/glib/2.86/x.tar.xz"),
+        None
+    );
+    for (v, stable) in [
+        ("48.1", true),
+        ("40.alpha", true),
+        ("2", true),
+        ("3.38.9", true),
+        ("3.37.1", false),
+        ("2.99.4", false),
+        ("3.38.91", false),
+        ("1.90", false),
+        ("1.89.89", false),
+        ("39.0", true),
+    ] {
+        assert_eq!(gnome_stable(v), stable, "{v}");
+    }
+}
+
+/// r413: npm package derivation, pinned against the
+/// oracle's own `generate_input_values` over every
+/// registry.npmjs.org URL in homebrew-core (292/292).
+#[test]
+fn npm_package_matches_oracle() {
+    let rows: &[(&str, Option<(&str, &str)>)] = &[
+        (
+            "https://registry.npmjs.org/typescript/-/typescript-5.7.3.tgz",
+            Some(("typescript", "typescript")),
+        ),
+        (
+            "https://registry.npmjs.org/@babel/core/-/core-7.26.0.tgz",
+            Some(("@babel/core", "%40babel%2Fcore")),
+        ),
+        ("https://registry.npmjs.org/@napi-rs/nice/latest", None),
+        ("https://registry.npmjs.org/", None),
+        ("https://example.com/pkg/-/pkg-1.0.tgz", None),
+    ];
+    for (url, want) in rows {
+        assert_eq!(
+            npm_package(url).map(|p| {
+                let enc = form_encode_component(&p);
+                (p, enc)
+            }),
+            want.map(|(p, e)| (p.to_string(), e.to_string())),
+            "{url}"
+        );
+    }
+}
+
+/// r412: Sourceforge strategy inputs, pinned against
+/// the oracle's own `generate_input_values` over
+/// every sourceforge-ish URL in homebrew-core
+/// (900/900, 683 matching). Bare project homepages
+/// deliberately do NOT match (brew falls through).
+#[test]
+fn sourceforge_values_match_oracle() {
+    let rows: &[(&str, Option<(Option<&str>, &str)>)] = &[
+        (
+            "https://downloads.sourceforge.net/bbmap/BBMap_40.05.tar.gz",
+            Some((
+                Some("https://sourceforge.net/projects/bbmap/rss"),
+                r"url=.*?/bbmap/files/.*?[-_/](\d+(?:[-.]\d+)+)[-_/%.]",
+            )),
+        ),
+        (
+            "https://downloads.sourceforge.net/project/lzmautils/xz-5.8.4.tar.gz",
+            Some((
+                Some("https://sourceforge.net/projects/lzmautils/rss"),
+                r"url=.*?/lzmautils/files/.*?[-_/](\d+(?:[-.]\d+)+)[-_/%.]",
+            )),
+        ),
+        (
+            "https://sourceforge.net/projects/bbmap/rss",
+            Some((
+                None,
+                r"url=.*?/bbmap/files/.*?[-_/](\d+(?:[-.]\d+)+)[-_/%.]",
+            )),
+        ),
+        ("https://matio.sourceforge.net/", None),
+        ("https://sourceforge.net/", None),
+    ];
+    for (url, want) in rows {
+        assert_eq!(
+            sourceforge_values(url),
+            want.map(|(u, r)| (u.map(str::to_string), r.to_string())),
+            "{url}"
+        );
+    }
+}
+
+/// r410: Apache strategy inputs, pinned against the
+/// oracle's own `generate_input_values` over every
+/// apache.org URL in homebrew-core (233/233); these
+/// rows span the dyn/closer.lua, archive, and
+/// non-matching forms.
+#[test]
+fn apache_values_match_oracle() {
+    let rows: &[(&str, Option<(&str, &str)>)] = &[
+        (
+            "https://www.apache.org/dyn/closer.lua?path=flink/flink-cdc-3.7.0/flink-cdc-3.7.0-2.2-bin.tar.gz",
+            Some((
+                "https://archive.apache.org/dist/flink/",
+                r#"href=["']?flink-cdc-v?(\d+(?:\.\d+)+)/"#,
+            )),
+        ),
+        (
+            "https://archive.apache.org/dist/ant/binaries/apache-ant-1.10.18-bin.tar.xz",
+            Some((
+                "https://archive.apache.org/dist/ant/binaries/",
+                r#"href=["']?apache-ant-v?(\d+(?:\.\d+)+)-bin\.t"#,
+            )),
+        ),
+        (
+            "https://archive.apache.org/dist/activemq/6.4.0/apache-activemq-6.4.0-bin.tar.gz",
+            Some((
+                "https://archive.apache.org/dist/activemq/",
+                r#"href=["']?v?(\d+(?:\.\d+)+)/"#,
+            )),
+        ),
+        ("https://www.apache.org/licenses/LICENSE-2.0", None),
+        ("https://example.com/dist/foo-1.2.tar.gz", None),
+    ];
+    for (url, want) in rows {
+        assert_eq!(
+            apache_values(url),
+            want.map(|(u, r)| (u.to_string(), r.to_string())),
+            "{url}"
+        );
+    }
+}
+
+/// r409: resource currents — explicit version wins,
+/// a git tag detects in place of the URL, and an
+/// undetectable URL is stamped with the formula's
+/// version (brew's SoftwareSpec#owner=), which is
+/// how e.g. wzprof's `simple.wasm` test resource
+/// reports the parent's 0.2.0.
+#[test]
+fn resource_current_derivation() {
+    let wasm = "https://github.com/dispatchrun/wzprof/raw/c2e9f22/testdata/c/simple.wasm";
+    assert_eq!(
+        resource_current(None, None, wasm, "0.2.0").as_deref(),
+        Some("0.2.0")
+    );
+    assert_eq!(
+        resource_current(Some("9.9".into()), None, wasm, "0.2.0").as_deref(),
+        Some("9.9")
+    );
+    assert_eq!(
+        resource_current(
+            None,
+            Some("v0.14.0".into()),
+            "https://github.com/rggen/rggen-verilog.git",
+            "0.36.1"
+        )
+        .as_deref(),
+        Some("0.14.0")
+    );
+    // An undetectable tag does not fall back to the
+    // URL; the stamp applies instead.
+    assert_eq!(
+        resource_current(
+            None,
+            Some("release".into()),
+            "https://example.com/x/foo-1.2.3.tar.gz",
+            "4.0"
+        )
+        .as_deref(),
+        Some("4.0")
+    );
+    // No version anywhere: stays undetected.
+    assert_eq!(resource_current(None, None, wasm, ""), None);
+}
+
 /// r384/r407: PyPI project derivation, as shown by
 /// `brew livecheck -r --verbose` on python-shaped
 /// resources and pinned against the oracle strategy's
@@ -182,7 +547,7 @@ fn debug_matched_dedupes_in_discovery_order() {
 /// resource) derives `python-dateutil`, and a wheel
 /// keeps its tags in the name, as the oracle does.
 #[test]
-fn pypi_project_and_file_version_tokens() {
+fn pypi_project_and_version_parse() {
     let flit = "https://files.pythonhosted.org/packages/e7/91/flit_core-4.1.0.tar.gz";
     assert_eq!(pypi_project(flit).as_deref(), Some("flit-core"));
     let whl = "https://files.pythonhosted.org/packages/a/packaging-26.3-py3-none-any.whl";
@@ -218,15 +583,17 @@ fn pypi_project_and_file_version_tokens() {
     }
     // Path-segment fallback (influxdb@2 ui-assets).
     assert_eq!(
-        url_version_token(
+        version_parse(
             "https://github.com/influxdata/ui/releases/download/OSS-v2.10.0/build.tar.gz"
         )
         .as_deref(),
         Some("2.10.0")
     );
-    // r389/r403: resource-current detection across the
-    // oracle-probed filename shapes (None = delegate;
-    // every Some is the oracle's own reported version).
+    // r389/r403/r408: resource-current detection across
+    // the oracle-probed filename shapes. Since r408
+    // these run the faithful Version.parse port, so
+    // every row is the oracle's own reported version
+    // (None only where the oracle detects none).
     let shapes: &[(&str, Option<&str>)] = &[
         ("foo-1.0rc1.tar.gz", Some("1.0rc1")),
         ("foo-2.0-beta.3.tar.gz", Some("2.0-beta.3")),
@@ -235,9 +602,8 @@ fn pypi_project_and_file_version_tokens() {
         ("foo_1.2.3_alpha.tar.gz", Some("1.2.3_alpha")),
         ("foo-2024.01.tar.gz", Some("2024.01")),
         // r407: the oracle's `.post\d+` forms (probed
-        // via `brew ruby` Version.parse); `1.2.post`
-        // (no digits) stays None here, delegating rather
-        // than guessing (the oracle reports `1.2.post`).
+        // via `brew ruby` Version.parse), including the
+        // digit-less `.post` tail the oracle also keeps.
         ("python-dateutil-2.9.0.post0.tar.gz", Some("2.9.0.post0")),
         ("foo-1.2.3.post12.tar.gz", Some("1.2.3.post12")),
         ("foo-1.2-post3.tar.gz", Some("1.2-post3")),
@@ -246,7 +612,7 @@ fn pypi_project_and_file_version_tokens() {
         ("foo-1.2xpost3.tar.gz", Some("1.2xpost3")),
         ("foo-1.2.POST3.tar.gz", Some("3")),
         ("foo-1.2.dev3.tar.gz", Some("3")),
-        ("foo-1.2.post.tar.gz", None),
+        ("foo-1.2.post.tar.gz", Some("1.2.post")),
         ("foo-r16.tar.gz", Some("16")),
         ("foo-1.0.0-linux.tar.gz", Some("1.0.0")),
         ("foo-1.2.3.4.5.tar.gz", Some("1.2.3.4.5")),
@@ -259,7 +625,7 @@ fn pypi_project_and_file_version_tokens() {
         ("foo128.tar.gz", Some("128")),
         ("foo-ver1.2.tar.gz", Some("1.2")),
         ("foo-1.2.3-rc.1+build5.tar.gz", Some("1.2.3-rc.1")),
-        ("foo-1.2.3+build5.tar.gz", None),
+        ("foo-1.2.3+build5.tar.gz", Some("5")),
         ("foo-1.0_amd64.tar.gz", Some("64")),
         ("foo-1.0-src.tar.gz", Some("1.0")),
         ("foo-1.0.RELEASE.tar.gz", Some("1.0.RELEASE")),
@@ -273,13 +639,13 @@ fn pypi_project_and_file_version_tokens() {
         ("foo-1.0.0-snapshot.tar.gz", Some("1.0.0")),
         ("foo-1.0.0-x64.tar.gz", Some("1.0.0")),
         ("foo-1.0.0-arm64.tar.gz", Some("64")),
-        ("foo-1.0_1.tar.gz", None),
+        ("foo-1.0_1.tar.gz", Some("0.1")),
         ("packaging-26.3-py3-none-any.whl", Some("26.3")),
         ("zope_interface-7.0.3-py3-none-any.whl", Some("7.0.3")),
     ];
     for (name, want) in shapes {
         assert_eq!(
-            url_version_token(&format!("https://example.com/x/{name}")).as_deref(),
+            version_parse(&format!("https://example.com/x/{name}")).as_deref(),
             *want,
             "shape {name}"
         );
@@ -566,4 +932,90 @@ fn cask_comma_versions_compare_segmentwise() {
     assert_eq!(lc_cmp(true, "1.2,300", "1.2,400"), Ordering::Less);
     assert_eq!(lc_cmp(true, "1.3,1", "1.2,999"), Ordering::Greater);
     assert_eq!(lc_cmp(false, "1.0", "1.0.1"), Ordering::Less);
+}
+
+/// r419: the RubyGems gem name, greedy to the last
+/// versioned hyphen before `.gem` (329/329 vs the
+/// oracle generator corpus), and /gems/<x>/versions/.
+#[test]
+fn ruby_gem_name_mirrors_the_oracle_generator() {
+    let g = |u: &str| ruby_gem_name(u);
+    assert_eq!(
+        g("https://rubygems.org/downloads/bundler-2.5.9.gem").as_deref(),
+        Some("bundler")
+    );
+    assert_eq!(
+        g("https://rubygems.org/downloads/foo-bar-1.0-x64-mingw32.gem").as_deref(),
+        Some("foo-bar")
+    );
+    assert_eq!(
+        g("https://rubygems.org/downloads/activesupport-7.1.3.2.gem").as_deref(),
+        Some("activesupport")
+    );
+    assert_eq!(
+        g("https://rubygems.org/gems/rake/versions/rake-13.2.1.gem").as_deref(),
+        Some("rake")
+    );
+    assert_eq!(g("https://rubygems.org/downloads/noversion.gem"), None);
+    assert_eq!(g("https://rubygems.org/api/v1/gems/rake.json"), None);
+}
+
+/// r420: the Launchpad project is the first path
+/// segment on any launchpad.net host (27/27 vs the
+/// oracle generator corpus).
+#[test]
+fn launchpad_project_mirrors_the_oracle_generator() {
+    let g = |u: &str| launchpad_project(u);
+    assert_eq!(
+        g("https://launchpad.net/intltool/trunk/0.51.0/+download/intltool-0.51.0.tar.gz")
+            .as_deref(),
+        Some("intltool")
+    );
+    assert_eq!(
+        g("https://bugs.launchpad.net/ubuntu/+source/ncurses/+bug/1").as_deref(),
+        Some("ubuntu")
+    );
+    assert_eq!(
+        g("https://launchpad.net/libmetalink/").as_deref(),
+        Some("libmetalink")
+    );
+    assert_eq!(g("https://launchpad.net"), None);
+    assert_eq!(g("https://launchpad.net/"), None);
+    assert_eq!(g("https://notlaunchpad.net/foo/"), None);
+    assert_eq!(g("https://example.com/launchpad.net/foo"), None);
+}
+
+/// r421: Bitbucket generated values (30/30 vs the
+/// oracle generator corpus, regex source included):
+/// lazy prefix, dotted version, tarball suffix
+/// collapse; `/get/` checks the tags tab.
+#[test]
+fn bitbucket_values_mirror_the_oracle_generator() {
+    let v = |u: &str| bitbucket_values(u);
+    assert_eq!(
+        v("https://bitbucket.org/agalanin/fuse-zip/downloads/fuse-zip-0.7.2.tar.gz"),
+        Some((
+            "https://bitbucket.org/agalanin/fuse-zip/downloads/?iframe=true&spa=0".to_string(),
+            r"href=.*?fuse-zip-v?(\d+(?:\.\d+)+)\.t".to_string(),
+            "i"
+        ))
+    );
+    assert_eq!(
+        v("https://bitbucket.org/amc-nicemice/par/get/1.53.0.tar.bz2"),
+        Some((
+            "https://bitbucket.org/amc-nicemice/par/downloads/?tab=tags&iframe=true&spa=0"
+                .to_string(),
+            r#"<td[^>]*?class="name"[^>]*?>\s*v?(\d+(?:\.\d+)+)\s*?<"#.to_string(),
+            "im"
+        ))
+    );
+    // The version stops at the first hyphen after a
+    // dotted run; the rest is suffix (mecab shape).
+    assert_eq!(
+        v("https://bitbucket.org/eunjeon/mecab-ko/downloads/mecab-0.996-ko-0.9.2.tar.gz")
+            .map(|x| x.1),
+        Some(r"href=.*?mecab-v?(\d+(?:\.\d+)+)-ko-0\.9\.2\.t".to_string())
+    );
+    assert_eq!(v("https://bitbucket.org/foo/bar"), None);
+    assert_eq!(v("https://example.com/foo/downloads/x-1.2.tar.gz"), None);
 }

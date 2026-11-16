@@ -15,6 +15,27 @@ fn sbpl_str(path: &Path) -> String {
     s
 }
 
+/// The job-server socket allow of a profile built for `user_temp`.
+fn job_server_sockets(user_temp: Option<&Path>) -> String {
+    let mut s = String::new();
+    push_job_server_sockets(&mut s, user_temp);
+    s
+}
+
+/// The one clause that admits a job-server socket under `root`, as the emitter writes it.
+fn job_server_clause(root: &Path, quiet_only: bool) -> String {
+    let quiet = if quiet_only {
+        "(/\\\\.ubd)"
+    } else {
+        "(/\\\\.ubd)?"
+    };
+    format!(
+        " (regex \"^{}{quiet}/tjs-{}/s$\")",
+        sbpl_str(root).replace('.', "\\\\."),
+        "[0-9a-f]".repeat(16)
+    )
+}
+
 /// The TmpOnly write confinement with no home-scoped allow in it.
 fn homeless_write_confinement() -> String {
     let mut s = String::new();
@@ -24,11 +45,12 @@ fn homeless_write_confinement() -> String {
 
 #[test]
 fn home_unset_yields_no_home_scoped_rule() {
-    let tmp_only = [BASE_PROFILE, &homeless_write_confinement()].concat();
+    let base = [BASE_PROFILE, &job_server_sockets(None)].concat();
+    let tmp_only = [base.as_str(), &homeless_write_confinement()].concat();
     for home in [None, Some("")] {
         assert_eq!(
             profile_for_home(home, None, FsCapability::HomeReadWrite),
-            BASE_PROFILE
+            base
         );
         assert_eq!(
             profile_for_home(home, None, FsCapability::TmpOnly),
@@ -51,6 +73,7 @@ fn tmp_only_confines_writes_to_the_writable_roots() {
 
     let confinement = [
         BASE_PROFILE,
+        &job_server_sockets(None),
         PREFERENCE_WRITE_DENY,
         "(deny file-write*)(allow file-write*",
     ]
@@ -463,13 +486,14 @@ fn symlinked_ancestor_with_absent_leaf_is_denied_at_resolved_target() {
 #[test]
 fn nonexistent_home_falls_back_to_the_base_profile() {
     let bogus = "/nonexistent/aterm-no-such-home-xyz";
+    let base = [BASE_PROFILE, &job_server_sockets(None)].concat();
     assert_eq!(
         profile_for_home(Some(bogus), None, FsCapability::HomeReadWrite),
-        BASE_PROFILE
+        base
     );
     assert_eq!(
         profile_for_home(Some(bogus), None, FsCapability::TmpOnly),
-        [BASE_PROFILE, &homeless_write_confinement()].concat()
+        [base.as_str(), &homeless_write_confinement()].concat()
     );
 }
 
@@ -700,6 +724,61 @@ fn the_app_data_roots_share_no_entry_with_the_private_set() {
         assert!(
             !PRIVATE_SUBDIRS.contains(root),
             "{root} is an App Data root, not a Seatbelt private-data deny"
+        );
+    }
+}
+
+/// The network denial opens for a job-server socket and for nothing else: one allow of bind,
+/// accept and connect, on `tjs-<16 hex>/s` under `/private/tmp` and the admitted `$TMPDIR`
+/// (or the quiet folder of either), in every profile, write-confined or not.
+#[test]
+fn the_network_denial_opens_only_for_a_job_server_socket() {
+    let fallback = job_server_clause(Path::new(JOB_SERVER_FALLBACK_ROOT), false);
+    let opening = "(allow network-bind network-inbound network-outbound";
+    assert_eq!(job_server_sockets(None), format!("{opening}{fallback})"));
+    assert!(
+        fallback.ends_with(&format!("/tjs-{}/s$\")", "[0-9a-f]".repeat(16))),
+        "the socket's whole name is matched, to the end of the path; got {fallback}"
+    );
+
+    // A folder that is no user's `$TMPDIR` adds nothing.
+    let home = aterm_tempfile::tempdir().unwrap();
+    let canon_home = std::fs::canonicalize(home.path()).unwrap();
+    for fs in [FsCapability::HomeReadWrite, FsCapability::TmpOnly] {
+        let profile = profile_for_home(None, Some(&canon_home), fs);
+        assert!(
+            profile.starts_with(&[BASE_PROFILE, &job_server_sockets(None)].concat()),
+            "{fs:?}: the opening follows the base profile; got {profile}"
+        );
+        assert_eq!(
+            profile.matches("network").count(),
+            BASE_PROFILE.matches("network").count() + 3,
+            "{fs:?}: one opening, of three operations; got {profile}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(temp) = std::fs::canonicalize(std::env::temp_dir())
+            .ok()
+            .filter(|t| admitted_user_temp(t).is_some())
+        else {
+            aterm_spec::host::could_not_run(
+                "$TMPDIR is not a per-user /private/var/folders/…/T here",
+            );
+        };
+        let root = user_temp_root(&temp);
+        let quiet = root.join(aterm_tempfile::QUIET);
+        std::fs::create_dir_all(&quiet).unwrap();
+        // The whole `$TMPDIR`: the socket directly in it or in its quiet folder.
+        assert_eq!(
+            job_server_sockets(Some(root)),
+            format!("{opening}{fallback}{})", job_server_clause(root, false))
+        );
+        // A test run's `$TMPDIR`, the quiet folder: only there.
+        assert_eq!(
+            job_server_sockets(Some(&quiet)),
+            format!("{opening}{fallback}{})", job_server_clause(root, true))
         );
     }
 }

@@ -373,99 +373,181 @@ fn a_narrow_page_keeps_the_cell_bar_on_the_grid() {
     );
 }
 
-/// The grid gives the cell bar its row and never falls under three lines for it: in a window
-/// too short for both the bar gives way. Whether the bar stands is the window's to say, never
-/// the selection's or a staged change's: a narrow page judges it by the halved grid whether or
-/// not a row is selected, and every page as if changes waited to be written and the line under
-/// the grid stood one row high. So selecting a cell, selecting one whose line under the grid
-/// wraps onto more lines, and typing into one (which brings the write bar) neither take away
-/// the bar that names the cell nor bring it back; and a window taller than one that has the
-/// bar has it too.
+/// The grid gives the cell bar its row and keeps, under it, its own lines (the group, header
+/// and type lines) and one whole row: in a window too short for both the bar gives way.
+/// Whether the bar stands is the window's to say, never the selection's or a staged change's:
+/// a narrow page judges it by the halved grid whether or not a row is selected, and every page
+/// as if changes waited to be written and the line under the grid stood three lines high. So
+/// selecting a cell, selecting one whose line under the grid wraps onto more lines, and typing
+/// into one (which brings the write bar) neither take away the bar that names the cell nor
+/// bring it back; and a window taller than one that has the bar has it too. Wherever the bar
+/// stands, at every height around where it comes, wide and narrow, the page ends inside the
+/// window (its write bar, else the line under the grid), and the selected row stands whole in
+/// the grid's rows with nothing staged, with a change staged, with a line wrapped onto two or
+/// three lines, and with both. A line wrapped past three lines takes its room from the grid,
+/// down to the three lines the grid and its bar keep between them, and the write bar still ends
+/// inside the window.
 /// NEGATIVE CONTROL: with `page` judging the bar on the room the write bar and the wrapped
-/// line leave the grid (`steady` the room after both), a staged change takes the bar away:
-/// `` 760 x 400: staged: neither a selection nor a staged change adds or removes the bar ``.
+/// line leave the grid (`steady` the room after both), what is selected and staged adds or
+/// removes the bar: `` 760 x 520: wrapped past three lines: neither a selection nor a staged
+/// change adds or removes the bar left: true right: false ``. With `page` weighing the bar on
+/// three page lines under it (`under_bar = line * 3.0`, the grid's head before its type
+/// line), the grid under the bar cuts the selected row: `` 760 x 504: staged and wrapped: the
+/// selected row shows whole: LogicalRect { x: 123.0, y: 205.5, width: 260.0, height: 28.0 } in
+/// LogicalRect { x: 17.0, y: 207.0, width: 726.0, height: 26.5 } ``. With `page` judging the
+/// bar on a line of one row under the grid (`said_judged = said_least`), a wrapped line leaves
+/// the grid under the bar less than a row: `` 1400 x 372: staged and wrapped: the selected row
+/// shows whole: LogicalRect { x: 311.0, y: 203.0, width: 260.0, height: 28.0 } in LogicalRect
+/// { x: 205.0, y: 207.0, width: 826.0, height: 24.0 } ``. With the grid under the bar kept at
+/// its lines and a row whatever the room (`floor = cell_line + under_bar`), a line wrapped past
+/// three lines pushes the write bar out of the window: `` 1400 x 396: wrapped past three
+/// lines: tables/bar ends inside the window: LogicalRect { x: 204.0, y: 341.0, width: 828.0,
+/// height: 40.0 } ``.
 #[test]
 fn a_window_too_short_for_the_cell_bar_keeps_its_grid() {
     use super::native_tables_tests::{pk_of, place, tall_sheet};
     let three_lines = 3.0 * 30.0 * scale().max(1.0);
+    // The main column's padding ends 16 points above the window's foot.
+    let foot = |viewport: LogicalRect| viewport.height - 16.0;
     let barred = |ui: &CompiledUi| ui.semantic(&UiKey::new("tables/cellbar")).is_some();
-    for width in [NARROW.width, 1400.0] {
-        let bare = open_with(tall_sheet(80, 3));
-        let mut chosen = open_with(tall_sheet(80, 3));
-        act(&mut chosen, &format!("tables/cell/{}/c1", pk_of(2)), None);
-        // A change typed and not written: the write bar stands under the grid.
-        let mut staged = open_with(tall_sheet(80, 3));
-        act(&mut staged, &format!("tables/cell/{}/c1", pk_of(2)), None);
-        staged.native_runtime.tables_mut().unwrap().stage(
-            "machine",
-            &pk_of(2),
-            "c1",
-            "typed".into(),
-        );
-        // A conflict of two long values: its line under the grid says both, on several lines.
+    let (pk, other) = (pk_of(2), pk_of(5));
+    let seat = format!("tables/cell/{pk}/c1/seat");
+    // The page with row 2's first cell selected; with `values`, that cell a conflict of so many
+    // long values, which the line under the grid says each of; with `staged`, a change typed
+    // into another row and not written, so the write bar stands under the grid.
+    let open = |values: usize, staged: bool| {
         let mut snapshot = tall_sheet(80, 3);
-        let long = |who: &str| {
-            (
-                format!("the value {who} wrote, said whole by the line under the grid, {who}"),
-                Some(author(who, 1_000)),
-            )
-        };
         let cell = snapshot.sheets[0].rows[2].cells.get_mut("c1").unwrap();
-        cell.values = vec![long("m55"), long("m73"), long("m22")];
-        let mut wrapped = open_with(snapshot);
-        act(&mut wrapped, &format!("tables/cell/{}/c1", pk_of(2)), None);
-        // The line's height is its words' at this width, whatever the window's height.
+        cell.values = (0..values)
+            .map(|n| {
+                let who = format!("m{}", 20 + n);
+                (
+                    format!("the value {who} wrote, said whole by the line under the grid"),
+                    Some(author(&who, 1_000)),
+                )
+            })
+            .collect();
+        let mut app = open_with(snapshot);
+        act(&mut app, &format!("tables/cell/{pk}/c1"), None);
+        if staged {
+            app.native_runtime
+                .tables_mut()
+                .unwrap()
+                .stage("machine", &other, "c1", "typed".into());
+        }
+        app
+    };
+    for width in [NARROW.width, 1400.0] {
         let tall = LogicalRect::new(0.0, 0.0, width, 900.0);
-        let one_row = rect(&render_at(&bare, tall), "tables/said").height;
-        assert_eq!(
-            one_row,
-            rect(&render_at(&chosen, tall), "tables/said").height,
-            "{width}: the fixture's two lines stand equally tall"
-        );
+        // The line's height is its words' at this width, whatever the window's height.
+        let line_h = |app: &App| rect(&render_at(app, tall), "tables/said").height;
+        let bare = open_with(tall_sheet(80, 3));
+        let chosen = open(0, false);
+        let staged = open(0, true);
+        // The fewest values whose line wraps past three of its lines; one fewer is the tallest
+        // line of three lines or fewer.
+        let longer = (2..16)
+            .find(|n| line_h(&open(*n, true)) > 3.0 * said_line())
+            .expect("a conflict of long values wraps past three lines");
+        let wrapped = open(longer - 1, false);
+        let both = open(longer - 1, true);
+        let long = open(longer, true);
+        let one_row = line_h(&bare);
+        assert_eq!(one_row, line_h(&chosen), "{width}: one row each");
         assert!(
-            rect(&render_at(&wrapped, tall), "tables/said").height > one_row,
-            "{width}: the conflict's line wraps"
+            line_h(&wrapped) > one_row && line_h(&wrapped) <= 3.0 * said_line(),
+            "{width}: the conflict's line wraps onto two or three lines: {}",
+            line_h(&wrapped)
         );
-        assert_eq!(
-            said(&render_at(&staged, tall), "tables/bar/count").as_deref(),
-            Some("1 change not written"),
-            "{width}: the write bar stands"
-        );
+        for app in [&staged, &both, &long] {
+            assert_eq!(
+                said(&render_at(app, tall), "tables/bar/count").as_deref(),
+                Some("1 change not written"),
+                "{width}: the write bar stands"
+            );
+        }
+        // Every twenty points, and every four around the height the bar comes at.
+        let coarse: Vec<u32> = (200..=900).step_by(20).collect();
+        let comes = *coarse
+            .iter()
+            .find(|h| {
+                barred(&render_at(
+                    &bare,
+                    LogicalRect::new(0.0, 0.0, width, **h as f32),
+                ))
+            })
+            .expect("a window 900 points tall has the bar");
+        let mut heights: BTreeSet<u32> = coarse.into_iter().collect();
+        heights.extend((comes - 40..=comes + 40).step_by(4));
+        // Tallest first, as a window shrinks: the grid keeps the selected row it showed whole in
+        // view as its room shrinks.
         let mut stands = Vec::new();
-        for height in (200..=900).step_by(20) {
+        for &height in heights.iter().rev() {
             let viewport = LogicalRect::new(0.0, 0.0, width, height as f32);
+            let at = |of: &str| format!("{width} x {height}: {of}");
             let none = render_at(&bare, viewport);
-            for (of, app) in [
-                ("selected", &chosen),
-                ("staged", &staged),
-                ("wrapped", &wrapped),
+            for (of, app, writes, whole) in [
+                ("nothing selected", &bare, false, false),
+                ("selected", &chosen, false, true),
+                ("staged", &staged, true, true),
+                ("wrapped", &wrapped, false, true),
+                ("staged and wrapped", &both, true, true),
+                ("wrapped past three lines", &long, true, false),
             ] {
                 let ui = render_at(app, viewport);
                 assert_eq!(
                     barred(&none),
                     barred(&ui),
-                    "{width} x {height}: {of}: neither a selection nor a staged change adds \
-                     or removes the bar"
+                    "{}: neither a selection nor a staged change adds or removes the bar",
+                    at(of)
                 );
                 let grid = place(&ui, "tables/grid");
-                assert!(
-                    grid.height >= three_lines,
-                    "{width} x {height}: {of}: the grid keeps three lines: {grid:?}"
-                );
-                if barred(&ui) {
-                    assert_eq!(place(&ui, "tables/cellbar").bottom(), grid.y);
+                if !barred(&ui) {
+                    assert!(
+                        grid.height >= three_lines,
+                        "{}: the grid keeps three lines: {grid:?}",
+                        at(of)
+                    );
+                    continue;
                 }
-            }
-            let grid = place(&none, "tables/grid");
-            assert!(
-                grid.height >= three_lines,
-                "{width} x {height}: the grid keeps three lines: {grid:?}"
-            );
-            if barred(&none) {
-                assert_eq!(place(&none, "tables/cellbar").bottom(), grid.y);
+                let bar = place(&ui, "tables/cellbar");
+                assert_eq!(bar.bottom(), grid.y, "{}", at(of));
+                assert!(
+                    bar.height + grid.height >= three_lines,
+                    "{}: the grid and its bar keep three lines: {grid:?}",
+                    at(of)
+                );
+                // The page ends inside the window: the write bar and its Write, else the line.
+                let ends = if writes {
+                    vec!["tables/bar", WRITE]
+                } else {
+                    vec!["tables/said"]
+                };
+                for key in ends {
+                    let end = place(&ui, key);
+                    assert!(
+                        end.bottom() <= foot(viewport) + 0.5,
+                        "{}: {key} ends inside the window: {end:?}",
+                        at(of)
+                    );
+                }
+                if whole {
+                    assert!(
+                        grid.height >= three_lines,
+                        "{}: the grid keeps three lines: {grid:?}",
+                        at(of)
+                    );
+                    let (row, rows) = (place(&ui, &seat), place(&ui, "tables/rows"));
+                    assert!(
+                        row.y >= rows.y - 0.5 && row.bottom() <= rows.bottom() + 0.5,
+                        "{}: the selected row shows whole: {row:?} in {rows:?}",
+                        at(of)
+                    );
+                }
             }
             stands.push(barred(&none));
         }
+        stands.reverse();
         assert_eq!(
             stands.first(),
             Some(&false),

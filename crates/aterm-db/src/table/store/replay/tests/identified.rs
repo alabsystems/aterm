@@ -10,6 +10,19 @@ use astream_broker::BrokerRecord;
 use astream_wire::sync::Digest;
 use std::collections::BTreeSet;
 
+// Keep the oracle's full receipt representation independent of the production
+// descriptor. Its original push and receipt checks below remain unchanged.
+struct OriginalEntry {
+    receipt: Receipt,
+    wire: Identified,
+    conflict: bool,
+}
+
+struct OriginalReplay {
+    entries: Vec<OriginalEntry>,
+    witness: Witness,
+}
+
 /// The replay as one push per record, the record's identification and its claim checks
 /// interleaved, as it stood before they were split: the oracle.
 struct Interleaved {
@@ -17,7 +30,7 @@ struct Interleaved {
     pending: bool,
     witness: Witness,
     prefix_checked: bool,
-    entries: Vec<Entry>,
+    entries: Vec<OriginalEntry>,
 }
 impl Interleaved {
     fn new(acknowledged: Witness, pending: bool) -> Self {
@@ -59,7 +72,7 @@ impl Interleaved {
             }
             self.prefix_checked = true;
         }
-        self.entries.push(Entry {
+        self.entries.push(OriginalEntry {
             receipt: Receipt {
                 id,
                 received_ms,
@@ -77,13 +90,13 @@ impl Interleaved {
         ))
     }
 
-    fn finish(self) -> Result<Replay> {
+    fn finish(self) -> Result<OriginalReplay> {
         if !self.prefix_checked {
             return Err(Error::new(
                 "table history lost acknowledged custody records",
             ));
         }
-        Ok(Replay {
+        Ok(OriginalReplay {
             entries: self.entries,
             witness: self.witness,
         })
@@ -91,7 +104,10 @@ impl Interleaved {
 }
 
 /// The observer's replay as it stood: every record pushed, then the tail past the claim cut.
-fn interleaved_observed(records: Vec<BrokerRecord>, acknowledged: Witness) -> Result<Replay> {
+fn interleaved_observed(
+    records: Vec<BrokerRecord>,
+    acknowledged: Witness,
+) -> Result<OriginalReplay> {
     let mut builder = Interleaved::new(acknowledged, false);
     for record in records {
         builder.push(record)?;
@@ -108,7 +124,7 @@ fn interleaved_observed(records: Vec<BrokerRecord>, acknowledged: Witness) -> Re
 /// replay's witness; or the refusal's text.
 type Answer = std::result::Result<(Vec<(Receipt, Vec<u8>, Digest, bool)>, [u8; 40]), String>;
 
-fn answer(replay: Result<Replay>) -> Answer {
+fn answer(replay: Result<OriginalReplay>) -> Answer {
     replay
         .map(|replay| {
             let entries = replay
@@ -117,6 +133,26 @@ fn answer(replay: Result<Replay>) -> Answer {
                 .map(|entry| {
                     (
                         entry.receipt,
+                        entry.wire.wire().to_vec(),
+                        entry.wire.id(),
+                        entry.conflict,
+                    )
+                })
+                .collect();
+            (entries, replay.witness.bytes())
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn production_answer(replay: Result<Replay>) -> Answer {
+    replay
+        .map(|replay| {
+            let entries = replay
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.receipt(),
                         entry.wire.wire().to_vec(),
                         entry.wire.id(),
                         entry.conflict,
@@ -159,7 +195,7 @@ fn written(records: Vec<BrokerRecord>, acknowledged: Witness, pending: bool) -> 
         .into_iter()
         .try_for_each(|record| builder.push(record).map(drop))
         .and_then(|()| builder.finish());
-    answer(replay)
+    production_answer(replay)
 }
 fn written_interleaved(records: Vec<BrokerRecord>, acknowledged: Witness, pending: bool) -> Answer {
     let mut builder = Interleaved::new(acknowledged, pending);
@@ -250,7 +286,7 @@ fn identified_records_witness_every_claim_as_the_interleaved_replay() {
         for (claim, acknowledged) in &claims {
             let oracle = answer(interleaved_observed(records.clone(), *acknowledged));
             assert_eq!(
-                answer(read_observed(records.clone(), *acknowledged)),
+                production_answer(read_observed(records.clone(), *acknowledged)),
                 oracle,
                 "{what}, against {claim}: an observer"
             );

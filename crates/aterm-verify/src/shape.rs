@@ -1048,6 +1048,9 @@ pub struct Run {
     /// that directory leaves their units out, so its record of it is kept under a scope that
     /// says so ([`crate::disk::run_key`]).
     pub skipped: std::collections::BTreeSet<&'static str>,
+    /// The units its compile calls built beside another of their package and kind, and what
+    /// moved ([`crate::disk::note_used`], [`crate::disk::record_second_hashes`]).
+    pub second_hashes: crate::disk::SecondHashes,
     /// The shared-cache binding admitted before these unit observations, retained through
     /// publication so a replacement directory cannot inherit the earlier cache's unit set.
     pub(crate) used_cache: Option<std::sync::Arc<atpkg::build_cache::registered::KnownCargoCache>>,

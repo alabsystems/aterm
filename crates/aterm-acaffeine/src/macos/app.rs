@@ -665,7 +665,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        /// A writer posted [`crate::notify::CHANGED`].
+        /// A writer posted a change of this mug's files ([`crate::notify::post_changed`]).
         @sel(stateChanged:)
         fn state_changed(&self, _arg: Id) {
             if MainThread::new().is_some() {
@@ -1367,6 +1367,7 @@ fn run_app(main: MainThread, mug: Mug) -> Result<Ended, Unstarted> {
     // SAFETY: `-setActivationPolicy:` is `B24@0:8q16`.
     let _ =
         unsafe { send_bool_isize(app, sel!(setActivationPolicy:), ACTIVATION_POLICY_ACCESSORY) };
+    let paths = mug.paths.clone();
     let Some(target) = CaffeineTarget::alloc_init(
         main,
         TargetIvars {
@@ -1380,7 +1381,7 @@ fn run_app(main: MainThread, mug: Mug) -> Result<Ended, Unstarted> {
     let changed = {
         let target = target.clone_retained();
         // SAFETY (in the hook): `stateChanged:` is `v@:@` on the live target it retains.
-        crate::notify::observe_changed(move || unsafe {
+        crate::notify::observe_changed(&paths, move || unsafe {
             send_v_id(target.as_id(), sel!(stateChanged:), Id::NIL);
         })
     };

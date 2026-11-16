@@ -4418,7 +4418,11 @@ fn a_last_row_rail_runs_on_behind_every_descender() {
 /// `#d0d0d0` ink, the judges' 85%, and under it), at each size, under each style whose rail
 /// takes a lane there, every letter holds its bar.
 /// Control (`set_deep_light_rastered`): with the light read off the raster, Phaser's curl at 24 px
-/// leaves a `p` at 4.10 of its own 10.32.
+/// leaves a `p` at 4.10 of its own 10.32 (macOS's SF Mono). On a face where it does not, the
+/// control is taken at the first other scene of the law's, then of each line at 26 to 32 px, that
+/// leaves a letter under its bar, and the law is held there too: on Windows' Iosevka Term NL no
+/// scene of the law's does, and Comet's curl at 30 px leaves a `j` at 4.44 of its own 10.32
+/// (Windows x64, 2026-11-15).
 #[test]
 fn a_deep_cell_s_foot_leaves_a_rail_no_light() {
     let scene = Scene::LastRow;
@@ -4465,20 +4469,30 @@ fn a_deep_cell_s_foot_leaves_a_rail_no_light() {
         (n, under)
     };
     const CURLED: &[u8] = b"\x1b[4:3m\x1b[58;2;193;193;193m";
-    let mut under = Vec::new();
-    let mut judged_n = 0usize;
-    for (sgr, line) in [
-        (&b"\x1b[4m\x1b[58;2;193;193;193m"[..], "straight"),
-        (&b"\x1b[4:2m\x1b[58;2;193;193;193m"[..], "doubled"),
+    let lines: [(&'static [u8], &'static str); 3] = [
+        (b"\x1b[4m\x1b[58;2;193;193;193m", "straight"),
+        (b"\x1b[4:2m\x1b[58;2;193;193;193m", "doubled"),
         (CURLED, "curled"),
-    ] {
-        for px in [13.0, 16.0, 20.0, 24.0] {
-            for style in ["beam", "phaser", "comet"] {
-                let (n, u) = read(sgr, line, px, style, false);
-                judged_n += n;
-                under.extend(u);
+    ];
+    // Each line at each of `sizes`, under each style.
+    let scenes_at = |sizes: &[f32]| {
+        let mut scenes = Vec::new();
+        for (sgr, line) in lines {
+            for &px in sizes {
+                for style in ["beam", "phaser", "comet"] {
+                    scenes.push((sgr, line, px, style));
+                }
             }
         }
+        scenes
+    };
+    let judged = scenes_at(&[13.0, 16.0, 20.0, 24.0]);
+    let mut under = Vec::new();
+    let mut judged_n = 0usize;
+    for &(sgr, line, px, style) in &judged {
+        let (n, u) = read(sgr, line, px, style, false);
+        judged_n += n;
+        under.extend(u);
     }
     assert!(judged_n > 1_000, "fixture: {judged_n} letter-frames judged");
     assert!(
@@ -4487,10 +4501,25 @@ fn a_deep_cell_s_foot_leaves_a_rail_no_light() {
         under.len(),
         under.join("\n")
     );
-    let (_, control) = read(CURLED, "curled", 24.0, "phaser", true);
-    assert!(
-        !control.is_empty(),
-        "control: with the light read off its glyph's raster, every letter over Phaser's curl at \
-         24 px holds its bar"
-    );
+    // The control's scene: the measured one, then the law's others, then the larger sizes'.
+    let measured = (CURLED, "curled", 24.0, "phaser");
+    let control = std::iter::once(measured)
+        .chain(judged.iter().copied().filter(|&scene| scene != measured))
+        .chain(scenes_at(&[26.0, 28.0, 30.0, 32.0]))
+        .find(|&(sgr, line, px, style)| !read(sgr, line, px, style, true).1.is_empty());
+    let Some(scene @ (sgr, line, px, style)) = control else {
+        panic!(
+            "control: with the light read off its glyph's raster, every letter of every scene \
+             holds its bar"
+        )
+    };
+    if !judged.contains(&scene) {
+        let (_, under) = read(sgr, line, px, style, false);
+        assert!(
+            under.is_empty(),
+            "{} letter-frames under their bar where the control bites:\n{}",
+            under.len(),
+            under.join("\n")
+        );
+    }
 }

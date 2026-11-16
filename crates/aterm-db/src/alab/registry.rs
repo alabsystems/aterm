@@ -1559,7 +1559,7 @@ pub const FACES: &[Faced] = &[
     ),
     face(
         "machine-facts",
-        ("Mac facts", "Mac's facts"),
+        ("Machine facts", "Machine's facts"),
         Face::Mac,
         &["label", "mac", "hosts", "hw_model", "chip", "ram_gb", "at"],
     ),
@@ -1602,7 +1602,7 @@ pub const FACES: &[Faced] = &[
     ),
     face(
         "model",
-        ("Mac models", "Mac model"),
+        ("Machine models", "Machine model"),
         Face::Seeded,
         &[ROW_KEY, "marketing", "form", "chip_family", "year"],
     ),
@@ -1802,6 +1802,12 @@ pub fn birth(
     values: &BTreeMap<String, Value>,
     cells: &Cells,
 ) -> Result<String> {
+    if let Some(elsewhere) = born_elsewhere(collection.name) {
+        return Err(Error::new(&format!(
+            "{}: the grid adds no rows here; {elsewhere}",
+            collection.name
+        )));
+    }
     let text = |column: &str| values.get(column).and_then(Value::as_str);
     let need = |column: &str| {
         text(column).ok_or_else(|| {
@@ -1865,6 +1871,47 @@ pub fn birth(
         other => Err(Error::new(&format!(
             "{other}: the grid adds no rows here; a lab verb or the importer keys them"
         ))),
+    }
+}
+
+/// Whether [`birth`] makes a new row of `collection` a random key as it is written (a phone's,
+/// never a digest of its number), so no reading of its cells before the write names it.
+pub fn born_at_random(collection: &str) -> bool {
+    collection == "phone"
+}
+
+/// Who adds a new row of `collection` where the grid adds none ([`birth`] refuses one with
+/// these words, and the Tables page says them in place of its Add): `None` for a collection a
+/// grid row is born into. A compiled seed's rows (a provider, a CLI, a plan) come from every
+/// build, a machine model's from the first machine of that model to register, an import's from
+/// the importer, and each machine's own rows from that machine.
+pub fn born_elsewhere(collection: &str) -> Option<&'static str> {
+    match collection {
+        "mailbox" | "phone" | "address" | "machine" | "account" | "subaccount" | "auth-route"
+        | "preference" => None,
+        "provider" | "cli" | "plan" => Some("every build writes these from its reference rows"),
+        "model" => Some("a machine adds its model's row as it registers"),
+        "source" => Some("aterm db alab import --apply adds these rows"),
+        "machine-facts" | "account-obs" | "mailbox-obs" | "roll" => {
+            Some("each machine writes its own row")
+        }
+        _ => Some("a lab verb or the importer adds these rows"),
+    }
+}
+
+/// The verb that sets `collection`'s `column`, where no grid types it: a secret (a mailbox
+/// address's `password`, a mailbox's `mailbox_password` and `totp`), whose value only the secret
+/// store holds and which is read from standard input, never typed into a page; and a number a
+/// generation holds sealed (a phone's `number` in a generation builds up to 0.200.0 read). `<row>`
+/// stands for the row's key, which a new row has once it is written.
+pub fn set_by(collection: &str, column: &str) -> Option<&'static str> {
+    match (collection, column) {
+        ("address", "password") => Some("aterm db emails set <row> password --stdin"),
+        ("mailbox", "mailbox_password" | "totp") => {
+            Some("aterm db alab import --mailbox-toml <file> --apply")
+        }
+        ("phone", "number") => Some("aterm db phones set <row> number <number>"),
+        _ => None,
     }
 }
 

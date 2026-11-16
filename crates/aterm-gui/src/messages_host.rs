@@ -41,6 +41,13 @@ pub(crate) const MESSAGES_FLUSH_UI_WAIT: std::time::Duration = std::time::Durati
 pub(crate) const MESSAGES_FLUSH_EXIT_WAIT: std::time::Duration =
     std::time::Duration::from_millis(250);
 
+/// The key of the standing alert "The disk is filling", which the ask to free space raised until
+/// that ask was removed. No build raises it now; one a predecessor carried is withdrawn as it is
+/// seeded ([`App::retire_disk_filling`]). Its digest entry, which a later process adopts from the
+/// log, is withdrawn with the other retired keys
+/// ([`crate::system_state_access::RETIRED_KEYS`]).
+const RETIRED_DISK_FILLING_KEY: &str = "system.disk.filling";
+
 #[cfg(test)]
 pub(crate) use aterm_messages::page::MessageActionView;
 pub(crate) use aterm_messages::page::{MessageView, MessagesState, tag_words};
@@ -698,6 +705,7 @@ impl App {
     /// gate's paced paint asks for none: nothing the GUI paints reads the glass.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
         let strip = self.settle_strip_fall(now);
+        self.settle_dock_fall(now);
         if self.messages.settle_digest(self.messages_wall.now(), now) {
             self.digest_moved();
         }
@@ -785,6 +793,7 @@ impl App {
             self.messages.digest_deadline(),
             self.ripening_deadline(),
             self.strip_fall_due(),
+            self.dock_fall_due(),
         ]
         .into_iter()
         .flatten()
@@ -1066,12 +1075,8 @@ impl App {
             Intent::ShowSession {
                 window, session, ..
             } => {
-                let local = {
-                    let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-                    store
-                        .by_sid(&aterm_session::SessionId::new(session))
-                        .map(|h| h.local_id)
-                };
+                let local = aterm_session::SessionId::parse(&session)
+                    .and_then(|sid| self.local_session_of(&sid));
                 local.is_some_and(|local| {
                     self.focus_session_preferring(Some(WindowId(window)), local)
                 })
@@ -2353,6 +2358,21 @@ impl App {
             + self.messages.withdraw_key_prefix("secrets.asking.", now)
     }
 
+    /// Retire the standing disk alerts a predecessor carried, each of which asked a person to free
+    /// space: "The disk is filling" ([`RETIRED_DISK_FILLING_KEY`]), whose ask is gone, so nothing
+    /// in this build would end it, and "Disk full"
+    /// ([`crate::message_reporters::DISK_FULL_KEY`]), which this build writes as a log record
+    /// alone, so a volume that stays full, or came back before the update, would leave it standing.
+    /// Each is withdrawn, with no outcome to claim; a record under either key is no live message
+    /// and stays in the log.
+    fn retire_disk_filling(&mut self, now: Instant) -> usize {
+        self.messages
+            .withdraw_key_prefix(RETIRED_DISK_FILLING_KEY, now)
+            + self
+                .messages
+                .withdraw_key_prefix(crate::message_reporters::DISK_FULL_KEY, now)
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2403,6 +2423,7 @@ impl App {
         self.messages
             .seed_carried(&carried, self.messages_wall.now(), now);
         self.retire_obsolete_join_alerts(now);
+        self.retire_disk_filling(now);
         let old_process: Vec<MessageId> = self
             .messages
             .live_rows()

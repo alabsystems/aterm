@@ -28,6 +28,7 @@
 //! * A `[privacy]` switch off, and a debugger the person turned off, are told to the setup
 //!   worker as the row's wanted state ([`App::publish_access_opt_outs`]).
 
+use crate::platform::AppRt as _;
 use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::opt_out::OptOut;
@@ -64,9 +65,10 @@ pub(crate) const DEBUGGER_OFF: &str = "You turned debugger access off, so aterm 
 /// Digest keys System State replaced (§4): the Full Disk Access question and its regression,
 /// the Developer Tools line, the workstation lines and the vault's join and sync lines, and the
 /// fleet's no-route entry, which asked the person to allow Local Network now that the root LAN
-/// broker carries aterm's LAN traffic. An entry an older aterm left open under one is withdrawn
-/// once per process, never ended as fixed, since nothing here read its cause end.
-pub(crate) const RETIRED_KEYS: [&str; 9] = [
+/// broker carries aterm's LAN traffic. With them, the "disk is filling" entry of the ask to free
+/// space, which no build raises or ends now. An entry an older aterm left open under one is
+/// withdrawn once per process, never ended as fixed, since nothing here read its cause end.
+pub(crate) const RETIRED_KEYS: [&str; 10] = [
     "privacy.fda.needed",
     "privacy.fda.regressed",
     "privacy.devtools.not-granted",
@@ -76,7 +78,15 @@ pub(crate) const RETIRED_KEYS: [&str; 9] = [
     "privacy.secrets.join-unfinished",
     "privacy.secrets.not-synced",
     "fleet.unreadable.no-route",
+    "disk.filling",
 ];
+
+/// Digest key prefixes no reporter files under any longer, each over keys that carry their
+/// subject, withdrawn as [`RETIRED_KEYS`] are (once per process, and again after a seamless
+/// update adopted a parent's entries): the huge-folder entry (`vitals.huge-dir.<hash>.entries`),
+/// which asked a person to clean a build folder that the disk pass now empties itself, or
+/// records in the disk ledger where it leaves one.
+pub(crate) const RETIRED_KEY_PREFIXES: [&str; 1] = ["vitals.huge-dir."];
 
 /// The signal line's note under a verified Full Disk Access grant an update left off
 /// ([`App::note_fda_off_after_update`]).
@@ -1277,6 +1287,13 @@ impl App {
             for key in RETIRED_KEYS {
                 self.except_withdraw(key);
             }
+            for prefix in RETIRED_KEY_PREFIXES {
+                let ended = self.messages.withdraw_key_prefix(prefix, now);
+                if ended > 0 {
+                    aterm_log::info!("exceptions: withdrew {ended} under {prefix}");
+                    self.digest_moved();
+                }
+            }
         }
     }
 
@@ -1601,8 +1618,11 @@ impl App {
                     self.access_steps.pane_act = Some((access, Instant::now()));
                     (false, "queued")
                 }
-                // Setup's one early elevation turns developer mode on; the row offers no
-                // press of its own.
+                Access::NameRule | Access::SpotlightScope | Access::NetworkHelper if by_person => (self.press_developer_tools_install(), "Mac Setup"),
+                Access::NameRule | Access::SpotlightScope | Access::NetworkHelper => (false, "requires a person"),
+                Access::NetworkAuth => (false, "Secrets & identity"),
+                Access::LocalNetwork if by_person => (self.apprt.open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"), "Local Network settings"),
+                Access::LocalNetwork => (false, "requires a person"),
                 Access::Debugger => (false, "setup's own elevation's"),
             }
         };
@@ -1740,7 +1760,12 @@ impl App {
             Access::FullDiskAccess => Subject::FullDiskAccess,
             Access::DeveloperTools => Subject::DeveloperTools,
             Access::Accessibility => Subject::Accessibility,
-            Access::Debugger => return None,
+            Access::Debugger
+            | Access::NameRule
+            | Access::SpotlightScope
+            | Access::NetworkAuth
+            | Access::LocalNetwork
+            | Access::NetworkHelper => return None,
         };
         let now = Instant::now();
         self.take_walk_close(now);

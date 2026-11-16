@@ -96,6 +96,8 @@ mod claude_measure;
 #[cfg(target_os = "macos")]
 mod claude_rotation_proof;
 #[cfg(target_os = "macos")]
+mod claude_wall_panel;
+#[cfg(target_os = "macos")]
 mod clock;
 #[cfg(target_os = "macos")]
 mod codex;
@@ -123,8 +125,6 @@ mod composer_turn;
 mod crash;
 #[cfg(target_os = "macos")]
 mod deck_motion;
-#[cfg(target_os = "macos")]
-mod disk_ask_lane;
 #[cfg(target_os = "macos")]
 mod disk_full_lane;
 #[cfg(target_os = "macos")]
@@ -962,30 +962,13 @@ Outside any lab (no jail, no stub):
                                  run's record goes to $LAB_STATE/results/, its name carrying --label's WORD)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
-  disk-full [--aterm PATH] [--keep]
-                                 fill two 8 GiB sparse APFS images under their emergency line: verify the reserve goes first, a
-                                 died build's partial output goes and its finished units and sources stay, and ballast alone
-                                 gets one cannot-meet row and no removal (~2 min)
-  disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]
-                                 real Claude Code tabs in a lab whose HOME is a sparse APFS image (10-16 GiB) below
-                                 its floor once aterm's own pass is spent: verify the disk-free@v1 ask types its line to
-                                 the one tab whose checkout holds the most, naming that build as the tab's own, and the
-                                 ledger and `aterm harness disk why` credit its cleanup. clear (the default): the cleanup
-                                 clears the volume and ends the episode, and, the volume filled short again, the cooldown
-                                 opens none, aterm's disk worker runs instead and no tab gets a second line (~15 min).
-                                 partial: the cleanup frees a GiB or more with the volume still short, and the settled
-                                 episode asks nobody else (~10 min). unanswered: the asked tab answers with words alone,
-                                 its ask is handed off once its 20-minute answer window passes, aterm's disk worker runs
-                                 first, then the next largest build's tab is asked and frees, settling the episode, so
-                                 the third tab is never asked (~38 min). exhausted: the cap on lines; the second tab
-                                 asked answers with words too, the episode runs out at its two lines, no second worker
-                                 runs and the third tab is never asked (~60 min). worker: two tabs each hold a draft, so
-                                 none is asked and aterm's disk worker runs: its `rm -rf` of a tool cache is declined,
-                                 `aterm harness disk free` removes the cache (journalled, the volume risen by its size),
-                                 it reports `Nothing left:` and finishes, and no tab is typed or loses its draft
-                                 (~15 min). Every worker runs real Claude Code, started by name through the lab's
-                                 reroute (LAB_REROUTE), and each scenario fails unless it finishes, in its own folder
-                                 and a session of its own, its task in no tab's conversation
+  disk-full [--aterm PATH] [--keep] [--scenario died|ballast|custody]
+                                 fill 8 GiB sparse APFS images under their emergency line: verify the reserve goes first, a
+                                 died build's partial output goes and its finished units and sources stay (died), ballast
+                                 alone gets one cannot-meet row and no removal (ballast), and a gone session's worktree with
+                                 uncommitted edits is journalled deferred with no snapshot ref until the volume is back above
+                                 the line, then pinned, pushed to a bare server on the image and removed, every edit on a
+                                 ref (custody); every scenario without --scenario (~2 min, custody ~6 min)
   slot-capture [--watch DUR [--dir DIR]]
                                  verify `build-slot` record parsing in a scratch BUILD_SLOT_DIR, or watch ~/.cache/build-slot vs the holder scan
   slot-lane [--aterm PATH] [--keep]
@@ -1176,6 +1159,20 @@ Outside any lab (no jail, no stub):
                                  key the fold reads, and is otherwise admitted by the row of run 2's transcript carrying it
                                  and the check that read it, which the note names, or refuses NEW-KEY as one no run
                                  exercised; GONE reads a key the fold reads only on the rows it acts on
+  claude-wall-panel [--keep]
+                                 measure the managed Claude Code's own /usage panel over a standing usage wall (~3 min):
+                                 one session in a lab of its own (harness off, the stub's subscriber path with the
+                                 profile scope, fullscreen) into the five-hour limit, then the weekly one; at each, with
+                                 the wall standing, /usage and Enter on the composer's own row (never into the reset
+                                 program's dialog), the panel read with usage_panel_read, Escape; judged from the
+                                 screen, the debug and stub logs and the transcript: every key taken and every wait
+                                 answered, the panel opens at a final read (read=settled|refused; refused here, the
+                                 jail refusing the usage read) with the stub's figures, one GET /api/oauth/usage open
+                                 or shut, no /v1/messages, the transcript's standing wall and the screen's wall,
+                                 continuation and dialog as they were. On a PASS the frames go to
+                                 aterm-phase's fixtures and CLAUDE_ACCOUNTS.wall_panel_measured_on is written to the
+                                 build where the panel opened (else None); a FAIL keeps the frames and logs and leaves
+                                 the checkout as it was (--keep: the lab stays up)
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
                                  OPENS A WINDOW, one at a time: one instance of a debug or dev-seams aterm across a real
                                  seamless update (ATERM_DEBUG_SEAMLESS_REEXEC=1, `update apply`), legs gap, topics,
@@ -1428,7 +1425,6 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "idle-cpu" => idle_cpu::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
         "disk-full" => disk_full_lane::cmd_disk_full(args),
-        "disk-ask" => disk_ask_lane::cmd_disk_ask(args),
         "slot-capture" => slot_lane::cmd_slot_capture(args),
         "slot-lane" => slot_lane::cmd_slot_lane(args),
         "build-admit" => build_admit::cmd(args),
@@ -1474,6 +1470,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "harness-proof" => harness_proof::cmd_harness_proof(args),
         "codex-measure" => codex_measure::cmd_codex_measure(args),
         "claude-measure" => claude_measure::cmd_claude_measure(args),
+        "claude-wall-panel" => claude_wall_panel::cmd_claude_wall_panel(args),
         "seamless" => seamless::cmd_seamless(args),
         "installer-handoff" => installer_handoff::cmd(args),
         "cold-handoff" => installer_handoff::cold_cmd(args),

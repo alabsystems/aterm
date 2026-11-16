@@ -524,39 +524,6 @@ fn a_window_restored_under_the_other_form_keeps_its_grid_and_takes_its_grids_own
     }
 }
 
-/// CHIPS. A tab's chip meters its load in a window without the band (the Sill's window), as
-/// in any window of two or more tabs while the setting is not `off`.
-#[test]
-fn a_tab_chip_meters_its_load_in_a_window_without_the_band() {
-    let TwoWindows {
-        mut app,
-        second,
-        attached: _attached,
-        ..
-    } = two_windows();
-    let one = app.focused_session_id(second).expect("the first tab");
-    let two = app.next_session_id;
-    app.push_stub_tab(second, crate::stub_session(two));
-    assert_eq!(app.window_bars(second), StatsBars::Sill, "PRECONDITION");
-    app.vitals.snapshot = Some(std::sync::Arc::new(crate::stats_deck::tests::split_tab(
-        one, two,
-    )));
-    let loads = |app: &App| -> Vec<u8> {
-        let ws = &app.windows[&second];
-        let tabs = ws.tab_set.tabs();
-        tabs.iter()
-            .map(|tab| app.chip_load(tabs.len(), tab))
-            .collect()
-    };
-    let shown = loads(&app);
-    assert_eq!(shown.len(), 2, "PRECONDITION: two tabs");
-    assert!(shown.iter().all(|load| *load > 0), "each tab: {shown:?}");
-    set_bars(&mut app, "sill");
-    assert_eq!(loads(&app), shown, "the Sill everywhere meters the same");
-    set_bars(&mut app, "off");
-    assert_eq!(loads(&app), [0, 0], "off: no meter");
-}
-
 /// THE ROW. The palette's command and the published menu state read the front window: the
 /// check is its bit, and the command is idle unless the setting is `deck`.
 #[test]

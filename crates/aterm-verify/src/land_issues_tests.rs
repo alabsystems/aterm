@@ -52,6 +52,130 @@ fn issues_world() -> World {
     ])
 }
 
+#[test]
+fn a_retitle_and_a_measurement_merge_as_one_existing_issue() {
+    for retitle_main in [false, true] {
+        let world = issues_world();
+        let retitled = B.replace("— b", "— a corrected title");
+        let measured = B.replace("B's text.", "B's text, measured on the other side.");
+        let retitled_doc = issues(&[A, &retitled, C]);
+        let measured_doc = issues(&[A, D, &measured, C]);
+        let (branch, main) = if retitle_main {
+            (&measured_doc, &retitled_doc)
+        } else {
+            (&retitled_doc, &measured_doc)
+        };
+        let feature = commit(&world.work, INDEX, branch);
+        let main = rival_moves(&world, INDEX, main);
+        git(&world.work, &["fetch", "-q", "origin"]);
+        let union = gits_merge(&world, &main, &feature);
+        assert_eq!(
+            aterm_census::known_issues::entries(&union)
+                .iter()
+                .filter(|entry| entry.id == Some("ATERM-KI-1114-2"))
+                .count(),
+            2,
+            "negative control: Git splits the retitled issue: {union}"
+        );
+        let combined = measured.replace("— b", "— a corrected title");
+        let expected = issues(&[A, D, &combined, C]);
+        let (code, said, _) = land_with(&world, crates(&[]), |_, _| {
+            assert_eq!(
+                std::fs::read_to_string(world.work.join(INDEX)).unwrap(),
+                expected
+            );
+            green()
+        });
+        assert_eq!(code, exit::PASS, "{said:#?}");
+        assert_eq!(issues_at(&world, &origin_main(&world)), expected.trim_end());
+    }
+}
+
+#[test]
+fn coalescing_retitles_preserves_text_but_refuses_unproven_identity() {
+    use aterm_census::known_issues::parts;
+    let base = issues(&[A, B, C]);
+    let retitled = B.replace("— b", "— corrected");
+    let ours = issues(&[A, &retitled, C]);
+    let theirs = issues(&[A, D, B, C]);
+    let sources = [
+        parts(&base).unwrap(),
+        parts(&ours).unwrap(),
+        parts(&theirs).unwrap(),
+    ];
+    let refs = sources.each_ref();
+    let split = issues(&[A, B, D, &retitled, C]);
+    let combined = issues::coalesce_retitles(&split, refs, &[]).unwrap();
+    let parsed = parts(&combined).unwrap();
+    assert_eq!(parsed.len(), 5);
+    assert_eq!(parsed["ATERM-KI-1114-4"], D.trim_end());
+    let held = parsed["ATERM-KI-1114-2"];
+    assert_eq!(held.lines().next(), retitled.lines().next());
+    assert_eq!(
+        held.matches("B's text.").count(),
+        2,
+        "normalization drops no body lines"
+    );
+    assert!(combined.find("— d").unwrap() < combined.find("— corrected").unwrap());
+    let crlf = split.replace('\n', "\r\n");
+    let normalized = issues::coalesce_retitles(&crlf, refs, &[]).unwrap();
+    assert!(!normalized.replace("\r\n", "").contains('\n'));
+
+    let unknown = split.replace("— corrected", "— an unfamiliar heading");
+    assert!(issues::coalesce_retitles(&unknown, refs, &[]).is_none());
+    assert!(issues::reapply(&split, &ours, &unknown).is_none());
+    assert!(issues::reapply(&base, &ours, &split).is_none());
+    let empty_base = parts(HEAD).unwrap();
+    assert!(
+        issues::coalesce_retitles(&split, [&empty_base, &sources[1], &sources[2]], &[]).is_none()
+    );
+    assert!(
+        issues::coalesce_retitles(&split, [&sources[0], &empty_base, &sources[2]], &[]).is_none()
+    );
+    assert!(issues::coalesce_retitles(&format!("{split}\n```\n"), refs, &[]).is_none());
+}
+
+#[test]
+fn an_edit_after_a_split_retitle_keeps_its_prose_and_heading_choice() {
+    let world = issues_world();
+    let retitled = B.replace("— b", "— corrected");
+    commit(&world.work, INDEX, &issues(&[A, &retitled, C]));
+    rival_moves(&world, INDEX, &issues(&[A, D, B, C]));
+    git(&world.work, &["fetch", "-q", "origin"]);
+    git(&world.work, &["merge", "-q", "--no-edit", "origin/main"]);
+    let union = issues_at(&world, "HEAD");
+    assert!(aterm_census::known_issues::parts(&union).is_none());
+    // Keep the original title deliberately, then add evidence in a later commit.
+    let edited = union
+        .replace("## ATERM-KI-1114-2 — corrected\n", "")
+        .replace("B's text.", "B's text, measured after merging.");
+    commit(&world.work, INDEX, &format!("{edited}\n"));
+    let expected = B.replace("B's text.", "B's text, measured after merging.");
+    assert_eq!(
+        landed(&world, "edited after retitle"),
+        issues(&[A, D, &expected, C]).trim_end()
+    );
+}
+
+#[test]
+fn evidence_added_after_a_split_retitle_keeps_the_repair() {
+    let world = issues_world();
+    let retitled = B.replace("— b", "— corrected");
+    commit(&world.work, INDEX, &issues(&[A, &retitled, C]));
+    rival_moves(&world, INDEX, &issues(&[A, D, B, C]));
+    git(&world.work, &["fetch", "-q", "origin"]);
+    git(&world.work, &["merge", "-q", "--no-edit", "origin/main"]);
+    let union = issues_at(&world, "HEAD");
+    assert!(aterm_census::known_issues::parts(&union).is_none());
+    let edited = union.replace("B's text.", "B's text, measured after merging.");
+    commit(&world.work, INDEX, &format!("{edited}\n"));
+    let expected = retitled.replace("B's text.", "B's text, measured after merging.");
+    assert_eq!(
+        landed(&world, "measured after retitle"),
+        issues(&[A, D, &expected, C]).trim_end()
+    );
+}
+
 /// The open-issues file at `at` in `world`'s work checkout, as Git shows it.
 fn issues_at(world: &World, at: &str) -> String {
     git(&world.work, &["show", &format!("{at}:{INDEX}")])
@@ -526,6 +650,78 @@ fn unrelated_merge_bases_keep_a_bridge_closure_and_the_other_bridges_entries() {
     .expect("the unrelated internal bases can be merged")
     .expect("the outer union's resurrection is repaired");
     assert_eq!(fixed, issues(&[A, D, C]));
+}
+
+/// A VIRTUAL BASE CAN SPLIT A PROVEN RETITLE: the lower tips retitle and measure B,
+/// and their union duplicates its heading around D. Both bridges resolved that split;
+/// main then closes B while the child adds E beside it. The virtual base must retain B's
+/// identity so the outer union cannot reopen it.
+#[test]
+fn a_split_retitle_in_a_virtual_base_preserves_a_later_closure() {
+    for (existing, resolved) in [(true, true), (true, false), (false, true)] {
+        let world = issues_world();
+        // F is absent from the common ancestor: its two new headings must not be
+        // treated as a retitle of one established issue.
+        let original = if existing { B } else { F };
+        let retitled = original.replace(" — ", " — corrected ");
+        let measured = measured(original, "Measured on the other side.");
+        let left = commit(&world.work, INDEX, &issues(&[A, &retitled, C]));
+        let right = rival_moves(&world, INDEX, &issues(&[A, D, &measured, C]));
+        git(&world.work, &["fetch", "-q", "origin"]);
+        let union = gits_merge(&world, &right, &left);
+        let id = if existing {
+            "## ATERM-KI-1114-2"
+        } else {
+            "## ATERM-KI-1114-6"
+        };
+        assert_eq!(union.matches(id).count(), 2, "{union}");
+        let combined = measured.replace(" — ", " — corrected ");
+        let child_text = if resolved {
+            issues(&[A, D, E, &combined, C])
+        } else {
+            format!("{}\n", union.replace(D, &format!("{D}\n{E}")))
+        };
+        write(&world.work, INDEX, &child_text);
+        git(&world.work, &["add", "--", INDEX]);
+        let tree = git(&world.work, &["write-tree"]);
+        let child = issue_merge_commit(&world, &tree, &left, &right);
+        write(&world.work, INDEX, &issues(&[A, D, C]));
+        git(&world.work, &["add", "--", INDEX]);
+        let tree = git(&world.work, &["write-tree"]);
+        let main = issue_merge_commit(&world, &tree, &right, &left);
+        let bases: std::collections::BTreeSet<String> =
+            git(&world.work, &["merge-base", "--all", &child, &main])
+                .lines()
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(bases, std::collections::BTreeSet::from([left, right]));
+        let outer = git(
+            &world.work,
+            &["merge-tree", "--write-tree", "--no-messages", &child, &main],
+        );
+        let outer = outer.lines().next().unwrap();
+        assert!(issues_at(&world, outer).contains(id));
+        let repaired = issues::fixed(
+            &Git {
+                root: &world.work,
+                make: &git_cmd,
+            },
+            &main,
+            &child,
+            Some(outer),
+        )
+        .unwrap();
+        if existing {
+            let (fixed, _) =
+                repaired.expect("the virtual retitle must not prevent the closure repair");
+            assert_eq!(fixed, issues(&[A, D, E, C]), "resolved={resolved}");
+        } else {
+            assert_eq!(
+                repaired, None,
+                "independently minted IDs do not establish one issue"
+            );
+        }
+    }
 }
 
 /// A NONREGULAR HISTORICAL BASE IS NOT AN EMPTY ISSUES FILE: both sides explicitly resolved it

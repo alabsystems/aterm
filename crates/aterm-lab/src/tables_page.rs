@@ -4,17 +4,32 @@
 //! `lab tables-page`: the Tables page (docs/PLAN.md LT-08) on a private instance whose home holds
 //! a scratch registry with synthetic rows, two of its Macs' concurrent edits to one cell among
 //! them, the compiled reference rows, and a chip the owner stated that its Mac sees otherwise.
-//! It opens the page, takes a frame, stages an edit through `act`, takes a frame, opens a Mac's
+//! It opens the page, takes a frame, opens the Columns list and takes a frame, selects a Mac's
+//! status (STORED's folded stub, the columns no row fills, stands before it) and takes a frame,
+//! unfolds STORED with a press on its stub and takes a frame, stages an edit through `act`, takes
+//! a frame, opens a Mac's
 //! role (an enum) on its list of words and takes a frame, stages a word that is none of them
 //! and takes a frame of its refusal, asks `act` to write them (which `act` refuses: only a
-//! person's own press writes) and discards them, selects the grid's last column, takes a frame,
+//! person's own press writes) and discards them, turns the fold off from the Columns list,
+//! selects a Mac's linked count (the cell bar says the count, the line under the grid which
+//! rows name the Mac), takes a frame, selects the grid's last column, takes a frame,
 //! sorts the rows by a header, takes a frame, selects the stated chip (the line under the grid says both what is stated and what the Mac sees), takes
 //! a frame, in a narrow window opens the table picker and takes a frame, opens the Macs' own
 //! facts and selects a cell, takes a frame, opens the providers and takes a frame, opens the
-//! CLIs and selects one's key, takes a frame, opens the Mac models (the rail's last table) and
-//! takes a frame, opens Check and takes a frame, selects its first finding and takes a frame,
+//! CLIs and selects one's key, takes a frame, opens the machine models (the rail's last table)
+//! and takes a frame, opens the plans (each one's limits in words) and the imports (each one's
+//! time a date) and takes a frame of each, opens Check and takes a frame, selects its first
+//! finding and takes a frame,
 //! goes back to the machines, selects a cell and finds another row (the cell bar names the
-//! selected cell as not among the rows found), takes a frame; the frames go to the folder named.
+//! selected cell as not among the rows found), takes a frame and clears the find; then opens the
+//! links, adds one and opens its machine on the list of the machines (two under one label, each
+//! saying which it is) and takes a frame, chooses one and opens its account on its list and
+//! takes a frame, discards them and selects a written link, whose cells read as the rows they
+//! name and whose pane offers each, and takes a frame (docs/PLAN.md LT-30); then selects the
+//! machine that link names, whose Retire waits on the link, and takes a frame, ends the link from
+//! there and takes a frame of the machine's Retire freed, discards that, steps the lifecycle
+//! filter to retired rows and takes a frame, and adds an email, whose pane names the verb that
+//! sets its password, and takes a frame (docs/PLAN.md LT-24); the frames go to the folder named.
 //! `--lines N` sets the window's height (56 lines by default), so a short one shows the rail
 //! scrolled; `--columns N` its width (200 by default), so a narrow one (under 900 px) shows the
 //! table picker and the pane below the grid. No live vault, fleet or Commons is reached, and every
@@ -58,17 +73,40 @@ fn put(collection: &str, pk: &str, column: &str, value: Value) -> Result<Change,
     .map_err(fail)
 }
 
-/// The synthetic rows: three Macs, two addresses and a phone.
+/// A machine row seated again under a label another row holds, as a reinstall leaves one
+/// (docs/KNOWN_ISSUES.md ATERM-KI-1112-155): the choice of a link's machine tells the two apart.
+const SPLIT: &str = "mc-000000000000000d";
+/// The synthetic account and the link that names the third Mac and it.
+const ACCOUNT: &str = "ac-0000000000000001";
+const MACHINE: &str = "mc-000000000000000c";
+
+/// The synthetic rows: four Macs (two under one label), two addresses, a phone, an account and a
+/// link.
 fn rows() -> Result<Vec<Vec<Change>>, Fail> {
     let mut records = Vec::new();
-    for (pk, label, nickname, location, chip) in [
-        ("mc-000000000000000a", "m9", "Spare", "rack a", "M2"),
-        ("mc-000000000000000b", "m55", "Build", "rack b", "M4 Max"),
-        ("mc-000000000000000c", "m73", "Desk", "office", "M4 Pro"),
+    for (pk, label, nickname, location, chip, status) in [
+        (
+            "mc-000000000000000a",
+            "m9",
+            "Spare",
+            "rack a",
+            "M2",
+            "active",
+        ),
+        (
+            "mc-000000000000000b",
+            "m55",
+            "Build",
+            "rack b",
+            "M4 Max",
+            "active",
+        ),
+        (MACHINE, "m73", "Desk", "office", "M4 Pro", "active"),
+        (SPLIT, "m73", "Desk again", "office", "M4 Pro", "planned"),
     ] {
         records.push(vec![
             put("machine", pk, "label", json!(label))?,
-            put("machine", pk, "status", json!("active"))?,
+            put("machine", pk, "status", json!(status))?,
             put("machine", pk, "nickname", json!(nickname))?,
             put("machine", pk, "location", json!(location))?,
             put("machine", pk, "chip", json!(chip))?,
@@ -95,6 +133,20 @@ fn rows() -> Result<Vec<Vec<Change>>, Fail> {
             json!("Example Mobile"),
         )?,
         put("phone", "ph-0000000000000001", "row", json!("live"))?,
+    ]);
+    records.push(vec![
+        put("account", ACCOUNT, "provider", json!("openai"))?,
+        put("account", ACCOUNT, "realm", json!("global"))?,
+        put("account", ACCOUNT, "login", json!("ad-0000000000000001"))?,
+        put("account", ACCOUNT, "status", json!("active"))?,
+        put("account", ACCOUNT, "row", json!("live"))?,
+    ]);
+    let link = aterm_db::typed::keys::preference_pk(MACHINE, ACCOUNT).map_err(fail)?;
+    records.push(vec![
+        put("preference", &link, "machine", json!(MACHINE))?,
+        put("preference", &link, "account", json!(ACCOUNT))?,
+        put("preference", &link, "why", json!("owner"))?,
+        put("preference", &link, "row", json!("live"))?,
     ]);
     Ok(records)
 }
@@ -301,6 +353,23 @@ fn choose(inst: &Instance, view: &str, key: &str, narrow: bool) -> Result<(), Fa
     act(inst, view, key, None)
 }
 
+/// Open the cell `key` on its list: a press selects it and a second opens it, where the first
+/// did not (a cell already selected opens at one).
+fn open_list(inst: &Instance, view: &str, key: &str) -> Result<(), Fail> {
+    let listed = |inst: &Instance| {
+        inst.ctl(&["inspect", "app/v1", "view", view, "text"])
+            .stdout
+            .contains("tables/choice/0")
+    };
+    act(inst, view, key, None)?;
+    if !listed(inst) {
+        act(inst, view, key, None)?;
+    }
+    until(inst, view, "a list to choose from", |text| {
+        text.contains("tables/choice/0")
+    })
+}
+
 /// The rail's line that opens Check.
 const CHECK: &str = "tables/view/check";
 
@@ -319,6 +388,27 @@ fn drive(
         text.contains("Machines: ") || text.contains("Table: Machines")
     })?;
     let mut shots = vec![frame(inst, out, "tables-1-read.png")?];
+    // The Columns list: each column under its group, with how many rows fill it.
+    act(inst, &view, "tables/columns", None)?;
+    until(inst, &view, "the list of columns", |text| {
+        text.contains("tables/columns/fold")
+    })?;
+    shots.push(frame(inst, out, "tables-1b-columns.png")?);
+    act(inst, &view, "tables/columns", None)?;
+    // The columns no row fills fold into a stub at the end of their group: STORED's stands
+    // before the status.
+    act(inst, &view, "tables/cell/mc-000000000000000c/status", None)?;
+    until(inst, &view, "STORED's folded stub", |text| {
+        text.contains("tables/fold/stored")
+    })?;
+    shots.push(frame(inst, out, "tables-1c-folded.png")?);
+    // A press on the stub unfolds STORED, whose empty columns (a Mac's role among them) the
+    // frames below then show as any other.
+    act(inst, &view, "tables/fold/stored", None)?;
+    until(inst, &view, "STORED unfolded", |text| {
+        !text.contains("tables/fold/stored")
+    })?;
+    shots.push(frame(inst, out, "tables-1d-unfolded.png")?);
     act(
         inst,
         &view,
@@ -347,8 +437,10 @@ fn drive(
     let role = "tables/cell/mc-000000000000000b/role";
     act(inst, &view, role, None)?;
     act(inst, &view, role, None)?;
+    // A grid too short for every word (a narrow page's, with the row's pane below it) shows
+    // the words round the marked one, which need not be the first.
     until(inst, &view, "the role's words", |text| {
-        text.contains("tables/choice/0")
+        text.contains("tables/choice/")
     })?;
     shots.push(frame(inst, out, "tables-3a-choices.png")?);
     act(inst, &view, "tables/edit", Some("server"))?;
@@ -374,6 +466,26 @@ fn drive(
     act(inst, &view, "tables/discard", None)?;
     act(inst, &view, location, None)?;
     shots.push(frame(inst, out, "tables-4-unwritten.png")?);
+    // The fold turned off draws every column, the empty ones too: the linked count and the
+    // schema's last column below are among them, whatever the rows fill.
+    act(inst, &view, "tables/columns", None)?;
+    act(inst, &view, "tables/columns/fold", None)?;
+    act(inst, &view, "tables/columns", None)?;
+    until(inst, &view, "every column drawn", |text| {
+        !text.contains("tables/fold/")
+    })?;
+    // A linked count: the cell bar says the count as its cell does, and the line under the
+    // grid how many rows of which table name the row.
+    act(
+        inst,
+        &view,
+        "tables/cell/mc-000000000000000a/~machine.merged_into",
+        None,
+    )?;
+    until(inst, &view, "a linked count", |text| {
+        text.contains("names this row") || text.contains("name this row")
+    })?;
+    shots.push(frame(inst, out, "tables-4a-linked.png")?);
     // The grid's last column selected scrolls it across: the row's label stays at the left.
     act(inst, &view, "tables/cell/mc-000000000000000c/hosts", None)?;
     shots.push(frame(inst, out, "tables-5-across.png")?);
@@ -418,10 +530,18 @@ fn drive(
     })?;
     shots.push(frame(inst, out, "tables-10-cli.png")?);
     choose(inst, &view, "tables/sheet/model", narrow)?;
-    until(inst, &view, "the Mac models", |text| {
-        text.contains("Mac models")
+    until(inst, &view, "the machine models", |text| {
+        text.contains("Machine models")
     })?;
     shots.push(frame(inst, out, "tables-11-models.png")?);
+    // A plan's limits read in words, and an import's time as a date.
+    choose(inst, &view, "tables/sheet/plan", narrow)?;
+    until(inst, &view, "the plans", |text| text.contains("Plans"))?;
+    act(inst, &view, "tables/cell/anthropic-max/limits", None)?;
+    shots.push(frame(inst, out, "tables-11a-plans.png")?);
+    choose(inst, &view, "tables/sheet/source", narrow)?;
+    until(inst, &view, "the imports", |text| text.contains("Imports"))?;
+    shots.push(frame(inst, out, "tables-11b-imports.png")?);
     // Check: every finding in words, then the store's state; a finding selected shows the rows
     // it names.
     choose(inst, &view, CHECK, narrow)?;
@@ -443,5 +563,64 @@ fn drive(
         text.contains("not among the rows found")
     })?;
     shots.push(frame(inst, out, "tables-14-found.png")?);
+    act(inst, &view, "tables/find", Some(""))?;
+    // A link's machine is chosen from the machines' rows, each read by its words; two under one
+    // label say each one's key ending, status and whether a Mac holds it.
+    choose(inst, &view, "tables/sheet/preference", narrow)?;
+    until(inst, &view, "the links' Add", |text| {
+        text.contains("Add link")
+    })?;
+    act(inst, &view, "tables/rows/add", None)?;
+    let machine = "tables/cell/+new-1/machine";
+    until(inst, &view, "a new link", |text| text.contains(machine))?;
+    open_list(inst, &view, machine)?;
+    shots.push(frame(inst, out, "tables-15-choose-machine.png")?);
+    act(inst, &view, "tables/choice/1", None)?;
+    open_list(inst, &view, "tables/cell/+new-1/account")?;
+    shots.push(frame(inst, out, "tables-16-choose-account.png")?);
+    act(inst, &view, "tables/choice/0", None)?;
+    act(inst, &view, "tables/discard", None)?;
+    // A written link reads as the rows it names; its pane offers each.
+    let link = aterm_db::typed::keys::preference_pk(MACHINE, ACCOUNT).map_err(fail)?;
+    act(inst, &view, &format!("tables/cell/{link}/machine"), None)?;
+    until(inst, &view, "the rows a link names", |text| {
+        text.contains("tables/pane/row/to/machine")
+    })?;
+    shots.push(frame(inst, out, "tables-17-link.png")?);
+    // The machine the link names: its Retire waits on the link, which the pane lists.
+    choose(inst, &view, "tables/sheet/machine", narrow)?;
+    act(inst, &view, &format!("tables/cell/{MACHINE}/label"), None)?;
+    until(inst, &view, "the retire waiting on the link", |text| {
+        text.contains("1 live row names it")
+    })?;
+    shots.push(frame(inst, out, "tables-18-retire-waits.png")?);
+    // Ending the link from there frees the machine's Retire in the same Write.
+    act(inst, &view, "tables/pane/row/by/0", None)?;
+    until(inst, &view, "the link's End", |text| {
+        text.contains("End this link")
+    })?;
+    act(inst, &view, "tables/pane/row/retire", None)?;
+    choose(inst, &view, "tables/sheet/machine", narrow)?;
+    act(inst, &view, &format!("tables/cell/{MACHINE}/label"), None)?;
+    until(inst, &view, "the retire freed", |text| {
+        text.contains("Retire this machine") && !text.contains("1 live row names it")
+    })?;
+    shots.push(frame(inst, out, "tables-19-retire-freed.png")?);
+    act(inst, &view, "tables/discard", None)?;
+    // The lifecycle filter's next step: the retired rows.
+    act(inst, &view, "tables/rows/filter", None)?;
+    until(inst, &view, "the retired rows", |text| {
+        text.contains("Retired rows shown")
+    })?;
+    shots.push(frame(inst, out, "tables-20-retired.png")?);
+    // A new email: its password is set by a verb, never typed.
+    choose(inst, &view, "tables/sheet/address", narrow)?;
+    act(inst, &view, "tables/rows/add", None)?;
+    until(inst, &view, "a new email's password line", |text| {
+        text.contains("tables/pane/row/set/password")
+    })?;
+    shots.push(frame(inst, out, "tables-21-new-email.png")?);
+    // Nothing of it is staged, so its pane's Remove takes it back.
+    act(inst, &view, "tables/pane/row/drop", None)?;
     Ok(shots)
 }

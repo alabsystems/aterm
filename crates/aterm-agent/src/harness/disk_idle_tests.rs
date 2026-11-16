@@ -767,8 +767,8 @@ fn the_process_check_runs_under_the_locks_before_the_first_delete() {
             if stage == target::Stage::Locked {
                 order.borrow_mut().push("locked");
             }
-            if stage == target::Stage::Deleting {
-                order.borrow_mut().push("deleting");
+            if stage == target::Stage::Staging {
+                order.borrow_mut().push("staging");
             }
         },
     )

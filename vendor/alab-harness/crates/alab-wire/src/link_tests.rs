@@ -352,9 +352,9 @@ fn adopt(fake: &FakeAterm, clock: &Clock) -> Link {
 
 /// A harness image that took over a running child from an earlier image of
 /// itself has that image's duty: a claim aterm cannot make now, refused or
-/// unreachable, keeps the link lost and claimed again on the clock, where a
-/// launch would be absent and pass its vendor through.
-/// NEGATIVE CONTROL: the same refusals leave a launch absent.
+/// unreachable, keeps the link lost and claimed again on the clock. A fresh
+/// launch also retries unavailable transport, but has no earlier claim or grace.
+/// NEGATIVE CONTROL: a permanent refusal still leaves a fresh launch absent.
 #[test]
 fn an_adopted_child_keeps_its_claim_through_any_refusal() {
     let mut clock = Clock::new();
@@ -388,7 +388,8 @@ fn an_adopted_child_keeps_its_claim_through_any_refusal() {
 
     let gone = FakeAterm::for_harness("adopt-gone", &config());
     std::fs::remove_file(gone.sock_dir.join("c.sock")).expect("remove the socket");
-    assert!(launch(&gone, &clock).is_absent());
+    let fresh = launch(&gone, &clock);
+    assert!(fresh.is_lost() && !fresh.claims());
     let mut link = adopt(&gone, &clock);
     assert!(link.is_lost() && link.claims());
     assert!(
@@ -608,7 +609,7 @@ fn a_release_aterm_does_not_take_after_a_failed_reclaim_drops_the_connection() {
 /// kimi-alab's rule: an aterm that answered the handshake but not the claim's
 /// reads in time is busy, not away. The launch is lost, not absent, and the
 /// claim is made on the clock once aterm answers.
-/// NEGATIVE CONTROL: no socket at all is gone, and the launch is absent.
+/// An absent socket is unavailable rather than busy, and is also retried.
 #[test]
 fn a_launch_aterm_answers_late_after_the_handshake_is_claimed_again_not_given_up() {
     let fake = FakeAterm::for_harness("busy", &config());
@@ -640,12 +641,42 @@ fn a_launch_aterm_answers_late_after_the_handshake_is_claimed_again_not_given_up
     let lookup = gone.lookup(config.env());
     std::fs::remove_file(gone.sock_dir.join("c.sock")).expect("remove the socket");
     let mut away = Link::launch_with(config, std::process::id(), child(), 0, lookup);
-    assert!(away.is_absent());
+    assert!(away.is_lost() && !away.claims());
     let notes = away.take_notes();
     assert!(
         notes[0].starts_with("aterm unclaimed connect "),
         "{notes:?}"
     );
+}
+
+#[test]
+fn a_fresh_launch_recovers_an_initially_unavailable_endpoint_on_the_reclaim_clock() {
+    for contract in [Contract::Three, Contract::Four] {
+        let config = config()
+            .with_contracts(&[contract])
+            .unwrap()
+            .with_stream(false);
+        let fake = FakeAterm::for_harness("initially-unavailable", &config);
+        fake.serve_contracts(&[contract.number()]);
+        let socket = fake.sock_dir.join("c.sock");
+        let parked = fake.sock_dir.join("unavailable.sock");
+        std::fs::rename(&socket, &parked).unwrap();
+        let mut link = Link::launch_at(config, std::process::id(), &fake.locator(), child(), 0);
+        assert!(link.is_lost() && !link.claims() && !link.judges());
+        assert!(matches!(link.unclaimed(), Some(Failure::Gone(_))));
+        assert!(fake.requests().is_empty());
+
+        std::fs::rename(&parked, &socket).unwrap();
+        link.tick(child(), RECLAIM_EVERY_MS - 1);
+        assert!(fake.requests().is_empty(), "no retry before its clock");
+        link.tick(child(), RECLAIM_EVERY_MS);
+        assert!(link.judges() && link.claims());
+        assert!(!fake.in_grace(), "normal launch used no adoption grace");
+        assert_eq!(
+            fake.verbs().first().map(String::as_str),
+            Some("harness policy")
+        );
+    }
 }
 
 #[test]

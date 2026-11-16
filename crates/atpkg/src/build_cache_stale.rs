@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! WHAT NO BUILD READS AGAIN inside a build directory that stays: stale incremental folders,
-//! units an old compiler built, and, in a build directory whose check runs named the units they
-//! used ([`USED`], [`Kept`]), each unit of the workspace's own packages those runs superseded
-//! (none of the kept runs uses it, and one uses another build of the same package and kind,
-//! [`Part::Superseded`]). A
+//! units an old compiler built, and, in a build directory whose check runs or `targo` builds named
+//! the units they used ([`USED`], [`Kept`]; [`RECEIPTS`], [`Receipts`]), each unit of the
+//! workspace's own packages those runs superseded (none of the kept runs uses it, and one uses
+//! another build of the same package and kind, [`Part::Superseded`]). A
 //! unit whose folder, fingerprint or outputs cannot be listed is not read, so nothing is decided
 //! of it. A profile's units are read in both of
 //! cargo's layouts: `.fingerprint/<pkg>-<hash>` beside `deps/`, `build/` and `examples/` entries
@@ -121,9 +121,9 @@ pub struct Profile {
     /// Its `incremental/` crate folders.
     pub crates: Vec<Stamp>,
     pub units: Vec<Unit>,
-    /// The hashes of its units the build directory's kept runs used ([`USED`], [`Kept::runs`]),
-    /// together; `None` where the build directory carries no record, or one unread
-    /// ([`Survey::began`]).
+    /// The hashes of its units the build directory's kept runs used ([`USED`], [`Kept::runs`],
+    /// and each receipt [`Receipts::read`] takes), together; `None` where the build directory
+    /// carries no record (or one unread) and no receipt ([`Survey::began`]).
     pub used: Option<BTreeSet<String>>,
     /// The hashes of its units the run that last ended in the build directory retired
     /// ([`Kept::retired`]): a kept run used each, and none does since that run ended. Empty where
@@ -146,9 +146,9 @@ pub struct Survey {
     /// `None` where cargo last built here with a compiler no store holds, or that cannot be read.
     pub last_built: Option<LastBuilt>,
     pub profiles: Vec<Profile>,
-    /// When the oldest of the build directory's kept runs began ([`USED`], [`Kept::runs`],
-    /// [`Used::began_ms`]), no later than its record was written; `None` where it carries no
-    /// record, one unread, or one that keeps no run.
+    /// When the oldest of the build directory's kept runs began ([`USED`], [`Kept::runs`], and its
+    /// receipts, [`Receipts`]; [`Used::began_ms`]), each no later than its file was written;
+    /// `None` where it carries no record (or one unread, or one that keeps no run) and no receipt.
     pub began: Option<SystemTime>,
     /// The workspace's own packages the kept runs built ([`Used::members`]), together.
     pub members: BTreeSet<String>,
@@ -190,7 +190,7 @@ pub(crate) struct Observations {
     pub profiles_with_compiler_references: usize,
     pub units_without_compiler: usize,
     /// The build directory's record of the units its check runs used ([`USED`]) was read and
-    /// keeps a run ([`Survey::began`]).
+    /// keeps a run, or a receipt of a `targo` build was read ([`Survey::began`]).
     pub used_record: bool,
     pub profiles_naming_used_units: usize,
 }
@@ -284,9 +284,13 @@ pub enum Part {
 /// own features: cargo never rewrites a unit it found fresh, so its age says nothing of its use);
 /// every unit of a kind the record names none of; and every unit written since the run it is
 /// judged against began, which some compile built (spec-check's build of the models without the
-/// checkers). ACCEPTED: a unit of the workspace's own that a compile no run reports (a plain
-/// build, a doctest's or spec-check's) found fresh goes once a kept run replaced it or it is
-/// quiet for the window, though that compile reads it again: that compile builds it once more.
+/// checkers). A `targo` build that keeps a receipt ([`RECEIPTS`]) is a kept run too, read beside
+/// the record's ([`survey`]), and the record keeps a copy of each receipt it last took, so the
+/// next end that takes them ([`Kept::take_receipts`]) retires what a selection's build before used
+/// and its build since does not. ACCEPTED: a unit of the workspace's own that a compile no run
+/// or receipt reports (a build with no receipt, a doctest's or spec-check's) found fresh goes
+/// once a kept run replaced it or it is quiet for the window, though that compile reads it again:
+/// that compile builds it once more.
 /// The record before this one (schema 1, `.aterm-release-used`, a passing release run's alone) is
 /// not read and supersedes nothing; the first run to end in its build directory removes it
 /// ([`Kept::keep`]).
@@ -303,14 +307,52 @@ const USED_BEFORE: &str = ".aterm-release-used";
 pub const KEPT_RUNS: usize = 4;
 
 /// A kept run goes from a [`USED`] record once another run ends that began this much later
-/// ([`Kept::end`]): without it a scope nobody runs again, among [`KEPT_RUNS`] or fewer, stays
-/// the oldest kept run for good, and no unit written since it began would be superseded
-/// ([`Survey::began`]).
+/// ([`Kept::end`]), or once the record takes a receipt of a build that began this much later
+/// ([`Kept::take_receipts`]): without it a scope nobody runs again, among [`KEPT_RUNS`] or
+/// fewer, stays the oldest kept run for good, and no unit written since it began would be
+/// superseded ([`Survey::began`]).
 pub const KEPT_FOR: Duration = RECLAIM_STALE;
 
+/// The lock file beside the [`USED`] record that every change to the record holds from its read
+/// to its write ([`Kept::update`]): a verify run's end and a plain build's holder may end in one
+/// build directory at once, and a change made from a read the other's write then replaced would
+/// drop the other's kept run.
+pub const USED_LOCK: &str = ".aterm-used.lock";
+
+/// The longest a change to the [`USED`] record waits for another's [`USED_LOCK`]: a change reads,
+/// folds and writes one record of at most [`USED_MAX`] bytes, far within it. Past it the change
+/// is not made, and the record before stands.
+const USED_LOCK_WITHIN: Duration = Duration::from_secs(10);
+
 /// The most of a [`USED`] record read: some thousands of units of a few dozen bytes each, for
-/// each kept run. A longer one is not read, and supersedes nothing.
+/// each kept run and each receipt copy. A longer one is not read, and supersedes nothing.
 const USED_MAX: usize = 16 << 20;
+
+/// THE RECEIPTS `targo` KEEPS (Trust's DC-12a, `build_receipt.rs` in targo-core) in a build
+/// directory: once a build's compile graph has run and succeeded, one file for its selection,
+/// `<16 lowercase hex>.json` in this folder, replaced by the selection's next build and withdrawn
+/// by one whose graph succeeded but could keep none. Its `began_ms`, `members` and `profiles`
+/// are a [`Used`] in this module's encoding ([`Used::of_receipt`]); `members` names every member
+/// the build used. A build run as `cargo`, or by a Trust build without DC-12a, keeps none, and a
+/// build directory with no receipt is judged as it was before receipts.
+pub const RECEIPTS: &str = ".targo-receipts";
+
+/// The receipt format [`Receipt::of_bytes`] reads (targo's `FORMAT`).
+pub const RECEIPT_FORMAT: u64 = 1;
+
+/// The most of one receipt read: a few thousand units and the selection's roots are some hundreds
+/// of KiB. A longer one is not read, as a malformed one is not.
+const RECEIPT_MAX: usize = 4 << 20;
+
+/// The most bytes of receipts one read of a build directory takes, newest first; a receipt past
+/// it is not read.
+const RECEIPTS_READ_MAX: usize = 16 << 20;
+
+/// The most receipts one read of a build directory takes, newest first: one per selection built
+/// within [`KEPT_FOR`] of the newest. One past it is not read: its units are judged as a build's
+/// with no receipt, and the read is not whole ([`Receipts::unread`]), so nothing is retired at
+/// once from it.
+pub const RECEIPTS_MAX: usize = 64;
 
 /// The units a run used, by profile, the workspace's own packages it built, and when it began
 /// ([`USED`]).
@@ -382,42 +424,14 @@ impl Used {
     /// (each `-` an `_`): the same file (device and inode, a hard link) or its copy (the same
     /// length and modification time to the nanosecond, which cargo's copy keeps). None where no
     /// unit holds a twin; and none in the layout that names its entries with the hash, whose copies
-    /// [`Self::add`] does not read either.
+    /// [`Self::add`] does not read either ([`uplifted_units`]).
     pub fn add_uplifted(&mut self, leaf: &Path, profile: &str, package: &str, file: &Path) {
-        if !plain(package) || !profile.split('/').all(plain) {
-            return;
-        }
-        let Some(stem) = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| plain(n))
-            .map(|n| n.replace('-', "_"))
-        else {
-            return;
-        };
-        let Ok(copy) = std::fs::symlink_metadata(file) else {
-            return;
-        };
-        let dir = leaf.join(profile).join("build").join(package);
-        let Ok(units) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        for unit in units.flatten() {
-            let Some(hash) = unit
-                .file_name()
-                .to_str()
-                .filter(|h| is_hash(h))
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            let twin = std::fs::symlink_metadata(dir.join(&hash).join("out").join(&stem));
-            if twin.is_ok_and(|twin| twins(&copy, &twin)) {
-                self.profiles
-                    .entry(profile.to_owned())
-                    .or_default()
-                    .insert(hash);
-            }
+        let hashes = uplifted_units(leaf, profile, package, file);
+        if !hashes.is_empty() {
+            self.profiles
+                .entry(profile.to_owned())
+                .or_default()
+                .extend(hashes);
         }
     }
 
@@ -479,6 +493,236 @@ impl Used {
         }
         Some(used)
     }
+
+    /// The run a `targo` receipt's bytes hold ([`Receipt::of_bytes`]).
+    #[must_use]
+    pub fn of_receipt(bytes: &[u8]) -> Option<Used> {
+        Receipt::of_bytes(bytes).map(|receipt| receipt.run)
+    }
+
+    /// Each `(profile, hash)` unit it names.
+    fn units(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.profiles
+            .iter()
+            .flat_map(|(p, hashes)| hashes.iter().map(move |h| (p.as_str(), h.as_str())))
+    }
+}
+
+/// ONE `targo` RECEIPT ([`RECEIPTS`]) as this module reads it: the run it holds, and which of its
+/// profiles its build compiled incrementally.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Receipt {
+    /// Its `began_ms`, `members` and `profiles`, a [`USED`] record's run.
+    pub run: Used,
+    /// The profiles its `incremental` (Trust's DC-12b) names a unit of: those whose units the
+    /// build compiled into the profile's `incremental/` folder, which a member's unit of a
+    /// profile with incremental compilation on is. `None` for a receipt with no `incremental`
+    /// (written before DC-12b), which says nothing of it. A selection's name leaves out what
+    /// turns incremental compilation on or off (`CARGO_INCREMENTAL`, which aterm-verify's main
+    /// lane sets to `0` in the build directory plain builds share), though a member's unit hash
+    /// holds it: two builds of one selection that differ there replace each other's receipt and
+    /// use two sets of units, neither of which supersedes the other ([`Self::same_variant`]).
+    pub incremental: Option<BTreeSet<String>>,
+}
+
+impl Receipt {
+    /// The receipt a `targo` receipt's bytes hold: its `began_ms`, `members` and `profiles`
+    /// read as a [`USED`] record's run is ([`Used::of_value`]), and the profiles its
+    /// `incremental` names a unit of. `None` for bytes that are no receipt of format
+    /// [`RECEIPT_FORMAT`] with a `selection` object, that carry a `schema` (a record of this
+    /// module's, never a receipt), whose run is none, or whose `incremental` is there and is no
+    /// object of profiles, each named as a run's are, to objects.
+    #[must_use]
+    pub fn of_bytes(bytes: &[u8]) -> Option<Receipt> {
+        let v: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
+        if v.get("receipt").and_then(aterm_json::Value::as_u64) != Some(RECEIPT_FORMAT)
+            || !v.get("selection").is_some_and(aterm_json::Value::is_object)
+            || v.get("schema").is_some()
+        {
+            return None;
+        }
+        let incremental = match v.get("incremental") {
+            None => None,
+            Some(by_profile) => {
+                let mut named = BTreeSet::new();
+                for (profile, units) in by_profile.as_object()? {
+                    if !profile.split('/').all(plain) {
+                        return None;
+                    }
+                    if !units.as_object()?.is_empty() {
+                        named.insert(profile.clone());
+                    }
+                }
+                Some(named)
+            }
+        };
+        Some(Receipt {
+            run: Used::of_value(&v)?,
+            incremental,
+        })
+    }
+
+    /// The copy a [`USED`] record keeps ([`Kept::receipts`]): the run's value, with its
+    /// incremental profiles as an array (`incremental`) where the receipt said them.
+    fn value(&self) -> aterm_json::Value {
+        let mut v = self.run.value();
+        if let (Some(o), Some(profiles)) = (v.as_object_mut(), &self.incremental) {
+            o.insert(
+                "incremental".to_owned(),
+                aterm_json::Value::Array(
+                    profiles
+                        .iter()
+                        .map(|p| aterm_json::Value::from(p.as_str()))
+                        .collect(),
+                ),
+            );
+        }
+        v
+    }
+
+    /// The copy `v` holds ([`Self::value`]); `None` where its run is none, or its `incremental`
+    /// is there and is no array of profiles named as a run's are.
+    fn of_value(v: &aterm_json::Value) -> Option<Receipt> {
+        let incremental = match v.get("incremental") {
+            None => None,
+            Some(profiles) => Some(
+                profiles
+                    .as_array()?
+                    .iter()
+                    .map(|p| {
+                        p.as_str()
+                            .filter(|p| p.split('/').all(plain))
+                            .map(str::to_owned)
+                    })
+                    .collect::<Option<BTreeSet<String>>>()?,
+            ),
+        };
+        Some(Receipt {
+            run: Used::of_value(v)?,
+            incremental,
+        })
+    }
+
+    /// Whether the build behind this receipt and the one behind `since`, a later receipt of the
+    /// same selection, built `profile` in one variant, so what this one used there and `since`
+    /// did not is superseded: both say which profiles they compiled incrementally
+    /// ([`Self::incremental`]), and agree on `profile`. Builds that differ there (a plain build
+    /// and verify's main lane, `CARGO_INCREMENTAL=0`) each keep their units for the other.
+    #[must_use]
+    pub fn same_variant(&self, since: &Receipt, profile: &str) -> bool {
+        match (&self.incremental, &since.incremental) {
+            (Some(was), Some(now)) => was.contains(profile) == now.contains(profile),
+            _ => false,
+        }
+    }
+}
+
+/// THE RECEIPTS OF A BUILD DIRECTORY ([`RECEIPTS`]) one read takes ([`Self::read`]), each by its
+/// file's name without `.json` (its selection's name), and how many it left unread.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Receipts {
+    pub runs: BTreeMap<String, Receipt>,
+    /// How many files named as receipts, written within [`KEPT_FOR`] of the newest, the read did
+    /// not take: past a bound, unreadable, or none ([`Receipt::of_bytes`]). Such a receipt may
+    /// name a unit nothing read names, so a read that left one is not whole
+    /// ([`Self::whole`]), and nothing is retired at once from it.
+    pub unread: usize,
+}
+
+impl Receipts {
+    /// The receipts in the build directory `leaf`, as `fs` reads them: the regular files of the
+    /// real folder [`RECEIPTS`] named sixteen lowercase hex digits and `.json` (a write cut short
+    /// leaves a `.receipt-*.tmp` there), newest first, each written within [`KEPT_FOR`] of the
+    /// newest (an older one is a selection nobody built since, as [`Kept::end`] ages a run), at
+    /// most [`RECEIPTS_MAX`] of them, [`RECEIPT_MAX`] bytes each and [`RECEIPTS_READ_MAX`]
+    /// together; each run as beginning no later than its file was written. A receipt past a
+    /// bound, or that is none ([`Receipt::of_bytes`]), is not taken and is counted
+    /// ([`Self::unread`]). Empty where there is no such folder or it is a link; one that cannot
+    /// be listed is read as one receipt unread.
+    #[must_use]
+    pub fn read_on(fs: &dyn Fs, leaf: &Path) -> Receipts {
+        let dir = leaf.join(RECEIPTS);
+        let mut out = Receipts::default();
+        if fs.meta(&dir).map(|m| m.kind) != Some(Kind::Dir) {
+            return out;
+        }
+        let Some(entries) = fs.list(&dir) else {
+            out.unread = 1;
+            return out;
+        };
+        let mut files: Vec<(SystemTime, String)> = entries
+            .into_iter()
+            .filter_map(|(name, meta)| {
+                let stem = name
+                    .to_str()?
+                    .strip_suffix(".json")
+                    .filter(|s| is_hash(s))?;
+                let meta = meta.filter(|m| m.kind == Kind::File)?;
+                Some((meta.modified, stem.to_owned()))
+            })
+            .collect();
+        let Some(newest) = files.iter().map(|(at, _)| *at).max() else {
+            return out;
+        };
+        files.retain(|(at, _)| newest.duration_since(*at).unwrap_or(Duration::ZERO) <= KEPT_FOR);
+        files.sort_by(|a, b| b.cmp(a));
+        out.unread = files.len().saturating_sub(RECEIPTS_MAX);
+        files.truncate(RECEIPTS_MAX);
+        let mut budget = RECEIPTS_READ_MAX;
+        for (written, stem) in files {
+            let taken = fs
+                .head(&dir.join(format!("{stem}.json")), RECEIPT_MAX + 1)
+                .filter(|bytes| bytes.len() <= RECEIPT_MAX && bytes.len() <= budget)
+                .and_then(|bytes| {
+                    budget -= bytes.len();
+                    Receipt::of_bytes(&bytes)
+                });
+            let Some(mut receipt) = taken else {
+                out.unread += 1;
+                continue;
+            };
+            let written_ms = written
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            receipt.run.began_ms = receipt.run.began_ms.min(written_ms);
+            out.runs.insert(stem, receipt);
+        }
+        out
+    }
+
+    /// Whether the read took every receipt written within [`KEPT_FOR`] of the newest
+    /// ([`Self::unread`]): only then does no receipt name a unit the read does not see.
+    #[must_use]
+    pub const fn whole(&self) -> bool {
+        self.unread == 0
+    }
+
+    /// Each receipt's run.
+    fn used(&self) -> impl Iterator<Item = &Used> {
+        self.runs.values().map(|receipt| &receipt.run)
+    }
+
+    /// [`Self::read_on`] on the real filesystem.
+    #[must_use]
+    pub fn read(leaf: &Path) -> Receipts {
+        Self::read_on(&Disk, leaf)
+    }
+
+    /// Whether the read is whole ([`Self::whole`]) and the receipts of builds begun no earlier
+    /// than `run` began together name every unit `run` names, and it names one: the builds
+    /// behind them used what `run` used, so they speak for it ([`Kept::take_receipts`]).
+    #[must_use]
+    pub fn name_all(&self, run: &Used) -> bool {
+        let since: Vec<&Used> = self.used().filter(|r| r.began_ms >= run.began_ms).collect();
+        let mut units = run.units().peekable();
+        self.whole()
+            && units.peek().is_some()
+            && units.all(|(profile, hash)| {
+                since
+                    .iter()
+                    .any(|r| r.profiles.get(profile).is_some_and(|h| h.contains(hash)))
+            })
+    }
 }
 
 /// What a [`USED`] record holds: the newest run of each scope, and what the run that ended last
@@ -496,6 +740,10 @@ pub struct Kept {
     /// since have been built again in place by a compile no run reports, so it waits the stale
     /// window like any unit no kept run names.
     pub retired: Used,
+    /// A copy of each receipt the record last took ([`Self::take_receipts`]), by its name: what
+    /// the selection's build before used, which `targo` replaces on disk with what its build since
+    /// used. It is no kept run: [`survey`] reads the receipts on disk.
+    pub receipts: BTreeMap<String, Receipt>,
 }
 
 impl Kept {
@@ -556,6 +804,141 @@ impl Kept {
         self.retired.profiles.values().map(BTreeSet::len).sum()
     }
 
+    /// THE BUILDS BEHIND `receipts` ENDED (a `targo` build's holder at its end, or a run whose
+    /// builds' receipts speak for it, `covered`): the record takes a copy of them in place of the
+    /// copies it held ([`Self::receipts`]), and [`Self::retired`] becomes, as of the earliest of
+    /// the builds that retired something began, what the copies of the receipts they replaced
+    /// used (a copy of a selection whose receipt now began later), in each profile they built in
+    /// one variant ([`Receipt::same_variant`]); where `covered` names a scope and when its run
+    /// began, what that scope's kept run used, which goes from the record; and, as of when the
+    /// newest of them began, what each kept run that began more than [`KEPT_FOR`] before it used,
+    /// which goes from the record as [`Self::end`] ages a run; each less every unit a kept run or
+    /// any of `receipts` names. A receipt that is new, or that `targo` withdrew (its selection's
+    /// last build used units nobody knows), retires nothing. Returns how many units that is:
+    /// where nothing was retired and only the copies changed, 0, and what the last end or take
+    /// retired stands. `None` where the record would not change (the copies were these receipts
+    /// already and nothing was retired), and where the read of `receipts` is not whole
+    /// ([`Receipts::whole`]): a receipt it left may name a unit this would retire, so the record
+    /// before, and what it retired, stand.
+    pub fn take_receipts(
+        &mut self,
+        receipts: &Receipts,
+        covered: Option<(&str, u64)>,
+    ) -> Option<usize> {
+        if !receipts.whole() {
+            return None;
+        }
+        let mut dropped: Vec<Used> = Vec::new();
+        let mut since: Option<u64> = None;
+        let as_of = |since: &mut Option<u64>, ms: u64| {
+            *since = Some(since.map_or(ms, |s: u64| s.min(ms)));
+        };
+        for (name, now) in &receipts.runs {
+            let Some(was) = self
+                .receipts
+                .get(name)
+                .filter(|was| was.run.began_ms < now.run.began_ms)
+            else {
+                continue;
+            };
+            let superseded = Used {
+                profiles: was
+                    .run
+                    .profiles
+                    .iter()
+                    .filter(|(profile, _)| was.same_variant(now, profile))
+                    .map(|(profile, hashes)| (profile.clone(), hashes.clone()))
+                    .collect(),
+                ..Used::default()
+            };
+            if !superseded.profiles.is_empty() {
+                dropped.push(superseded);
+                as_of(&mut since, now.run.began_ms);
+            }
+        }
+        if let Some((scope, began_ms)) = covered
+            && let Some(run) = self.runs.remove(scope)
+        {
+            dropped.push(run);
+            as_of(&mut since, began_ms);
+        }
+        let newest = receipts
+            .used()
+            .map(|run| run.began_ms)
+            .chain(covered.map(|(_, began_ms)| began_ms))
+            .max();
+        if let Some(newest) = newest {
+            let window = u64::try_from(KEPT_FOR.as_millis()).unwrap_or(u64::MAX);
+            let aged: Vec<String> = self
+                .runs
+                .iter()
+                .filter(|(_, kept)| kept.began_ms.saturating_add(window) < newest)
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in aged {
+                dropped.extend(self.runs.remove(&name));
+                as_of(&mut since, newest);
+            }
+        }
+        if dropped.is_empty() {
+            if self.receipts == receipts.runs {
+                return None;
+            }
+            self.receipts.clone_from(&receipts.runs);
+            return Some(0);
+        }
+        self.receipts.clone_from(&receipts.runs);
+        let mut retired = Used {
+            began_ms: since.unwrap_or(0),
+            ..Used::default()
+        };
+        for run in dropped {
+            for (profile, hashes) in run.profiles {
+                retired.profiles.entry(profile).or_default().extend(hashes);
+            }
+        }
+        for kept in self.runs.values().chain(receipts.used()) {
+            for (profile, hashes) in &kept.profiles {
+                if let Some(gone) = retired.profiles.get_mut(profile) {
+                    gone.retain(|hash| !hashes.contains(hash));
+                }
+            }
+        }
+        retired.profiles.retain(|_, hashes| !hashes.is_empty());
+        self.retired = retired;
+        Some(self.retired.profiles.values().map(BTreeSet::len).sum())
+    }
+
+    /// CHANGE THE RECORD at the top of the build directory `leaf` ([`USED`]) by `change`, holding
+    /// its lock ([`USED_LOCK`]) from the read to the write: the record as it stands (an empty one
+    /// where there is none or it cannot be read, [`Self::read`]) is changed, and kept
+    /// ([`Self::keep`]) where `change` answers. `None` where it did not, and the record stands.
+    ///
+    /// # Errors
+    /// The lock was not taken within [`USED_LOCK_WITHIN`] (or could not be: `leaf` is no real
+    /// directory), or the write failed: the record before stands.
+    pub fn update<R>(
+        leaf: &Path,
+        change: impl FnOnce(&mut Kept) -> Option<R>,
+    ) -> std::io::Result<Option<R>> {
+        Self::update_within(leaf, USED_LOCK_WITHIN, change)
+    }
+
+    /// [`Self::update`], waiting at most `within` for the lock.
+    pub(crate) fn update_within<R>(
+        leaf: &Path,
+        within: Duration,
+        change: impl FnOnce(&mut Kept) -> Option<R>,
+    ) -> std::io::Result<Option<R>> {
+        let _held = crate::lock::lock_file_within(&leaf.join(USED_LOCK), within)?;
+        let mut kept = Kept::read(leaf);
+        let Some(changed) = change(&mut kept) else {
+            return Ok(None);
+        };
+        kept.keep(leaf)?;
+        Ok(Some(changed))
+    }
+
     /// Every profile the record names, a kept run's or a retired unit's.
     #[must_use]
     pub fn profiles(&self) -> BTreeSet<String> {
@@ -566,8 +949,8 @@ impl Kept {
             .collect()
     }
 
-    /// The record as [`USED`] holds it: schema 2, each kept run by its scope, and what the last
-    /// retired.
+    /// The record as [`USED`] holds it: schema 2, each kept run by its scope, what the last
+    /// retired, and, where it took any, its copies of the receipts (`receipts`, by name).
     #[must_use]
     pub fn encode(&self) -> String {
         let mut runs = aterm_json::Map::new();
@@ -578,14 +961,23 @@ impl Kept {
         o.insert("schema".to_owned(), aterm_json::Value::from(2u64));
         o.insert("runs".to_owned(), aterm_json::Value::Object(runs));
         o.insert("retired".to_owned(), self.retired.value());
+        if !self.receipts.is_empty() {
+            let mut receipts = aterm_json::Map::new();
+            for (name, receipt) in &self.receipts {
+                receipts.insert(name.clone(), receipt.value());
+            }
+            o.insert("receipts".to_owned(), aterm_json::Value::Object(receipts));
+        }
         aterm_json::to_string(&aterm_json::Value::Object(o)).unwrap_or_default()
     }
 
     /// The record `bytes` holds; `None` for bytes that are not [`Self::encode`]'s: another schema
     /// (the record before this one, schema 1, among them), no runs, more runs than
     /// [`Self::end`] ever leaves ([`KEPT_RUNS`]: what a run's end does with a record is bounded
-    /// by the runs it holds, so one that holds more is not read at all), nothing retired, or a
-    /// run that is none ([`Used::of_value`]).
+    /// by the runs it holds, so one that holds more is not read at all), nothing retired, more
+    /// receipt copies than a read takes ([`RECEIPTS_MAX`]) or one not named as a receipt is, or a
+    /// run or copy that is none ([`Used::of_value`], [`Receipt::of_value`]). A record with no
+    /// `receipts` holds no copy.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Kept> {
         let v: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
@@ -599,9 +991,22 @@ impl Kept {
         let mut kept = Kept {
             runs: BTreeMap::new(),
             retired: Used::of_value(v.get("retired")?)?,
+            receipts: BTreeMap::new(),
         };
         for (scope, run) in runs {
             kept.runs.insert(scope.clone(), Used::of_value(run)?);
+        }
+        if let Some(receipts) = v.get("receipts") {
+            let receipts = receipts.as_object()?;
+            if receipts.len() > RECEIPTS_MAX {
+                return None;
+            }
+            for (name, run) in receipts {
+                if !is_hash(name) {
+                    return None;
+                }
+                kept.receipts.insert(name.clone(), Receipt::of_value(run)?);
+            }
         }
         Some(kept)
     }
@@ -783,55 +1188,65 @@ fn old_compilers(survey: &Survey, profile: &Profile) -> Vec<bool> {
 
 /// Reads the build directory `leaf`: its profiles, the compiler that last built there, and the
 /// units its kept runs used and the last of them retired ([`USED`]), the oldest kept run's
-/// beginning and the retiring run's each read no later than the record was written.
+/// beginning and the retiring run's each read no later than the record was written. Each receipt
+/// `targo` kept there ([`Receipts::read_on`]) is a kept run beside the record's, read no later
+/// than its file was written; where there is no record and no receipt nothing is superseded.
+/// Where the read of the receipts is not whole ([`Receipts::whole`]), nothing the record retired
+/// goes at once: each unit waits the stale window as one no kept run names.
 pub fn survey(fs: &dyn Fs, leaf: &Path, profiles: &[PathBuf], store: Option<&Path>) -> Survey {
     let record = Kept::read_on(fs, leaf);
+    let receipts = Receipts::read_on(fs, leaf);
     let at = |ms: u64, written: SystemTime| {
         SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_millis(ms))
             .map(|began| began.min(written))
     };
-    let began = record.as_ref().and_then(|(written, kept)| {
+    let recorded = record.as_ref().and_then(|(written, kept)| {
         let oldest = kept.runs.values().map(|run| run.began_ms).min()?;
         at(oldest, *written)
     });
-    let retired_before = record
-        .as_ref()
-        .and_then(|(written, kept)| at(kept.retired.began_ms, *written));
+    let receipted = receipts
+        .used()
+        .map(|run| run.began_ms)
+        .min()
+        .and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)));
+    let began = recorded.into_iter().chain(receipted).min();
+    // What the record retired goes at once only while the receipts read whole: one left unread
+    // may name a retired unit that a build since used.
+    let retiring = record.as_ref().filter(|_| receipts.whole());
+    let retired_before = retiring.and_then(|(written, kept)| at(kept.retired.began_ms, *written));
     let named = |run: &Used, name: &str| run.profiles.get(name).cloned().unwrap_or_default();
+    let runs: Vec<&Used> = record
+        .iter()
+        .flat_map(|(_, kept)| kept.runs.values())
+        .chain(receipts.used())
+        .collect();
+    let judged = record.is_some() || !receipts.runs.is_empty();
     Survey {
         last_built: last_built(fs, leaf, store),
         profiles: profiles
             .iter()
             .map(|p| {
                 let mut read = profile(fs, p);
-                if let Some((_, kept)) = &record {
+                if judged {
                     let name = p
                         .strip_prefix(leaf)
                         .ok()
                         .and_then(Path::to_str)
                         .map(|n| n.replace(std::path::MAIN_SEPARATOR, "/"))
                         .unwrap_or_default();
-                    read.used = Some(
-                        kept.runs
-                            .values()
-                            .flat_map(|run| named(run, &name))
-                            .collect(),
-                    );
-                    read.retired = named(&kept.retired, &name);
+                    read.used = Some(runs.iter().flat_map(|run| named(run, &name)).collect());
+                    if let Some((_, kept)) = retiring {
+                        read.retired = named(&kept.retired, &name);
+                    }
                 }
                 read
             })
             .collect(),
-        members: record
-            .as_ref()
-            .map(|(_, kept)| {
-                kept.runs
-                    .values()
-                    .flat_map(|run| run.members.iter().cloned())
-                    .collect()
-            })
-            .unwrap_or_default(),
+        members: runs
+            .iter()
+            .flat_map(|run| run.members.iter().cloned())
+            .collect(),
         began,
         retired_before,
     }
@@ -940,52 +1355,60 @@ fn folder_units(fs: &dyn Fs, dir: &Path) -> Vec<Unit> {
         if unit_hash(&name).is_some() {
             continue;
         }
-        for folder in subdirs(fs, &package) {
-            let Some(hash) = folder
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|h| is_hash(h))
-                .map(str::to_owned)
-            else {
-                continue;
-            };
-            let fingerprint = folder.join("fingerprint");
-            if fs.meta(&fingerprint).is_none_or(|m| m.kind != Kind::Dir) {
-                continue;
-            }
-            let Some(listed) = fs.list(&folder) else {
-                continue;
-            };
-            let entries: Vec<PathBuf> = listed
-                .into_iter()
-                .filter(|(n, _)| n != "fingerprint")
-                .map(|(n, _)| folder.join(n))
-                .collect();
-            let out = folder.join("out");
-            let outputs: Vec<String> = if entries.contains(&out) {
-                let Some(listed) = fs.list(&out) else {
-                    continue;
-                };
-                listed
-                    .into_iter()
-                    .filter_map(|(n, _)| n.to_str().map(str::to_owned))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let Some(kind) = kind_of(fs, &name, &fingerprint, &outputs) else {
-                continue;
-            };
-            units.push(Unit {
-                rustc: compiler(fs, &fingerprint),
-                kind,
-                fingerprint: stamp(fs, &fingerprint),
-                artifacts: entries.iter().map(|p| stamp(fs, p)).collect(),
-                hash,
-                package: name.clone(),
-                folder: Some(folder),
-            });
+        units.extend(package_units(fs, &package, &name));
+    }
+    units
+}
+
+/// The units of the package `name` whose folder is `package` (`build/<pkg>`), as
+/// [`folder_units`] reads them.
+fn package_units(fs: &dyn Fs, package: &Path, name: &str) -> Vec<Unit> {
+    let mut units = Vec::new();
+    for folder in subdirs(fs, package) {
+        let Some(hash) = folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|h| is_hash(h))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let fingerprint = folder.join("fingerprint");
+        if fs.meta(&fingerprint).is_none_or(|m| m.kind != Kind::Dir) {
+            continue;
         }
+        let Some(listed) = fs.list(&folder) else {
+            continue;
+        };
+        let entries: Vec<PathBuf> = listed
+            .into_iter()
+            .filter(|(n, _)| n != "fingerprint")
+            .map(|(n, _)| folder.join(n))
+            .collect();
+        let out = folder.join("out");
+        let outputs: Vec<String> = if entries.contains(&out) {
+            let Some(listed) = fs.list(&out) else {
+                continue;
+            };
+            listed
+                .into_iter()
+                .filter_map(|(n, _)| n.to_str().map(str::to_owned))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let Some(kind) = kind_of(fs, name, &fingerprint, &outputs) else {
+            continue;
+        };
+        units.push(Unit {
+            rustc: compiler(fs, &fingerprint),
+            kind,
+            fingerprint: stamp(fs, &fingerprint),
+            artifacts: entries.iter().map(|p| stamp(fs, p)).collect(),
+            hash,
+            package: name.to_owned(),
+            folder: Some(folder),
+        });
     }
     units
 }
@@ -1327,6 +1750,430 @@ fn sysroot_named(info: &[u8]) -> Option<PathBuf> {
     let mut found = found.into_iter();
     let sysroot = found.next()?;
     found.next().is_none().then_some(sysroot)
+}
+
+/// The hash of each unit of `package` whose output cargo copied out of the build directory `leaf`
+/// to `file` under the target directory's `profile` ([`Used::add_uplifted`]): the unit
+/// `<profile>/build/<package>/<hash>` whose `out/` holds the file's twin under its crate name
+/// (each `-` an `_`), the same file or its copy ([`twins`]). None where no unit holds a twin.
+#[must_use]
+pub fn uplifted_units(leaf: &Path, profile: &str, package: &str, file: &Path) -> Vec<String> {
+    if !plain(package) || !profile.split('/').all(plain) {
+        return Vec::new();
+    }
+    let Some(stem) = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| plain(n))
+        .map(|n| n.replace('-', "_"))
+    else {
+        return Vec::new();
+    };
+    let Ok(copy) = std::fs::symlink_metadata(file) else {
+        return Vec::new();
+    };
+    let dir = leaf.join(profile).join("build").join(package);
+    let Ok(units) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut hashes = Vec::new();
+    for unit in units.flatten() {
+        let Some(hash) = unit
+            .file_name()
+            .to_str()
+            .filter(|h| is_hash(h))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let twin = std::fs::symlink_metadata(dir.join(&hash).join("out").join(&stem));
+        if twin.is_ok_and(|twin| twins(&copy, &twin)) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// The most of one fingerprint's JSON [`SecondHashes`] reads:a unit's `deps` hold one short
+/// entry for each dependency, some kilobytes for the widest crate. A longer one is not read.
+const FINGERPRINT_MAX: usize = 1 << 20;
+
+/// The most of a unit's hash file read ([`SecondHashes`]): sixteen hex digits.
+const HASH_FILE_MAX: usize = 64;
+
+/// The deepest chain of `deps` [`SecondHashes`] follows: a dependency graph's depth, with room.
+const DEPTH_MAX: usize = 64;
+
+/// The inputs of a fingerprint's JSON (targo's `Fingerprint`, `compiler/fingerprint/mod.rs`),
+/// in the order [`SecondHashes`] compares them; any other field but `deps` and `local` after
+/// them, by name, and `deps` last, as targo's own `compare` does: a unit's own input that moved
+/// is its cause before a dependency's.
+const INPUTS: [&str; 9] = [
+    "rustc",
+    "features",
+    "declared_features",
+    "target",
+    "profile",
+    "path",
+    "rustflags",
+    "config",
+    "compile_kind",
+];
+
+/// WHAT MOVED between two builds of one unit ([`SecondHashes::second_hash`]): the package whose
+/// own input differs (the unit's, or the dependency's the walk down `deps` reached) and which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    /// The package whose input moved, as the build directory names it (`aterm-serde`).
+    pub package: String,
+    /// The input: a fingerprint field (`features`, `profile`, …, one targo adds by its name);
+    /// `deps` where the edge itself moved (a dependency added or removed, another package under
+    /// its name, its `public` flag, or a dependency's unit that is gone); `folder` where no
+    /// input but the unit's own folder differs (`local`, which names it, alone); `unread` where
+    /// a fingerprint could not be read.
+    pub input: String,
+    /// What it moved from and to, or which edge, in a few words.
+    pub detail: String,
+}
+
+/// A UNIT A COMPILE BUILT BESIDE ANOTHER OF ITS PACKAGE, KIND ([`Unit::kind`]) AND SOURCE (its
+/// fingerprint's `path`): the second hash, the unit it is compared with (the other of its kind
+/// and source written last) and what moved between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondHash {
+    pub package: String,
+    pub kind: String,
+    /// The unit the compile built.
+    pub hash: String,
+    /// The other unit of its package and kind it is compared with.
+    pub other: String,
+    pub moved: Moved,
+}
+
+/// The unit of the layout that keeps one folder per unit the output `file` of a compile into the
+/// build directory `leaf` is in: `<profile>/build/<pkg>/<hash>/…` read as its profile (`debug`,
+/// `aarch64-apple-darwin/debug`), package and hash; `None` for a file of the other layout or
+/// outside `leaf`.
+#[must_use]
+pub fn folder_unit_of(leaf: &Path, file: &Path) -> Option<(String, String, String)> {
+    let rel = file.strip_prefix(leaf).ok()?;
+    let parts: Vec<&str> = rel
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => n.to_str(),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let at = parts
+        .iter()
+        .position(|p| *p == "build")
+        .filter(|at| *at > 0)?;
+    let package = *parts.get(at + 1)?;
+    let hash = *parts.get(at + 2)?;
+    (plain(package) && unit_hash(package).is_none() && is_hash(hash) && parts.len() > at + 3)
+        .then(|| (parts[..at].join("/"), package.to_owned(), hash.to_owned()))
+}
+
+/// THE SECOND-HASH READER of one profile's folder (`<leaf>/debug`): for a unit a compile built,
+/// the other unit of its package, kind and source and the first input that moved between them
+/// ([`Self::second_hash`]). It lists the unit's `build/<package>` folder, reads the
+/// fingerprints' JSON, and to follow a `deps` entry down reads the hash file of each unit of the
+/// profile, and of the host profile its host dependencies lie in ([`Self::with_host`]), once
+/// ([`Self::by_hash`]): an entry holds the name the dependent uses (`serde` for the package
+/// `aterm-serde`) and the hash the dependency's hash file holds, never its folder. It walks
+/// nothing below a unit's fingerprint and removes nothing.
+pub struct SecondHashes<'a> {
+    fs: &'a dyn Fs,
+    profile: PathBuf,
+    /// The host profile's folder where `profile` is a cross target's (`<leaf>/debug` beside
+    /// `<leaf>/<triple>/debug`): its proc-macros and build scripts are built there.
+    host: Option<PathBuf>,
+    /// Each unit's hash, as its hash file holds it, to its package and fingerprint JSON.
+    index: std::cell::OnceCell<BTreeMap<String, (String, PathBuf)>>,
+}
+
+impl<'a> SecondHashes<'a> {
+    #[must_use]
+    pub fn new(fs: &'a dyn Fs, profile: &Path) -> Self {
+        Self {
+            fs,
+            profile: profile.to_path_buf(),
+            host: None,
+            index: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The reader of a cross target's profile whose host dependencies (proc-macros, build
+    /// scripts) lie in the host profile's folder `host`: a `deps` entry is found in either.
+    #[must_use]
+    pub fn with_host(mut self, host: &Path) -> Self {
+        if host != self.profile {
+            self.host = Some(host.to_path_buf());
+        }
+        self
+    }
+
+    /// THE UNIT `hash` OF `package` IS A SECOND HASH where the profile holds another unit of its
+    /// package and kind built from the same source (the same fingerprint `path`: another version
+    /// of a registry crate is another package, not a second hash of it): compared with the one
+    /// of those written last (by its fingerprint), the first input that moved, followed down
+    /// `deps` to the dependency whose own input moved. `None` where it is the first unit of its
+    /// kind and source, or its folder cannot be read; a unit whose fingerprint JSON cannot be
+    /// read is compared with the other of its kind written last, its input `unread`, and another
+    /// whose JSON cannot be read is passed over, its source unknown.
+    #[must_use]
+    pub fn second_hash(&self, package: &str, hash: &str) -> Option<SecondHash> {
+        if !plain(package) || !is_hash(hash) {
+            return None;
+        }
+        let units = package_units(self.fs, &self.profile.join("build").join(package), package);
+        let built = units.iter().find(|u| u.hash == hash)?;
+        let mut others: Vec<&Unit> = units
+            .iter()
+            .filter(|u| u.kind == built.kind && u.hash != built.hash)
+            .collect();
+        others
+            .sort_by(|a, b| (b.fingerprint.newest, &b.hash).cmp(&(a.fingerprint.newest, &a.hash)));
+        let (other, moved) = match self.json_of(&built.fingerprint.path) {
+            Some(new) => others.into_iter().find_map(|other| {
+                let old = self.json_of(&other.fingerprint.path)?;
+                (old.get("path") == new.get("path"))
+                    .then(|| (other, self.moved(package, &new, &old, 0)))
+            })?,
+            None => (
+                *others.first()?,
+                Moved {
+                    package: package.to_owned(),
+                    input: "unread".to_owned(),
+                    detail: "a fingerprint's JSON could not be read".to_owned(),
+                },
+            ),
+        };
+        Some(SecondHash {
+            package: package.to_owned(),
+            kind: built.kind.clone(),
+            hash: built.hash.clone(),
+            other: other.hash.clone(),
+            moved,
+        })
+    }
+
+    /// The fingerprint JSON of the unit whose fingerprint folder is `dir`: its first ordinary
+    /// `.json` by name (not a native output record, `outputs-…`).
+    fn json_of(&self, dir: &Path) -> Option<aterm_json::Value> {
+        let mut names: Vec<String> = self
+            .fs
+            .list(dir)?
+            .into_iter()
+            .filter(|(_, m)| m.is_some_and(|m| m.kind == Kind::File))
+            .filter_map(|(n, _)| n.to_str().map(str::to_owned))
+            .filter(|n| n.ends_with(".json") && !n.starts_with("outputs-"))
+            .collect();
+        names.sort();
+        self.read_json(&dir.join(names.first()?))
+    }
+
+    /// The JSON object at `file`, read whole up to [`FINGERPRINT_MAX`].
+    fn read_json(&self, file: &Path) -> Option<aterm_json::Value> {
+        aterm_uds::progress::tick();
+        let bytes = self.fs.head(file, FINGERPRINT_MAX + 1)?;
+        (bytes.len() <= FINGERPRINT_MAX)
+            .then(|| aterm_json::from_slice::<aterm_json::Value>(&bytes).ok())
+            .flatten()
+            .filter(aterm_json::Value::is_object)
+    }
+
+    /// Each unit of the profile and of its host profile ([`Self::with_host`]) by the hash its hash
+    /// file holds (the hex of the fingerprint's hash, `lib-aterm_json` beside
+    /// `lib-aterm_json.json`), read once: its package and its fingerprint JSON.
+    fn by_hash(&self) -> &BTreeMap<String, (String, PathBuf)> {
+        self.index.get_or_init(|| {
+            let mut index = BTreeMap::new();
+            let packages: Vec<PathBuf> = std::iter::once(&self.profile)
+                .chain(self.host.as_ref())
+                .flat_map(|profile| subdirs(self.fs, &profile.join("build")).collect::<Vec<_>>())
+                .collect();
+            for package in packages {
+                let Some(name) = package.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                for folder in subdirs(self.fs, &package) {
+                    let fingerprint = folder.join("fingerprint");
+                    for (file, meta) in self.fs.list(&fingerprint).unwrap_or_default() {
+                        let Some(file) = file.to_str() else {
+                            continue;
+                        };
+                        if meta.is_none_or(|m| m.kind != Kind::File)
+                            || file == "invoked.timestamp"
+                            || file.starts_with("dep-")
+                            || file.starts_with("output-")
+                            || file.ends_with(".json")
+                        {
+                            continue;
+                        }
+                        let Some(head) = self.fs.head(&fingerprint.join(file), HASH_FILE_MAX)
+                        else {
+                            continue;
+                        };
+                        let Some(hex) = std::str::from_utf8(&head)
+                            .ok()
+                            .map(str::trim)
+                            .filter(|h| is_hash(h))
+                        else {
+                            continue;
+                        };
+                        index.insert(
+                            hex.to_owned(),
+                            (name.to_owned(), fingerprint.join(format!("{file}.json"))),
+                        );
+                    }
+                }
+            }
+            index
+        })
+    }
+
+    /// The first input of `package` that moved from `old` to `new`, each a fingerprint's JSON:
+    /// its own [`INPUTS`], then any other field but `deps` and `local` (the unit's own dep-info
+    /// path, which names its folder and so differs in every pair), then the first `deps` entry
+    /// that differs, followed down to the dependency whose own input moved.
+    fn moved(
+        &self,
+        package: &str,
+        new: &aterm_json::Value,
+        old: &aterm_json::Value,
+        depth: usize,
+    ) -> Moved {
+        let at = |input: &str, detail: String| Moved {
+            package: package.to_owned(),
+            input: input.to_owned(),
+            detail,
+        };
+        let fields = |v: &aterm_json::Value| -> BTreeSet<String> {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let mut others: Vec<String> = fields(new)
+            .union(&fields(old))
+            .filter(|f| !INPUTS.contains(&f.as_str()) && *f != "deps" && *f != "local")
+            .cloned()
+            .collect();
+        others.sort();
+        for field in INPUTS.iter().map(|f| (*f).to_owned()).chain(others) {
+            let (was, is) = (old.get(&field), new.get(&field));
+            if was != is {
+                return at(&field, format!("{} -> {}", shown(was), shown(is)));
+            }
+        }
+        let new_deps = deps_of(new);
+        let old_deps = deps_of(old);
+        let mut matched = vec![false; old_deps.len()];
+        for dep in &new_deps {
+            let Some(i) =
+                (0..old_deps.len()).find(|i| !matched[*i] && old_deps[*i].name == dep.name)
+            else {
+                return at("deps", format!("{} added", dep.name));
+            };
+            matched[i] = true;
+            let was = &old_deps[i];
+            if was.pkg_id != dep.pkg_id {
+                return at("deps", format!("{}: another package", dep.name));
+            }
+            if was.public != dep.public {
+                return at(
+                    "deps",
+                    format!("{}: public {} -> {}", dep.name, was.public, dep.public),
+                );
+            }
+            if was.hash == dep.hash {
+                continue;
+            }
+            if depth >= DEPTH_MAX {
+                return at(
+                    "deps",
+                    format!("{}: deeper than {DEPTH_MAX} dependencies", dep.name),
+                );
+            }
+            let index = self.by_hash();
+            let (Some((to, new_json)), Some((_, old_json))) = (
+                index.get(&hash_hex(dep.hash)),
+                index.get(&hash_hex(was.hash)),
+            ) else {
+                return at("deps", format!("{}: a build of it is gone", dep.name));
+            };
+            let (Some(n), Some(o)) = (self.read_json(new_json), self.read_json(old_json)) else {
+                return Moved {
+                    package: to.clone(),
+                    input: "unread".to_owned(),
+                    detail: "a fingerprint's JSON could not be read".to_owned(),
+                };
+            };
+            return self.moved(to, &n, &o, depth + 1);
+        }
+        if let Some(gone) = old_deps
+            .iter()
+            .zip(&matched)
+            .find(|(_, m)| !**m)
+            .map(|(d, _)| d)
+        {
+            return at("deps", format!("{} removed", gone.name));
+        }
+        at(
+            "folder",
+            "no input but the unit's own folder (`local`) differs".to_owned(),
+        )
+    }
+}
+
+/// One entry of a fingerprint's `deps` (targo writes `[pkg_id, name, public, hash]`).
+struct Dep {
+    pkg_id: Option<aterm_json::Value>,
+    name: String,
+    public: bool,
+    hash: Option<u64>,
+}
+
+/// The `deps` of a fingerprint's JSON, in order; an entry of another shape is read as far as it
+/// goes (no name is the empty one, no hash none), so it still compares.
+fn deps_of(v: &aterm_json::Value) -> Vec<Dep> {
+    v.get("deps")
+        .and_then(aterm_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|d| Dep {
+            pkg_id: d.get_index(0).cloned(),
+            name: d
+                .get_index(1)
+                .and_then(aterm_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            public: d
+                .get_index(2)
+                .and_then(aterm_json::Value::as_bool)
+                .unwrap_or(false),
+            hash: d.get_index(3).and_then(aterm_json::Value::as_u64),
+        })
+        .collect()
+}
+
+/// The hex a unit's hash file holds for the fingerprint hash `hash` (targo's `to_hex`: its
+/// little-endian bytes); none for no hash.
+fn hash_hex(hash: Option<u64>) -> String {
+    hash.map(|h| h.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect())
+        .unwrap_or_default()
+}
+
+/// A field's value in a few words: its JSON, cut at 120 characters; `absent` for none.
+fn shown(v: Option<&aterm_json::Value>) -> String {
+    let Some(v) = v else {
+        return "absent".to_owned();
+    };
+    let text = aterm_json::to_string(v).unwrap_or_default();
+    match text.char_indices().nth(120) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
 }
 
 /// [`Fs`] on the real filesystem.

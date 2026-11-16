@@ -3143,9 +3143,17 @@ mod bell_parks {
         until_within(MUST_HAPPEN, what, || seen().then_some(()));
     }
 
+    /// A private bell, started as ServingFd::enter starts the process's: an arm never starts one.
+    #[track_caller]
+    fn started_bell() -> Bell {
+        let bell = Bell::new();
+        assert!(bell.start(), "the hang-up bell starts on this platform");
+        bell
+    }
+
     /// A private bell whose thread has ended, seen through the ring of an arm standing then.
     fn ended_bell() -> Bell {
-        let bell = Bell::new();
+        let bell = started_bell();
         let (near, _far) = CtlStream::pair().expect("socket pair");
         let (ring, rung) = std::sync::mpsc::sync_channel(1);
         let armed = bell.arm(&near, ring).expect("the bell starts");
@@ -3244,10 +3252,12 @@ mod bell_parks {
                 park.lane = Lane {
                     slice: sliced,
                     hung_up: gone_after_two_slices,
+                    bell: None,
                 };
                 park.belled = Lane {
                     slice: belled,
                     hung_up: gone_after_two_slices,
+                    bell: None,
                 };
                 park.bell = &bell;
                 let mut looks = 0;
@@ -3288,7 +3298,7 @@ mod bell_parks {
         let (_armed_client, armed_server) = CtlStream::pair().expect("socket pair");
         let sub = Subscription::single(&watchers);
         let wake = sub.bell();
-        let armed = counted_park(std::sync::Arc::new(Bell::new()), armed_server, sub);
+        let armed = counted_park(std::sync::Arc::new(started_bell()), armed_server, sub);
         until("the armed park to wait, or to end", || {
             counts().0 == 1 || armed.is_finished()
         });
@@ -3335,7 +3345,7 @@ mod bell_parks {
         let watchers = std::sync::Arc::<Watchers>::default();
         let sub = Subscription::single(&watchers);
         let alive = || false;
-        let bell = Bell::new();
+        let bell = started_bell();
         let mut park = Park::new(&sub, &alive, OnHangup::Abort, Stretch::None);
         park.bell = &bell;
         let mut tries = Vec::new();
@@ -3386,7 +3396,7 @@ mod bell_parks {
         }
 
         let (client, server) = CtlStream::pair().expect("socket pair");
-        let bell = std::sync::Arc::new(Bell::new());
+        let bell = std::sync::Arc::new(started_bell());
         let lane_bell = std::sync::Arc::clone(&bell);
         // An unscoped lane, so a failure below is reported at its hang detector rather than
         // after the park's own ten minutes.
@@ -3399,10 +3409,12 @@ mod bell_parks {
             park.lane = Lane {
                 slice: sliced,
                 hung_up: caller_hung_up,
+                bell: None,
             };
             park.belled = Lane {
                 slice: belled,
                 hung_up: caller_hung_up,
+                bell: None,
             };
             park.bell = &lane_bell;
             let ended = park.run(

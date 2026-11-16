@@ -1055,7 +1055,7 @@ fn a_call_with_when_belongs_to_the_subagent_whose_prompt_holds_it() {
 
 /// A custom mode's `script` answers only a conversation whose first prompt holds a step's `when`,
 /// step by step; every other conversation, `toolstart` in it or not, is the mode's replies', so a
-/// lane can script one session (aterm's disk worker) beside tabs its replies answer.
+/// lane can script one session beside tabs its replies answer.
 #[test]
 fn a_custom_scripts_keyed_steps_answer_only_their_own_conversation() {
     let script = J::parse(

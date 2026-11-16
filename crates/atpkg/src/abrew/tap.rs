@@ -1490,10 +1490,11 @@ fn livecheck_block_open(line: &str) -> bool {
 /// a block's shape is outside the line scanner's subset (no
 /// plain `url`, interpolation, unterminated block).
 ///
-/// (name, url, explicit version, livecheck block)
+/// (name, url, explicit version, git tag, livecheck block)
 pub type ResourceStanza = (
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<super::formula::LivecheckSpec>,
 );
@@ -1539,6 +1540,7 @@ pub fn parse_resource_stanzas(text: &str) -> Option<Vec<ResourceStanza>> {
         }
         let collect = !on_stack.iter().any(|&(_, other)| other);
         let mut url: Option<String> = None;
+        let mut tag: Option<String> = None;
         let mut version: Option<String> = None;
         let mut livecheck: Option<super::formula::LivecheckSpec> = None;
         let mut lc_seen = false;
@@ -1576,6 +1578,24 @@ pub fn parse_resource_stanzas(text: &str) -> Option<Vec<ResourceStanza>> {
                 livecheck = Some(parse_livecheck_block(&block)?);
                 continue;
             }
+            // The `tag:` spec of a git resource (its URL
+            // line or a continuation line): brew detects
+            // the resource version from the tag, not the
+            // URL (Version.detect fetches :tag first).
+            if tag.is_none()
+                && let Some(rest) = it
+                    .strip_prefix("tag:")
+                    .or_else(|| it.split(", tag:").nth(1))
+                && let Some(t) = rest
+                    .trim_start()
+                    .strip_prefix('"')
+                    .and_then(|r| r.split('"').next())
+            {
+                if t.contains("#{") {
+                    return None;
+                }
+                tag = Some(t.to_string());
+            }
             if url.is_none()
                 && let Some(u) = cask_quoted(it, "url")
             {
@@ -1594,7 +1614,7 @@ pub fn parse_resource_stanzas(text: &str) -> Option<Vec<ResourceStanza>> {
         }
         if collect {
             let url = url?;
-            out.push((name, url, version, livecheck));
+            out.push((name, url, version, tag, livecheck));
         }
     }
     Some(out)
@@ -2133,13 +2153,11 @@ fn parse_plist_shape(params: &str, lines: &[String]) -> Option<super::formula::P
         .or_else(|| tail.strip_prefix(".short_version"))
     {
         (PlistProp::Short, r)
-    } else if let Some(r) = tail
-        .strip_prefix("&.version")
-        .or_else(|| tail.strip_prefix(".version"))
-    {
-        (PlistProp::Bundle, r)
     } else {
-        return None;
+        let r = tail
+            .strip_prefix("&.version")
+            .or_else(|| tail.strip_prefix(".version"))?;
+        (PlistProp::Bundle, r)
     };
     let regex = if rest.is_empty() {
         false

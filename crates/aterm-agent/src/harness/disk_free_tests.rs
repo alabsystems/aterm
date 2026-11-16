@@ -38,6 +38,19 @@ impl Home {
         std::fs::write(dir.join("blob"), vec![7u8; len]).expect("cache file");
         dir
     }
+
+    /// [`Home::cache`], the folder `rel`'s first two components name (`.cache/<name>`) tagged a
+    /// cache by its tool ([`CACHEDIR_TAG`]), so the pass may take it ([`evidence`]).
+    fn tagged(&self, rel: &str, len: usize) -> PathBuf {
+        let dir = self.cache(rel, len);
+        let top: PathBuf = rel.split('/').take(2).collect();
+        std::fs::write(
+            self.path.join(top).join(CACHEDIR_TAG),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# a test tool's cache\n",
+        )
+        .expect("a cache tag");
+        dir
+    }
 }
 
 #[cfg(unix)]
@@ -400,7 +413,14 @@ fn revoked_index_permission_reports_actual_partial_bytes_and_keeps_remaining_pay
         }
     };
     let removed = super::super::target::remove_unmanaged_tree(&path, admitted.id, &mut permit);
-    let verdict = record_removal(&admitted, removed, &w, &mut |_| true, "fixture removal");
+    let verdict = record_removal(
+        &admitted,
+        &admitted.path,
+        removed,
+        &w,
+        &mut |_| true,
+        "fixture removal",
+    );
     let Verdict::Failed { freed, .. } = verdict else {
         panic!("{verdict:?}");
     };
@@ -936,6 +956,7 @@ fn a_partial_removal_keeps_both_the_removal_and_completion_record_failure() {
         let mut attempted = Vec::new();
         let verdict = record_removal(
             &admitted,
+            &admitted.path,
             Ok(done),
             &w,
             &mut |line| {
@@ -1101,22 +1122,1295 @@ fn a_survey_lists_what_the_roots_hold_that_may_go_largest_first_and_removes_noth
     }
 }
 
-/// WHAT A WORKER REMOVED IS ITS OWN ROWS' BYTES: another session's rows, a refusal and an intent
-/// count for nothing, so the figure can differ from the volume's rise.
+/// One day, in seconds.
+#[cfg(not(windows))]
+const DAY: i64 = 86_400;
+
+/// The free bytes the pass's tests reclaim up to, and a free figure short of it.
+#[cfg(not(windows))]
+const GOAL: u64 = 100 << 30;
+#[cfg(not(windows))]
+const SHORT: Option<u64> = Some(1 << 30);
+
+/// What a folder the pass may take holds: over its floor.
+#[cfg(not(windows))]
+const BIG: usize = 2 << 20;
+
+/// A wall clock no test reaches: [`PASS_WALL`] is a budget of the product's, and a test
+/// process stalled past it would be cut and fail on what it removed.
+#[cfg(not(windows))]
+const NO_WALL: Duration = Duration::from_secs(3600);
+
+/// The hang detector of a wait for something that must happen.
+#[cfg(not(windows))]
+const HANG: Duration = Duration::from_secs(60);
+
+/// [`world`] at the clock `now`.
+#[cfg(not(windows))]
+fn at<'a>(
+    home: &'a Home,
+    processes: discover::Processes<'a>,
+    mounts: &'a Table,
+    now: i64,
+) -> World<'a> {
+    World {
+        now,
+        ..world(home, processes, mounts)
+    }
+}
+
+/// A dater for a pass that must date nothing off the look's thread: it fails the test.
+#[cfg(not(windows))]
+fn no_dater(path: &Path, _: &Reading) -> Dated {
+    panic!("{} was dated through the guard", path.display())
+}
+
+/// The reads of a pass that dates its guarded children through `dater`, under no wall clock.
+#[cfg(not(windows))]
+fn dating(dater: Dater<'_>) -> Reads<'_> {
+    Reads {
+        dater,
+        wall: NO_WALL,
+        wait: HANG,
+    }
+}
+
+/// The reads of a pass over `.cache` alone, whose children are read in place.
+#[cfg(not(windows))]
+fn in_place() -> Reads<'static> {
+    dating(&no_dater)
+}
+
+/// One pass over `w` up to [`GOAL`], free space read through `measure`, with every row it
+/// journalled.
+#[cfg(not(windows))]
+fn swept(
+    w: &World<'_>,
+    reads: &Reads<'_>,
+    measure: &mut dyn FnMut() -> Option<u64>,
+) -> (Passed, Vec<Value>) {
+    let mut rows = Vec::new();
+    let passed = pass(w, GOAL, reads, measure, &mut |r| {
+        rows.push(aterm_json::from_str::<Value>(r).expect("a row is one JSON object"));
+        true
+    });
+    (passed, rows)
+}
+
+/// The paths a pass removed, in the order it removed them.
+#[cfg(not(windows))]
+fn gone(passed: &Passed) -> Vec<PathBuf> {
+    passed
+        .outcomes
+        .iter()
+        .filter(|o| matches!(o.verdict, Verdict::Removed { .. }))
+        .map(|o| o.path.clone())
+        .collect()
+}
+
+/// Each row's `(action, path)`.
+#[cfg(not(windows))]
+fn acts(rows: &[Value]) -> Vec<(String, PathBuf)> {
+    rows.iter()
+        .map(|r| {
+            (
+                r["action"].as_str().expect("action").to_owned(),
+                PathBuf::from(r["path"].as_str().expect("path")),
+            )
+        })
+        .collect()
+}
+
+/// Unix seconds now: the `T` the dated fixtures are written at.
+#[cfg(not(windows))]
+fn clock() -> i64 {
+    i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("the clock fits")
+}
+
+/// Set the modification time of the file or folder at `path` to `at` (unix seconds).
+#[cfg(not(windows))]
+fn stamp(path: &Path, at: i64) {
+    let when = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
+    std::fs::File::open(path)
+        .and_then(|f| f.set_modified(when))
+        .expect("set the modification time");
+}
+
+/// The modification time of the entry at `path`, in unix seconds.
+#[cfg(unix)]
+fn modified(path: &Path) -> i64 {
+    let at = std::fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .expect("a modification time");
+    i64::try_from(
+        at.duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs(),
+    )
+    .expect("fits")
+}
+
+/// A PATH'S LAST USE IS THE NEWEST WRITE OR CHANGE UNDER IT, read in the walk that counts its
+/// bytes: a file nested three folders down, written later than everything above it, dates the
+/// whole tree, and a file child is dated by itself. A tree whose every modification time was set
+/// back a month, as `cp -a`, `rsync -a` and `tar` leave an unpacked tree, is still dated today,
+/// by the change time setting those times left, and the pass, three days on, keeps it. NEGATIVE
+/// CONTROL: the fixture's modification times do read a month old, so dating by modification
+/// time alone (drop the change time from `target::written`) reads the unpacked tree a month old,
+/// fails the assertion on its date, and the pass removes it.
+#[cfg(unix)]
 #[test]
-fn removed_by_adds_a_sessions_own_removals() {
-    let at = |sid: &str, action: &str, bytes: Option<u64>| {
-        row(1, sid, Path::new("/c/x"), action, bytes, "words")
+fn judge_dates_a_path_by_the_newest_write_or_change_under_it() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+
+    let deep = home.tagged(".cache/tool/a/b", 4096);
+    stamp(&deep.join("blob"), t + 3 * DAY);
+    let tool = home.path.join(".cache/tool");
+    let admitted = judge(&tool, &w).expect("an ordinary cache");
+    assert_eq!(admitted.last_use, Some(t + 3 * DAY), "{admitted:?}");
+    assert!(!admitted.partial);
+    let file = judge(&deep.join("blob"), &w).expect("a file under a root");
+    assert_eq!(file.last_use, Some(t + 3 * DAY), "{file:?}");
+
+    let sub = home.tagged(".cache/unpacked/sub", BIG);
+    let unpacked = home.path.join(".cache/unpacked");
+    for entry in [sub.join("blob"), sub.clone(), unpacked.clone()] {
+        stamp(&entry, t - 30 * DAY);
+        assert_eq!(modified(&entry), t - 30 * DAY, "{}", entry.display());
+    }
+    let admitted = judge(&unpacked, &w).expect("an ordinary cache");
+    assert!(
+        admitted.last_use > Some(t - DAY) && admitted.last_use < Some(t + DAY),
+        "set back a month, changed within the day: {admitted:?}"
+    );
+
+    let w = at(&home, &nobody, &mounts, t + 3 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert!(passed.outcomes.is_empty(), "{passed:?}");
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(
+        sub.join("blob").is_file(),
+        "unpacked three days ago: it stays"
+    );
+    assert!(deep.join("blob").is_file(), "written today: it stays");
+}
+
+/// THE PASS KEEPS WHAT IS IN USE, BY ITS DATE OR BY A PROCESS: of three `.cache` folders nothing
+/// else distinguishes, the one written a day ago and the one a process holds a file under stay,
+/// with no row naming either, and the one unused for nine days goes. The window is
+/// `[disk] idle_build_days`: under a one-day window a folder written a day ago goes, and with
+/// the key below 1 there is no window, so a folder nine days unused stays and free space is not
+/// measured. NEGATIVE CONTROL: an hour later, with no process under it, the held folder goes
+/// too (so the scan kept it, not its date), and the written one still stays (so its date kept
+/// it, not the scan); dropping the window from `pass` removes the written folder in the first
+/// pass, and a pass that reads a constant seven days keeps the one-day folder.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_keeps_a_cache_folder_written_within_its_window_or_that_a_process_uses() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let written = home.tagged(".cache/written", BIG);
+    stamp(&written.join("blob"), t + 8 * DAY);
+    let used = home.tagged(".cache/used", BIG);
+    let idle = home.tagged(".cache/idle", BIG);
+    let holds = |dirs: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
+        let mut scan = PathScan::default();
+        if dirs.contains(&used) {
+            scan.users.push(PathUse {
+                pid: 4242,
+                how: "fd",
+                path: used.join("blob"),
+            });
+        }
+        Ok(scan)
     };
-    let rows = vec![
-        at("s-a", "removing", Some(1000)),
-        at("s-a", "removed", Some(10)),
-        at("s-a", "failed", Some(5)),
-        at("s-a", "refused", Some(70)),
-        at("s-b", "removed", Some(100)),
-        "not a row".to_string(),
-    ];
-    assert_eq!(removed_by(&rows, "s-a"), 15);
-    assert_eq!(removed_by(&rows, "s-b"), 100);
-    assert_eq!(removed_by(&rows, "s-c"), 0);
+    let now = t + 9 * DAY;
+    let w = at(&home, &holds, &mounts, now);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [idle.clone()], "{passed:?}");
+    assert!(!idle.exists(), "unused for nine days: it goes");
+    assert!(
+        written.join("blob").is_file(),
+        "written a day ago: it stays"
+    );
+    assert!(used.join("blob").is_file(), "a process uses it: it stays");
+    assert_eq!(
+        acts(&rows),
+        [
+            ("removing".to_owned(), idle.clone()),
+            ("removed".to_owned(), idle.clone())
+        ],
+        "no row names a folder that stays"
+    );
+    assert_eq!(passed.cut, None);
+
+    let w = at(&home, &nobody, &mounts, now + 3600);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [used.clone()], "{passed:?}");
+    assert!(!used.exists(), "no process uses it now: it goes");
+    assert!(written.join("blob").is_file(), "still within its window");
+
+    let home = Home::new();
+    let recent = home.tagged(".cache/recent", BIG);
+    stamp(&recent.join("blob"), t + 8 * DAY);
+    let one_day = World {
+        config: Config {
+            idle_build_days: 1,
+            ..on()
+        },
+        ..at(&home, &nobody, &mounts, now)
+    };
+    let (passed, _) = swept(&one_day, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [recent], "a one-day window: {passed:?}");
+
+    let home = Home::new();
+    let old = home.tagged(".cache/old", BIG);
+    let no_window = World {
+        config: Config {
+            idle_build_days: 0,
+            ..on()
+        },
+        ..at(&home, &nobody, &mounts, now)
+    };
+    let mut measured = 0;
+    let (passed, rows) = swept(&no_window, &in_place(), &mut || {
+        measured += 1;
+        SHORT
+    });
+    assert_eq!(passed, Passed::default());
+    assert!(rows.is_empty() && measured == 0);
+    assert!(old.join("blob").is_file(), "no window: it stays");
+}
+
+/// THE LEDGER HOLDS EACH REMOVAL BEFORE IT STARTS: for each outside cache the pass takes, its
+/// `disk-free` `removing` row, carrying the bytes counted, is written while the folder is still
+/// whole, and its `removed` row once it is gone. NEGATIVE CONTROL: over a second home, a ledger
+/// that cannot write the `removing` row leaves both folders (so the removal waits on the row);
+/// writing the row after the removal fails the closure's own look at the folder.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_journals_each_outside_cache_before_it_removes_it() {
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let first = home.tagged(".cache/first", BIG);
+    let second = home.tagged(".cache/second", BIG);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let mut rows = Vec::new();
+    let passed = pass(&w, GOAL, &in_place(), &mut || SHORT, &mut |line| {
+        let row = aterm_json::from_str::<Value>(line).expect("a row is one JSON object");
+        let path = PathBuf::from(row["path"].as_str().expect("path"));
+        match row["action"].as_str() {
+            Some("removing") => assert!(
+                path.join("blob").is_file(),
+                "{} is whole when its intent is written",
+                path.display()
+            ),
+            Some("removed") => assert!(!path.exists(), "{} is gone", path.display()),
+            other => panic!("an unexpected row: {other:?}"),
+        }
+        rows.push(row);
+        true
+    });
+    assert_eq!(
+        acts(&rows),
+        [
+            ("removing".to_owned(), first.clone()),
+            ("removed".to_owned(), first.clone()),
+            ("removing".to_owned(), second.clone()),
+            ("removed".to_owned(), second.clone()),
+        ]
+    );
+    for row in &rows {
+        assert_eq!(row["kind"], Value::from(KIND));
+        assert_eq!(row["sid"], Value::from("s-worker"));
+        assert!(
+            row["bytes"].as_u64().is_some_and(|bytes| bytes >= 2 << 20),
+            "{row:?}"
+        );
+    }
+    assert_eq!(gone(&passed), [first, second]);
+    assert!(passed.bytes >= 4 << 20, "{passed:?}");
+
+    let home = Home::new();
+    let first = home.tagged(".cache/first", BIG);
+    let second = home.tagged(".cache/second", BIG);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let mut tried = Vec::new();
+    let passed = pass(&w, GOAL, &in_place(), &mut || SHORT, &mut |line| {
+        tried.push(line.to_owned());
+        !line.contains("\"removing\"")
+    });
+    assert!(first.join("blob").is_file() && second.join("blob").is_file());
+    assert!(tried.iter().any(|line| line.contains("\"removing\"")));
+    assert!(gone(&passed).is_empty(), "{passed:?}");
+    assert_eq!(passed.bytes, 0);
+    assert_eq!(passed.outcomes.len(), 2, "{passed:?}");
+    assert!(
+        passed
+            .outcomes
+            .iter()
+            .all(|o| o.verdict == Verdict::Refused(UNJOURNALLED.to_owned())),
+        "{passed:?}"
+    );
+}
+
+/// A FOLDER WRITTEN AFTER THE PASS CHOSE IT STAYS: both folders are nine days old when the pass
+/// dates them; a file is written into the second while the first is being removed, and the
+/// judgment its `removing` row would be written from dates it again. NEGATIVE CONTROL: without
+/// that second date check (remove on the first read's date) the second folder goes, with the
+/// file just written into it.
+#[cfg(not(windows))]
+#[test]
+fn a_folder_written_after_it_was_chosen_is_kept() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let first = home.tagged(".cache/first", BIG);
+    let second = home.tagged(".cache/second", BIG);
+    let now = t + 9 * DAY;
+    let w = at(&home, &nobody, &mounts, now);
+    let mut rows = Vec::new();
+    let passed = pass(&w, GOAL, &in_place(), &mut || SHORT, &mut |line| {
+        let row = aterm_json::from_str::<Value>(line).expect("a row is one JSON object");
+        if row["action"].as_str() == Some("removed") {
+            let new = second.join("new");
+            std::fs::write(&new, b"written while the pass ran").expect("a late write");
+            stamp(&new, now);
+        }
+        rows.push(row);
+        true
+    });
+    assert_eq!(gone(&passed), [first.clone()], "{passed:?}");
+    assert!(second.join("blob").is_file() && second.join("new").is_file());
+    assert_eq!(
+        acts(&rows),
+        [
+            ("removing".to_owned(), first.clone()),
+            ("removed".to_owned(), first)
+        ],
+        "no intent row names the folder written since"
+    );
+}
+
+/// The three folders of the order test under `home`, each tagged a cache: `zz-old` and
+/// trust-cg's store written at `t`, `aa-new` a day later and twice the size.
+#[cfg(not(windows))]
+fn ordered(home: &Home, t: i64) -> [PathBuf; 3] {
+    let old = home.tagged(".cache/zz-old", BIG);
+    let new = home.tagged(".cache/aa-new", 2 * BIG);
+    stamp(&new.join("blob"), t + DAY);
+    let store = home.tagged(".cache/trust-cg", BIG);
+    [old, new, store]
+}
+
+/// LEAST RECENTLY USED FIRST, TRUST'S STORE NEVER, AND NO FURTHER THAN THE TARGET: with free
+/// space back at the target once the oldest folder is gone, only it goes; with free space short
+/// throughout, the order is the oldest, then the newer (which is the larger and sorts first by
+/// name), and trust-cg's store stays, though it is tagged and as old as the oldest: its proof
+/// certificates are Trust's to evict. Where the free figure does not move (a snapshot holds the
+/// bytes), the pass stops once what it removed covers the 3 MiB it first measured short, and
+/// says so, and the folder after them stays. NEGATIVE CONTROL: a free figure that cannot be read removes nothing and says the
+/// pass was cut; ordering largest first or by name takes `aa-new` first; dropping trust-cg from
+/// `PASS_KEPT` takes the store; and the verb, given the store, removes it, so every fence admits
+/// it and it is the pass's own rule that keeps it.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_takes_the_least_recently_written_first_keeps_trusts_store_and_stops_at_its_target() {
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let [old, new, store] = ordered(&home, t);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+
+    let (passed, rows) = swept(&w, &in_place(), &mut || None);
+    assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+    assert_eq!(passed.cut.as_deref(), Some(CUT_UNMEASURED));
+    assert!(old.exists() && new.exists() && store.exists());
+
+    let (passed, _) = swept(&w, &in_place(), &mut || {
+        if old.exists() { SHORT } else { Some(GOAL) }
+    });
+    assert_eq!(gone(&passed), [old.clone()], "{passed:?}");
+    assert_eq!(passed.cut, None, "it stopped at its target");
+    assert!(new.join("blob").is_file() && store.join("blob").is_file());
+
+    let home = Home::new();
+    let [old, new, store] = ordered(&home, t);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [old, new], "{passed:?}");
+    assert_eq!(passed.cut, None, "it reached every folder");
+    assert!(store.join("blob").is_file(), "Trust's store stays");
+    let (outcomes, _) = free(std::slice::from_ref(&store), false, &w);
+    assert!(
+        matches!(outcomes[0].verdict, Verdict::Removed { .. }),
+        "{outcomes:?}"
+    );
+
+    let home = Home::new();
+    let [old, new, store] = ordered(&home, t);
+    let later = home.tagged(".cache/later", BIG);
+    stamp(&later.join("blob"), t + 2 * DAY);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let (passed, _) = swept(&w, &in_place(), &mut || Some(GOAL - (3 << 20)));
+    assert_eq!(gone(&passed), [old, new], "{passed:?}");
+    assert_eq!(passed.cut.as_deref(), Some(CUT_COUNTED));
+    assert!(later.join("blob").is_file(), "covered: it stays");
+    assert!(store.join("blob").is_file(), "it stays");
+}
+
+/// THE PASS REACHES TWO ROOTS, AND NOT EVERYTHING UNDER THEM: nine days unused and over the
+/// floor, a child of `~/.npm`, one of `~/.cargo/registry`, aterm's own folder and a campaign
+/// scope's folder under `~/.cache` all stay, as do a lock folder too small to move the free
+/// figure and a folder with a mount point under it, while an ordinary `.cache` child beside
+/// them goes and no row names a folder that stays. NEGATIVE CONTROL: the verb, given the `.npm`
+/// child and the campaign scopes' folder, removes each, so every fence admits them and it is
+/// the pass's own reach that left them; and an hour later, under a mount table that holds no
+/// mount, the pass takes the folder the mount kept.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_reaches_only_the_roots_and_folders_it_may() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let npm = home.cache(".npm/x", BIG);
+    let registry = home.cache(".cargo/registry/x", BIG);
+    let ours = home.tagged(".cache/aterm", BIG);
+    let scope = home.tagged(".cache/alab-release-scope/s1", BIG);
+    std::fs::write(scope.join("receipt.json"), b"{}").expect("a receipt");
+    let slot = home.tagged(".cache/build-slot", 4096);
+    let ordinary = home.tagged(".cache/ordinary", BIG);
+    let vm = home.tagged(".cache/vm", BIG);
+    let mut mounted = whole();
+    mounted.mounts.push(Mount {
+        on: vm.join("disk"),
+        from: "/dev/disk9s1".to_owned(),
+        fstype: "apfs".to_owned(),
+        local: true,
+        automounted: false,
+        removable: true,
+        read_only: false,
+        container: None,
+    });
+    let w = at(&home, &nobody, &mounted, t + 9 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [ordinary.clone()], "{passed:?}");
+    assert_eq!(
+        acts(&rows),
+        [
+            ("removing".to_owned(), ordinary.clone()),
+            ("removed".to_owned(), ordinary.clone())
+        ]
+    );
+    for kept in [&npm, &registry, &ours, &scope, &slot, &vm] {
+        assert!(kept.join("blob").is_file(), "{} stays", kept.display());
+    }
+    assert!(scope.join("receipt.json").is_file());
+
+    let scopes = home.path.join(".cache/alab-release-scope");
+    let (outcomes, _) = free(&[npm.clone(), scopes.clone()], false, &w);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o.verdict, Verdict::Removed { .. })),
+        "{outcomes:?}"
+    );
+    assert!(!npm.exists() && !scopes.exists());
+
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY + 3600);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [vm], "no mount under it now: {passed:?}");
+}
+
+/// THE PATH FENCES COME BEFORE ANY READ UNDER A CHILD: a child that is a link, a child of a root
+/// that is a link, and any child while the mount table is unread are each refused by `read` in
+/// `judge`'s own words, and a read whose time is up answers with a partial walk. A pass over a
+/// home whose `.cache` is a link removes nothing, writes nothing and measures nothing. A pass
+/// whose mount table was not read whole, or not read at all, reads no folder and measures
+/// nothing, and says it was cut: it could not look, so it has not run out. NEGATIVE CONTROL:
+/// dating a child before `placed` (the walk alone) answers each of these with a size and a date
+/// instead of the refusal, and the pass removes the folder the linked root reaches; the same
+/// home under a table read whole loses its folder; a walk that ignores its deadline reads the
+/// folder whole.
+#[cfg(not(windows))]
+#[test]
+fn read_refuses_before_it_reads_under_a_path() {
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let reading = |mounts: Option<&Table>| Reading {
+        home: home.path.clone(),
+        mounts: mounts.cloned(),
+        until: Instant::now() + NO_WALL,
+        wait: HANG,
+    };
+    let far = home.cache("far", BIG);
+    let cache = home.path.join(".cache");
+    std::fs::create_dir_all(&cache).expect("root");
+    let link = cache.join("tool");
+    atpkg::platform::atomic_symlink(&far, &link).expect("a link");
+    let refused = read(&link, &reading(Some(&mounts))).expect_err("a link is refused");
+    assert!(refused.contains("symbolic link"), "{refused}");
+    assert_eq!(Err(refused), judge(&link, &w).map(|_| ()));
+
+    let plain = home.tagged(".cache/plain", BIG);
+    let refused = read(&plain, &reading(None)).expect_err("no mount table, no read");
+    assert!(refused.contains("not read whole"), "{refused}");
+    let dated = read(&plain, &reading(Some(&mounts))).expect("an ordinary child is read");
+    assert!(
+        dated.bytes >= 2 << 20 && dated.newest.is_some(),
+        "{dated:?}"
+    );
+    assert!(!dated.partial, "{dated:?}");
+    let out_of_time = Reading {
+        until: Instant::now(),
+        ..reading(Some(&mounts))
+    };
+    let cut_short = read(&plain, &out_of_time).expect("its place admits it");
+    assert!(cut_short.partial, "{cut_short:?}");
+
+    let unread = Table {
+        complete: false,
+        ..Table::default()
+    };
+    for table in [Some(&unread), None] {
+        let blind = World {
+            mounts: table,
+            ..at(&home, &nobody, &mounts, t + 9 * DAY)
+        };
+        let mut measured = 0;
+        let (passed, rows) = swept(&blind, &in_place(), &mut || {
+            measured += 1;
+            SHORT
+        });
+        assert_eq!(passed.cut.as_deref(), Some(CUT_MOUNTS), "{passed:?}");
+        assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+        assert_eq!(measured, 0, "nothing is measured");
+        assert!(plain.join("blob").is_file());
+    }
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [plain], "{passed:?}");
+
+    let linked = Home::new();
+    let behind = linked.tagged("real-cache/tool", BIG);
+    atpkg::platform::atomic_symlink(&linked.path.join("real-cache"), &linked.path.join(".cache"))
+        .expect("a linked root");
+    let w = at(&linked, &nobody, &mounts, t + 9 * DAY);
+    let through = linked.path.join(".cache/tool");
+    let refused = read(
+        &through,
+        &Reading {
+            home: linked.path.clone(),
+            mounts: Some(mounts.clone()),
+            until: Instant::now() + NO_WALL,
+            wait: HANG,
+        },
+    )
+    .expect_err("a child of a linked root is refused");
+    assert!(refused.contains("reached through a link"), "{refused}");
+    assert_eq!(Err(refused), judge(&through, &w).map(|_| ()));
+    let mut measured = 0;
+    let (passed, rows) = swept(&w, &in_place(), &mut || {
+        measured += 1;
+        SHORT
+    });
+    assert_eq!(passed, Passed::default());
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(measured, 0, "nothing to read, nothing measured");
+    assert!(behind.join("blob").is_file(), "what the root reaches stays");
+}
+
+/// Wait, under a one-minute hang detector, for the read of `path` to have returned.
+#[cfg(not(windows))]
+fn returned(path: &Path) {
+    let hang = Instant::now() + HANG;
+    while locked(&HELD).contains_key(path) {
+        assert!(
+            Instant::now() < hang,
+            "the read of {} never returned",
+            path.display()
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+}
+
+/// A FIRST READ THAT DOES NOT RETURN IS SKIPPED, SAID ONCE AND NOT MADE AGAIN WHILE IT IS
+/// PENDING: a read blocked as a privacy dialog blocks one times out after its wait, and while
+/// it is pending a second read of the same folder is not started and a pass dates no child of
+/// its root (a `.cache` child beside it still goes). Such a pass says it was cut while the
+/// pending read's own walk has time left, since a later look can read the root; once that
+/// walk's time is up only a person can end the wait, and the pass is not cut. The answer of a
+/// read the look stopped waiting for is kept: the next pass takes it and does not read that
+/// folder again. A pass whose dater times out journals one `refused` row for that child,
+/// removes nothing of that root, dates no further guarded child and says it was cut.
+/// NEGATIVE CONTROL: once the blocked read is let go, the same call answers with its reading
+/// and a pass reads that root again (so it was the pending read that held it); without the
+/// kept answer that pass dates both children; a later read of the folder that blocks again
+/// owes no second row.
+#[cfg(not(windows))]
+#[test]
+fn a_read_that_does_not_return_is_skipped_said_once_and_not_made_again_while_it_is_pending() {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let first = home.cache("Library/Caches/go-build", BIG);
+    let second = home.cache("Library/Caches/pip", BIG);
+    let beside = home.tagged(".cache/beside", BIG);
+    let nothing = CacheUse {
+        bytes: 0,
+        partial: false,
+        newest: None,
+    };
+    let reads_made = Arc::new(AtomicUsize::new(0));
+    let blocked = |made: &Arc<AtomicUsize>| {
+        let made = Arc::clone(made);
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let (began, begun) = std::sync::mpsc::channel::<()>();
+        let look = move |_: &Path| {
+            made.fetch_add(1, Ordering::SeqCst);
+            let _ = began.send(());
+            let _ = held.recv();
+            Ok::<CacheUse, String>(nothing)
+        };
+        (let_go, begun, look)
+    };
+    let (let_go, begun, look) = blocked(&reads_made);
+    let wait = Duration::from_millis(1);
+    let walking = Instant::now() + NO_WALL;
+    assert_eq!(
+        date_off_thread(&first, wait, walking, look),
+        Dated::TimedOut { said: false }
+    );
+    // The read's thread may not have run within the wait: its count is read once it began.
+    begun.recv_timeout(HANG).expect("the blocked read began");
+    let (_unused, _never, look) = blocked(&reads_made);
+    assert_eq!(
+        date_off_thread(&first, wait, walking, look),
+        Dated::StillHeld
+    );
+    assert_eq!(reads_made.load(Ordering::SeqCst), 1, "one read, pending");
+
+    let dated = Cell::new(0);
+    let counting = |_: &Path, _: &Reading| {
+        dated.set(dated.get() + 1);
+        Dated::At(Err("a test's dater reads nothing".to_owned()))
+    };
+    let counted = dating(&counting);
+    let now = t + 9 * DAY;
+    let w = at(&home, &nobody, &mounts, now);
+    let (passed, _) = swept(&w, &counted, &mut || SHORT);
+    assert_eq!(dated.get(), 0, "no child of a root with a read pending");
+    assert_eq!(gone(&passed), [beside], "the other root is still read");
+    assert_eq!(
+        passed.cut.as_deref(),
+        Some(CUT_PENDING),
+        "the root was not read, and a later look can read it"
+    );
+    assert!(first.join("blob").is_file() && second.join("blob").is_file());
+
+    let_go.send(()).expect("the blocked read is waiting");
+    returned(&first);
+    assert_eq!(
+        date_off_thread(&first, HANG, walking, move |_: &Path| Ok(nothing)),
+        Dated::At(Ok(nothing))
+    );
+    let (passed, rows) = swept(&w, &counted, &mut || SHORT);
+    assert_eq!(
+        dated.get(),
+        1,
+        "the answer the first look did not wait for stands for `first`; only `second` is dated"
+    );
+    assert_eq!(passed.cut, None, "{passed:?}");
+    assert!(passed.outcomes.is_empty(), "{passed:?}");
+    assert_eq!(acts(&rows), [("refused".to_owned(), second.clone())]);
+    let (let_go, _begun, look) = blocked(&reads_made);
+    assert_eq!(
+        date_off_thread(&first, wait, walking, look),
+        Dated::TimedOut { said: true },
+        "said once a process"
+    );
+    let_go.send(()).expect("the blocked read is waiting");
+    returned(&first);
+
+    let home = Home::new();
+    let first = home.cache("Library/Caches/go-build", BIG);
+    let (let_go, _begun, look) = blocked(&reads_made);
+    assert_eq!(
+        date_off_thread(&first, wait, Instant::now(), look),
+        Dated::TimedOut { said: false }
+    );
+    let w = at(&home, &nobody, &mounts, now);
+    let (passed, rows) = swept(&w, &counted, &mut || SHORT);
+    assert_eq!(dated.get(), 1, "its root is still not read");
+    assert_eq!(
+        passed.cut, None,
+        "a read held past its own walk's time is out of reach, not unread"
+    );
+    assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+    let_go.send(()).expect("the blocked read is waiting");
+    returned(&first);
+
+    let home = Home::new();
+    let first = home.cache("Library/Caches/go-build", BIG);
+    let second = home.cache("Library/Caches/pip", BIG);
+    let dated = Cell::new(0);
+    let timing_out = |_: &Path, _: &Reading| {
+        dated.set(dated.get() + 1);
+        Dated::TimedOut { said: false }
+    };
+    let w = at(&home, &nobody, &mounts, now);
+    let (passed, rows) = swept(&w, &dating(&timing_out), &mut || SHORT);
+    assert_eq!(dated.get(), 1, "no guarded child is dated after a wait");
+    assert_eq!(passed.held, [first.clone()]);
+    assert_eq!(
+        passed.cut.as_deref(),
+        Some(CUT_HELD),
+        "the folders after it were not read"
+    );
+    assert!(passed.outcomes.is_empty(), "{passed:?}");
+    assert_eq!(acts(&rows), [("refused".to_owned(), first.clone())]);
+    assert_eq!(rows[0]["text"], Value::from(HELD_READ));
+    assert!(first.join("blob").is_file() && second.join("blob").is_file());
+}
+
+/// A GUARDED FOLDER A PATH FENCE REFUSES IS LEFT WITH ONE `refused` ROW, through the dater the
+/// product ships: a link under `~/Library/Caches` is refused by its read, on the read's own
+/// thread, and the pass writes one row with the fence's words; an hour later, read again, it
+/// owes no second row. A link under `~/.cache`, which is read in place, is left with no row,
+/// and an ordinary `Library/Caches` folder beside them is dated by the shipped dater and goes.
+/// NEGATIVE CONTROL: without the once-a-process memo the second pass writes the row again;
+/// with the row unwritten the first pass's rows are the ordinary folder's two alone.
+#[cfg(not(windows))]
+#[test]
+fn a_guarded_folder_a_fence_refuses_is_said_once_through_the_shipped_dater() {
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let far = home.cache("far", BIG);
+    let ordinary = home.cache("Library/Caches/Homebrew", BIG);
+    let guarded = home.path.join("Library/Caches/Yarn");
+    atpkg::platform::atomic_symlink(&far, &guarded).expect("a link under the guarded root");
+    std::fs::create_dir_all(home.path.join(".cache")).expect("root");
+    let plain = home.path.join(".cache/linked");
+    atpkg::platform::atomic_symlink(&far, &plain).expect("a link under `.cache`");
+    let shipped = dating(&date_within);
+    let now = t + 9 * DAY;
+    let w = at(&home, &nobody, &mounts, now);
+    let (passed, rows) = swept(&w, &shipped, &mut || SHORT);
+    assert_eq!(gone(&passed), [ordinary.clone()], "{passed:?}");
+    assert_eq!(passed.cut, None, "{passed:?}");
+    assert_eq!(
+        acts(&rows),
+        [
+            ("removing".to_owned(), ordinary.clone()),
+            ("removed".to_owned(), ordinary),
+            ("refused".to_owned(), guarded.clone()),
+        ]
+    );
+    assert!(
+        rows[2]["text"]
+            .as_str()
+            .is_some_and(|why| why.contains("symbolic link")),
+        "{rows:?}"
+    );
+    assert_eq!(passed.refused.len(), 1, "{passed:?}");
+
+    let w = at(&home, &nobody, &mounts, now + 3600);
+    let (passed, rows) = swept(&w, &shipped, &mut || SHORT);
+    assert!(passed.refused.is_empty() && rows.is_empty(), "{passed:?}");
+    assert!(far.join("blob").is_file(), "what the links reach stays");
+}
+
+/// A PARTIAL WALK, OR A FOLDER NO TIME WAS READ OF, STAYS: a guarded folder whose read came
+/// back cut short is kept though the newest time it saw is nine days old, since what the walk
+/// did not reach may be newer, and so is one whose read saw no time at all; neither is named
+/// in a row, and neither cuts the pass. NEGATIVE CONTROL: the same folder, an hour on, read
+/// whole with that date, goes; taking a partial walk at its word removes it in the first pass.
+#[cfg(not(windows))]
+#[test]
+fn a_partial_walk_or_an_undated_folder_stays() {
+    use std::cell::Cell;
+
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let tool = home.cache("Library/Caches/node-gyp", BIG);
+    let answer = Cell::new(CacheUse {
+        bytes: 2 << 20,
+        partial: true,
+        newest: Some(t),
+    });
+    let answering = |_: &Path, _: &Reading| Dated::At(Ok(answer.get()));
+    let reads = dating(&answering);
+    let now = t + 9 * DAY;
+    for (hour, used) in [
+        (0, answer.get()),
+        (
+            1,
+            CacheUse {
+                bytes: 2 << 20,
+                partial: false,
+                newest: None,
+            },
+        ),
+    ] {
+        answer.set(used);
+        let w = at(&home, &nobody, &mounts, now + hour * 3600);
+        let (passed, rows) = swept(&w, &reads, &mut || SHORT);
+        assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+        assert_eq!(passed.cut, None, "{passed:?}");
+        assert!(tool.join("blob").is_file(), "{used:?}: it stays");
+    }
+    answer.set(CacheUse {
+        bytes: 2 << 20,
+        partial: false,
+        newest: Some(t),
+    });
+    let w = at(&home, &nobody, &mounts, now + 2 * 3600);
+    let (passed, _) = swept(&w, &reads, &mut || SHORT);
+    assert_eq!(gone(&passed), [tool], "whole, nine days old: {passed:?}");
+}
+
+/// A FOLDER A PROCESS TAKES UP AFTER IT WAS CHOSEN IS REFUSED ON RECORD: the pass's scan finds
+/// nobody under the folder, its `removing` row is written, and the scan the removal makes just
+/// before it starts finds a process holding a file there. The folder stays whole, and the
+/// ledger holds its `removing` row, then a `refused` row with the process named. NEGATIVE
+/// CONTROL: without the pass's own `refused` row the intent would stand alone, read as a
+/// removal that never finished; without the removal's second scan the folder goes.
+#[cfg(not(windows))]
+#[test]
+fn a_folder_a_process_takes_up_after_it_was_chosen_is_refused_on_record() {
+    use std::cell::Cell;
+
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let folder = home.tagged(".cache/folder", BIG);
+    let scans = Cell::new(0);
+    let taken_up = |dirs: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
+        scans.set(scans.get() + 1);
+        let mut scan = PathScan::default();
+        if scans.get() > 1 {
+            scan.users.push(PathUse {
+                pid: 4242,
+                how: "fd",
+                path: dirs[0].join("blob"),
+            });
+        }
+        Ok(scan)
+    };
+    let w = at(&home, &taken_up, &mounts, t + 9 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(scans.get(), 2, "the pass's scan, then the removal's own");
+    assert!(folder.join("blob").is_file(), "in use now: it stays");
+    assert_eq!(
+        acts(&rows),
+        [
+            ("removing".to_owned(), folder.clone()),
+            ("refused".to_owned(), folder.clone())
+        ]
+    );
+    assert!(
+        rows[1]["text"]
+            .as_str()
+            .is_some_and(|why| why.contains("process 4242")),
+        "{rows:?}"
+    );
+    assert_eq!(passed.bytes, 0);
+    assert_eq!(passed.outcomes.len(), 1, "{passed:?}");
+    assert!(passed.outcomes[0].refused(), "{passed:?}");
+}
+
+/// THE PASS'S WORK IS BOUNDED. Its dating stops at its wall clock: with none, an old folder
+/// stays and the pass says it was cut. A folder read fresh is not read again until its window
+/// could have passed: dated once nine days on, not at all the day after, and again once its
+/// last write is seven days old, when it goes. One scan of the running processes answers for
+/// every folder a pass chose: three a process uses stay on that one scan, with no judgment and
+/// no row, and an hour later, nobody under them, they go on one scan more for each. And it
+/// judges at most eight folders it then keeps: of nine that hold a managed cache's marker,
+/// eight are judged, none goes, no row is written, and the pass says it was cut; the next
+/// pass, the same second, reads only the ninth, since a folder judged and kept is not read
+/// again for an hour. NEGATIVE CONTROL: with a wall clock the old folder goes; without the
+/// fresh memo the fresh folder is dated at every look; a scan for each judgment makes the
+/// three folders' pass scan three times; without the bound the first pass over the nine is not
+/// cut, and without the kept memo the second chooses all nine again.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_bounds_its_work() {
+    use std::cell::{Cell, RefCell};
+
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let old = home.tagged(".cache/old", BIG);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let none = Reads {
+        wall: Duration::ZERO,
+        ..in_place()
+    };
+    let (passed, rows) = swept(&w, &none, &mut || SHORT);
+    assert_eq!(passed.cut.as_deref(), Some(CUT_WALL), "{passed:?}");
+    assert!(rows.is_empty() && old.join("blob").is_file());
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [old]);
+
+    let home = Home::new();
+    let tool = home.cache("Library/Caches/node-gyp", BIG);
+    stamp(&tool.join("blob"), t + 8 * DAY);
+    let dated = Cell::new(0);
+    let counting = |path: &Path, r: &Reading| {
+        dated.set(dated.get() + 1);
+        Dated::At(read(path, r))
+    };
+    let counted = dating(&counting);
+    for (day, dates, there) in [(9, 1, true), (10, 1, true), (16, 2, false)] {
+        let w = at(&home, &nobody, &mounts, t + day * DAY);
+        let (passed, _) = swept(&w, &counted, &mut || SHORT);
+        assert_eq!(dated.get(), dates, "day {day}");
+        assert_eq!(tool.exists(), there, "day {day}: {passed:?}");
+    }
+
+    let home = Home::new();
+    let used: Vec<PathBuf> = (1..=3)
+        .map(|i| home.tagged(&format!(".cache/used-{i}"), BIG))
+        .collect();
+    let scans = Cell::new(0);
+    let all_used = |dirs: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
+        scans.set(scans.get() + 1);
+        Ok(PathScan {
+            users: dirs
+                .iter()
+                .map(|dir| PathUse {
+                    pid: 4242,
+                    how: "cwd",
+                    path: dir.clone(),
+                })
+                .collect(),
+            ..PathScan::default()
+        })
+    };
+    let w = at(&home, &all_used, &mounts, t + 9 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(scans.get(), 1, "one scan answers for all three");
+    assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+    assert_eq!(passed.cut, None, "a folder in use is no judgment kept");
+    assert!(used.iter().all(|f| f.join("blob").is_file()));
+    let none_used = |dirs: &[PathBuf], skip: &[u32]| -> std::io::Result<PathScan> {
+        scans.set(scans.get() + 1);
+        nobody(dirs, skip)
+    };
+    let w = at(&home, &none_used, &mounts, t + 9 * DAY + 3600);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed).len(), 3, "{passed:?}");
+    assert_eq!(scans.get(), 1 + 1 + 3, "the pass's, then one a removal");
+
+    let home = Home::new();
+    let marker = atpkg::build_cache::registered::CUSTODY_MARKERS[0];
+    let managed: Vec<PathBuf> = (1..=9)
+        .map(|i| {
+            let folder = home.tagged(&format!(".cache/managed-{i}"), BIG);
+            std::fs::write(folder.join(marker), br#"{"schema":999}"#).expect("a marker");
+            folder
+        })
+        .collect();
+    let chosen = RefCell::new(Vec::new());
+    let counting = |dirs: &[PathBuf], skip: &[u32]| -> std::io::Result<PathScan> {
+        chosen.borrow_mut().push(dirs.len());
+        nobody(dirs, skip)
+    };
+    let w = at(&home, &counting, &mounts, t + 9 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+    assert_eq!(passed.cut.as_deref(), Some(CUT_KEPT), "{passed:?}");
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+    assert_eq!(passed.cut, None, "the ninth is kept: {passed:?}");
+    assert_eq!(
+        *chosen.borrow(),
+        [9, 1],
+        "the eight judged and kept are not read again the same second"
+    );
+    assert!(managed.iter().all(|f| f.join("blob").is_file()));
+}
+
+/// THE UNGUARDED ROOT IS READ FIRST: with two folders under `~/.cache` and one under
+/// `~/Library/Caches`, the guarded folder's dater runs after both `.cache` folders were read,
+/// which the free figure measured before each read counts, so no guarded wait spends the
+/// pass's wall clock before `.cache`. NEGATIVE CONTROL: with `Library/Caches` listed first the
+/// dater runs on the pass's first measure.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_reads_the_unguarded_root_before_the_guarded_one() {
+    use std::cell::Cell;
+
+    let t = clock();
+    let mounts = whole();
+    let home = Home::new();
+    let guarded = home.cache("Library/Caches/ccache", BIG);
+    let a = home.tagged(".cache/a", BIG);
+    let b = home.tagged(".cache/b", BIG);
+    let measured = Cell::new(0);
+    let dated_at = Cell::new(0);
+    let dater = |path: &Path, r: &Reading| {
+        dated_at.set(measured.get());
+        Dated::At(read(path, r))
+    };
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let (passed, _) = swept(&w, &dating(&dater), &mut || {
+        measured.set(measured.get() + 1);
+        SHORT
+    });
+    assert_eq!(dated_at.get(), 3, "after both `.cache` reads");
+    assert_eq!(gone(&passed).len(), 3, "{passed:?}");
+    assert!(!guarded.exists() && !a.exists() && !b.exists());
+}
+
+/// THE GRANT IS THE PASS'S OFF SWITCH: with `[disk] auto_free_gib = 0` an old folder stays,
+/// nothing is journalled and free space is not measured. NEGATIVE CONTROL: the same tree with
+/// the grant on loses the folder.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_removes_nothing_while_the_grant_is_off() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let old = home.tagged(".cache/old", BIG);
+    let on = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let off = World {
+        config: Config {
+            auto_free_gib: 0,
+            ..Config::default()
+        },
+        ..at(&home, &nobody, &mounts, t + 9 * DAY)
+    };
+    let mut measured = 0;
+    let (passed, rows) = swept(&off, &in_place(), &mut || {
+        measured += 1;
+        SHORT
+    });
+    assert_eq!(passed, Passed::default());
+    assert!(rows.is_empty() && measured == 0);
+    assert!(old.join("blob").is_file());
+
+    let (passed, _) = swept(&on, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [old.clone()]);
+    assert!(!old.exists());
+}
+
+/// THE PASS TAKES PROVEN CACHES ALONE: of idle `.cache` folders over the floor, a build tool's
+/// own cache by its name (`pip`) and a folder its tool tagged (`CACHEDIR.TAG`) go, while a folder
+/// with no evidence (`notes`, holding a token file, as `huggingface` does), a tagged folder of a
+/// name the pass keeps (`huggingface`, `aterm-machines`, `codex-alab`), a folder whose tag is a
+/// link, one whose tag is too short to hold the signature and a hidden tagged folder all stay,
+/// and no row names any of them. A guarded root's child is taken by its name alone:
+/// `Library/Caches/Homebrew` goes, while `Library/Caches/notes`, tagged, is never dated. NEGATIVE
+/// CONTROL: the verb, given `notes` and the tagged `huggingface`, removes each, so every fence
+/// admits them and it is the pass's evidence rule that kept them; and `notes`, tagged afterwards,
+/// goes on the next pass.
+#[cfg(not(windows))]
+#[test]
+fn the_pass_takes_only_folders_proven_caches_and_keeps_what_no_tool_makes_again() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let pip = home.cache(".cache/pip", BIG);
+    let tagged = home.tagged(".cache/some-tool", BIG);
+    let notes = home.cache(".cache/notes", BIG);
+    std::fs::write(notes.join("token"), b"hf_not_made_again").expect("a token");
+    let hf = home.tagged(".cache/huggingface", BIG);
+    let machines = home.tagged(".cache/aterm-machines", BIG);
+    let codex = home.tagged(".cache/codex-alab", BIG);
+    let linked_tag = home.cache(".cache/linked-tag", BIG);
+    let real_tag = home.path.join("elsewhere.tag");
+    std::fs::write(&real_tag, [b'x'; 64]).expect("a tag elsewhere");
+    atpkg::platform::atomic_symlink(&real_tag, &linked_tag.join(CACHEDIR_TAG)).expect("a link");
+    let stub = home.cache(".cache/stub-tag", BIG);
+    std::fs::write(stub.join(CACHEDIR_TAG), b"Sig").expect("a short tag");
+    let hidden = home.tagged(".cache/.hidden", BIG);
+    let brew = home.cache("Library/Caches/Homebrew", BIG);
+    let guarded_notes = home.tagged("Library/Caches/notes", BIG);
+    let shipped = dating(&date_within);
+    let now = t + 9 * DAY;
+    let w = at(&home, &nobody, &mounts, now);
+    let (passed, rows) = swept(&w, &shipped, &mut || SHORT);
+    let mut went = gone(&passed);
+    went.sort();
+    let mut want = vec![pip.clone(), tagged.clone(), brew.clone()];
+    want.sort();
+    assert_eq!(went, want, "{passed:?}");
+    for kept in [
+        &notes,
+        &hf,
+        &machines,
+        &codex,
+        &linked_tag,
+        &stub,
+        &hidden,
+        &guarded_notes,
+    ] {
+        assert!(kept.join("blob").is_file(), "{} stays", kept.display());
+        assert!(
+            acts(&rows).iter().all(|(_, path)| path != kept),
+            "no row names {}: {rows:?}",
+            kept.display()
+        );
+    }
+    assert!(notes.join("token").is_file());
+
+    let (outcomes, _) = free(&[notes.clone(), hf.clone()], false, &w);
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o.verdict, Verdict::Removed { .. })),
+        "{outcomes:?}"
+    );
+
+    let home = Home::new();
+    let notes = home.cache(".cache/notes", BIG);
+    let w = at(&home, &nobody, &mounts, now);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert!(gone(&passed).is_empty(), "{passed:?}");
+    std::fs::write(
+        notes.join(CACHEDIR_TAG),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .expect("a cache tag");
+    let w = at(&home, &nobody, &mounts, now + 2 * 3600);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [notes], "tagged now: {passed:?}");
+}
+
+/// A FILE A TOOL READS IS IN USE: a pip cache whose files were last written nine days ago but
+/// one of which was read yesterday stays, since a read time the volume records is a use.
+/// NEGATIVE CONTROL: the same cache with that read time set back nine days goes.
+#[cfg(unix)]
+#[test]
+fn a_cache_read_within_its_window_stays() {
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let pip = home.cache(".cache/pip", BIG);
+    let read = |at: i64| {
+        let when = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
+        std::fs::File::options()
+            .write(true)
+            .open(pip.join("blob"))
+            .and_then(|f| f.set_times(std::fs::FileTimes::new().set_accessed(when)))
+            .expect("set the read time");
+    };
+    read(t + 8 * DAY);
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert!(passed.outcomes.is_empty() && rows.is_empty(), "{passed:?}");
+    assert!(pip.join("blob").is_file(), "read yesterday: it stays");
+
+    // Not read again until its window from that read could have passed.
+    read(t);
+    let w = at(&home, &nobody, &mounts, t + 16 * DAY);
+    let (passed, _) = swept(&w, &in_place(), &mut || SHORT);
+    assert_eq!(gone(&passed), [pip], "{passed:?}");
+}
+
+/// A REMOVAL CUT SHORT LEAVES NO PART OF A CACHE WHERE ITS TOOL LOOKS, AND THE NEXT PASS
+/// FINISHES IT: the pass sets a pip cache aside before it removes it, so when a folder in it
+/// cannot be emptied the pass fails having removed part of it, and `~/.cache/pip` is gone whole
+/// while what is left sits under one `.aterm-removing-<ino>-pip` name. Once the folder can be
+/// emptied, the next pass removes what is left, its `removing` row first. A folder that only
+/// carries the stage's prefix, its name not its own inode, stays with one `refused` row.
+/// NEGATIVE CONTROL: removing in place (the verb's way) leaves the part that failed at
+/// `~/.cache/pip` itself, where pip would find half its cache.
+#[cfg(unix)]
+#[test]
+fn a_removal_cut_short_leaves_no_part_where_the_tool_looks_and_the_next_pass_finishes_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let t = clock();
+    let home = Home::new();
+    let mounts = whole();
+    let pip = home.cache(".cache/pip", BIG);
+    let stuck = pip.join("stuck");
+    std::fs::create_dir(&stuck).expect("a folder");
+    std::fs::write(stuck.join("wheel"), vec![1u8; 4096]).expect("a file");
+    let foreign = home.cache(".cache/.aterm-removing-1-other", BIG);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).expect("read-only");
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).ok();
+    assert!(
+        passed
+            .outcomes
+            .iter()
+            .any(|o| o.path == pip && matches!(o.verdict, Verdict::Failed { .. })),
+        "{passed:?}"
+    );
+    assert!(!pip.exists(), "no part of it where pip looks");
+    let staged: Vec<PathBuf> = std::fs::read_dir(home.path.join(".cache"))
+        .expect("the root")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(STAGE) && n.ends_with("-pip"))
+        })
+        .collect();
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert!(staged[0].join("stuck/wheel").is_file());
+    std::fs::set_permissions(
+        staged[0].join("stuck"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("writable again");
+    assert!(
+        acts(&rows).contains(&("refused".to_owned(), foreign.clone())),
+        "{rows:?}"
+    );
+    assert!(
+        foreign.join("blob").is_file(),
+        "not one this pass set aside"
+    );
+
+    let w = at(&home, &nobody, &mounts, t + 9 * DAY + 3600);
+    let (passed, rows) = swept(&w, &in_place(), &mut || SHORT);
+    assert!(!staged[0].exists(), "the next pass finished it: {passed:?}");
+    let acted = acts(&rows);
+    let removing = acted
+        .iter()
+        .position(|a| *a == ("removing".to_owned(), staged[0].clone()));
+    let removed = acted
+        .iter()
+        .position(|a| *a == ("removed".to_owned(), staged[0].clone()));
+    assert!(
+        removing.is_some() && removing < removed,
+        "intent first: {rows:?}"
+    );
+    assert!(foreign.join("blob").is_file());
+
+    let home = Home::new();
+    let pip = home.cache(".cache/pip", BIG);
+    let stuck = pip.join("stuck");
+    std::fs::create_dir(&stuck).expect("a folder");
+    std::fs::write(stuck.join("wheel"), vec![1u8; 4096]).expect("a file");
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).expect("read-only");
+    let w = world(&home, &nobody, &mounts);
+    let (outcomes, _) = free(std::slice::from_ref(&pip), false, &w);
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).ok();
+    assert!(
+        matches!(outcomes[0].verdict, Verdict::Failed { .. }),
+        "{outcomes:?}"
+    );
+    assert!(
+        stuck.join("wheel").is_file(),
+        "in place, the part that failed stays where pip looks"
+    );
 }

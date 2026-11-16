@@ -45,6 +45,8 @@ pub(crate) enum Cause {
     Window,
     /// The window's chrome rows changed: the tab strip appeared or folded.
     Chrome,
+    /// The window chrome column changed (DK-2).
+    Dock,
     /// One window's sessions re-gridded directly.
     Term,
     /// A pane pass under no other entry point.
@@ -68,6 +70,7 @@ impl Cause {
             Self::Input => "input",
             Self::Window => "window",
             Self::Chrome => "chrome",
+            Self::Dock => "dock",
             Self::Term => "term",
             Self::Pass => "pass",
             Self::Redraw => "redraw",

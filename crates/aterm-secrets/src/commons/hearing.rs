@@ -213,6 +213,30 @@ pub const CAPS: Floor = Floor {
     unheard_passes: true,
 };
 
+/// The first release that follows a vault into format 2: it reads format-2 records and stores
+/// the format mark that lets it exchange with a format-2 node. None does yet, so no release
+/// passes [`FENCE`]. The format fence itself (the version-2 bound, tracker FL-147) is not
+/// enough: a node with it and no format-2 reader states format 1 for good, and a format-2 node
+/// exchanges nothing with it ([`crate::crossing::RecordsBound::can_exchange`]), so a floor at
+/// the fence's release would let the first format-2 write cut off every Mac but its writer.
+/// Tracker FL-148 names its own release here, one whose every build reads format 2 (the
+/// reasoning of [`NO_SECRET_FILE`]).
+pub const READS_FORMAT: Option<Version> = None;
+
+/// The floor the first format-2 write waits on (`docs/DESIGN-vault-log-2026-11-14.md` step 3;
+/// the write, tracker FL-148, waits on it holding for 14 days on both admin seats): every
+/// current member heard within [`RECENT`] reports [`READS_FORMAT`] or later, so while none is
+/// named, every member heard within [`RECENT`] holds it. A member unheard for [`RECENT`] through
+/// a watch that long passes, as for [`CAPS`]: a floor that waited on every seat would never open
+/// while most seats are silent, and a Mac that returns below the floor is fenced, not misled:
+/// its bound and a format-2 node's cannot exchange
+/// ([`crate::crossing::RecordsBound::can_exchange`]), so it takes and serves nothing across the
+/// line and stays on its consistent prefix.
+pub const FENCE: Floor = Floor {
+    version: READS_FORMAT,
+    unheard_passes: true,
+};
+
 /// The gate a registry secret's put into the vault waits on (tracker LT-04B): every current
 /// member heard within [`RECENT`] reporting `release` or later, where `release` is the first
 /// that writes no vault entry to a file ([`NO_SECRET_FILE`] outside a test); with none named,

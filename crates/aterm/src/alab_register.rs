@@ -2,10 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! What starts self-registration (docs/DESIGN-alab-lab-model-2026-11-01.md §6, step 7), and what
-//! this Mac reads about itself for it: the Commons runtime's completed repair rounds wake
+//! this machine reads about itself for it: the Commons runtime's completed repair rounds wake
 //! `aterm_db::alab::register::Registrar`, a release build only, so a test, a debug build under a
-//! lab or a checkout's `targo run` never publishes a Mac's facts. The readers here are the only
-//! code that touches the host; `Registrar::start` keeps the IOPlatformUUID in this process.
+//! lab or a checkout's `targo run` never publishes a machine's facts. The readers here, and on
+//! Linux `aterm_sysprobe::linux::Root`'s, are the only code that touches the host;
+//! `Registrar::start` keeps the IOPlatformUUID (on Linux `/etc/machine-id`) in this process.
 
 use aterm_db::{
     alab::register::{Outcome, Probe, Registered, Registrar, ThisMac},
@@ -87,14 +88,8 @@ fn core_counts(layout: &aterm_sysprobe::CpuLayout) -> (Option<u64>, Option<u64>)
     (Some(performance), Some(efficiency))
 }
 
-/// Bytes as decimal gigabytes, rounded, the way a disk is sold.
-#[cfg(target_os = "macos")]
-fn gigabytes(bytes: u64) -> u64 {
-    bytes.saturating_add(500_000_000) / 1_000_000_000
-}
-
 /// This process's fleet node, read: registering never mints one.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn fleet_node() -> Option<String> {
     let state = aterm_types::dirs::state_dir()?;
     aterm_net::fleet_member::read_node_identity(&state)
@@ -123,10 +118,10 @@ fn output(program: &str, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// This Mac: `None` where it cannot state its model or its hardware, which its row needs. Off
-/// macOS there is no IOPlatformUUID, and the registry's rows are one physical Mac each.
+/// This Mac: `None` where it cannot state its model or its hardware, which its row needs.
 #[cfg(target_os = "macos")]
 fn probe() -> Option<Probe> {
+    use aterm_db::alab::register::gigabytes;
     use aterm_machines::hardware::{ioreg_value, uuid_shaped};
     let platform_uuid = output("/usr/sbin/ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
         .and_then(|text| ioreg_value(&text, "IOPlatformUUID"))
@@ -161,7 +156,17 @@ fn probe() -> Option<Probe> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// This Linux machine ([`Probe::linux`] over `/`), with its fleet node: `None` where it cannot
+/// state its model or its `/etc/machine-id`.
+#[cfg(target_os = "linux")]
+fn probe() -> Option<Probe> {
+    Some(Probe {
+        node: fleet_node(),
+        ..Probe::linux(&aterm_sysprobe::linux::Root::system())?
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn probe() -> Option<Probe> {
     None
 }

@@ -314,9 +314,9 @@ impl crate::App {
     /// is not said to be nobody. Never an alert (a concluded worker needs nobody now), and a stall
     /// keeps its need instead. A person who turned it Off did it themselves, and a worker with its
     /// own report of its end has only that ([`crate::task_record::reports_its_own_end`]): a credit
-    /// claim's worker gets its claim-worker record here, finished or not, and the disk worker its
-    /// disk-worker record from the disk watch. A record a restart carried was told by the process
-    /// that moved it. The entry goes when no failed conclusion stands, whichever process raised it.
+    /// claim's worker gets its claim-worker record here, finished or not, and a disk worker an
+    /// earlier build left gets none. A record a restart carried was told by the process that
+    /// moved it. The entry goes when no failed conclusion stands, whichever process raised it.
     pub(crate) fn note_worker_conclusion(&mut self, session: u64) {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
             return;

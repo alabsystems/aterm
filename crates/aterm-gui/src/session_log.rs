@@ -334,6 +334,21 @@ pub(crate) struct AgentMove<'a> {
     pub(crate) reader: Option<aterm_phase::Program>,
     /// The foreground group it was read under.
     pub(crate) pgid: i32,
+    /// The `state` record that decided it, `None` for a reader's move.
+    pub(crate) stream: Option<StreamMove<'a>>,
+}
+
+/// The `state` record behind a move the claim's stream decided.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamMove<'a> {
+    /// The record's `seq`.
+    pub(crate) hseq: u64,
+    /// The claim's holder.
+    pub(crate) holder: &'a str,
+    /// The tab's own session.
+    pub(crate) by: Actor,
+    /// The agent the claim's registry row names.
+    pub(crate) agent: aterm_phase::Program,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2271,12 +2286,22 @@ impl SessionLog {
         self.close_run(fg.node, out, by, at);
     }
 
-    /// The published agent verdict moved: `mark agent word= rev= gen= fp=`, then the turn tracker's transitions.
+    /// The published agent verdict moved: `mark agent word= rev= gen= fp=` for a reader's move,
+    /// `mark agent word= rev= hseq= holder=` through [`Self::stream_mark`] for one a `state`
+    /// record decided, then the turn tracker's transitions.
+    ///
+    /// A move with no agent run open opens one: for the reader that read it, or, for a stream's
+    /// move, for the agent the claim's registry row names (a harness whose process name is in
+    /// no table still gets its run). Either run is one nothing but that source named
+    /// (`by_screen`), so the word `-` (the screen shows no agent, the record says `ended`) ends
+    /// it, and a process name that names the same agent later confirms it.
     pub(crate) fn agent_moved(&mut self, m: AgentMove<'_>, at: Stamp) -> Option<u64> {
         self.reconcile_person(at);
         self.resync();
         self.name_pending(self.cmd, None);
-        let named = m.reader.filter(|r| match r {
+        let generic = |r: &aterm_phase::Program| matches!(r, aterm_phase::Program::Generic);
+        let from_row = m.stream.map(|s| s.agent).filter(|r| !generic(r));
+        let named = from_row.or(m.reader).filter(|r| match r {
             aterm_phase::Program::Claude
             | aterm_phase::Program::Codex
             | aterm_phase::Program::Grok
@@ -2290,7 +2315,11 @@ impl SessionLog {
             && let Some(reader) = named
         {
             let f = with(Fields::new(), Key::Agent, tok(Key::Agent, reader.name()));
-            let mut open = Open::new(Kind::Agent, Src::Screen, Conf::Strong).fields(f);
+            let mut open = match m.stream {
+                Some(s) => Open::new(Kind::Agent, Src::Harness, Conf::Claim).by(s.by),
+                None => Open::new(Kind::Agent, Src::Screen, Conf::Strong),
+            }
+            .fields(f);
             if let Some(parent) = self
                 .fg
                 .filter(|f| f.pgid == m.pgid)
@@ -2316,25 +2345,32 @@ impl SessionLog {
             .or_else(|_| Fields::new().word(Key::Word, "unknown"))
             .unwrap_or_default();
         let f = with(word, Key::Rev, Some(Val::U(m.rev)));
-        let f = with(
-            f,
-            Key::Gen,
-            m.stamp
-                .and_then(|s| ShortId::new(&s.generation.to_string()))
-                .map(Val::Id),
-        );
-        let f = with(
-            f,
-            Key::Fp,
-            m.stamp
-                .and_then(|s| ShortId::new(&format!("{:016x}", s.fp)))
-                .map(Val::Id),
-        );
-        let mut mark = Mark::new(Kind::Agent, Src::Screen, Conf::Strong).fields(f);
-        if let Some(a) = &self.agent {
-            mark = mark.at(a.node);
+        let node = self.agent.as_ref().map(|a| a.node);
+        if let Some(s) = m.stream {
+            // A stream's row carries the record's number where a screen's carries the screen.
+            let f = with(f, Key::Hseq, Some(Val::U(s.hseq)));
+            let _ = self.stream_mark(Kind::Agent, node, f, s.holder, s.by, at);
+        } else {
+            let f = with(
+                f,
+                Key::Gen,
+                m.stamp
+                    .and_then(|s| ShortId::new(&s.generation.to_string()))
+                    .map(Val::Id),
+            );
+            let f = with(
+                f,
+                Key::Fp,
+                m.stamp
+                    .and_then(|s| ShortId::new(&format!("{:016x}", s.fp)))
+                    .map(Val::Id),
+            );
+            let mut mark = Mark::new(Kind::Agent, Src::Screen, Conf::Strong).fields(f);
+            if let Some(node) = node {
+                mark = mark.at(node);
+            }
+            let _ = self.log.mark(mark, at);
         }
-        let _ = self.log.mark(mark, at);
         let Self { log, agent, .. } = self;
         let wake = agent.as_mut().and_then(|a| {
             a.tracker.observe(

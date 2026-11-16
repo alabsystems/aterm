@@ -575,6 +575,7 @@ fn the_glance_reads_nothing_by_itself_while_the_lan_broker_does_not_answer() {
         Box::new(Nobody { runs: runs_tx }),
         ReaderSeams {
             tick: Duration::from_millis(20),
+            sharing: Box::new(|| true),
             lan: Box::new(move || {
                 let _ = looks_tx.send(());
                 asked.load(Ordering::SeqCst)
@@ -635,6 +636,7 @@ fn seams(watch: bool, posts: Sender<()>) -> ReaderSeams {
         post: Box::new(move || posts.send(()).is_ok()),
         tick: Duration::from_secs(3600),
         moved: None,
+        sharing: Box::new(|| true),
         lan: Box::new(|| true),
         away: Box::new(|| false),
     }
@@ -919,6 +921,7 @@ fn inert_seams() -> ReaderSeams {
         post: Box::new(|| true),
         tick: Duration::from_secs(3600),
         moved: None,
+        sharing: Box::new(|| true),
         lan: Box::new(|| true),
         away: Box::new(|| false),
     }
@@ -1183,6 +1186,7 @@ fn the_glance_asks_the_lan_door_only_for_a_read_it_makes() {
         Box::new(Nobody { runs: runs_tx }),
         ReaderSeams {
             tick: Duration::from_millis(20),
+            sharing: Box::new(|| true),
             lan: Box::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
                 true
@@ -3694,4 +3698,140 @@ fn sightings_count_the_sessions_waiting_for_memory_and_their_claims() {
     assert_eq!(wait_of(&[shell("s-b1", "memory", "4.0"), older], "2"), None);
     // A partial answer: no count.
     assert_eq!(wait_of(&[shell("s-b1", "memory", "4.0")], "2"), None);
+}
+
+/// A refused full config may leave the UI on synthesized update-only text. Automatic fleet
+/// reads still use the original file's sharing authority before invoking their runner.
+#[cfg(unix)]
+#[test]
+fn automatic_fleet_reads_keep_sharing_authority_after_config_refusal() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for (bytes, mode, reads) in [
+        (None, 0o600, true),
+        (Some(b"".as_slice()), 0o600, true),
+        (Some(b"font_px = \"bad\"\n".as_slice()), 0o600, true),
+        (
+            Some(b"font_px = \"bad\"\n[swarm]\nenabled = true\n".as_slice()),
+            0o600,
+            true,
+        ),
+        (
+            Some(b"font_px = \"bad\"\n[swarm]\nenabled = false\n".as_slice()),
+            0o600,
+            false,
+        ),
+        (Some(b"[swarm\n".as_slice()), 0o600, false),
+        (Some(b"[swarm]\nenabled = 1\n".as_slice()), 0o600, false),
+        (Some(b"[swarm]\nextra = true\n".as_slice()), 0o600, false),
+        (Some(b"[swarm]\nenabled = true\n".as_slice()), 0o664, false),
+        (Some(b"\xff".as_slice()), 0o600, false),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        let path = aterm_secrets::swarm::config_in_home(&home).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if let Some(bytes) = bytes {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        // The same observation, typed admission and update-only fallback as warm_config;
+        // the test constructor keeps asset discovery inert.
+        let loaded =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, true)
+                .and_then(|observed| {
+                    crate::native_config_service::VersionedConfigService::new(observed.text)
+                });
+        let service = loaded.unwrap_or_else(|_| {
+            let fallback = crate::app_config::update_switches_stand_in(Some(&path));
+            crate::native_config_service::VersionedConfigService::new(fallback.text).unwrap()
+        });
+        let config = service.snapshot().config;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let lan = Arc::new(AtomicUsize::new(0));
+        let seen_lan = Arc::clone(&lan);
+        let (gate, wait) = std::sync::mpsc::channel();
+        drop(gate);
+        let (started, _started) = std::sync::mpsc::channel();
+        let runner = Gated {
+            runs: Arc::clone(&runs),
+            gate: wait,
+            started,
+        };
+        let mut seams = ReaderSeams {
+            book: Box::new(|| BookFacts { in_fleet: true }),
+            watch: Arc::new(AtomicBool::new(config.fleet_watch_enabled())),
+            sharing: Box::new(automatic_sharing(Some(home))),
+            now_ms: Box::new(|| 1_000),
+            post: Box::new(|| true),
+            lan: Box::new(move || {
+                seen_lan.fetch_add(1, Ordering::SeqCst);
+                true
+            }),
+            ..inert_seams()
+        };
+        let slot = Arc::new(Mutex::new(FleetSlot::default()));
+        let (kick, kicks) = std::sync::mpsc::channel();
+        drop(kick);
+        reader_loop(Box::new(runner), &mut seams, &slot, &kicks);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            usize::from(reads),
+            "{bytes:?}, mode {mode:o}"
+        );
+        assert_eq!(
+            lan.load(Ordering::SeqCst),
+            usize::from(reads),
+            "{bytes:?}, mode {mode:o}"
+        );
+        let slot = slot.lock().unwrap();
+        assert_eq!(
+            slot.tried_ms,
+            reads.then_some(1_000),
+            "{bytes:?}, mode {mode:o}"
+        );
+        assert_eq!(
+            slot.generation,
+            u16::from(reads),
+            "{bytes:?}, mode {mode:o}"
+        );
+    }
+}
+
+#[test]
+fn a_read_names_two_tabs_sharing_five_characters_apart_once_their_ids_are_known() {
+    let one = "tm4r7aaaaaa";
+    let two = "tm4r7abbbbb";
+    let manager = |sid: &str, label: &str| FleetManager {
+        label: label.to_owned(),
+        sid: sid.to_owned(),
+        workers: 1,
+    };
+    // As a read parses: the twins named at five, before this aterm knows either.
+    let mut snapshot = FleetSnapshot {
+        macs: vec![FleetMac {
+            managers: vec![
+                manager(one, "tm4r7"),
+                manager(two, "tm4r7"),
+                manager("tm4r8aaaaaa", "lead"),
+            ],
+            ..FleetMac::default()
+        }],
+        ..FleetSnapshot::default()
+    };
+    for sid in [one, two] {
+        let id = aterm_types::tab_id::TabId::parse(sid).expect("a tab id");
+        crate::tab_ids::note_here(&aterm_session::SessionId::from_tab(id));
+    }
+    snapshot.rename_by_id();
+    let labels: Vec<&str> = snapshot.macs[0]
+        .managers
+        .iter()
+        .map(|m| m.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        ["tm4r7aa", "tm4r7ab", "lead"],
+        "each twin is named as far as tells it apart; a role is kept"
+    );
 }

@@ -113,41 +113,43 @@ fn a_presence_refresh_never_classifies() {
 }
 
 #[test]
-fn each_chip_carries_its_tabs_load_until_the_bars_are_off() {
-    let (mut app, wid, _first, _ctx) = app_with_stub();
+fn reported_cpu_changes_leave_tab_chip_metadata_unchanged() {
+    let (mut app, wid, first, first_ctx) = app_with_stub();
     let (second, _second_ctx) = second_tab(&mut app, wid);
-    let mut snap = crate::stats_deck::tests::snapshot();
-    snap.tabs[0].key = second;
-    snap.tabs[0].scope.cores.level = 5.0;
-    app.vitals.snapshot = Some(std::sync::Arc::new(snap));
-    let loads = |app: &App| {
-        let mut metadata: Vec<crate::tab_bar::TabStripMetadata> = app.windows[&wid]
-            .tab_set
-            .tabs()
-            .iter()
-            .map(|t| crate::tab_bar::TabStripMetadata::from_presentation(&t.presentation))
-            .collect();
-        app.stamp_presence_chips(wid, &mut metadata);
-        metadata.iter().map(|m| m.load).collect::<Vec<_>>()
-    };
-    let lit = loads(&app);
-    assert_eq!(lit.last(), Some(&128), "five of ten cores: half the meter");
-    assert!(
-        lit[..lit.len() - 1].iter().all(|&l| l == 0),
-        "an unmeasured tab draws no meter: {lit:?}"
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
+    let baseline = app.tab_strip_metadata(wid);
+    assert!(baseline.len() >= 2, "the strip contains both terminal tabs");
+    for capacity in [1, 10, 512] {
+        for reported in [0.0, 5.0, 40.0] {
+            let mut snap = crate::stats_deck::tests::snapshot();
+            snap.cpu
+                .as_mut()
+                .expect("machine ticks")
+                .cores
+                .resize(capacity, aterm_vitals::CoreView::default());
+            snap.tabs[0].key = second;
+            snap.tabs[0].scope.cores.raw = reported;
+            snap.tabs[0].scope.cores.level = reported;
+            snap.tabs[0].scope.cpu_accounting =
+                Some(aterm_vitals::published_cpu::CpuAccounting::PUBLISHED_COUNTERS);
+            app.vitals.snapshot = Some(Arc::new(snap));
+            assert_eq!(
+                app.tab_strip_metadata(wid),
+                baseline,
+                "reported {reported} cores on a {capacity}-core machine do not qualify chip geometry"
+            );
+        }
+    }
+
+    // An independent published presence mark still reaches the shared renderer metadata.
+    ask(&first_ctx, Some("check this result"));
+    app.refresh_presence_session(first);
+    let marked = app.tab_strip_metadata(wid);
+    assert_ne!(
+        marked, baseline,
+        "the strip still projects program presence"
     );
-    assert_eq!(
-        app.tab_strip_metadata(wid).last().map(|m| m.load),
-        Some(128)
-    );
-    app.config
-        .sys
-        .get_or_insert_with(Default::default)
-        .stats_bars = Some("off".into());
-    assert!(
-        loads(&app).iter().all(|&l| l == 0),
-        "the bars off, no meters"
-    );
+    assert!(marked.iter().any(|chip| chip.attention == ChipLevel::Wait));
 }
 
 #[test]

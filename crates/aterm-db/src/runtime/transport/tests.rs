@@ -394,6 +394,78 @@ fn round_at(
     (dialled, served)
 }
 
+/// `worker`'s round run to its end, as a worker whose round began at `started` by the
+/// transport's clock, its state changed by `change`: a round whose thread ended, which the
+/// transport that joins it takes as it took any other.
+fn ended_at(worker: Worker, started: Instant, change: impl FnOnce(&mut Repair)) -> Worker {
+    let Worker {
+        channel,
+        task,
+        incoming,
+        target,
+        started: _,
+        heard,
+        ended,
+    } = worker;
+    let (to, mut repair, success, report) = task.join().unwrap();
+    change(&mut repair);
+    Worker {
+        channel,
+        task: thread::spawn(move || (to, repair, success, report)),
+        incoming,
+        target,
+        started,
+        heard,
+        ended,
+    }
+}
+
+/// A round held among a transport's workers as one still in flight ([`held_in`]); dropped, it
+/// ends unreleased.
+struct Held {
+    ended: Arc<AtomicBool>,
+    go: std::sync::mpsc::Sender<()>,
+}
+impl Held {
+    /// End the round: the transport's next tick joins it, as it joins any round whose thread
+    /// ended.
+    fn release(self) {
+        self.ended.store(true, Ordering::Release);
+        let _ = self.go.send(());
+    }
+}
+
+/// `worker`'s round run to its end, held in `transport` as a round that began at `started` by its
+/// clock and is still in flight, as every round a transport runs is one of its workers until a
+/// tick joins it: its ticks leave it, and the rounds' receipts it may judge, until
+/// [`Held::release`].
+fn held_in(transport: &mut Transport, worker: Worker, started: Instant) -> Held {
+    let Worker {
+        channel,
+        task,
+        incoming,
+        target,
+        heard,
+        ..
+    } = worker;
+    let ended = task.join().unwrap();
+    let (go, released) = std::sync::mpsc::channel::<()>();
+    let flag = Arc::new(AtomicBool::new(false));
+    transport.workers.push(Worker {
+        channel,
+        task: thread::spawn(move || {
+            let _ = released.recv();
+            ended
+        }),
+        incoming,
+        target,
+        started,
+        heard,
+        ended: flag.clone(),
+    });
+    Held { ended: flag, go }
+}
+
 /// The seats read ([`Transport::hear_versions`], which a transport's tick runs every [`SEATS`])
 /// checks an unchanged 85-entry fleet book's signatures once: the transport keeps each verdict,
 /// so its second read checks none, and a read after one entry changed checks that entry alone.
@@ -2137,6 +2209,7 @@ fn a_local_append_dials_the_peer_at_once_and_its_peer_offers_it_back_to_nobody()
         mac.watching(Moves::start(
             &lab.paths[node],
             bootstrap.journal_dir(),
+            &lab.paths[node].dir.join("commons.toml"),
             bootstrap.trust(),
             bell,
         ));
@@ -2816,6 +2889,7 @@ fn a_table_written_here_is_offered_to_a_resting_peer_and_not_back_to_its_source(
             mac.watching(Moves::unwatched(
                 &lab.paths[node],
                 bootstrap.journal_dir(),
+                &lab.paths[node].dir.join("commons.toml"),
                 bootstrap.trust(),
             ));
             let (address, beacon) = &beacons[node];
@@ -2871,6 +2945,865 @@ fn a_table_written_here_is_offered_to_a_resting_peer_and_not_back_to_its_source(
             assert_eq!(back, None, "nobody else to offer it to");
             assert_eq!(macs[1].hints.hot_count(), 0);
         }
+    }
+}
+
+/// A table this Mac took up after it last traded table lists with its peer is offered to that
+/// peer when it writes there, though no round since has listed it, across real rounds. Each Mac
+/// sweeps its peer until it rests, Mac 1 last, while Mac 1 lists three of the four tables Mac 0
+/// lists; the lists of every round, whichever Mac dialled it, are each Mac's latest word on what
+/// the other lists (`crate::runtime::discovery`'s `Peer::listed`). Each Mac's look starts after
+/// that, so a store it holds was found after its lists, as a Mac's look finds a store it enrolled
+/// after them. Mac 0 writes the fourth, and its walk passes Mac 1 by (Mac 1's lists left out that
+/// table, which Mac 0 listed). Mac 1 then writes the table: its look finds it moved, and its walk
+/// dials Mac 0 with the table led, though Mac 1 did not list it in its last lists with Mac 0;
+/// Mac 0 holds both records.
+///
+/// This is the newly enrolled writer's reply of `auto_enrollment_tests` where no round lists the
+/// table between its enrolment and its write.
+/// MUTANT (`crate::replica::TAKES_ONLY_LISTED`, as before 2026-11-15): no seat takes a table this
+/// Mac did not list with it, so no dial of Mac 1's is due, and its record would wait for an
+/// audit.
+#[test]
+fn a_table_taken_up_since_the_last_lists_is_offered_to_the_peer_when_written_here() {
+    let late = 3;
+    let mut pair = Pair::swept(4, late);
+    let now = pair.now;
+
+    pair.write(late, 0);
+    pair.macs[0].look_soon();
+    pair.macs[0].tick(now).unwrap();
+    assert!(
+        pair.macs[0].hints.next(now).is_none(),
+        "Mac 1's lists left out the table Mac 0 wrote"
+    );
+
+    pair.write(late, 1);
+    pair.macs[1].look_soon();
+    pair.macs[1].tick(now).unwrap();
+    assert_eq!(
+        pair.macs[1].hints.hot_count(),
+        1,
+        "the look found the table moved"
+    );
+    crate::replica::TAKES_ONLY_LISTED.with(|flag| flag.set(true));
+    let unoffered = pair.dial_due(1);
+    crate::replica::TAKES_ONLY_LISTED.with(|flag| flag.set(false));
+    assert!(!unoffered, "MUTANT: Mac 1 has no dial due");
+    pair.walks_back(late);
+}
+
+/// A table this Mac held before its last lists with its peer and did not list then (its policy
+/// excluded it) is not offered to that peer when written here, across real rounds: no round of
+/// this Mac's takes it with any peer. After the sweep, whose lists came before Mac 1's look
+/// began, Mac 0 dials Mac 1 again, which still lists three of the four tables; Mac 1's lists with
+/// Mac 0 are now that round's, later than its look's first sight of every store. Mac 1 writes the
+/// fourth: its look finds it moved, and no dial of Mac 1's is due.
+/// MUTANT (`crate::runtime::moved::HELD_RESTAMPED`): Mac 1's look stamps its stores anew, the
+/// table looks taken up since the lists, and Mac 1 dials Mac 0 for it.
+/// MUTANT (`crate::replica::TAKES_ANY_UNLISTED`): a table this Mac did not list is offered
+/// however long it held it, and Mac 1 dials Mac 0 for it.
+#[test]
+fn a_table_held_before_the_last_lists_and_left_out_of_them_is_not_offered() {
+    use crate::replica::TAKES_ANY_UNLISTED;
+    use crate::runtime::moved::HELD_RESTAMPED;
+    for mutant in [None, Some(&HELD_RESTAMPED), Some(&TAKES_ANY_UNLISTED)] {
+        let late = 3;
+        let mut pair = Pair::swept(4, late);
+        let (full, listed) = (pair.full.clone(), pair.listed.clone());
+        let report = pair.round(0, &full[0], &listed, Repair::default());
+        assert!(report.control.is_ok(), "{report:?}");
+        pair.macs[1].tick(pair.now).unwrap();
+        assert!(!pair.dial_due(1), "the round moved nothing");
+
+        pair.write(late, 1);
+        let set = |on: bool| {
+            if let Some(flag) = mutant {
+                flag.with(|flag| flag.set(on));
+            }
+        };
+        set(true);
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(pair.now).unwrap();
+        let offered = pair.dial_due(1);
+        set(false);
+        assert_eq!(
+            pair.macs[1].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+        assert_eq!(
+            offered,
+            mutant.is_some(),
+            "a dial due (MUTANT {})",
+            mutant.is_some()
+        );
+    }
+}
+
+/// A table store this Mac took up from what a round brought alone is not offered to a seat whose
+/// last lists did not show this Mac listing the table, across a real round: its source holds it,
+/// and a seat that subscribes to the table takes it up in its own rounds, while one whose policy
+/// excludes it would spend a round that moves nothing on the dial and another on the lead it
+/// lacks. A write here to that store is offered to the seat. After the sweep, Mac 1 hears a third
+/// seat, whose round with it read its lists before Mac 1's look began and found Mac 1 listing
+/// three of the four tables. Mac 0 writes the fourth and dials Mac 1 leading it: Mac 1's look
+/// finds the store grown by what that round brought and names Mac 0, and its walk dials nobody.
+/// Mac 1 then writes the table: its look finds it grown here, and its walk dials the third seat
+/// with the table led.
+/// MUTANT (`BROUGHT_STORES_OFFERED`, as before this was bounded): the brought store is offered
+/// as one written here, and Mac 1's walk dials the third seat for it.
+#[test]
+fn a_store_taken_up_from_a_round_alone_is_not_offered_to_a_seat_whose_lists_left_it_out() {
+    for mutant in [false, true] {
+        let lists_at = Instant::now();
+        let late = 3;
+        let mut pair = Pair::swept(4, late);
+        let digests: Vec<_> = pair
+            .tables
+            .iter()
+            .map(|(scope, _)| scope.digest())
+            .collect();
+        let full = pair.full.clone();
+        // Below Mac 0's listener in address order, which a walk dials in here.
+        let seat: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let now = pair.now;
+        pair.macs[1]
+            .hints
+            .observe(&Hints::new([87; 32]).wire(seat.port()), seat, now);
+        let (chosen, _) = pair.macs[1].hints.next(now).unwrap();
+        assert_eq!(chosen, seat, "Mac 1 dials the seat it heard");
+        pair.macs[1].hints.finish(
+            seat,
+            Repair::heard_from([9; 48]).listing_at(digests[..late].to_vec(), [], lists_at),
+            Outcome::Repaired { transferred: false },
+            now,
+        );
+        pair.now += crate::runtime::discovery::WALK_GAP;
+        let walk = |pair: &mut Pair| {
+            pair.macs[1]
+                .hints
+                .next(pair.now)
+                .map(|(address, repair)| (address, repair.leads(&digests[late])))
+        };
+
+        pair.write(late, 0);
+        let mut handed = Repair::default();
+        assert!(handed.lead(digests[late]));
+        let report = pair
+            .round(0, &full[0], &full[1], handed)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digests[late]), 1));
+        BROUGHT_STORES_OFFERED.with(|flag| flag.set(mutant));
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(pair.now).unwrap();
+        BROUGHT_STORES_OFFERED.with(|flag| flag.set(false));
+        assert_eq!(
+            pair.macs[1].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+        if mutant {
+            assert_eq!(
+                walk(&mut pair),
+                Some((seat, true)),
+                "MUTANT: the third seat is walked for the brought store"
+            );
+            continue;
+        }
+        assert_eq!(
+            walk(&mut pair),
+            None,
+            "Mac 0 is the store's source, and the third seat's lists left the table out"
+        );
+
+        pair.write(late, 1);
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(pair.now).unwrap();
+        assert_eq!(
+            walk(&mut pair),
+            Some((seat, true)),
+            "the write here is offered to the third seat"
+        );
+    }
+}
+
+/// A peer that took a table up and listed it in a round it dialled in is offered a write to it
+/// here, across real rounds: the lists of a completed round the seat dialled in are this Mac's
+/// latest word on what it lists (`crate::runtime::discovery`'s `Hints::settle`). After the
+/// sweep, in which Mac 1 left the fourth table out, Mac 1 takes it up and dials Mac 0 listing all
+/// four. Mac 0 writes the table: its look finds it moved, its walk dials Mac 1 with the table
+/// led, and Mac 1 holds the record.
+/// MUTANT (`crate::runtime::discovery::INCOMING_LISTS_LEFT`): Mac 0 reads the lists of its own
+/// last dial, which left the table out, and has no dial due; the record would wait for Mac 0's
+/// audit or Mac 1's next round.
+#[test]
+fn a_seat_that_took_a_table_up_in_its_own_round_is_offered_a_write_to_it() {
+    use crate::runtime::discovery::INCOMING_LISTS_LEFT;
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, late);
+        let digest = pair.tables[late].0.digest();
+        let full = pair.full.clone();
+        let now = pair.now;
+        let (dialled, served) = round_at(&full[1], &full[0], &pair.listeners[0], Repair::default());
+        INCOMING_LISTS_LEFT.with(|flag| flag.set(mutant));
+        pair.macs[0].finish(served, now);
+        INCOMING_LISTS_LEFT.with(|flag| flag.set(false));
+        pair.macs[1].finish(dialled, now);
+        pair.macs[0].reports().for_each(drop);
+        let report = pair.macs[1].reports().last().unwrap();
+        assert!(report.control.is_ok(), "{report:?}");
+        pair.macs[0].tick(now).unwrap();
+        assert!(!pair.dial_due(0), "Mac 1's round moved nothing here");
+
+        pair.write(late, 0);
+        pair.macs[0].look_soon();
+        pair.macs[0].tick(now).unwrap();
+        assert_eq!(
+            pair.macs[0].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+        if mutant {
+            assert!(!pair.dial_due(0), "MUTANT: Mac 0 has no dial due");
+            continue;
+        }
+        let (address, repair) = pair.macs[0]
+            .hints
+            .next(now)
+            .expect("Mac 0's walk dials Mac 1 for the table it wrote");
+        assert_eq!(address, pair.peers[0]);
+        assert!(repair.leads(&digest), "the dial leads the written table");
+        let report = pair
+            .round(0, &full[0], &full[1], repair)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        assert_eq!(
+            crate::replica::tests::witness::held(&pair.lab, &pair.tables, late, 1),
+            1,
+            "Mac 1 holds Mac 0's record"
+        );
+    }
+}
+
+/// A peer that left a table out in a round it dialled in, after this Mac's own last round with it
+/// found both listing the table, is still offered a write to it here, across real rounds: the
+/// peer's selection may take the table again with no round between (its owner excluded the table
+/// and included it again), which nothing tells this Mac, so the later round's lists widen what
+/// this Mac's own round found and never narrow it (`crate::runtime::discovery::may_take`). After
+/// the sweep, in which both list all four tables, Mac 1 dials Mac 0 listing only three; then it
+/// lists the fourth again, and no round follows. Mac 0 writes the fourth: its look finds it moved,
+/// its walk dials Mac 1 with the table led, and Mac 1 holds the record.
+/// MUTANT (`crate::runtime::discovery::LATER_LISTS_NARROW`, as 2c91654df0d had it): the later
+/// lists alone tell, the write is parked, and Mac 0 has no dial due; the record would wait for
+/// the next round between the two, at rest an audit.
+#[test]
+fn a_seat_that_left_a_table_out_in_its_own_round_is_still_offered_a_write_to_it() {
+    use crate::runtime::discovery::LATER_LISTS_NARROW;
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, 4);
+        let digest = pair.tables[late].0.digest();
+        let full = pair.full.clone();
+        let now = pair.now;
+        let narrow = Arc::new(crate::replica::tests::witness::endpoint(
+            &pair.lab,
+            &pair.tables[..late],
+            1,
+        ));
+        let (dialled, served) = round_at(&narrow, &full[0], &pair.listeners[0], Repair::default());
+        pair.macs[0].finish(served, now);
+        pair.macs[1].finish(dialled, now);
+        pair.macs[0].reports().for_each(drop);
+        let report = pair.macs[1].reports().last().unwrap();
+        assert!(report.control.is_ok(), "{report:?}");
+        pair.macs[0].tick(now).unwrap();
+        assert!(!pair.dial_due(0), "Mac 1's round moved nothing here");
+
+        pair.write(late, 0);
+        LATER_LISTS_NARROW.with(|flag| flag.set(mutant));
+        pair.macs[0].look_soon();
+        pair.macs[0].tick(now).unwrap();
+        let due = pair.dial_due(0);
+        LATER_LISTS_NARROW.with(|flag| flag.set(false));
+        if mutant {
+            assert!(!due, "MUTANT: Mac 0 has no dial due");
+            continue;
+        }
+        let (address, repair) = pair.macs[0]
+            .hints
+            .next(now)
+            .expect("Mac 0's walk dials Mac 1 for the table it wrote");
+        assert_eq!(address, pair.peers[0]);
+        assert!(repair.leads(&digest), "the dial leads the written table");
+        let report = pair
+            .round(0, &full[0], &full[1], repair)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        assert_eq!(
+            crate::replica::tests::witness::held(&pair.lab, &pair.tables, late, 1),
+            1,
+            "Mac 1 holds Mac 0's record"
+        );
+    }
+}
+
+/// A record a round brings that this Mac already holds, because another of its rounds brought
+/// it after this one read the store's inventory, adds nothing (`crate::replica::Report::added`),
+/// so a write here in the same look is still offered to the seat, across real rounds. Mac 0
+/// hands Mac 1 a record of a table both list; as its batch arrives, another round (as from a
+/// third Mac, whose receipt the test makes) has put the record in Mac 1's store, and Mac 1 writes
+/// its own. Mac 1's look finds the table grown by two, of which its rounds added one: it names no
+/// seat, and its walk dials Mac 0 with the table led; Mac 0 holds both records.
+/// MUTANT (`HELD_RECEIPTS_BRING`, as before 2026-11-14): the held record counts as brought, the
+/// two receipts cover the growth, Mac 0 is taken as holding all that moved, and Mac 1 has no
+/// dial due.
+#[test]
+fn a_record_held_when_its_batch_arrives_does_not_cover_a_write_here() {
+    use std::sync::mpsc;
+    for mutant in [false, true] {
+        let mut pair = Pair::swept(2, 2);
+        let digest = pair.tables[1].0.digest();
+        let full = pair.full.clone();
+        let now = pair.now;
+        pair.write(1, 0);
+        let (arrived, batch) = mpsc::channel();
+        let (go, released) = mpsc::channel::<()>();
+        let hook: crate::replica::IngestHook = Box::new(move |wires| {
+            arrived.send(wires.to_vec()).unwrap();
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the test releases the batch");
+            Ok(())
+        });
+        crate::replica::BEFORE_INGEST
+            .lock()
+            .unwrap()
+            .push((digest, hook));
+        let mut handed = Repair::default();
+        assert!(handed.lead(digest));
+        let (dialled, served) = round_at(&full[0], &full[1], &pair.listeners[1], handed);
+        let wires = batch
+            .recv_timeout(Duration::from_secs(60))
+            .expect("Mac 1 receives the batch");
+        assert_eq!(wires.len(), 1);
+        pair.ingest(1, 1, &wires);
+        pair.macs[1]
+            .moves
+            .received(Subject::Table(digest), [7; 48], now, 1);
+        pair.write(1, 1);
+        go.send(()).unwrap();
+        HELD_RECEIPTS_BRING.with(|flag| flag.set(mutant));
+        pair.macs[1].finish(served, now);
+        HELD_RECEIPTS_BRING.with(|flag| flag.set(false));
+        pair.macs[0].finish(dialled, now);
+        let took = pair.macs[1].reports().last().unwrap().application.unwrap();
+        assert_eq!(
+            (took.table, took.received, took.added),
+            (Some(digest), 1, 0),
+            "the record was held when it arrived"
+        );
+        let report = pair.macs[0].reports().last().unwrap().application.unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(now).unwrap();
+        if mutant {
+            assert!(!pair.dial_due(1), "MUTANT: Mac 1 has no dial due");
+            continue;
+        }
+        pair.walks_back(1);
+    }
+}
+
+/// A round's receipt that comes after a look already found what it brought covers nothing that
+/// look did not find, across real rounds. Mac 0 dials Mac 1 with a record of a table both list,
+/// and the round has put it in Mac 1's store before Mac 1 joins its end. Mac 1's look finds the
+/// table moved with no receipt and names no seat; its walk dials Mac 0, which holds the record,
+/// and that round settles Mac 0, which ends the walk. Mac 1 writes the table, and then joins Mac
+/// 0's round. Its look finds the table grown by one, the write, as the late receipt brought one:
+/// the round began before the look that found its record, so it names no seat, and the walk
+/// dials Mac 0 again, which then holds both records.
+/// MUTANT (`crate::runtime::moved::STALE_SOURCES_HOLD`): the late receipt covers the write, Mac
+/// 0 is named as holding it, and Mac 1 has no dial due; the write would wait for an audit.
+#[test]
+fn a_receipt_after_a_look_that_found_its_record_covers_no_later_write() {
+    use crate::runtime::moved::STALE_SOURCES_HOLD;
+    for mutant in [false, true] {
+        let mut pair = Pair::swept(2, 2);
+        let digest = pair.tables[1].0.digest();
+        let full = pair.full.clone();
+        let began = pair.now;
+        pair.write(1, 0);
+        let mut handed = Repair::default();
+        assert!(handed.lead(digest));
+        let (dialled, served) = round_at(&full[0], &full[1], &pair.listeners[1], handed);
+        let served = held_in(&mut pair.macs[1], served, began);
+        pair.macs[0].finish(dialled, began);
+        let report = pair.macs[0].reports().last().unwrap().application.unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+
+        let look = began + Duration::from_secs(1);
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(look).unwrap();
+        assert_eq!(
+            pair.macs[1].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+        let (address, repair) = pair.macs[1]
+            .hints
+            .next(look)
+            .expect("Mac 1's walk dials Mac 0 for the record it found");
+        assert_eq!(address, pair.peers[1]);
+        let (walked, answered) = round_at(&full[1], &full[0], &pair.listeners[0], repair);
+        pair.macs[0].finish(answered, look);
+        pair.macs[1].finish(ended_at(walked, look, |_| {}), look);
+        pair.macs[0].reports().for_each(drop);
+        let report = pair.macs[1].reports().last().unwrap().application.unwrap();
+        assert_eq!(
+            (report.table, report.sent, report.added),
+            (Some(digest), 0, 0),
+            "Mac 0 held the record"
+        );
+        assert!(pair.macs[1].hints.next(look).is_none());
+        assert_eq!(pair.macs[1].hints.hot_count(), 0, "the walk ended");
+
+        pair.write(1, 1);
+        pair.now = look + crate::runtime::discovery::WALK_GAP;
+        STALE_SOURCES_HOLD.with(|flag| flag.set(mutant));
+        served.release();
+        pair.macs[1].tick(pair.now).unwrap();
+        STALE_SOURCES_HOLD.with(|flag| flag.set(false));
+        let took = pair.macs[1].reports().last().unwrap().application.unwrap();
+        assert_eq!(
+            (took.table, took.added),
+            (Some(digest), 1),
+            "the late receipt"
+        );
+        if mutant {
+            assert!(!pair.dial_due(1), "MUTANT: Mac 1 has no dial due");
+            continue;
+        }
+        pair.walks_back(1);
+    }
+}
+
+/// A write here that the walk passed by on a seat's lists, while a round of the seat's that
+/// lists the table anew was in flight, is offered to that seat as that round ends, across real
+/// rounds. After the sweep, in which Mac 1 left the fourth table out, Mac 1 takes it up and dials
+/// Mac 0 listing all four, and that round has ended before Mac 0 joins it. Mac 0 writes the
+/// table: its look finds it moved, and its walk passes Mac 1 by on the sweep's lists. Mac 0 then
+/// joins Mac 1's round, whose lists take the table: its walk dials Mac 1 with the table led, and
+/// Mac 1 holds the record.
+/// MUTANT (`crate::runtime::discovery::PARKS_NOTHING`): the move passed by is dropped, and Mac 0
+/// has no dial due once the round's lists come; the record would wait for an audit.
+#[test]
+fn a_write_passed_by_on_lists_a_round_in_flight_replaces_is_offered_as_it_ends() {
+    use crate::runtime::discovery::PARKS_NOTHING;
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, late);
+        let digest = pair.tables[late].0.digest();
+        let full = pair.full.clone();
+        let began = pair.now;
+        let (dialled, served) = round_at(&full[1], &full[0], &pair.listeners[0], Repair::default());
+        let served = ended_at(served, began, |_| {});
+        pair.macs[1].finish(dialled, began);
+        let report = pair.macs[1].reports().last().unwrap();
+        assert!(report.control.is_ok(), "{report:?}");
+
+        pair.write(late, 0);
+        let now = began + Duration::from_secs(1);
+        pair.now = now;
+        PARKS_NOTHING.with(|flag| flag.set(mutant));
+        pair.macs[0].look_soon();
+        pair.macs[0].tick(now).unwrap();
+        let passed = pair.macs[0].hints.next(now);
+        pair.macs[0].finish(served, now);
+        let due = pair.dial_due(0);
+        PARKS_NOTHING.with(|flag| flag.set(false));
+        assert!(passed.is_none(), "the sweep's lists left the table out");
+        pair.macs[0].reports().for_each(drop);
+        if mutant {
+            assert!(!due, "MUTANT: Mac 0 has no dial due");
+            continue;
+        }
+        let (address, repair) = pair.macs[0]
+            .hints
+            .next(now)
+            .expect("Mac 0's walk dials Mac 1 for the table it wrote");
+        assert_eq!(address, pair.peers[0]);
+        assert!(repair.leads(&digest), "the dial leads the written table");
+        let report = pair
+            .round(0, &full[0], &full[1], repair)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        assert_eq!(
+            crate::replica::tests::witness::held(&pair.lab, &pair.tables, late, 1),
+            1,
+            "Mac 1 holds Mac 0's record"
+        );
+    }
+}
+
+/// A table this Mac's configuration selects again, after its rounds left it out of their lists,
+/// is offered to the peer when written here, across real rounds. As in
+/// `a_table_held_before_the_last_lists_and_left_out_of_them_is_not_offered`, Mac 1 held the fourth
+/// table before its last lists with Mac 0 and left it out of them, as its policy excluding it
+/// would. Its configuration then changes (the exclusion is lifted), and Mac 1 writes the table:
+/// its look counts the store as taken up at the change, its walk dials Mac 0 with the table led,
+/// and Mac 0 holds the record.
+/// MUTANT (`crate::runtime::moved::CONFIG_UNSTAMPED`): the change restamps nothing, and Mac 1 has
+/// no dial due; the record would wait for a round that lists the table, at rest an audit.
+#[test]
+fn a_table_the_configuration_selects_again_is_offered_when_written_here() {
+    use crate::runtime::moved::CONFIG_UNSTAMPED;
+    for mutant in [false, true] {
+        let late = 3;
+        let mut pair = Pair::swept(4, late);
+        let digest = pair.tables[late].0.digest();
+        let (full, listed) = (pair.full.clone(), pair.listed.clone());
+        let report = pair.round(0, &full[0], &listed, Repair::default());
+        assert!(report.control.is_ok(), "{report:?}");
+        pair.macs[1].tick(pair.now).unwrap();
+        assert!(!pair.dial_due(1), "the round moved nothing");
+
+        aterm_secrets::fsx::write_atomic(&pair.config(1), b"[commons]\n", 0o600).unwrap();
+        pair.write(late, 1);
+        CONFIG_UNSTAMPED.with(|flag| flag.set(mutant));
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(pair.now).unwrap();
+        CONFIG_UNSTAMPED.with(|flag| flag.set(false));
+        assert_eq!(
+            pair.macs[1].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+        if mutant {
+            assert!(!pair.dial_due(1), "MUTANT: Mac 1 has no dial due");
+            continue;
+        }
+        let (address, repair) = pair.macs[1]
+            .hints
+            .next(pair.now)
+            .expect("Mac 1's walk dials Mac 0 for the table it selects again");
+        assert_eq!(address, pair.peers[1]);
+        assert!(repair.leads(&digest), "the dial leads the written table");
+        let report = pair
+            .round(1, &full[1], &full[0], repair)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        assert_eq!(
+            crate::replica::tests::witness::held(&pair.lab, &pair.tables, late, 0),
+            1,
+            "Mac 0 holds Mac 1's record"
+        );
+    }
+}
+
+/// A table written here in the moment after a round brought this Mac a record of it, before the
+/// look that round asked for, is still offered to the seat the round came from, across real
+/// rounds: the look finds the table grown by more than the round brought, so the seat cannot
+/// hold all of what moved it. Mac 0 hands Mac 1 a record of a table both list, and Mac 1 writes
+/// its own there before it looks; its walk then dials Mac 0 with the table led, and Mac 0 holds
+/// both records.
+///
+/// This is the recipient's external write of `process_sync_tests`, which its test made as soon as
+/// the source's record arrived: the recipient's look saw both in one, named the source as holding
+/// what moved, and the write waited for an audit (its wait stopped by a silent minute on
+/// 2026-11-14, `the source holds the recipient's external write`).
+/// MUTANT (`crate::runtime::moved::SOURCES_HOLD_ALL`): the source is taken as holding all that
+/// moved, and Mac 1 has no dial due.
+#[test]
+fn a_write_in_the_same_look_as_a_received_record_is_offered_to_its_source() {
+    for mutant in [false, true] {
+        let mut pair = Pair::swept(2, 2);
+        let digest = pair.tables[1].0.digest();
+        let full = pair.full.clone();
+        let now = pair.now;
+
+        pair.write(1, 0);
+        let mut handed = Repair::default();
+        assert!(handed.lead(digest));
+        let report = pair
+            .round(0, &full[0], &full[1], handed)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        pair.write(1, 1);
+        crate::runtime::moved::SOURCES_HOLD_ALL.with(|flag| flag.set(mutant));
+        pair.macs[1].tick(now).unwrap();
+        crate::runtime::moved::SOURCES_HOLD_ALL.with(|flag| flag.set(false));
+        if mutant {
+            assert!(
+                pair.macs[1]
+                    .hints
+                    .next_dial_at(now, true)
+                    .is_none_or(|at| at > now),
+                "MUTANT: Mac 1 has no dial due"
+            );
+            continue;
+        }
+        pair.walks_back(1);
+    }
+}
+
+/// A round whose table exchange broke off names no seat the source of what it brought, so a write
+/// here that the walk had yet to offer that seat is still offered, across real rounds. Mac 1
+/// writes a table both list, and its look finds it moved; before its walk dials, Mac 0 dials in
+/// over that table with a record of its own. Mac 1, the responder, receives Mac 0's batch first,
+/// and while that receive waits ([`crate::replica::BEFORE_INGEST`]) Mac 0's side of the round is
+/// cancelled: Mac 1 holds Mac 0's record and sends none of its own. Mac 1's look finds the table
+/// grown by what the round brought, names no seat, and its walk dials Mac 0 with the table led;
+/// Mac 0 holds both records.
+/// MUTANT (`INTERRUPTED_RECEIPTS_HOLD`, as before 2026-11-14): the broken round's receipt covers
+/// the growth, Mac 0 is taken as holding the move, which replaces the write's, and Mac 1 has no
+/// dial due; the write would wait for an audit.
+#[test]
+fn a_round_that_broke_off_names_no_seat_holding_a_write_it_did_not_carry() {
+    use std::sync::mpsc;
+    for mutant in [false, true] {
+        let mut pair = Pair::swept(2, 2);
+        let digest = pair.tables[1].0.digest();
+        let full = pair.full.clone();
+        let now = pair.now;
+        pair.write(1, 1);
+        pair.macs[1].look_soon();
+        pair.macs[1].tick(now).unwrap();
+        assert_eq!(
+            pair.macs[1].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+
+        pair.write(1, 0);
+        let (arrived, batch) = mpsc::channel();
+        let (go, released) = mpsc::channel::<()>();
+        let hook: crate::replica::IngestHook = Box::new(move |_| {
+            arrived.send(()).unwrap();
+            released
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the test releases the batch");
+            Ok(())
+        });
+        crate::replica::BEFORE_INGEST
+            .lock()
+            .unwrap()
+            .push((digest, hook));
+        let mut handed = Repair::default();
+        assert!(handed.lead(digest));
+        let (dialled, served) = round_at(&full[0], &full[1], &pair.listeners[1], handed);
+        batch
+            .recv_timeout(Duration::from_secs(60))
+            .expect("Mac 1 receives Mac 0's batch");
+        dialled.stop();
+        go.send(()).unwrap();
+        let served = ended_at(served, now, |_| {});
+        INTERRUPTED_RECEIPTS_HOLD.with(|flag| flag.set(mutant));
+        pair.macs[1].finish(served, now);
+        INTERRUPTED_RECEIPTS_HOLD.with(|flag| flag.set(false));
+        pair.macs[0].finish(dialled, now);
+        pair.macs[0].reports().for_each(drop);
+        let broken = pair.macs[1]
+            .reports()
+            .last()
+            .unwrap()
+            .application_interrupted
+            .expect("Mac 1's round broke off");
+        assert_eq!(
+            (broken.table, broken.added, broken.sent),
+            (Some(digest), 1, 0),
+            "Mac 1 holds Mac 0's record and sent none of its own"
+        );
+        pair.macs[1].tick(now).unwrap();
+        if mutant {
+            assert!(!pair.dial_due(1), "MUTANT: Mac 1 has no dial due");
+            continue;
+        }
+        pair.walks_back(1);
+    }
+}
+
+/// Two Macs' transports over loopback on a witness lab's tables (`crate::replica`), each swept
+/// by the other until it rests, Mac 1 last, while Mac 1 lists only some of them; each Mac's look
+/// starts after that ([`Pair::swept`]).
+struct Pair {
+    lab: crate::table::tests::Lab,
+    tables: Vec<(crate::table::Scope, [std::path::PathBuf; 2])>,
+    /// Each Mac's endpoint listing every table.
+    full: [Arc<Endpoint>; 2],
+    /// Mac 1's endpoint listing the tables it listed through its sweep.
+    listed: Arc<Endpoint>,
+    listeners: [RecheckedListener; 2],
+    /// Where each Mac dials its peer.
+    peers: [SocketAddr; 2],
+    macs: [Transport; 2],
+    /// Every scheduler call reads this one instant or a later one it names: no wait ends by the
+    /// time the test takes. A walk may dial from it.
+    now: Instant,
+}
+
+impl Pair {
+    /// The pair on `count` tables, Mac 1 listing the first `mac1_lists` of them while each Mac
+    /// sweeps its peer.
+    fn swept(count: usize, mac1_lists: usize) -> Self {
+        use crate::replica::tests::witness::{endpoint, tables};
+        use aterm_secrets::commons::roster::Role;
+        let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, count);
+        let full = [0, 1].map(|node| Arc::new(endpoint(&lab, &tables, node)));
+        let listed = Arc::new(endpoint(&lab, &tables[..mac1_lists], 1));
+        let listeners = [0, 1].map(|_| {
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()
+        });
+        let peers = [1, 0].map(|to| listeners[to].local_addr().unwrap());
+        let mut pair = Self {
+            lab,
+            tables,
+            full: full.clone(),
+            listed: listed.clone(),
+            listeners,
+            peers,
+            macs: [
+                loopback_mode(None, 0, [84; 32]),
+                loopback_mode(None, 0, [85; 32]),
+            ],
+            now: Instant::now(),
+        };
+        for from in [0, 1] {
+            let (client, server) = if from == 0 {
+                (&full[0], &listed)
+            } else {
+                (&listed, &full[0])
+            };
+            let address = pair.peers[from];
+            loop {
+                pair.hear(from);
+                let (chosen, repair) = pair.macs[from].hints.next(pair.now).unwrap();
+                assert_eq!(chosen, address);
+                let report = pair.round(from, client, server, repair);
+                assert!(report.control.is_ok(), "{report:?}");
+                let settled = if from == 0 {
+                    pair.macs[0].hints.rests(address)
+                } else {
+                    !pair.macs[1].hints.follow_up_contains(address)
+                };
+                if settled {
+                    break;
+                }
+                pair.now = pair.macs[from].hints.next_at(address);
+            }
+            assert!(pair.macs[from].hints.established(address));
+        }
+        // A walk dials an endpoint once its gap after its last round is over.
+        pair.now += crate::runtime::discovery::WALK_GAP;
+        for node in [0, 1] {
+            let bootstrap = pair.lab.bootstrap(node);
+            pair.macs[node].watching(Moves::unwatched(
+                &pair.lab.paths[node],
+                bootstrap.journal_dir(),
+                &pair.config(node),
+                bootstrap.trust(),
+            ));
+            pair.hear(node);
+            assert!(
+                pair.macs[node].hints.next(pair.now).is_none(),
+                "Mac {node} dials nothing"
+            );
+        }
+        pair
+    }
+
+    /// Where Mac `node`'s look reads the Commons configuration's stamp
+    /// (`crate::runtime::moved::Look::held_since`): no file until a test writes one.
+    fn config(&self, node: usize) -> std::path::PathBuf {
+        self.lab.paths[node].dir.join("commons-policy.toml")
+    }
+
+    /// Mac `node` hears its peer's beacon at `now`.
+    fn hear(&mut self, node: usize) {
+        let address = self.peers[node];
+        let beacon = Hints::new([86; 32]).wire(address.port());
+        self.macs[node].hints.observe(&beacon, address, self.now);
+    }
+
+    /// Mac `node` writes a record of table `table`.
+    fn write(&self, table: usize, node: usize) {
+        crate::replica::tests::witness::write(&self.lab, &self.tables, table, node);
+    }
+
+    /// Mac `node` puts `wires`, records of table `table`, in its store of it, as another of its
+    /// rounds would.
+    fn ingest(&self, table: usize, node: usize, wires: &[(astream_wire::sync::Digest, Vec<u8>)]) {
+        let bootstrap = self.lab.bootstrap(node);
+        let session = crate::table::Session::open(&bootstrap).unwrap();
+        let (scope, paths) = &self.tables[table];
+        let mut store = crate::table::store::Store::open(&session, &paths[node], *scope).unwrap();
+        for (_, wire) in wires {
+            store.ingest(&session, wire).unwrap();
+        }
+    }
+
+    /// Whether Mac `node` has a dial due at `now`, as its schedule reads, which changes nothing.
+    fn dial_due(&self, node: usize) -> bool {
+        self.macs[node]
+            .hints
+            .next_dial_at(self.now, true)
+            .is_some_and(|at| at <= self.now)
+    }
+
+    /// One round Mac `from` dials its peer with, on `client` to `server`, joined by both
+    /// transports at `now`; its report.
+    fn round(
+        &mut self,
+        from: usize,
+        client: &Arc<Endpoint>,
+        server: &Arc<Endpoint>,
+        repair: Repair,
+    ) -> RepairRound {
+        let to = 1 - from;
+        let (dialled, served) = round_at(client, server, &self.listeners[to], repair);
+        self.macs[to].finish(served, self.now);
+        self.macs[from].finish(dialled, self.now);
+        self.macs[to].reports().for_each(drop);
+        self.macs[from].reports().last().unwrap()
+    }
+
+    /// Mac 1 has written `table` after Mac 0 wrote one record of it: its walk is due, dials Mac 0
+    /// with the table led, and the round leaves Mac 0 holding both records.
+    fn walks_back(&mut self, table: usize) {
+        let digest = self.tables[table].0.digest();
+        let now = self.now;
+        assert!(
+            self.macs[1]
+                .hints
+                .next_dial_at(now, true)
+                .is_some_and(|at| at <= now),
+            "Mac 1's walk is due"
+        );
+        let (address, repair) = self.macs[1]
+            .hints
+            .next(now)
+            .expect("Mac 1's walk dials Mac 0 for the table it wrote");
+        assert_eq!(address, self.peers[1]);
+        assert!(repair.leads(&digest), "the dial leads the written table");
+        let full = self.full.clone();
+        let report = self
+            .round(1, &full[1], &full[0], repair)
+            .application
+            .unwrap();
+        assert_eq!((report.table, report.sent), (Some(digest), 1));
+        assert_eq!(
+            crate::replica::tests::witness::held(&self.lab, &self.tables, table, 0),
+            2,
+            "Mac 0 holds Mac 1's record"
+        );
     }
 }
 

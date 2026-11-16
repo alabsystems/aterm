@@ -40,6 +40,7 @@ fn leaf(local: u64, cwd: Option<&str>, title: &str) -> restore::RestoredSplitTre
 
 pub(crate) fn layout(tabs: &[(&str, &str)]) -> RestoreManifest {
     RestoreManifest::new(vec![restore::WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

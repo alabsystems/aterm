@@ -399,6 +399,7 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
         .unwrap_or_else(|| panic!("the capture holds the {restore_tag} leaf"))
         .clone();
     crate::restore::WindowLayout {
+        dock: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

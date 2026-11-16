@@ -7049,6 +7049,35 @@ fn readback_rechecks_preexisting_worktrees_and_dependencies_after_a_clone_batch(
     }
 }
 
+/// A later probe on the same item cannot reuse preserved destinations in a different
+/// outcome's explanation, even when the caller still holds the earlier person verdict.
+#[test]
+fn repository_explanation_drops_preserved_details_after_recovery() {
+    let names = names("kept", 5);
+    let (sys, item) = listing(&names, &names);
+    let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+    for name in &names {
+        sys.stat_of(
+            Path::new(&item.user.home).join(name).to_str().unwrap(),
+            stat(false, 0o600),
+        );
+    }
+    let preserved = item.probe(&sys, &context);
+    assert!(matches!(preserved, Probe::Person { .. }), "{preserved:?}");
+    let explanation = item.explain(&preserved).unwrap();
+    assert!(explanation.why.contains("~/kept-004"), "{explanation:?}");
+    for name in &names {
+        sys.stat_of(
+            Path::new(&item.user.home).join(name).to_str().unwrap(),
+            stat(true, 0o700),
+        );
+    }
+    let recovered = item.probe(&sys, &context);
+    assert!(matches!(recovered, Probe::Ok { .. }), "{recovered:?}");
+    assert!(item.explain(&recovered).is_none());
+    assert!(item.explain(&preserved).is_none());
+}
+
 /// Existing destinations stay untouched while the others clone. They remain part of the
 /// expected count and keep the stage unfinished; preserving a folder never completes it.
 #[test]

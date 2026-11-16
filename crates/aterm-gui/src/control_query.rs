@@ -558,7 +558,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
     format!(
         "OK {} {} {} {} session={} cell_w={} cell_h={} font_px={:.2} scale={:.2} window={} \
          window_rows={} window_cols={} composed_rows={} grid_w={} grid_h={} \
-         frame_w={} frame_h={} surface_w={} surface_h={} offset_x={} offset_y={} \
+         dock={} dock_cells={} frame_w={} frame_h={} surface_w={} surface_h={} offset_x={} offset_y={} \
          band_left={} band_right={} band_top={} band_bottom={} crop_left={} \
          crop_right={} crop_top={} crop_bottom={} pad={} pad_top={} pad_bottom={} head={} \
          tab_rows={} deck_y={} deck_h={} viewers={} visible_viewers={} geometry={} \
@@ -580,6 +580,10 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         snapshot.composed_rows,
         snapshot.pixel_w,
         snapshot.pixel_h,
+        snapshot
+            .dock
+            .map_or_else(|| "none".to_string(), |view| view.to_string()),
+        snapshot.dock_cells,
         snapshot.frame_w,
         snapshot.frame_h,
         snapshot.surface_w,
@@ -3054,7 +3058,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         "{{\"rows\":{},\"cols\":{},\"pixel_w\":{},\"pixel_h\":{},\
          \"session\":{},\"cell_w\":{},\"cell_h\":{},\"font_px\":{:.2},\"scale\":{:.2},\
          \"window\":{},\"window_rows\":{},\"window_cols\":{},\"composed_rows\":{},\
-         \"grid_w\":{},\"grid_h\":{},\"frame_w\":{},\"frame_h\":{},\
+         \"grid_w\":{},\"grid_h\":{},\"dock\":{},\"dock_cells\":{},\"frame_w\":{},\"frame_h\":{},\
          \"surface_w\":{},\"surface_h\":{},\"offset_x\":{},\"offset_y\":{},\
          \"band_left\":{},\"band_right\":{},\"band_top\":{},\"band_bottom\":{},\
          \"crop_left\":{},\"crop_right\":{},\"crop_top\":{},\"crop_bottom\":{},\
@@ -3077,6 +3081,10 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         snapshot.composed_rows,
         snapshot.pixel_w,
         snapshot.pixel_h,
+        snapshot
+            .dock
+            .map_or_else(|| "null".to_string(), |view| view.to_string()),
+        snapshot.dock_cells,
         snapshot.frame_w,
         snapshot.frame_h,
         snapshot.surface_w,

@@ -632,8 +632,8 @@ pub(crate) fn hosted_with(
 ) -> Act {
     let ctx = {
         let guard = store.read().unwrap_or_else(PoisonError::into_inner);
-        let Some(h) = guard
-            .by_sid(&aterm_session::SessionId::new(sid))
+        let Some(h) = aterm_session::SessionId::parse(sid)
+            .and_then(|id| guard.by_sid(&id))
             .filter(|h| h.state != SessionState::Exited)
         else {
             return Act::Observe;

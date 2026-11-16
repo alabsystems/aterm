@@ -27,7 +27,7 @@ use crate::{
     Error, Result,
     database::Change,
     typed::{
-        Collection, LIFECYCLE,
+        Collection, LIFECYCLE, MAX_PK,
         cell::{self, CellKey, CellValue, Cells, Projection, Row},
         guard, keys,
         owned::OwnedRead,
@@ -50,11 +50,12 @@ pub const fn day_of(ms: u64) -> u64 {
     ms / MS_PER_DAY
 }
 
-/// What this Mac reads about itself. No `Debug`: it holds the IOPlatformUUID, which never leaves
-/// the process (`keys::hw_hint`).
+/// What this machine reads about itself. No `Debug`: it holds the IOPlatformUUID (a Linux
+/// machine's `/etc/machine-id`), which never leaves the process (`keys::hw_hint`).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Probe {
-    /// `sysctl hw.model`, as read (`Mac16,8`).
+    /// The machine's model as read: a Mac's `sysctl hw.model` (`Mac16,8`), a Linux machine's
+    /// DMI product name or device-tree model ([`Probe::linux`]); [`model_key`] makes its key.
     pub hw_model: String,
     pub chip: Option<String>,
     pub cores_p: Option<u64>,
@@ -69,6 +70,8 @@ pub struct Probe {
     pub hosts: Vec<String>,
     /// The key-derived node principal, 16 lower-case hex digits without `n-`.
     pub node: Option<String>,
+    /// The identity the keyed hint is made of: a Mac's IOPlatformUUID, a Linux machine's
+    /// `/etc/machine-id`.
     pub platform_uuid: String,
 }
 
@@ -207,16 +210,109 @@ impl Plan {
     }
 }
 
-/// A `model` row's key from `hw.model` (`Mac16,8` becomes `Mac16-8`).
+/// A `model` row's key from a machine's model as read ([`Probe::hw_model`]): each run of
+/// characters outside the key grammar (`,`, a space, `.`, `(`, anything not ASCII) becomes one
+/// `-`, and none leads or closes it. Case is kept, so a Mac's key is what it always was
+/// (`Mac16,8` becomes `Mac16-8`) and a Linux machine's name reads as written (`Precision 5570`
+/// becomes `Precision-5570`). A mapped name longer than the grammar ([`MAX_PK`]) keeps its first
+/// characters and closes with `-` and six hex digits of its SHA-256, so two models that differ
+/// only past the cut (`Raspberry Pi Compute Module 4 Rev 1.0` and `… 5 …`) are two rows, never
+/// one model row described for both.
 ///
 /// # Errors
-/// What is left does not fit the key grammar.
+/// Nothing in the grammar is left.
 pub fn model_key(hw_model: &str) -> Result<String> {
-    let key = hw_model.trim().replace(',', "-");
+    /// `-` and the hex digits that close a long name's key.
+    const TAIL: usize = 1 + 6;
+    let mut key = String::new();
+    for c in hw_model.trim().chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '-'
+        };
+        if c != '-' || !(key.is_empty() || key.ends_with('-')) {
+            key.push(c);
+        }
+    }
+    while key.ends_with('-') {
+        key.pop();
+    }
+    if key.len() > MAX_PK {
+        let digest = aterm_digest::Sha256::digest(key.as_bytes());
+        key.truncate(MAX_PK - TAIL);
+        while key.ends_with('-') {
+            key.pop();
+        }
+        key.push('-');
+        aterm_codec::hex::push_lower(&mut key, &digest[..3]);
+    }
     if pk_grammar(&key) {
         Ok(key)
     } else {
-        Err(Error::new("hw.model does not make a model key"))
+        Err(Error::new("the machine's model makes no model key"))
+    }
+}
+
+/// Bytes as decimal gigabytes, rounded, the way a disk is sold.
+pub const fn gigabytes(bytes: u64) -> u64 {
+    bytes.saturating_add(500_000_000) / 1_000_000_000
+}
+
+/// The installed memory, whole GiB, that a Linux kernel's `MemTotal` (KiB) stands for. The kernel
+/// counts what is left after its page map (1/64 of memory with 4 KiB pages), the firmware's
+/// reserve and a crash kernel's, so 64 GiB reads about 62.8 and a plain rounding up says 63. It
+/// rounds up to a step of a quarter of the power of two at or below it, at least 1 GiB: 16 to 32
+/// GiB in steps of 4, 32 to 64 in steps of 8, which holds every size modules sum to (24, 48, 96
+/// and 192 included). Memory the firmware gives a GPU is no part of `MemTotal`, and nothing an
+/// unprivileged process reads states it.
+#[must_use]
+pub const fn installed_gib(mem_total_kib: u64) -> u64 {
+    const GIB_KIB: u64 = 1 << 20;
+    if mem_total_kib == 0 {
+        return 0;
+    }
+    let power = 1_u64 << mem_total_kib.ilog2();
+    let step = if power / 4 > GIB_KIB {
+        power / 4
+    } else {
+        GIB_KIB
+    };
+    mem_total_kib.div_ceil(step).saturating_mul(step) / GIB_KIB
+}
+
+impl Probe {
+    /// A Linux machine's readings under `root` ([`aterm_sysprobe::linux::Root::system`] on the
+    /// machine, a fixture tree in tests): its model ([`aterm_sysprobe::linux::Root::product_model`]),
+    /// chip, physical cores, memory, root volume, the host names its owner set, and
+    /// `/etc/machine-id` as the identity the keyed hint is made of ([`keys::hw_hint`], exactly as
+    /// a Mac's IOPlatformUUID), which stays in this process. `None` where it states no model or no
+    /// machine id, which its row needs, as a Mac with no IOPlatformUUID states nothing. A Linux
+    /// machine has no GPU cores or OS major to state, and no fleet node until its caller adds one.
+    ///
+    /// A reinstall writes a new machine id, so a reinstalled Linux machine births a new machine
+    /// row the owner merges (`merged_into`), where a reinstalled Mac is adopted by its hint.
+    ///
+    /// Memory is the installed amount `MemTotal` stands for ([`installed_gib`]).
+    #[must_use]
+    pub fn linux(root: &aterm_sysprobe::linux::Root) -> Option<Self> {
+        let platform_uuid = root.machine_id()?;
+        let hw_model = root.product_model()?;
+        let (cores_p, cores_e) = root.core_counts();
+        Some(Self {
+            hw_model,
+            chip: root.chip(),
+            cores_p,
+            cores_e,
+            gpu_cores: None,
+            ram_gb: root.mem_total_kib().map(installed_gib),
+            disk_gb: root.volume_bytes().map(gigabytes),
+            arch: Some(std::env::consts::ARCH.to_owned()),
+            os_major: None,
+            hosts: root.owner_host_names(),
+            node: None,
+            platform_uuid,
+        })
     }
 }
 
@@ -505,9 +601,11 @@ fn model_birth(cells: &Cells, probe: &Probe) -> Result<Vec<Change>> {
 /// a second row naming them would hold the original at `node-ambiguous` for good; this Mac's facts
 /// row still states what it read. `machine` is the `machine` collection as the generation written
 /// declares it, so its hosts go in the form that generation holds them ([`cell::texts_change`]).
+/// Its `model` is left out where `models` holds that model's row and it is not live.
 fn machine_birth(
     input: &Input<'_>,
     (machine, machines): (&Collection, &Projection),
+    models: &Projection,
     pk: &str,
     label: &str,
 ) -> Result<Vec<Change>> {
@@ -525,14 +623,14 @@ fn machine_birth(
     let mut changes = vec![
         automatic(machine, pk, "label", Value::from(label))?,
         automatic(machine, pk, "status", Value::from("active"))?,
-        automatic(
-            machine,
-            pk,
-            "model",
-            Value::from(model_key(&probe.hw_model)?),
-        )?,
-        automatic(machine, pk, LIFECYCLE, Value::from("live"))?,
     ];
+    // A model row the owner retired is left out: a live machine born naming it would be refused
+    // (`typed::check::names_not_live`), and with it every later pass that plans the birth again.
+    let model = model_key(&probe.hw_model)?;
+    if !models.rows.get(&model).is_some_and(|row| !row.live()) {
+        changes.push(automatic(machine, pk, "model", Value::from(model))?);
+    }
+    changes.push(automatic(machine, pk, LIFECYCLE, Value::from("live"))?);
     if let Some(node) = probe
         .node
         .as_deref()
@@ -1339,7 +1437,7 @@ fn pick(
 /// What this Mac should write now over the registry it holds.
 ///
 /// # Errors
-/// `hw.model` makes no model key, all machine numbers are reserved, or a cell this Mac would
+/// The machine's model makes no model key, all machine numbers are reserved, or a cell this Mac would
 /// write breaks its column's rules.
 pub fn plan(input: &Input<'_>, view: &crate::typed::View) -> Result<Plan> {
     if !view.complete {
@@ -1560,7 +1658,13 @@ fn plan_projected(
                     },
                     own_pk.clone(),
                     None,
-                    machine_birth(input, (machine, machines), &own_pk, &label)?,
+                    machine_birth(
+                        input,
+                        (machine, machines),
+                        &cell::project(&MODEL, cells),
+                        &own_pk,
+                        &label,
+                    )?,
                 )
             }
         },

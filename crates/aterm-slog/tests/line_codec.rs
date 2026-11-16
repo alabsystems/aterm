@@ -1655,7 +1655,12 @@ fn the_desc_mark_is_appended_local_and_its_text_is_a_host_fact() {
 /// wire encode, which keeps no host text, drops it.
 #[test]
 fn a_requests_why_text_is_appended_host_text_and_reads_back() {
-    assert_eq!(FIELDS.last().map(|(k, ..)| *k), Some(Key::WhyText));
+    let key_at = |key: Key| FIELDS.iter().position(|(k, ..)| *k == key);
+    assert_eq!(
+        key_at(Key::WhyText).map(|i| i + 1),
+        key_at(Key::Hseq),
+        "appended: every earlier key keeps its index, a stream record's number after it"
+    );
     assert_eq!(
         (Key::WhyText.word(), Key::WhyText.tier(), Key::WhyText.cap()),
         ("why_text", Tier::Host, Cap::Text(256))

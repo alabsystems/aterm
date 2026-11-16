@@ -338,6 +338,7 @@ src/prompt.rs	a_row_at_or_past_the_room_gives_the_row_under_it_a_lead	box-wrap-i
 src/prompt.rs	a_rows_lead_is_carried_to_the_row_under_it	box-wrap-invariance	
 src/prompt.rs	a_title_whole_on_its_row_takes_no_row_under_it	box-wrap-invariance	
 src/prompt.rs	a_vendor_reason_stacked_over_the_owners_rule_does_not_hide_it_in_the_old_layout	owner-review-contract	
+src/prompt.rs	a_windows_trust_path_is_read_as_claude_code_draws_it	box-wrap-invariance	
 src/prompt.rs	a_workflow_box_is_kind_workflow_with_its_description	prompt-corpus	
 src/prompt.rs	a_wrapped_auto_deny_countdown_is_one_countdown_not_a_note	box-wrap-invariance	
 src/prompt.rs	a_wrapped_trust_path_is_read_whole	box-wrap-invariance	

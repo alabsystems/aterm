@@ -17,6 +17,8 @@ pub(crate) struct GlPresentBufs {
     bloom: GlBuffer,
     shimmer: GlBuffer,
     tray: GlBuffer,
+    dock_tray: GlBuffer,
+    dock_blit: GlBuffer,
     crown: GlBuffer,
     /// The bloom extract's instances (`bloom_glow_scratch[extract_first..]`).
     extract: Option<(GlBuffer, usize)>,
@@ -33,6 +35,8 @@ impl GlPresentBufs {
             bloom: u(std::mem::size_of::<BloomUniform>())?,
             shimmer: u(std::mem::size_of::<ShimmerUniform>())?,
             tray: u(std::mem::size_of::<TrayUniform>())?,
+            dock_tray: u(std::mem::size_of::<TrayUniform>())?,
+            dock_blit: u(std::mem::size_of::<BlitUniform>())?,
             crown: u(std::mem::size_of::<HdrGlowUniform>())?,
             extract: None,
             crown_stream: None,
@@ -44,6 +48,7 @@ impl GlPresentBufs {
 /// the stand-in, the sizes, and what drew over the frame.
 #[derive(Clone, Copy)]
 pub(crate) struct GlPosted {
+    dock: Option<([u32; 4], u64)>,
     /// The blit's uniform: placement (`content_off`), crop, invert, overlay,
     /// bands.
     blit: BlitUniform,
@@ -99,11 +104,17 @@ fn post_damage(
         .into_iter()
         .try_fold(dirty?, |acc, r| union_rect_opt(Some(acc), r, now.frame))?;
     let placed = blit_footprint(&now.blit, changed, now.dest);
-    union_rect_opt(
+    let frame = union_rect_opt(
         union_rect_opt(Some(placed), Some(last.crown), now.dest),
         Some(now.crown),
         now.dest,
-    )
+    )?;
+    let dock = if last.dock == now.dock && now.dock.is_none_or(|(_, serial)| serial != 0) {
+        Some([0, 0, 0, 0])
+    } else {
+        union_rect_opt(card(last.dock), card(now.dock), now.dest)
+    };
+    union_rect_opt(Some(frame), dock, now.dest)
 }
 
 /// Where a change to `rect` of the frame (frame pixels, half-open) shows on
@@ -357,7 +368,7 @@ impl GpuRenderer {
         if shimmer_region.is_some() {
             live.ensure_pipeline(Pipeline::Shimmer)?;
         }
-        if tray.is_some() {
+        if tray.is_some() || win.dock_card.is_some() {
             live.ensure_pipeline(Pipeline::Tray)?;
         }
         if run_hdr_glow {
@@ -628,6 +639,58 @@ impl GpuRenderer {
             live.pipeline(row)
                 .unwrap_or_else(|| panic!("gl present: {row:?} ensured above"))
         };
+        let dock_card = win.dock_card.clone();
+        let dock_rect = win.dock_rect((dw, dh));
+        let mut dock_redraw = false;
+        if let Some(card) = dock_card.as_ref() {
+            let fresh = win.gl_dock_stage.as_ref().is_none_or(|stage| {
+                !stage.input.on(&live.dev) || (stage.input.width, stage.input.height) != card.size
+            });
+            if fresh {
+                let (format, alias) = offscreen_format(&live.dev);
+                win.gl_dock_stage = Some(ArmDockStage {
+                    input: live.dev.texture_2d(
+                        TexelFormat::Rgba8Unorm,
+                        card.size.0,
+                        card.size.1,
+                        None,
+                    )?,
+                    target: live
+                        .dev
+                        .texture_2d(format, card.size.0, card.size.1, alias)?,
+                    serial: None,
+                });
+            }
+            let stage = win.gl_dock_stage.as_ref().expect("dock stage ensured");
+            dock_redraw = card.serial == 0 || stage.serial != Some(card.serial);
+            if dock_redraw {
+                live.dev.upload_rows(
+                    &stage.input,
+                    0,
+                    card.size.1,
+                    &card.rgba,
+                    card.size.0 * 4,
+                    card.size.0,
+                )?;
+                self.tray_uploads += 1;
+                self.tray_upload_bytes += card.rgba.len() as u64;
+            }
+            let mut uniform = want.for_dock(&card.quad());
+            uniform.content_off = [win.dock_origin.0 as f32, win.dock_origin.1 as f32];
+            live.dev
+                .write_buffer(&bufs.dock_blit, aterm_bits::bytes_of(&uniform))?;
+            live.dev.write_buffer(
+                &bufs.dock_tray,
+                aterm_bits::bytes_of(&TrayUniform {
+                    rect: [0.0, 0.0, card.size.0 as f32, card.size.1 as f32],
+                    fb: [card.size.0 as f32, card.size.1 as f32],
+                    _pad: [0.0; 2],
+                }),
+            )?;
+        } else {
+            // A hidden dock keeps no resident stage, as no tray keeps no tray card.
+            win.gl_dock_stage = None;
+        }
         let nearest = live.nearest();
         let linear = live.linear();
         let off = &win.gl_offscreen.as_ref().expect("checked above").tex;
@@ -748,6 +811,29 @@ impl GpuRenderer {
             pass.bind_texture(&card.tex, linear, binds.fragment_textures[0], false);
             pass.draw(4, 1)?;
         }
+        if let Some(stage) = win.gl_dock_stage.as_ref() {
+            if dock_redraw {
+                let binds = Pipeline::Tray.spec().binds;
+                let mut pass = frame.begin_pass(
+                    &stage.target,
+                    false,
+                    crate::device_layer::FrameLoad::Clear(crate::device_layer::ClearColor4 {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    None,
+                    (
+                        &bufs.dock_tray,
+                        binds.vertex_uniform.expect("tray vertex uniform"),
+                    ),
+                )?;
+                pass.set_pipeline(pipe(Pipeline::Tray));
+                pass.bind_texture(&stage.input, nearest, binds.fragment_textures[0], false);
+                pass.draw(4, 1)?;
+            }
+        }
         let mut crown_drawn = [0, 0, 0, 0];
         {
             let binds = Pipeline::Blit.spec().binds;
@@ -790,8 +876,21 @@ impl GpuRenderer {
                 bind_glow_lights(&mut pass, live, crown_row, bufs.crown_stream.as_ref());
                 pass.draw(6, crown_count)?;
             }
+            if let (Some(stage), Some([x0, y0, x1, y1])) = (win.gl_dock_stage.as_ref(), dock_rect) {
+                if x1 > x0 && y1 > y0 {
+                    let binds = Pipeline::Blit.spec().binds;
+                    pass.set_scissor(Some((x0, y0, x1 - x0, y1 - y0)));
+                    pass.bind_uniform(&bufs.dock_blit, binds.fragment_buffers[0]);
+                    pass.set_pipeline(pipe(Pipeline::Blit));
+                    pass.bind_texture(&stage.target, nearest, binds.fragment_textures[0], raw);
+                    pass.draw(3, 1)?;
+                }
+            }
         }
         frame.submit()?;
+        if let (Some(stage), Some(card)) = (win.gl_dock_stage.as_mut(), dock_card.as_ref()) {
+            stage.serial = Some(card.serial);
+        }
         let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
         let bloom = if bloom_state.is_some() {
             bloom_scissor
@@ -821,6 +920,7 @@ impl GpuRenderer {
             (rect, card.serial)
         });
         let posted = GlPosted {
+            dock: dock_rect.zip(dock_card.as_ref().map(|card| card.serial)),
             blit: want,
             frame: (fw, fh),
             dest: (dw, dh),

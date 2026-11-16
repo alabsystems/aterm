@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reference and unique rules and findings (design §6). A table is one causal domain, so no
-//! foreign key or unique constraint is atomic against a concurrent writer and nothing cascades:
-//! every write this Mac authors, on any path, is refused when, with the write landed on its own
-//! view, a reference it makes names a row that view does not hold, two live rows come to share
-//! a declared unique set, or a row live rows reference is retired ([`refused`]); and every
-//! reader re-checks the converged rows and reports what it finds ([`findings`]), what
-//! concurrent writes left among them. A finding or refusal names collections, keys and
-//! columns, never a value, so an address never reaches a report.
+//! Reference and unique rules and findings (design §6). A table is one causal domain, so no foreign
+//! key or unique constraint is atomic against a concurrent writer and nothing cascades: every write
+//! this Mac authors, on any path, is refused when, with the write landed on its own view, a
+//! reference it makes names a row that view does not hold, two live rows come to share a declared
+//! unique set, a row live rows reference is retired, or a live row comes to name a row that is not
+//! live ([`refused`]); and every reader re-checks the converged rows and reports what it finds
+//! ([`findings`]), what concurrent writes left among them. A finding or refusal names collections,
+//! keys and columns, never a value, so an address never reaches a report.
 
 use super::{
     Collection, Column, Kind, Refused, Table, Ty, View,
@@ -84,10 +84,10 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
         "protected-secret" => {
             "A protected row holds a secret: no table shows it, and the owner clears it"
         }
-        "schema-split" => "Macs state different versions of this table's columns",
+        "schema-split" => "Machines state different versions of this table's columns",
         "quota-spent" => {
-            "A Mac's automatic records reached the table's quota: what it states or adds past it \
-             counts once the table rolls"
+            "A machine's automatic records reached the table's quota: what it states or adds past \
+             it counts once the table rolls"
         }
         "roll" => "The table should roll to its next generation",
         "generation-unopened" => {
@@ -105,6 +105,39 @@ pub fn said(kind: &str) -> &str {
     sentence(kind)
         .or_else(|| crate::alab::checks::sentence(kind))
         .unwrap_or(kind)
+}
+
+/// A finding of `kind`'s heading, a few words in sentence case, for each word [`sentence`] says;
+/// `None` for any other word (a lab rule's heading is beside its sentence,
+/// [`crate::alab::checks::heading`]).
+pub fn heading(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "conflict" => "Values written at once",
+        "dangling" => "Reference to no row",
+        "unique" => "Value held twice",
+        "raw" => "Value from a newer build",
+        "protected-secret" => "Secret in a protected row",
+        "schema-split" => "Columns differ between machines",
+        "quota-spent" => "Quota spent",
+        "roll" => "Roll due",
+        "generation-unopened" => "Generation does not open",
+        _ => return None,
+    })
+}
+
+/// What a page heads a finding of `kind` with: its heading ([`heading`], else the lab's
+/// [`crate::alab::checks::heading`]), else its word with each dash a space and its first letter
+/// a capital (`schema-split` would read `Schema split`), so a kind no heading is written for still
+/// reads as words.
+pub fn headed(kind: &str) -> String {
+    if let Some(heading) = heading(kind).or_else(|| crate::alab::checks::heading(kind)) {
+        return heading.to_owned();
+    }
+    let words = kind.replace('-', " ");
+    let mut chars = words.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// Whether a row is protected (design §4.7, "protection is data, not source"): any candidate
@@ -244,8 +277,10 @@ fn landed(collection: &Collection, cells: &Cells, rows: &[Vec<Change>]) -> Proje
 /// save, an owner verb, a revert, the importer, `adopt`, `prefer`, a seed, registration or
 /// observation pass), judged over `rows` (one record each) against `view`, the table as the
 /// writer reads it: a reference the write makes names a row the table holds ([`missing_row`]),
-/// no two live rows come to share a declared unique set ([`unique_clash`]), and no row live
-/// rows reference is retired or ended ([`retired_referenced`]). Answers the first refusal.
+/// no two live rows come to share a declared unique set ([`unique_clash`]), no row live rows
+/// reference is retired or ended ([`retired_referenced`]), and no live row comes to name a row
+/// that is not live ([`names_not_live`]), the same rule from the referrer's side. Answers the
+/// first refusal.
 ///
 /// Only what the write itself makes is judged: a clash, a dangling reference or a reference to
 /// an ended row that concurrent writes left in rows or columns the write leaves as they are
@@ -262,6 +297,15 @@ pub fn refused(
     missing_row(table, rows, &view.cells, &view.owned, seeded)
         .or_else(|| unique_clash(table, rows, &view.cells))
         .or_else(|| retired_referenced(table, rows, &view.cells))
+        .or_else(|| names_not_live(table, rows, &view.cells))
+}
+
+/// Every reference `value`, a value of type `ty`, holds: a `Ref`, each `Ref` of a list or a set
+/// an owned or log row states whole, and each inside a struct, as `(target collection, key)`.
+pub fn references<'a>(ty: &Ty, value: &'a aterm_json::Value) -> Vec<(&'static str, &'a str)> {
+    let mut out = Vec::new();
+    refs(ty, value, &mut out);
+    out
 }
 
 /// The first reference a write's `rows` (one record each) make into `table` that names a key
@@ -272,7 +316,7 @@ pub fn refused(
 /// write leaves alone, which a concurrent write may have made so, never holds the write back
 /// ([`findings`] still reports it): a cells column the write does not change, and a column of an
 /// owned row that states what this writer's row in `owned` already holds there. A row `seeded`
-/// says every build of the table compiles (a seed a pass has not written here yet) may be named
+/// says this build compiles (a seed a pass has not written here yet) may be named
 /// too; [`findings`] reports the reference until a pass writes it. A reference into a collection
 /// that is not a cells collection of `table` is not judged, as [`findings`] does not judge one.
 pub fn missing_row(
@@ -451,35 +495,186 @@ pub fn retired_referenced(table: &Table, rows: &[Vec<Change>], cells: &Cells) ->
     if ending.is_empty() {
         return None;
     }
-    for referring in table.collections.iter().filter(|c| c.kind == Kind::Cells) {
-        let after = landed(referring, cells, rows);
-        let mut targets = Vec::new();
-        for (rpk, row) in after.rows.iter().filter(|(_, row)| row.live()) {
-            for (name, field) in &row.fields {
-                let Some(column) = referring.column(name) else {
-                    continue;
-                };
-                targets.clear();
-                field_refs(column, field, &mut targets);
-                if let Some(&(schema, pk)) = ending.iter().find(|(schema, pk)| {
-                    !(referring.name == schema.name && rpk == pk)
-                        && targets
-                            .iter()
-                            .any(|(target, key)| *target == schema.name && key == pk)
-                }) {
-                    return Some(Refused {
-                        collection: schema.name,
-                        pk: pk.to_owned(),
-                        column: super::LIFECYCLE.to_owned(),
-                        rule: format!(
-                            "live {} row {} names this row; end that row or point it elsewhere \
-                             first",
-                            referring.name,
-                            keys::safe_key(rpk)
-                        ),
-                    });
+    let (schema, pk, referring, rpk) =
+        naming(table, rows, cells).find_map(|(referring, rpk, named)| {
+            named.iter().find_map(|(target, key)| {
+                ending
+                    .iter()
+                    .find(|(schema, pk)| schema.name == *target && *pk == key.as_str())
+                    .map(|&(schema, pk)| (schema, pk, referring, rpk.clone()))
+            })
+        })?;
+    Some(Refused {
+        collection: schema.name,
+        pk: pk.to_owned(),
+        column: super::LIFECYCLE.to_owned(),
+        rule: format!(
+            "live {referring} row {} names this row; end that row or point it elsewhere first",
+            keys::safe_key(&rpk)
+        ),
+    })
+}
+
+/// Every row of a cells collection of `table` that live cells rows other than itself name once
+/// `rows` land on `cells`, with the naming rows (collection and key) in the table's order: the
+/// rows [`retired_referenced`] refuses a row's retirement over, read by the same rule. The
+/// Tables page names them before it stages a retire.
+pub fn referrers(
+    table: &Table,
+    rows: &[Vec<Change>],
+    cells: &Cells,
+) -> BTreeMap<(&'static str, String), Vec<(&'static str, String)>> {
+    let mut found: BTreeMap<(&'static str, String), Vec<(&'static str, String)>> = BTreeMap::new();
+    for (referring, rpk, named) in naming(table, rows, cells) {
+        for target in named {
+            let by = found.entry(target).or_default();
+            if !by.iter().any(|(c, k)| *c == referring && *k == rpk) {
+                by.push((referring, rpk.clone()));
+            }
+        }
+    }
+    found
+}
+
+/// Each live row of a cells collection of `table` once `rows` land on `cells` (collection and
+/// key), with every row it names other than itself (collection and key), by its columns' order:
+/// in the table's order of collections, then each collection's keys. An owned row names nothing
+/// here, as [`retired_referenced`] says.
+fn naming<'a>(
+    table: &'a Table,
+    rows: &'a [Vec<Change>],
+    cells: &'a Cells,
+) -> impl Iterator<Item = (&'static str, String, Vec<(&'static str, String)>)> + 'a {
+    table
+        .collections
+        .iter()
+        .filter(|c| c.kind == Kind::Cells)
+        .flat_map(move |referring| {
+            let after = landed(referring, cells, rows);
+            let mut found = Vec::new();
+            let mut targets = Vec::new();
+            for (rpk, row) in after.rows.iter().filter(|(_, row)| row.live()) {
+                let mut named: Vec<(&'static str, String)> = Vec::new();
+                for (name, field) in &row.fields {
+                    let Some(column) = referring.column(name) else {
+                        continue;
+                    };
+                    targets.clear();
+                    field_refs(column, field, &mut targets);
+                    for &(target, key) in &targets {
+                        let itself = target == referring.name && key == rpk;
+                        if !itself && !named.iter().any(|(t, k)| *t == target && k == key) {
+                            named.push((target, key.to_owned()));
+                        }
+                    }
+                }
+                if !named.is_empty() {
+                    found.push((referring.name, rpk.clone(), named));
                 }
             }
+            found
+        })
+}
+
+/// The first reference a write's `rows` make from a live cells row of `table` to a row of a
+/// cells collection that, once they land on `cells`, is held and not live (retired, ended,
+/// merged, or its lifecycle conflicted): [`retired_referenced`] from the referrer's side. A
+/// referrer the write makes live (a birth, or a revival of an ended or conflicted row) makes
+/// every reference it holds then, so each is judged; a referrer live before makes only those its
+/// written cells hold that they did not hold before: a value a written cell takes in place of
+/// another (a candidate of a conflicted cell it settles is no new reference), and a member of a
+/// `Set(Ref)` the write makes present. A write that restates a reference the row already holds
+/// adds none and is not refused for it, as an unrelated write is not. A target
+/// the table does not hold is [`missing_row`]'s. An owned or log row is a Mac's statement about
+/// itself with no lifecycle of its own and is not judged, as [`retired_referenced`] does not
+/// count one. The refusal names the referrer's collection, row and column, and the target's
+/// collection and key, never a value.
+pub fn names_not_live(table: &Table, rows: &[Vec<Change>], cells: &Cells) -> Option<Refused> {
+    // Each cells row the write touches, with the columns (and set members) it writes.
+    let mut written: BTreeMap<(&'static str, &str), Vec<(&str, Option<&str>)>> = BTreeMap::new();
+    for change in rows.iter().flatten() {
+        let Some(schema) = table
+            .collection(&change.collection)
+            .filter(|c| c.kind == Kind::Cells)
+        else {
+            continue;
+        };
+        if let Ok(key) = CellKey::parse(&change.key) {
+            written
+                .entry((schema.name, key.pk))
+                .or_default()
+                .push((key.col, key.elem));
+        }
+    }
+    // The references the write makes, as (referrer collection, row, column, target, key).
+    let mut made: Vec<(&'static str, &str, &'static str, &'static str, String)> = Vec::new();
+    let mut referrer = None::<(&'static str, Projection, Projection)>;
+    for (&(name, pk), columns) in &written {
+        let Some(schema) = table.collection(name) else {
+            continue;
+        };
+        if referrer.as_ref().is_none_or(|(held, ..)| *held != name) {
+            referrer = Some((
+                name,
+                super::cell::project(schema, cells),
+                landed(schema, cells, rows),
+            ));
+        }
+        let Some((_, before, after)) = referrer.as_ref() else {
+            continue;
+        };
+        let Some(row) = after.rows.get(pk).filter(|row| row.live()) else {
+            continue;
+        };
+        let held = before.rows.get(pk).filter(|row| row.live());
+        for (column_name, field) in &row.fields {
+            let Some(column) = schema.column(column_name) else {
+                continue;
+            };
+            let mut buf = Vec::new();
+            field_refs(column, field, &mut buf);
+            // A live referrer: only a reference its written cells hold that they did not before
+            // (a member the write makes present, a value it puts in place of another).
+            if let Some(held) = held {
+                let set = matches!(column.ty, Ty::Set(Ty::Ref(_)));
+                let mut had = Vec::new();
+                if let Some(field) = held.fields.get(column_name) {
+                    field_refs(column, field, &mut had);
+                }
+                buf.retain(|&(target, key)| {
+                    let cell = set.then_some(key);
+                    columns
+                        .iter()
+                        .any(|&(col, elem)| col == column.name && elem == cell)
+                        && !had.contains(&(target, key))
+                });
+            }
+            made.extend(
+                buf.iter()
+                    .filter(|&&(target, key)| !(target == name && key == pk))
+                    .map(|&(target, key)| (name, pk, column.name, target, key.to_owned())),
+            );
+        }
+    }
+    let mut targets: BTreeMap<&'static str, Projection> = BTreeMap::new();
+    for (collection, pk, column, target, key) in made {
+        let Some(schema) = table.collection(target).filter(|c| c.kind == Kind::Cells) else {
+            continue;
+        };
+        let landed = targets
+            .entry(schema.name)
+            .or_insert_with(|| landed(schema, cells, rows));
+        if landed.rows.get(&key).is_some_and(|row| !row.live()) {
+            return Some(Refused {
+                collection,
+                pk: pk.to_owned(),
+                column: column.to_owned(),
+                rule: format!(
+                    "names {target} row {}, which is not live; point it at a live row, leave it \
+                     empty, or make that row live first",
+                    keys::safe_key(&key)
+                ),
+            });
         }
     }
     None

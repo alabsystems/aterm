@@ -9,7 +9,8 @@ use super::*;
 /// at it alone finds.
 #[test]
 fn the_live_services_read_and_fseventsd_is_the_one_restarted() {
-    let reading = read().expect("the process table and memory read");
+    let reading =
+        read(aterm_vitals::services::followed_from).expect("the process table and memory read");
     assert!(reading.total > 0);
     assert!(!reading.services.is_empty(), "{reading:?}");
     let kernels = aterm_sysprobe::coalitions::coalition_of(1).expect("launchd's coalition");
@@ -41,7 +42,7 @@ fn the_live_services_read_and_fseventsd_is_the_one_restarted() {
         aterm_sysprobe::process_path(fseventsd.pid).as_deref(),
         Some(std::path::Path::new(restart.path))
     );
-    let Look::Running(service, total) = look(&restart) else {
+    let Look::Running(service, total) = look(restart.identity()) else {
         panic!("the fseventsd the table holds is looked at");
     };
     assert_eq!((service.pid, total), (fseventsd.pid, reading.total));

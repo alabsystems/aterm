@@ -9,7 +9,7 @@ mod self_cpu;
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
 use super::view::{
-    Line, c2, class_why, classes_json, exact_partition, header_line, mem_classes, mem_clauses, rec,
+    Line, class_why, classes_json, exact_partition, header_line, mem_classes, mem_clauses, rec,
     scope_keys, unavailable,
 };
 use super::{Ctx, clock_s, exe_word};
@@ -37,9 +37,6 @@ const HARDWARE_NOT_SAMPLED: &str =
 fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     match (q.subject, snap) {
         (Some(subject), _) => Bare::Subject(subject),
-        (None, Some(s)) if crate::scheduling::idle_performance(s).is_some() => {
-            Bare::Subject(WhySubject::Cpu)
-        }
         (None, Some(s)) => bare_subject(s),
         (None, None) => Bare::Subject(WhySubject::Cpu),
     }
@@ -74,13 +71,9 @@ fn nonneg(v: i64) -> u64 {
 #[derive(Clone, Copy, Debug)]
 struct Printed {
     tab: Result<i64, &'static str>,
-    tab_low: bool,
     aterm_rest: i64,
-    rest_high: bool,
-    rest_low: bool,
     others: i64,
     services: i64,
-    unaccounted: Option<i64>,
 }
 
 struct Reading<'a> {
@@ -134,26 +127,24 @@ impl<'a> Reading<'a> {
 
     fn printed(&self) -> Option<Printed> {
         let f = self.a.facts.as_deref()?;
-        let (tab, p) = match (self.a.parts, self.a.you.role) {
-            (Some(p), _) => (Ok(p.tab), p),
-            (None, Role::Unavailable(w)) => (Err(w), f.split.parts_of(&[])),
-            (None, _) => (Err("not_sampled"), f.split.parts_of(&[])),
+        let has_tab = f.split.tabs.iter().any(|(k, _)| self.panes.contains(k));
+        let tab = if has_tab {
+            Ok(f.split.tab_reported_of(&self.panes))
+        } else {
+            Err("not_sampled")
         };
-        let (services, unaccounted) = (p.services, Some(p.unaccounted));
+        let aterm_rest = f.split.own_reported()
+            + f.split
+                .tab_reported
+                .iter()
+                .filter(|(k, _)| !self.panes.contains(k))
+                .map(|(_, rate)| *rate)
+                .sum::<i64>();
         Some(Printed {
             tab,
-            tab_low: self.a.tab_at_least(self.s),
-            aterm_rest: p.aterm_rest,
-            rest_high: f.split.via == Via::Coalitions
-                && !f.split.ownership_incomplete
-                && !f.provenance_incomplete
-                && self.a.bounded(self.s),
-            rest_low: f.split.via == Via::Subtraction
-                || f.split.ownership_incomplete
-                || f.provenance_incomplete,
-            others: p.others,
-            services,
-            unaccounted,
+            aterm_rest,
+            others: f.split.others_mc,
+            services: f.split.services_mc,
         })
     }
 
@@ -197,28 +188,6 @@ impl<'a> Reading<'a> {
         }
     }
 
-    fn mostly(&self) -> Option<String> {
-        let p = self.printed()?;
-        let aterm = p.tab.unwrap_or(0).saturating_add(p.aterm_rest);
-        let parts = [
-            (Part::Services, p.services),
-            (Part::Others, p.others),
-            (Part::Aterm, aterm),
-        ];
-        let (part, mc) = parts
-            .into_iter()
-            .fold((Part::Services, i64::MIN), |best, (part, mc)| {
-                if mc > best.1 { (part, mc) } else { best }
-            });
-        if let Some(unaccounted) = p.unaccounted.filter(|u| *u > mc) {
-            return Some(format!(
-                "mostly unaccounted CPU ({})",
-                c2(cores(unaccounted))
-            ));
-        }
-        (mc > 0).then(|| format!("mostly {} ({})", self.part_word(part), c2(cores(mc))))
-    }
-
     fn headline(&self, subject: WhySubject) -> String {
         if subject == WhySubject::Mem
             && let Some(top) = self
@@ -237,6 +206,7 @@ impl<'a> Reading<'a> {
             return match (subject, self.a.facts.is_some(), self.split_missing()) {
                 (WhySubject::Cpu, false, "warming") => "causes not read yet",
                 (WhySubject::Cpu, false, _) => "causes not read now",
+                (WhySubject::Cpu, true, _) => "CPU cause unavailable: execution window unknown",
                 _ => "no cause open",
             }
             .into();
@@ -311,7 +281,6 @@ impl<'a> Reading<'a> {
 
     fn cpu_sentence(&self) -> Line {
         let mut clauses = vec![format!("global cpu: {}", self.busy_words())];
-        clauses.extend(self.mostly());
         clauses.push(self.headline(WhySubject::Cpu));
         clauses.push(self.you_clause());
         Self::sentence(&clauses)
@@ -356,73 +325,27 @@ impl<'a> Reading<'a> {
     fn split_line(&self) -> Line {
         let (Some(f), Some(p)) = (self.a.facts.as_deref(), self.printed()) else {
             return line(
-                "split",
-                format!("split {}", unavailable(self.split_missing())),
+                "reported_cpu",
+                format!("reported_cpu {}", unavailable(self.split_missing())),
             );
         };
-        let tab = match p.tab {
-            Ok(mc) => format!("{}{mc}", if p.tab_low { "≥" } else { "" }),
-            Err(w) => unavailable(w),
-        };
-        let mut t = format!(
-            "split tab_mc={tab} aterm_rest_mc={}{} others_mc={} services_mc={} unaccounted_mc={}",
-            if p.rest_high {
-                "≤"
-            } else if p.rest_low {
-                "≥"
-            } else {
-                ""
-            },
-            p.aterm_rest,
-            if f.split.via == Via::Subtraction
-                || f.split.ownership_incomplete
-                || f.provenance_incomplete
-            {
-                format!("≥{}", p.others)
-            } else {
-                p.others.to_string()
-            },
-            if f.split.via == Via::Subtraction
-                || f.split.ownership_incomplete
-                || f.provenance_incomplete
-            {
-                format!("≥{}", p.services)
-            } else {
-                p.services.to_string()
-            },
-            p.unaccounted.map_or_else(
-                || unavailable(f.lane.word().unwrap_or("lane_off:coalitions")),
-                |u| u.to_string()
-            )
-        );
-        if f.split.delegated_mc > 0 {
-            t.push_str(&format!(" delegated_mc={}", f.split.delegated_mc));
-        }
-        t.push_str(&format!(
-            " exact={} via={}",
-            if f.split.exact { "exact" } else { "heuristic" },
-            f.split.via.word()
-        ));
-        if f.split.via == Via::Coalitions {
-            t.push_str(&format!(" n={}", f.split.listed));
-        }
-        if f.split
-            .ambiguous_tabs
-            .iter()
-            .any(|k| self.panes.contains(k))
-        {
-            t.push_str(&format!(
-                " tab_charge_mc={} tab_floor_mc={}",
-                f.split.tab_charge_of(&self.panes),
-                f.split
-                    .tab_floors
-                    .iter()
-                    .filter(|(k, _)| self.panes.contains(k))
-                    .map(|(_, mc)| *mc)
-                    .sum::<i64>()
-            ));
-        }
-        line("split", t)
+        let tab = p.tab.map_or_else(unavailable, |mc| mc.to_string());
+        line(
+            "reported_cpu",
+            format!(
+                "reported_cpu tab_mc={tab} aterm_rest_mc={} others_mc={} services_mc={} read_span_ns={} coalition_coverage={} via={} execution_window=unavailable:execution_window_unknown",
+                p.aterm_rest,
+                p.others,
+                p.services,
+                f.window_ns,
+                if f.split.coverage_complete {
+                    "complete"
+                } else {
+                    "partial"
+                },
+                f.split.via.word()
+            ),
+        )
     }
 
     fn you_line(&self, subject: WhySubject) -> Line {
@@ -442,8 +365,10 @@ impl<'a> Reading<'a> {
             t.push_str(" basis=machine_calm");
         }
         match (subject, y.figure, y.unattributed_mc) {
-            (WhySubject::Cpu, Some(fig), Some(u)) => {
-                t.push_str(&format!(" cpu_at_least_mc={fig} unattributed_mc={u}"));
+            (WhySubject::Cpu, Some(fig), _) => {
+                t.push_str(&format!(
+                    " reported_cpu_mc={fig} execution_window=unavailable:execution_window_unknown"
+                ));
             }
             (_, Some(fig), _) => {
                 let key = match subject {
@@ -465,7 +390,7 @@ impl<'a> Reading<'a> {
                 .any(|k| self.panes.contains(k))
         {
             t.push_str(&format!(
-                " cpu_charge_mc={} actual=ambiguous_reap",
+                " cpu_charge_mc={} reap_accounting=ambiguous",
                 f.split.tab_charge_of(&self.panes)
             ));
         }
@@ -572,8 +497,8 @@ impl<'a> Reading<'a> {
                 }
                 if r.ownership_mixed {
                     t.push_str(&format!(
-                        " ownership=mixed outside_floor_mc={}",
-                        r.outside_floor_mc
+                        " ownership=mixed outside_reported_mc={}",
+                        r.outside_reported_mc
                     ));
                 }
                 if let Some((read, deferred)) = self.activity_head(r) {
@@ -920,9 +845,6 @@ pub fn why_text(
     let mut tail: Vec<Line> = w.causes().map(|c| w.cause_line(c)).collect();
     tail.extend(w.service_lines());
     tail.extend(w.tail(subject));
-    if subject == WhySubject::Cpu && crate::scheduling::idle_performance(s).is_some() {
-        tail.push(line("scheduling-observation", "scheduling runnable-wait-with-idle-performance cause=unproven; inspect sys cores and sys procs for worker policy, measured intervals and the active diagnostic executable"));
-    }
     let mut rows = Rows::of(&w, &ranked, q.top);
     loop {
         let body = rows.lines(&w, subject);
@@ -1008,7 +930,19 @@ impl Reading<'_> {
             self.a
                 .cannot
                 .iter()
-                .map(|(what, why)| Jv::obj([("what", Jv::s(*what)), ("reason", Jv::why(why))]))
+                .map(|(what, why)| {
+                    Jv::obj([
+                        ("what", Jv::s(*what)),
+                        (
+                            "reason",
+                            if *why == "execution_window_unknown" {
+                                Jv::why("unavailable:execution_window_unknown")
+                            } else {
+                                Jv::why(why)
+                            },
+                        ),
+                    ])
+                })
                 .collect(),
         )
     }
@@ -1023,49 +957,24 @@ impl Reading<'_> {
         let (Some(f), Some(p)) = (self.a.facts.as_deref(), self.printed()) else {
             return self.split_unknown();
         };
-        let tab = match p.tab {
-            Ok(mc) if p.tab_low => Jv::at_least(nonneg(mc), "not_sampled"),
-            Ok(mc) => Jv::Int(mc),
-            Err(w) => Jv::why(w),
-        };
-        let rest = if p.rest_low {
-            Jv::at_least(nonneg(p.aterm_rest), "not_sampled")
-        } else if p.rest_high {
-            Jv::at_most(nonneg(p.aterm_rest), "not_sampled")
-        } else {
-            Jv::Int(p.aterm_rest)
-        };
         Jv::obj([
-            ("tab", tab),
-            ("aterm_rest", rest),
+            ("tab", p.tab.map_or_else(Jv::why, Jv::Int)),
+            ("aterm_rest", Jv::Int(p.aterm_rest)),
+            ("others", Jv::Int(p.others)),
+            ("services", Jv::Int(p.services)),
+            ("basis", Jv::s("published_counters")),
+            ("read_span_ns", Jv::u(f.window_ns)),
             (
-                "others",
-                if f.split.via == Via::Subtraction
-                    || f.split.ownership_incomplete
-                    || f.provenance_incomplete
-                {
-                    Jv::at_least(nonneg(p.others), "not_sampled")
+                "coalition_coverage",
+                Jv::s(if f.split.coverage_complete {
+                    "complete"
                 } else {
-                    Jv::Int(p.others)
-                },
+                    "partial"
+                }),
             ),
             (
-                "services",
-                if f.split.via == Via::Subtraction
-                    || f.split.ownership_incomplete
-                    || f.provenance_incomplete
-                {
-                    Jv::at_least(nonneg(p.services), "not_sampled")
-                } else {
-                    Jv::Int(p.services)
-                },
-            ),
-            (
-                "unaccounted",
-                p.unaccounted.map_or_else(
-                    || Jv::why(f.lane.word().unwrap_or("lane_off:coalitions")),
-                    Jv::Int,
-                ),
+                "execution_window",
+                Jv::why("unavailable:execution_window_unknown"),
             ),
         ])
     }
@@ -1100,11 +1009,18 @@ impl Reading<'_> {
             },
         };
         o.set("trend", self.pass_json(subject));
+        if subject == WhySubject::Cpu {
+            o.set("accounting_basis", Jv::s("machine_ticks"));
+        }
         match self.a.facts.as_deref() {
             Some(f) => {
                 o.set(
-                    "exact",
-                    Jv::s(if f.split.exact { "exact" } else { "heuristic" }),
+                    "coalition_coverage",
+                    Jv::s(if f.split.coverage_complete {
+                        "complete"
+                    } else {
+                        "partial"
+                    }),
                 );
                 o.set("via", Jv::s(f.split.via.word()));
                 if f.split.via == Via::Coalitions {
@@ -1115,7 +1031,7 @@ impl Reading<'_> {
                 }
             }
             None => {
-                o.set("exact", Jv::s("heuristic"));
+                o.set("coalition_coverage", Jv::s("unknown"));
                 o.set("via", self.split_unknown());
             }
         }
@@ -1135,6 +1051,9 @@ impl Reading<'_> {
             (
                 "role",
                 match y.role {
+                    Role::Unavailable("execution_window_unknown") => {
+                        Jv::why("unavailable:execution_window_unknown")
+                    }
                     Role::Unavailable(w) => Jv::why(w),
                     r => Jv::s(r.word()),
                 },
@@ -1144,9 +1063,12 @@ impl Reading<'_> {
             o.set("basis", Jv::s("machine_calm"));
         }
         match (subject, y.figure, y.unattributed_mc) {
-            (WhySubject::Cpu, Some(fig), Some(u)) => {
-                o.set("cpu_at_least_mc", Jv::u(nonneg(fig)));
-                o.set("unattributed_mc", Jv::u(nonneg(u)));
+            (WhySubject::Cpu, Some(fig), _) => {
+                o.set("reported_cpu_mc", Jv::Int(fig));
+                o.set(
+                    "execution_window",
+                    Jv::why("unavailable:execution_window_unknown"),
+                );
             }
             (_, Some(fig), _) => {
                 let key = match subject {
@@ -1170,10 +1092,10 @@ impl Reading<'_> {
             o.set("cpu_charge_mc", Jv::Int(f.split.tab_charge_of(&self.panes)));
             o.set("cpu_ambiguous", Jv::Bool(true));
             o.set(
-                "cpu_floor_mc",
+                "cpu_own_reported_mc",
                 Jv::Int(
                     f.split
-                        .tab_floors
+                        .tab_reported
                         .iter()
                         .filter(|(k, _)| self.panes.contains(k))
                         .map(|(_, mc)| *mc)
@@ -1244,7 +1166,7 @@ impl Reading<'_> {
                 }
                 if r.ownership_mixed {
                     o.set("ownership", Jv::s("mixed"));
-                    o.set("outside_floor_mc", Jv::u(nonneg(r.outside_floor_mc)));
+                    o.set("outside_reported_mc", Jv::u(nonneg(r.outside_reported_mc)));
                 }
                 if let Some((read, deferred)) = self.activity_head(r) {
                     o.set("read_bps", Jv::u(read));
@@ -1456,7 +1378,7 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
     let ranked = w.ranked(subject);
     match subject {
         WhySubject::Cpu => {
-            o.set("split_mc", w.split_json());
+            o.set("reported_cpu_mc", w.split_json());
             if let Some(value) = self_cpu::json(&s.self_cpu) {
                 o.set("self_cpu", value);
             }

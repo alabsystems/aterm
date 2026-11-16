@@ -394,8 +394,9 @@ fn the_self_update_block_is_exact_is_the_whole_prelude_and_breaks_no_reader() {
 /// build, or into its checkout while dev-linked), runs the store build alone under
 /// `--no-alab-harness`, `--no-harness` or `ATERM_NO_HARNESS=1`, before grok-alab is installed,
 /// and whenever `bin/grok-alab` is not live: a yanked/revoked tombstone, a shim whose build was
-/// removed or never marked ready, a checkout shim with no dev link. No other agent's twin
-/// carries the hand-off.
+/// removed or never marked ready, a checkout shim with no dev link. kimi's twin, whose word
+/// kimi-alab leads, carries the same hand-off to kimi-alab; the twin of a word no row leads
+/// (claude, codex, agy, and muse until muse-alab leads it at HX-13) carries none.
 #[cfg(unix)]
 #[test]
 fn the_grok_twin_hands_its_session_to_grok_alab_once_installed() {
@@ -539,6 +540,16 @@ fn the_grok_twin_hands_its_session_to_grok_alab_once_installed() {
     std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
     std::fs::write(&marker, "program = \"grok-alab\"\n").unwrap();
     assert_eq!(run(&argv, false), handed, "dev-linked: the harness");
+    let kimi = twin_prelude("kimi", &prefix, None, &[], &crate::yolo::policy_of("kimi"));
+    assert_eq!(
+        kimi.matches(" run -- \"$@\"").count(),
+        1,
+        "kimi's twin hands its launch over once: {kimi}"
+    );
+    assert!(
+        kimi.contains("bin/kimi-alab' run -- \"$@\"") && !kimi.contains("grok-alab"),
+        "to kimi-alab: {kimi}"
+    );
     for other in ["claude", "codex", "agy", "muse"] {
         let prelude = twin_prelude(other, &prefix, None, &[], &crate::yolo::policy_of(other));
         assert!(
@@ -722,6 +733,39 @@ fn the_yolo_block_expands_prints_and_reaches_the_exec() {
         "aterm: yolo (default): running 'claude' '--dangerously-skip-permissions' \
          '--' '--yolo'\n"
     );
+    let muse = lay("muse");
+    let behind = "<exec><--disable-approval><--disable-sandbox><--trust-workspace>\
+                  <--disable-request-user-input><x>\n";
+    assert_eq!(run(&muse, &["exec", "x"]).0, behind);
+    assert_eq!(run(&muse, &["--yolo", "exec", "x"]).0, behind);
+    assert_eq!(run(&muse, &["exec", "--yolo", "x"]).0, behind);
+    assert_eq!(
+        run(&muse, &["skills", "list"]),
+        ("<skills><list>\n".into(), String::new())
+    );
+    assert_eq!(
+        run(&muse, &["--approval-mode", "never"]),
+        ("<--approval-mode><never>\n".into(), String::new())
+    );
+    let (stdout, stderr) = run(&muse, &[]);
+    assert_eq!(
+        stdout,
+        "<--disable-approval><--disable-sandbox><--trust-workspace>\
+         <--disable-request-user-input>\n"
+    );
+    assert_eq!(
+        stderr,
+        format!(
+            "{}\n",
+            crate::yolo::default_echo_line(
+                "muse",
+                &crate::yolo::flags_of("muse")
+                    .iter()
+                    .map(|f| (*f).to_string())
+                    .collect::<Vec<_>>()
+            )
+        )
+    );
     for args in [
         &["--new-option", "value", "resume", "thread-id"][..],
         &["--image", "one.png", "two.png", "resume", "thread-id"][..],
@@ -742,6 +786,25 @@ fn the_yolo_block_expands_prints_and_reaches_the_exec() {
         run(&codex, &["--model", "resume", "fix this"]).0,
         "<--dangerously-bypass-approvals-and-sandbox><--model><resume><fix this>\n"
     );
+    for args in [
+        &["--model", "exec", "exec", "x"][..],
+        &["--yolo", "--model", "exec", "exec", "x"][..],
+        &["--model", "exec", "--yolo", "exec", "x"][..],
+    ] {
+        assert_eq!(
+            run(&muse, args).0,
+            "<--model><exec><exec><--disable-approval><--disable-sandbox>\
+             <--trust-workspace><--disable-request-user-input><x>\n",
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        run(&muse, &["--new-option", "value", "--yolo", "exec", "x"]),
+        (
+            "<--new-option><value><--yolo><exec><x>\n".into(),
+            String::new()
+        )
+    );
     let agy = lay("agy");
     assert_eq!(
         run(&claude, &["--no-harness", "-p", "hello"]).0,
@@ -755,10 +818,17 @@ fn the_yolo_block_expands_prints_and_reaches_the_exec() {
         run(&agy, &["--no-alab-harness", "--", "--no-harness"]).0,
         "<--dangerously-skip-permissions><--><--no-harness>\n"
     );
-    // kimi, grok and muse: their harnesses' `run` sets the yolo default and expands `--yolo`
-    // (HX-09b, HX-10d, HX-13a), so their twins run every launch as typed and print nothing, but
-    // still take `--no-harness` off.
-    for program in ["kimi", "grok", "muse"] {
+    // muse keeps aterm's block until muse-alab leads `muse` (HX-13c): `--no-harness` comes off
+    // ahead of it, and the default still lands.
+    assert_eq!(
+        run(&muse, &["--no-harness", "exec", "x"]).0,
+        behind,
+        "muse --no-harness"
+    );
+    // kimi and grok: their harnesses' `run` sets the yolo default and expands `--yolo` (HX-09b,
+    // HX-10d), so their twins run every launch as typed and print nothing, but still take
+    // `--no-harness` off.
+    for program in ["kimi", "grok"] {
         let twin = lay(program);
         for args in [
             &["--yolo"][..],
@@ -794,6 +864,7 @@ fn the_yolo_block_renders_fail_closed() {
     let ok = Policy {
         flags: &["--ok"],
         markers: &["--ok"],
+        ..Policy::NONE
     };
     assert_eq!(sh_yolo_prelude("claude", &Policy::NONE, &[]), "");
     assert_eq!(
@@ -824,6 +895,28 @@ fn the_yolo_block_renders_fail_closed() {
         ""
     );
     assert_eq!(
+        sh_yolo_prelude(
+            "claude",
+            &Policy {
+                after: &["ex'ec"],
+                ..ok
+            },
+            &[]
+        ),
+        ""
+    );
+    assert_eq!(
+        sh_yolo_prelude(
+            "claude",
+            &Policy {
+                skip: &["sk ip"],
+                ..ok
+            },
+            &[]
+        ),
+        ""
+    );
+    assert_eq!(
         sh_yolo_prelude("claude", &ok, &["up'date"]),
         "",
         "a self-update verb the block would embed is not shell-safe"
@@ -841,6 +934,19 @@ fn the_yolo_block_renders_fail_closed() {
     assert!(block.contains(crate::yolo::ECHO_PREFIX), "{block}");
     assert!(block.contains(crate::yolo::DEFAULT_ECHO_PREFIX), "{block}");
     assert!(!block.contains("--no-harness"), "its own block: {block}");
+    let block = sh_yolo_prelude("muse", &crate::yolo::policy_of("muse"), &[]);
+    let note = block.lines().next().unwrap();
+    assert!(
+        note.starts_with("# ")
+            && note.contains(" muse ")
+            && note.contains(
+                "('--disable-approval' '--disable-sandbox' '--trust-workspace' \
+                 '--disable-request-user-input')"
+            ),
+        "{note}"
+    );
+    assert!(block.contains(crate::yolo::ECHO_PREFIX), "{block}");
+    assert!(block.contains(crate::yolo::DEFAULT_ECHO_PREFIX), "{block}");
 }
 
 #[cfg(unix)]

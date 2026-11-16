@@ -113,7 +113,7 @@ pub fn member_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> 
         Some(lab) => Ok(lab.to_owned()),
         None => Err(crate::Error::new(format!(
             "{LAB_MEMBER_SERVICE_ENV} names no lab service (`_alab-lab-<1 to 6 lowercase letters \
-             or digits>._tcp`), so this Mac browses for no member"
+             or digits>._tcp`), so this machine browses for no member"
         ))),
     }
 }
@@ -144,7 +144,7 @@ pub fn vault_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> {
         Some(lab) => Ok(lab.to_owned()),
         None => Err(crate::Error::new(format!(
             "{LAB_VAULT_SERVICE_ENV} names no lab service (`_alab-lab-<1 to 6 lowercase letters \
-             or digits>._tcp`), so this Mac browses for no vault"
+             or digits>._tcp`), so this machine browses for no vault"
         ))),
     }
 }
@@ -377,7 +377,7 @@ fn resolve_first(instance: &str, service: &str, within: Duration) -> Option<Even
 
 /// What [`browse_members`] says off macOS, which this build browses for members on alone: a
 /// member is named by its address instead.
-pub const NO_BROWSE: &str = "this Mac cannot browse the network for ALab's members (that needs \
+pub const NO_BROWSE: &str = "this machine cannot browse the network for ALab's members (that needs \
      macOS's Bonjour): name one with `aterm members join --at <host>`";
 
 /// In unit tests: nothing is browsed, and no member is found.
@@ -386,7 +386,7 @@ pub fn browse_members(_budget: Duration) -> crate::Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-/// Off macOS no browse runs, so a joining Mac names a member with `--at` ([`NO_BROWSE`]); an
+/// Off macOS no browse runs, so a joining machine names a member with `--at` ([`NO_BROWSE`]); an
 /// empty answer would read as no member on the network.
 ///
 /// # Errors
@@ -699,7 +699,7 @@ pub(crate) fn resolve_all(_instances: &[String], _budget: Duration) -> Vec<Disco
 /// holders after a heal both resolve `alab-secrets.local:7484`, distinguished by `label=` in
 /// their TXT (`DESIGN-fluid-swarm` §4.1 F7), and a vault server's round gates its pulls on each
 /// instance's TXT, so one instance must not replace another's TXT ([`crate::server::VaultTxt`]:
-/// an instance only adds to what its endpoints are pulled for). An exact repeat is kept once.
+/// each instance counts in what its endpoints are pulled for). An exact repeat is kept once.
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_instances(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
     let mut out = Vec::new();

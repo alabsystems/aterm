@@ -1508,9 +1508,21 @@ fn refuted_meta(w: &TapWorld, peer: &Peer) -> String {
 
 /// Moves the world's clock, where it must, into this Mac's turn to settle a pair that it and m22
 /// split just now: the turns go to the pair's writers in seat order, each
-/// [`claude_token::SETTLE_TURN_SECS`] long from the split ([`claude_token::settle`]), so where m22's
-/// seat comes first this Mac's turn is the second, and the clock moves half a turn into it.
+/// [`claude_token::SETTLE_TURN_SECS`] long from each Mac's first sighting of the split
+/// ([`claude_token::settle`]), so both Macs see it first, at the world's clock now, writing
+/// nothing; where m22's seat comes first this Mac's turn is the second, and the clock moves half a
+/// turn into it.
 fn into_this_macs_turn(w: &TapWorld, peer: &Peer) {
+    let key = Key::parse(KEY).unwrap();
+    for paths in [&peer.here, &peer.m22.paths] {
+        claude_token::test_sight_split(
+            paths,
+            &key,
+            u64::try_from(w.clock()).unwrap(),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .expect("sees the split");
+    }
     let records = aterm_secrets::client::load_records(&peer.here).expect("the records");
     let seats = aterm_secrets::client::seats_ever(records.log().expect("a log"));
     let seat = |label: &str| {

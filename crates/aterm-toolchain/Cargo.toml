@@ -23,6 +23,7 @@ publish = false
 description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule, the toolchain lease, the named lock whose wait names a stuck holder, and the status digest a sealed toolchain is rechecked by"
 
 [dependencies]
+aterm-path = { workspace = true }
 # Resolve Cargo's configured final target without guessing its spelling, and follow a
 # config's `include` as Targo loads it (`build_cache::config_dirs`). The parser has no proc
 # macro dependency and already belongs to the tools' normal graph.
@@ -33,7 +34,7 @@ aterm-toml = { workspace = true }
 # device is a volume serial and one path has many spellings, the gone-checkout
 # rule reads a device through the one identity export and compares paths
 # through the one key (`aterm_sysprobe::volumes::file_id`,
-# `aterm_sysprobe::paths`). Workspace crate; every crate that depends on this
+# `aterm_path`). Workspace crate; every crate that depends on this
 # one already reaches it.
 aterm-sysprobe = { workspace = true }
 

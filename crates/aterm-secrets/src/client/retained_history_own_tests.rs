@@ -353,14 +353,26 @@ fn a_key_only_receipt_retains_a_repin_after_cache_loss() {
     let records = full.1;
     full.1 = limits().records;
     assert!(
-        full.plan(&Reads::new(&lab.m7), &config, source.log().unwrap(), false)
-            .is_err()
+        full.plan(
+            &Reads::new(&lab.m7),
+            &config,
+            source.log().unwrap(),
+            false,
+            log_entries::FrontierFor::Candidate,
+        )
+        .is_err()
     );
     full.1 = records;
     full.2 = limits().bytes;
     assert!(
-        full.plan(&Reads::new(&lab.m7), &config, source.log().unwrap(), false)
-            .is_err()
+        full.plan(
+            &Reads::new(&lab.m7),
+            &config,
+            source.log().unwrap(),
+            false,
+            log_entries::FrontierFor::Candidate,
+        )
+        .is_err()
     );
     acknowledge_for(&lab.m7, &source, &config).unwrap();
     assert_ne!(
@@ -375,5 +387,114 @@ fn a_key_only_receipt_retains_a_repin_after_cache_loss() {
     );
     assert!(project_store(&Reads::new(&lab.m7), &config, Store::with_compiled(None)).is_err());
     assert!(project_store(&Reads::new(&lab.m7), &config, source).is_ok());
+    lab.server.stop();
+}
+
+/// A caller that enrolls nothing (an author's snapshot, `conflicts`, the labels read) holds
+/// records that grew past the applied log to the rule before 2026-11-15, equality, and runs no
+/// search: only a writer's take shows containment. Here a receipt's context is reached through
+/// the cached handoff alone, the configured key is bound to it by no receipt, and the records
+/// hold the applied log and one put more. The refusal ends at the writer's acknowledgement,
+/// which binds the configured key, so equality locks no caller out that a vault pass does not
+/// let back in.
+///
+/// NEGATIVE CONTROL (2026-11-16): with [`log_entries::FrontierFor::Reader`] answered as a
+/// writer's check is, `a caller that enrolls nothing was answered by containment` fails: the
+/// snapshot's check runs the search under its shared observation and accepts.
+#[test]
+fn a_caller_that_enrolls_nothing_holds_grown_records_to_equality_and_searches_nothing() {
+    use log_entries::FrontierFor;
+    let _answering = crate::client::ServersAnswering::set();
+    let lab = crate::client::log_entries_tests::two_macs(&[(
+        crate::text::Audience::Everyone,
+        "shared",
+        b"old",
+    )]);
+    let source = crate::client::load_records(&lab.m7).unwrap();
+    assert_eq!(
+        crate::client::load_state(&lab.m7).unwrap().records_digest,
+        source.heads_digest(),
+        "FIXTURE: the state names the log this Mac holds"
+    );
+    let admin = crate::client::admin_open(&lab.m22).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&crate::text::Audience::Everyone, "shared", b"new")
+        .unwrap();
+    crate::client::admin_publish(&lab.m22, &admin, &doc).unwrap();
+    let mut grown = source.clone();
+    grown
+        .ingest(&crate::client::load_records(&lab.m22).unwrap().encode())
+        .unwrap();
+    assert_ne!(grown.heads_digest(), source.heads_digest());
+    let log = grown.log().unwrap();
+
+    // The configuration moved to the next signer with no followed list; the cached envelope's
+    // handoff is all that ties it to the key the receipt holds.
+    let mut config = crate::client::configured(&lab.m7).unwrap();
+    let next_seed = [53; 32];
+    config.signer = Some(crate::envelope::signer_public(&next_seed).unwrap());
+    config.followed.clear();
+    let envelope = crate::envelope::sign_unchecked(
+        &crate::envelope::Unsigned {
+            name: config.name.clone(),
+            seq: 1,
+            time: 1,
+            handoff: crate::envelope::test_chain(&config.name, &[admin.seed, next_seed]),
+            parents: Vec::new(),
+            lockers: vec![crate::envelope::Locker {
+                label: "admin".into(),
+                armored: crate::envelope::test_armor(b"inert lineage witness"),
+            }],
+        },
+        &next_seed,
+    )
+    .unwrap();
+    fsx::write_atomic(&lab.m7.cache_file(), &envelope, 0o600).unwrap();
+    assert!(
+        read(&lab.m7)
+            .unwrap()
+            .context(&Reads::new(&lab.m7), &config, log)
+            .unwrap()
+            .is_some(),
+        "FIXTURE: the receipt's context is reached through the handoff"
+    );
+    assert!(
+        !durably_bound(&Reads::new(&lab.m7), &config, log.network()).unwrap(),
+        "FIXTURE: no receipt binds the configured key"
+    );
+
+    let check = |serving| {
+        log_entries::check_legacy_frontier(&Reads::new(&lab.m7), &config, log, serving).unwrap()
+    };
+    let before = log_entries::WITNESS_SEARCHES.get();
+    assert!(
+        !check(FrontierFor::Reader),
+        "a caller that enrolls nothing was answered by containment"
+    );
+    let refused = log_entries::checked_author_projection_for(&lab.m7, &config, &grown)
+        .err()
+        .expect("an author's snapshot of records that grew past the applied log");
+    assert_eq!(
+        refused.kind(),
+        crate::ErrorKind::MembershipHistoryUnavailable
+    );
+    assert_eq!(
+        log_entries::WITNESS_SEARCHES.get(),
+        before,
+        "a caller that enrolls nothing searched"
+    );
+    assert!(
+        check(FrontierFor::Candidate),
+        "CONTROL: a writer's check finds the applied heads in the same records"
+    );
+    assert_eq!(log_entries::WITNESS_SEARCHES.get(), before + 1);
+
+    // The writer's acknowledgement binds the configured key, and the refusal ends.
+    acknowledge_for(&lab.m7, &grown, &config).unwrap();
+    assert!(durably_bound(&Reads::new(&lab.m7), &config, log.network()).unwrap());
+    assert!(check(FrontierFor::Reader));
+    log_entries::checked_author_projection_for(&lab.m7, &config, &grown)
+        .expect("the snapshot reads once a receipt binds the key");
+    assert_eq!(log_entries::WITNESS_SEARCHES.get(), before + 1);
     lab.server.stop();
 }

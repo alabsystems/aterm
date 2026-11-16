@@ -95,7 +95,7 @@ pub(crate) enum ReservationTap {
     Verified,
     /// Another writer's record of the pin's face at the answered offset.
     Collision,
-    /// `Bridge::unverified_publication`'s case `n` (1 to 5).
+    /// `Bridge::unverified_publication`'s case `n` (1 to 6).
     Unverifiable(u8),
     /// The attach's replay settled a keyed re-post's entry at its key's winner, read back
     /// (`Bridge::keyed_winner_at`), not published again.

@@ -1155,6 +1155,12 @@ pub trait Check {
     fn poll(&mut self) -> std::io::Result<Option<Ended>>;
     /// Terminates the check's processes (leaving `trustd` alone) and reaps its root.
     fn end(&mut self) -> Ended;
+    /// Once it ended, what the lane's writer of its log read of all its output while storing
+    /// it ([`store_log`]); [`LogRead::Unread`] where no writer read it ([`record`] then reads
+    /// its log).
+    fn log_read(&self) -> LogRead {
+        LogRead::Unread
+    }
 }
 
 /// Execution backend that spawns and monitors slot checks.
@@ -1551,6 +1557,27 @@ pub struct Finished {
     pub load: Option<f64>,
     /// Whether the `trustd` the run held went away while the check ran ([`Checks::trustd_lost`]).
     pub trustd_lost: bool,
+    /// What the lane's writer of its log read of its output ([`Check::log_read`]).
+    pub log_read: LogRead,
+}
+
+/// What the lane's writer of a check's log read of the check's output once it ended
+/// ([`Check::log_read`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogRead {
+    /// No writer read it: a check that writes its own log. [`record`] reads the log.
+    #[default]
+    Unread,
+    /// Its writer read all of the output to its end, and stored it.
+    Read {
+        /// Whether the output said targo would not start the check
+        /// ([`trust_facts::TRUSTD_REFUSED`]), anywhere in it, in lines the stored log left
+        /// out too.
+        refused: bool,
+    },
+    /// Its writer did not read the output to its end, so its stored log is not whole (its frame
+    /// is left unended): why.
+    Incomplete(&'static str),
 }
 
 /// Reason [`run_slots`] stopped before draining its queue.
@@ -1596,6 +1623,7 @@ pub fn run_slots(
         (over_budget, interrupted): (bool, bool),
         checks: &dyn Checks,
     ) -> (Finished, Admitted) {
+        let log_read = r.check.log_read();
         let f = Finished {
             wall: checks.now().saturating_sub(r.since),
             job: r.job,
@@ -1604,6 +1632,7 @@ pub fn run_slots(
             interrupted,
             load: (r.load.1 > 0).then(|| r.load.0 / f64::from(r.load.1)),
             trustd_lost: checks.trustd_lost() > r.lost,
+            log_read,
         };
         (f, r._claim)
     }
@@ -1788,11 +1817,15 @@ impl TreeTimes {
 }
 
 /// Writes sidecar status, pace, budget, and `trustd` marks for the judge after a check ends: a
-/// `.trustd` mark when targo would not start it, and a `.trustd-lost` mark, what serves the
-/// socket now, when the `trustd` it ran beside went away while it ran.
+/// `.trustd` mark when targo would not start it (its output said so anywhere: what its log
+/// writer read of all of it, [`Finished::log_read`], or where no writer read it, its stored log
+/// read through [`trust_facts::open_log`]), and a `.trustd-lost` mark, what serves the socket
+/// now, when the `trustd` it ran beside went away while it ran.
 ///
 /// # Errors
-/// Returns an error if the diagnostic log cannot be read completely or a sidecar cannot be written.
+/// Returns an error if its log writer did not read its output to the end
+/// ([`LogRead::Incomplete`]), the log it reads cannot be read completely, or a sidecar cannot
+/// be written.
 pub fn record(
     f: &Finished,
     budget: Duration,
@@ -1813,7 +1846,11 @@ pub fn record(
     if f.over_budget {
         write("budget", format!("{}\n", budget.as_secs()));
     }
-    let refused = crate::durable::open_regular_file(log).and_then(log_refused);
+    let refused = match f.log_read {
+        LogRead::Unread => trust_facts::open_log(log).and_then(log_refused),
+        LogRead::Read { refused } => Ok(refused),
+        LogRead::Incomplete(why) => Err(std::io::Error::other(why)),
+    };
     if matches!(refused, Ok(true)) {
         write("trustd", format!("{}\n", probe()));
     }
@@ -1838,25 +1875,621 @@ pub fn record(
     }
 }
 
-/// Search the entire log with constant storage, retaining enough overlap for a split literal.
-/// Even after a match, finish reading so a later IO failure cannot establish a complete receipt.
+/// Searches the whole of `log` for [`trust_facts::TRUSTD_REFUSED`] with constant storage
+/// ([`LaunchRefusal`]). Even after a match it reads to the end, so a later read failure cannot
+/// establish a complete receipt.
 fn log_refused(mut log: impl std::io::Read) -> std::io::Result<bool> {
-    const NEEDLE: &[u8] = trust_facts::TRUSTD_REFUSED.as_bytes();
-    let mut buf = [0u8; 8192 + NEEDLE.len()];
-    let mut kept = 0;
-    let mut found = false;
+    let mut refusal = LaunchRefusal::default();
+    let mut buf = [0u8; 8192];
     loop {
-        let n = match log.read(&mut buf[kept..]) {
+        let n = match log.read(&mut buf) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             read => read?,
         };
         if n == 0 {
-            return Ok(found);
+            return Ok(refusal.found);
         }
-        let end = kept + n;
-        found = found || buf[..end].windows(NEEDLE.len()).any(|w| w == NEEDLE);
-        kept = (NEEDLE.len() - 1).min(end);
-        buf.copy_within(end - kept..end, 0);
+        refusal.feed(&buf[..n]);
+    }
+}
+
+/// Whether a check's output says targo would not start it ([`trust_facts::TRUSTD_REFUSED`]),
+/// read as it streams by, across the seams between reads.
+#[derive(Debug, Default)]
+pub(crate) struct LaunchRefusal {
+    /// The last bytes read, one short of the needle, for a needle split between two reads.
+    tail: Vec<u8>,
+    /// Whether the needle was found.
+    pub(crate) found: bool,
+}
+
+impl LaunchRefusal {
+    /// Reads the next `bytes` of the output.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        let needle = trust_facts::TRUSTD_REFUSED.as_bytes();
+        if self.found || bytes.is_empty() {
+            return;
+        }
+        let keep = needle.len() - 1;
+        let mut seam = std::mem::take(&mut self.tail);
+        seam.extend_from_slice(&bytes[..bytes.len().min(keep)]);
+        let holds = |hay: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        self.found = holds(&seam) || holds(bytes);
+        self.tail = if bytes.len() >= keep {
+            bytes[bytes.len() - keep..].to_vec()
+        } else {
+            seam[seam.len().saturating_sub(keep)..].to_vec()
+        };
+    }
+}
+
+/// The compressed bytes a check's stored log holds before the lane keeps, of the rest of its
+/// output, only the lines the judge reads and the output's last [`LOG_TAIL`] bytes
+/// ([`store_log`]): 8 MiB. The 148 MB plain logs m18 kept (DC-08) are kept to there. How much
+/// output that is depends on how well the output compresses, which no real check's log has
+/// measured with [`aterm_zstd`] yet.
+pub(crate) const LOG_STORED: u64 = 8 << 20;
+
+/// How much of the end of a check's output a stored log past its cap keeps, whatever the judge
+/// reads in it ([`store_log`]): 256 KiB, for a person to read what a check was doing when it
+/// ended (one ended at its budget, one that failed, one interrupted).
+pub(crate) const LOG_TAIL: u64 = 256 << 10;
+
+/// How much of a check's output [`store_log_with`] reads at a time past a line's first
+/// [`trust_facts::LINE_MAX`] bytes.
+const LOG_READ: usize = 64 << 10;
+
+/// How far past its cap a stored log reaches, besides the lines the judge reads
+/// ([`store_log_with`]): the line being written as it reached the cap (a line the judge reads,
+/// at most [`trust_facts::LINE_MAX`] bytes, or the first `LINE_MAX + 1` bytes of a longer one,
+/// then what one read of [`LOG_READ`] took and its newline), the output's last [`LOG_TAIL`]
+/// bytes, what the encoder held back at the cap (at most a block), and the frame's headers, its
+/// checksum and the notes of what was left out, within another block.
+pub(crate) const LOG_SLACK: u64 =
+    trust_facts::LINE_MAX + LOG_READ as u64 + LOG_TAIL + 2 * aterm_zstd::frame::BLOCK_MAX as u64;
+
+/// The most a check's stored log holds besides the lines the judge reads: [`LOG_STORED`] and
+/// [`LOG_SLACK`]. The lines the judge reads past the cap are kept whatever their number, since
+/// it counts them (an `[UNKNOWN]` budget row a function, a `[transport:` row a target, a memory
+/// admission refused), so they are the one part of a stored log no constant bounds; the lines it
+/// reads nothing in, a line that only looks like a path refusal among them
+/// ([`trust_facts::JUDGED`]), are left out past the cap. A run's `logs` folder holds, besides
+/// those lines, at most [`logs_bound`] of its checks: a run removes, before it checks a
+/// library, the logs and sidecars of that library's earlier versions with its own.
+pub(crate) const LOG_BOUND: u64 = LOG_STORED + LOG_SLACK;
+
+/// The most a run's `logs` folder holds of the stored logs of `checks` checks, besides the
+/// lines the judge reads: each check's [`LOG_BOUND`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the bound the lane states and its tests hold a run's logs to; no run reads it"
+    )
+)]
+pub(crate) const fn logs_bound(checks: u64) -> u64 {
+    checks.saturating_mul(LOG_BOUND)
+}
+
+/// How long the output a stored log holds may wait in the encoder, unreadable from the file,
+/// while the check writes nothing more ([`store_log_with`]): a person following a running
+/// check's log (`ship trust log`) reads what it wrote at most this long ago, a line it has not
+/// ended included.
+const LOG_FLUSH: Duration = Duration::from_secs(5);
+
+/// How long [`LogWriter::finish`] waits, once the check's root was reaped, for its output to
+/// end before it stops reading past what the pipe holds.
+const LOG_DRAIN: Duration = Duration::from_secs(5);
+
+/// The most a stopped [`LogWriter`] still stores of what the pipe held when it stopped.
+const LOG_STOP_DRAIN: usize = 1 << 20;
+
+/// A writer that counts what reached `inner`, and after `inner`'s first error takes and drops
+/// what it is given, so the output feeding it is still read ([`store_log`]).
+struct Counted<W> {
+    inner: W,
+    /// The bytes `inner` took.
+    bytes: u64,
+    /// Whether `inner` refused a write or a flush.
+    failed: bool,
+}
+
+impl<W: Write> Write for Counted<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.failed {
+            match self.inner.write_all(buf) {
+                Ok(()) => self.bytes = self.bytes.saturating_add(len64(buf)),
+                Err(_) => self.failed = true,
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.failed && self.inner.flush().is_err() {
+            self.failed = true;
+        }
+        Ok(())
+    }
+}
+
+/// The length of `bytes`, as a count of bytes stored.
+fn len64(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+}
+
+/// What [`store_log`] did with a check's output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Stored {
+    /// The bytes it left out once the stored log held its cap: of lines the judge does not
+    /// read before the output's last bytes, and of lines longer than it reads.
+    pub(crate) left_out: u64,
+    /// The lines those bytes were in.
+    pub(crate) lines_left_out: u64,
+    /// Whether the output said targo would not start the check ([`LaunchRefusal`]), anywhere
+    /// in what was read of it.
+    pub(crate) refused: bool,
+    /// Whether reading the output failed before its end: the stored log stops where the read
+    /// did, its frame unended, so no reader takes it for the whole output.
+    pub(crate) read_failed: bool,
+    /// Whether it stopped reading the output while a process still held it open
+    /// ([`CheckOutput::cut_short`]): the stored log says so ([`stopped_note`]).
+    pub(crate) stopped: bool,
+}
+
+impl Stored {
+    /// What the lane's writer read of the output ([`LogRead`]).
+    const fn log_read(self) -> LogRead {
+        if self.read_failed {
+            LogRead::Incomplete("reading the check's output failed before its end")
+        } else {
+            LogRead::Read {
+                refused: self.refused,
+            }
+        }
+    }
+}
+
+/// The line a stored log ends with where [`store_log`] left `bytes` of output out of it, in
+/// `lines` lines, once it held `cap` compressed bytes, keeping the output's last `tail` bytes.
+/// It names nothing the judge reads ([`trust_facts::judged`]), and starts on a line of its own.
+pub(crate) fn left_out_note(bytes: u64, lines: u64, cap: u64, tail: u64) -> String {
+    format!(
+        "\naterm trust lane: {bytes} bytes of this check's output, in {lines} lines, were left out once its stored log reached {cap} bytes; it keeps all the output before that, every line the judge reads and the output's last {tail} bytes\n"
+    )
+}
+
+/// The line a stored log ends with where [`store_log`] stopped reading the output while a
+/// process still held it open ([`Stored::stopped`]). It names nothing the judge reads, and
+/// starts on a line of its own.
+pub(crate) fn stopped_note() -> String {
+    format!(
+        "\naterm trust lane: the lane stopped reading this check's output {} s after its root ended, while a process the check left still held it open; what that process wrote after is not here\n",
+        LOG_DRAIN.as_secs()
+    )
+}
+
+/// A check's output as [`store_log_with`] reads it: its bytes, and a wait for more that can
+/// end.
+pub(crate) trait CheckOutput: std::io::Read {
+    /// Whether more output, or its end, may be read before `until`: `false` once `until` came
+    /// with nothing to read.
+    fn more_before(&mut self, until: Instant) -> bool;
+
+    /// Once a read returned its end, whether that was not the output's end: the reader stopped
+    /// while a process still held the output open.
+    fn cut_short(&self) -> bool {
+        false
+    }
+}
+
+/// Output held in memory, all of it there to read.
+impl CheckOutput for &[u8] {
+    fn more_before(&mut self, _: Instant) -> bool {
+        true
+    }
+}
+
+impl<R: CheckOutput + ?Sized> CheckOutput for &mut R {
+    fn more_before(&mut self, until: Instant) -> bool {
+        (**self).more_before(until)
+    }
+
+    fn cut_short(&self) -> bool {
+        (**self).cut_short()
+    }
+}
+
+/// The encoder a stored log is written through, and since when it holds output a reader of the
+/// stored log cannot read yet.
+struct LogSink<W: Write> {
+    enc: aterm_zstd::Encoder<Counted<W>>,
+    held: Option<Instant>,
+}
+
+impl<W: Write> LogSink<W> {
+    /// Stores `bytes` (a refused write stores nothing more, [`Counted`]).
+    fn write(&mut self, bytes: &[u8]) {
+        let _ = self.enc.write_all(bytes);
+        self.held.get_or_insert_with(Instant::now);
+    }
+
+    /// The compressed bytes the stored log took.
+    fn bytes(&self) -> u64 {
+        self.enc.get_ref().bytes
+    }
+
+    /// Whether the stored log refused a write.
+    fn failed(&self) -> bool {
+        self.enc.get_ref().failed
+    }
+
+    /// Before a wait for more output: once the encoder has held output for [`LOG_FLUSH`] with
+    /// nothing more to read, flushes it into the stored log.
+    fn idle(&mut self, from: &mut impl CheckOutput) {
+        if let Some(since) = self.held
+            && !from.more_before(since + LOG_FLUSH)
+        {
+            let _ = self.enc.flush();
+            self.held = None;
+        }
+    }
+}
+
+/// Reads into `line` through the next `\n`, at most `max` bytes, as `read_until(b'\n')` over
+/// `take(max)` reads, letting `sink` flush what it holds before each wait for more output
+/// ([`LogSink::idle`]): a line the check has not ended holds back no line before it.
+///
+/// # Errors
+/// A read failed (one interrupted is made again); `line` holds what was read before it.
+fn read_line<R: CheckOutput, W: Write>(
+    from: &mut BufReader<R>,
+    line: &mut Vec<u8>,
+    max: usize,
+    sink: &mut LogSink<W>,
+) -> std::io::Result<()> {
+    use std::io::BufRead as _;
+    while line.len() < max {
+        if from.buffer().is_empty() {
+            sink.idle(from.get_mut());
+        }
+        let buf = match from.fill_buf() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            buf => buf?,
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let room = &buf[..buf.len().min(max - line.len())];
+        let (n, ended) = room
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or((room.len(), false), |i| (i + 1, true));
+        line.extend_from_slice(&room[..n]);
+        from.consume(n);
+        if ended {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Stores a check's output, read from `from` to its end, zstd-compressed into `to`, line by
+/// line as [`trust_facts::Measured::of_log`] reads a log (through each `\n`): every line until
+/// `to` has taken `cap` bytes; past that, the lines `judged` keeps and the output's last `tail`
+/// bytes (whole lines), in the order the output had them, then [`left_out_note`]. A line longer
+/// than [`trust_facts::LINE_MAX`], which the judge skips whole, is past the cap left out whole,
+/// and one the cap reached as it was written is cut there and ended with its newline, still
+/// longer than the judge reads. So the stored log is the output less whole lines the judge
+/// reads nothing in, and less the end of lines it skips: it finds in it every fact the whole
+/// output gave ([`trust_facts::judged`]). Past `cap`, what the stored log holds besides the
+/// lines the judge reads stays within [`LOG_SLACK`] (for the lane's `tail`, [`LOG_TAIL`]).
+/// Before each wait for more output, what the encoder holds is flushed into `to` once it has
+/// held it for [`LOG_FLUSH`], so a reader of the stored log reads what the check wrote until
+/// then, but the last `tail` bytes held past `cap`, which only the output's end writes. A write
+/// `to` refused stores nothing more; `from` is read to its end all the same, so the check never
+/// waits on a full pipe. Whether the output said targo would not start the check is read over
+/// all of it ([`LaunchRefusal`]). A read of `from` that failed ends the storing there, leaving
+/// the frame unended ([`Stored::read_failed`]), so every reader of the stored log fails rather
+/// than take it for the whole output; where `from` stopped while a process still held it open
+/// ([`CheckOutput::cut_short`]), the stored log ends with [`stopped_note`].
+pub(crate) fn store_log_with<R: CheckOutput>(
+    from: R,
+    to: impl Write,
+    cap: u64,
+    tail: u64,
+    judged: &dyn Fn(&[u8]) -> bool,
+) -> Stored {
+    let mut from = BufReader::with_capacity(LOG_READ, from);
+    let counted = Counted {
+        inner: to,
+        bytes: 0,
+        failed: false,
+    };
+    let mut sink = LogSink {
+        enc: aterm_zstd::Encoder::new(counted, aterm_zstd::encode::Options::new()),
+        held: None,
+    };
+    let max_line = usize::try_from(trust_facts::LINE_MAX + 1).unwrap_or(usize::MAX);
+    let mut refusal = LaunchRefusal::default();
+    let mut stored = Stored::default();
+    // Past the cap, the last lines read, each with whether the judge reads it, held until they
+    // fall out of the last `tail` bytes (a judged one is then written, another left out) or the
+    // output ends (all are written).
+    let mut last: VecDeque<(Vec<u8>, bool)> = VecDeque::new();
+    let mut last_bytes: u64 = 0;
+    let mut line = Vec::new();
+    let mut piece = Vec::new();
+    'lines: loop {
+        line.clear();
+        if read_line(&mut from, &mut line, max_line, &mut sink).is_err() {
+            stored.read_failed = true;
+            break;
+        }
+        if line.is_empty() {
+            break;
+        }
+        refusal.feed(&line);
+        let failed = sink.failed();
+        let under = !failed && sink.bytes() < cap;
+        if len64(&line) <= trust_facts::LINE_MAX {
+            // A line the judge reads as one.
+            if under {
+                sink.write(&line);
+            } else if !failed {
+                let keep = judged(&line);
+                last_bytes = last_bytes.saturating_add(len64(&line));
+                last.push_back((std::mem::take(&mut line), keep));
+                while last_bytes > tail {
+                    let Some((out, keep)) = last.pop_front() else {
+                        break;
+                    };
+                    last_bytes = last_bytes.saturating_sub(len64(&out));
+                    if keep {
+                        sink.write(&out);
+                    } else {
+                        stored.left_out = stored.left_out.saturating_add(len64(&out));
+                        stored.lines_left_out = stored.lines_left_out.saturating_add(1);
+                    }
+                }
+            }
+            continue;
+        }
+        // A line longer than the judge reads, which it skips whole. Under the cap it is
+        // written, its first `LINE_MAX + 1` bytes at least, so what is written of it is still
+        // longer than the judge reads; where the cap comes within it, it is cut there and ended
+        // with its newline. Past the cap it is left out whole.
+        let whole = !under;
+        let mut left = 0;
+        if under {
+            sink.write(&line);
+        } else {
+            left = len64(&line);
+        }
+        let mut cut = false;
+        let mut ended = line.last() == Some(&b'\n');
+        while !ended {
+            piece.clear();
+            if read_line(&mut from, &mut piece, LOG_READ, &mut sink).is_err() {
+                stored.read_failed = true;
+                break 'lines;
+            }
+            if piece.is_empty() {
+                break;
+            }
+            ended = piece.last() == Some(&b'\n');
+            refusal.feed(&piece);
+            if whole {
+                left = left.saturating_add(len64(&piece));
+            } else if !cut && sink.bytes() < cap {
+                sink.write(&piece);
+            } else {
+                cut = true;
+                if ended {
+                    left = left.saturating_add(len64(&piece) - 1);
+                    sink.write(b"\n");
+                } else {
+                    left = left.saturating_add(len64(&piece));
+                }
+            }
+        }
+        if (whole || cut) && !sink.failed() {
+            stored.left_out = stored.left_out.saturating_add(left);
+            stored.lines_left_out = stored.lines_left_out.saturating_add(1);
+        }
+    }
+    stored.refused = refusal.found;
+    if stored.read_failed {
+        // What was stored stays readable up to the failed read, and the frame is left unended.
+        let _ = sink.enc.flush();
+        return stored;
+    }
+    for (out, _) in last {
+        sink.write(&out);
+    }
+    if stored.left_out > 0 {
+        sink.write(left_out_note(stored.left_out, stored.lines_left_out, cap, tail).as_bytes());
+    }
+    stored.stopped = from.get_ref().cut_short();
+    if stored.stopped {
+        sink.write(stopped_note().as_bytes());
+    }
+    let _ = sink.enc.finish();
+    stored
+}
+
+/// [`store_log_with`] as the lane stores a check's log: the judge's own lines
+/// ([`trust_facts::judged_line`]).
+pub(crate) fn store_log(from: impl CheckOutput, to: impl Write, cap: u64, tail: u64) -> Stored {
+    store_log_with(from, to, cap, tail, &trust_facts::judged_line)
+}
+
+/// A check's output pipe, read until every process holding its write end closed it; or, once
+/// `stop` is at its end ([`LogWriter::finish`] stopped waiting), only what the pipe holds then,
+/// up to [`LOG_STOP_DRAIN`] bytes, so a process the check left holding it open keeps the
+/// stored log from ending no longer. Once stopping, the output ends for good the first time the
+/// pipe holds nothing, so no line is read in two parts with a pause between them.
+struct UntilStopped {
+    pipe: std::io::PipeReader,
+    stop: std::io::PipeReader,
+    stopping: bool,
+    /// What was read once stopping.
+    drained: usize,
+    /// Once the output ended for good, whether a process still held it open then
+    /// ([`CheckOutput::cut_short`]).
+    over: Option<bool>,
+}
+
+impl std::io::Read for UntilStopped {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsFd as _;
+        if self.over.is_some() {
+            return Ok(0);
+        }
+        if !self.stopping {
+            let ready = aterm_uds::ready::either(self.stop.as_fd(), self.pipe.as_fd())?;
+            if ready.first {
+                self.stopping = true;
+            } else {
+                let n = self.pipe.read(buf)?;
+                if n == 0 {
+                    self.over = Some(false);
+                }
+                return Ok(n);
+            }
+        }
+        if self.drained >= LOG_STOP_DRAIN {
+            self.over = Some(true);
+            return Ok(0);
+        }
+        let room = buf.len().min(LOG_STOP_DRAIN - self.drained);
+        let pipe = &self.pipe;
+        let read = aterm_uds::ready::with_nonblocking(pipe.as_fd(), || {
+            let mut reader = pipe;
+            reader.read(&mut buf[..room])
+        });
+        match read {
+            Ok(0) => {
+                self.over = Some(false);
+                Ok(0)
+            }
+            Ok(n) => {
+                self.drained += n;
+                Ok(n)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.over = Some(true);
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl CheckOutput for UntilStopped {
+    fn more_before(&mut self, until: Instant) -> bool {
+        use std::os::fd::AsFd as _;
+        self.stopping
+            || self.over.is_some()
+            || !matches!(
+                aterm_uds::ready::either_until(self.stop.as_fd(), self.pipe.as_fd(), until),
+                Ok(None)
+            )
+    }
+
+    fn cut_short(&self) -> bool {
+        self.over == Some(true)
+    }
+}
+
+/// The thread storing one check's output as its stored log ([`store_log`]) while the check
+/// runs: the check writes into a pipe, never into the file, so what it writes past the cap
+/// costs no disk.
+struct LogWriter {
+    /// Dropped to stop the thread waiting for the output's end ([`UntilStopped`]).
+    stop: Option<std::io::PipeWriter>,
+    done: std::sync::mpsc::Receiver<Stored>,
+    /// What the thread stored, once [`LogWriter::finish`] has it; `None` after it where the
+    /// thread ended without saying (its storing panicked).
+    stored: Option<Stored>,
+    /// Whether [`LogWriter::finish`] ran.
+    finished: bool,
+}
+
+impl LogWriter {
+    /// Starts storing what `pipe` reads into `file`, compressed, past `cap` only the judged lines
+    /// and the output's last `tail` bytes. A thread whose storing panics still reads the pipe to
+    /// its end, so the check never dies writing into a pipe nobody reads (`SIGPIPE`), and says
+    /// nothing of what it stored.
+    ///
+    /// # Errors
+    /// Making the stop pipe, or starting the thread.
+    fn start(
+        pipe: std::io::PipeReader,
+        file: fs::File,
+        cap: u64,
+        tail: u64,
+    ) -> std::io::Result<Self> {
+        let (stop_reader, stop) = aterm_uds::pipe()?;
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("trust-log".into())
+            .spawn(move || {
+                let mut until = UntilStopped {
+                    pipe,
+                    stop: stop_reader,
+                    stopping: false,
+                    drained: 0,
+                    over: None,
+                };
+                let stored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    store_log(&mut until, std::io::BufWriter::new(file), cap, tail)
+                }));
+                if let Ok(stored) = stored {
+                    let _ = tx.send(stored);
+                }
+                drop(tx);
+                // What a process the check left still writes is read and dropped, so it never
+                // waits on a full pipe or fails its write.
+                let _ = std::io::copy(&mut until.pipe, &mut std::io::sink());
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            done,
+            stored: None,
+            finished: false,
+        })
+    }
+
+    /// Waits, once the check's root was reaped and its processes ended, for its output to end
+    /// and its stored log to be written; after [`LOG_DRAIN`], stops the thread reading past what
+    /// the pipe holds ([`UntilStopped`]) and waits for it to store that, as long as it takes:
+    /// stopped, it waits on nothing but its own work. Leaves [`LogWriter::stored`] `None` where
+    /// the thread ended without saying what it stored.
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.stored = match self.done.recv_timeout(LOG_DRAIN) {
+            Ok(stored) => Some(stored),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                drop(self.stop.take());
+                self.done.recv().ok()
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+    }
+
+    /// What it read of the output, once [`LogWriter::finish`] ran ([`LogRead`]).
+    fn log_read(&self) -> LogRead {
+        match self.stored {
+            Some(stored) => stored.log_read(),
+            None if self.finished => {
+                LogRead::Incomplete("the check's log writer ended without saying what it stored")
+            }
+            None => LogRead::Incomplete("the check's log writer was not waited for"),
+        }
     }
 }
 
@@ -2555,6 +3188,44 @@ fn clear_receipt(path: &Path, directory: bool) -> std::io::Result<()> {
     }
 }
 
+/// The logs and sidecars in `logdir` (`<name>@<version>.log…`) of the libraries `work` checks,
+/// at a version other than the one it checks, each with whether it is a report directory: a
+/// library's version bump would otherwise leave its earlier version's logs there for good, and
+/// no run reads them. Only a regular file, or a report directory, is named; anything else stays.
+///
+/// # Errors
+/// `logdir` could not be read.
+fn earlier_versions(logdir: &Path, work: &[&Selected]) -> std::io::Result<Vec<(PathBuf, bool)>> {
+    let now: BTreeMap<&str, String> = work
+        .iter()
+        .map(|s| (s.lib.name.as_str(), format!("{}.log", s.lib.spec)))
+        .collect();
+    let mut out = Vec::new();
+    for entry in fs::read_dir(logdir)? {
+        let entry = entry?;
+        let Ok(file) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(log) = file.split_once('@').and_then(|(name, _)| now.get(name)) else {
+            continue;
+        };
+        if file.starts_with(log.as_str()) {
+            continue;
+        }
+        let Some((_, rest)) = file.split_once(".log") else {
+            continue;
+        };
+        let kind = entry.file_type()?;
+        let report = rest == ".report";
+        if (rest.is_empty() || rest.starts_with('.'))
+            && ((report && kind.is_dir()) || (!report && kind.is_file()))
+        {
+            out.push((entry.path(), report));
+        }
+    }
+    Ok(out)
+}
+
 /// The checks, then the judge: `Err` is why nothing was decided.
 fn check_and_conclude(
     cfg: &Config,
@@ -2571,6 +3242,7 @@ fn check_and_conclude(
         let log = prep.logdir.join(format!("{}.log", s.lib.spec));
         for ext in [
             "",
+            trust_facts::STORED_SUFFIX,
             ".rc",
             ".pace",
             ".trustd",
@@ -2583,6 +3255,12 @@ fn check_and_conclude(
                 .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
         }
         clear_receipt(Path::new(&format!("{}.report", log.display())), true)
+            .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
+    }
+    for (path, directory) in earlier_versions(&prep.logdir, &work)
+        .map_err(|e| format!("compiler receipt namespace could not be read: {e}"))?
+    {
+        clear_receipt(&path, directory)
             .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
     }
     let seed = cfg.repo.join(trust_facts::COSTS);
@@ -2935,8 +3613,8 @@ fn cost_of(f: &Finished, driver: &Driver) -> std::io::Result<Option<Cost>> {
     } else if f.over_budget {
         Some(Cut::OverBudget)
     } else {
-        let file = crate::durable::open_regular_file(&f.job.log)?;
-        let m = trust_facts::Measured::of_log(BufReader::new(file), &f.ended.code.to_string())?;
+        let log = trust_facts::open_log(&f.job.log)?;
+        let m = trust_facts::Measured::of_log(log, &f.ended.code.to_string())?;
         (m.summary.is_empty() || !m.ended.is_empty() || m.transport).then_some(Cut::Failed)
     };
     Ok(cost_when_cut(f, driver, cut))
@@ -3769,6 +4447,19 @@ fn canonical_repo(cfg: &Config) -> PathBuf {
     fs::canonicalize(&cfg.repo).unwrap_or_else(|_| cfg.repo.clone())
 }
 
+/// The folder of logs under the target root a run with `--target-root named` (or none) uses
+/// on this host ([`target_root`]), for `trust log` to read.
+///
+/// # Errors
+/// Why no target root `targo trust` admits.
+pub(crate) fn log_dir(repo: &Path, named: Option<&Path>) -> Result<PathBuf, String> {
+    let mut cfg = Config::new(repo, Scope::WholeTree);
+    cfg.target_root = named.map(Path::to_path_buf);
+    Ok(target_root(&cfg, Machine.cache().as_deref())?
+        .path
+        .join("logs"))
+}
+
 /// Resolves this run's target root from `--target-root` or [`choose_root`].
 fn target_root(cfg: &Config, cache: Option<&Path>) -> Result<Root, String> {
     if let Some(named) = &cfg.target_root {
@@ -4439,6 +5130,12 @@ struct RealChecks<'a> {
     admission: Admission<'a>,
     /// Where the gate says what a check waits for.
     out: Box<dyn Write + 'a>,
+    /// The compressed bytes a check's stored log holds before only its judged lines and its
+    /// last bytes are kept ([`LOG_STORED`]).
+    log_cap: u64,
+    /// How much of the end of a check's output its stored log keeps past the cap
+    /// ([`LOG_TAIL`]).
+    log_tail: u64,
 }
 
 impl<'a> RealChecks<'a> {
@@ -4475,6 +5172,8 @@ impl<'a> RealChecks<'a> {
             sweep: || aterm_sysprobe::procs::processes().map(|s| s.procs),
             admission,
             out,
+            log_cap: LOG_STORED,
+            log_tail: LOG_TAIL,
         }
     }
 }
@@ -4507,7 +5206,8 @@ impl Checks for RealChecks<'_> {
             return Err(e);
         }
         job.target.clone_from(&target);
-        let log = crate::durable::create_fresh(&job.log)?;
+        // The check's output is stored compressed (`<name@version>.log.zst`, [`LogWriter`]).
+        let stored = crate::durable::create_fresh(&trust_facts::stored_log(&job.log))?;
         job.lock = fork_lock(self.repo, &job.argv);
         if let Some(l) = &job.lock {
             self.locks.entry(l.path.clone()).or_insert(l.created);
@@ -4536,6 +5236,10 @@ impl Checks for RealChecks<'_> {
         // The gate's env(1) execs targo only once the lane lets it go, so an exec error there
         // would read as the check's own failure.
         exec_ready(&self.driver.targo)?;
+        // Its stdout and stderr are one pipe, whose writer thread stores what it reads.
+        let (from, to) = aterm_uds::pipe()?;
+        let err = aterm_uds::kept_out(|| to.try_clone())?;
+        let mut log = LogWriter::start(from, stored, self.log_cap, self.log_tail)?;
         // The root is identified, and its record names it, before it runs targo ([`GATE`]).
         let mut cmd = command("/bin/sh");
         cmd.arg("-c")
@@ -4559,14 +5263,17 @@ impl Checks for RealChecks<'_> {
             )
             .current_dir(self.repo)
             .stdin(Stdio::piped())
-            .stdout(log.try_clone()?)
-            .stderr(log);
+            .stdout(to)
+            .stderr(err);
         proc_tree::new_session(&mut cmd);
         // The record holds the slot before the root can run, and never replaces another
         // run's: a slot whose record is left is held ([`slot_held`]).
         let record = self.root.join(format!(".check.{}", job.slot));
         let written = crate::durable::open_create_new(&record)?.write_all(rec.text().as_bytes());
-        let mut child = match written.and_then(|()| cmd.spawn()) {
+        let spawned = written.and_then(|()| cmd.spawn());
+        // The pipe's writers are the check's alone from here, so its output ends with them.
+        drop(cmd);
+        let mut child = match spawned {
             Ok(child) => child,
             Err(e) => {
                 let _ = fs::remove_file(&record);
@@ -4600,6 +5307,7 @@ impl Checks for RealChecks<'_> {
                 proc_tree::Act::End,
             );
             let _ = child.wait();
+            log.finish();
             let held = left == proc_tree::Left::Nothing || stamp_slot(&target);
             if left.spent() && held {
                 let _ = fs::remove_file(&record);
@@ -4615,6 +5323,7 @@ impl Checks for RealChecks<'_> {
             times: TreeTimes::default(),
             read_at: None,
             sweep: self.sweep,
+            log: Some(log),
         }))
     }
 
@@ -4694,6 +5403,8 @@ struct RealCheck {
     /// When it last read them.
     read_at: Option<Instant>,
     sweep: fn() -> Option<Vec<aterm_sysprobe::procs::ProcessReading>>,
+    /// The thread storing its output ([`LogWriter`]); `None` for a check a test made with none.
+    log: Option<LogWriter>,
 }
 
 impl RealCheck {
@@ -4714,6 +5425,14 @@ impl RealCheck {
         i32::try_from(self.child.id()).ok()
     }
 
+    /// Waits for its stored log to be written ([`LogWriter::finish`]), its root reaped and its
+    /// processes ended.
+    fn store(&mut self) {
+        if let Some(log) = &mut self.log {
+            log.finish();
+        }
+    }
+
     /// The end `usage` says. The record goes only when `left` found nothing of the check
     /// ([`proc_tree::Left::spent`]) and the slot is `held` as that needs; otherwise it stays,
     /// holding the slot for a later reap.
@@ -4724,6 +5443,7 @@ impl RealCheck {
         held: bool,
     ) -> Ended {
         use std::os::unix::process::ExitStatusExt as _;
+        self.store();
         let e = Ended {
             code: usage
                 .status
@@ -4797,12 +5517,19 @@ impl Check for RealCheck {
                 maxrss: self.times.peak(),
                 threads: self.times.threads(),
             };
+            self.store();
             self.ended = Some(e);
             if left.spent() && held {
                 let _ = fs::remove_file(&self.record);
             }
             e
         }
+    }
+
+    fn log_read(&self) -> LogRead {
+        self.log
+            .as_ref()
+            .map_or(LogRead::Unread, LogWriter::log_read)
     }
 }
 

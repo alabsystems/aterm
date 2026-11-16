@@ -742,6 +742,13 @@ impl App {
                     workers_in_front: ws.tab_set.home().is_some()
                         && ws.tab_set.home() == ws.tab_set.active_id(),
                     restored_tabs,
+                    // The record that agrees with the grid and frame written beside it; a
+                    // headless app seats no dock and keeps its rows' records as they came.
+                    dock: if self.headless {
+                        ws.dock.pref
+                    } else {
+                        ws.dock.written()
+                    },
                 }
             })
             .collect();
@@ -1735,14 +1742,15 @@ impl App {
         // Every record the layout brings back is seeded and every shell handed back is a tab: what
         // the layout's session IDs left in the tasks directory, and no record here keeps, goes. A
         // seamless update's successor sweeps nothing: its sessions keep their IDs, so the files
-        // under the IDs its layout names are its own live sessions', which go at their close or
-        // at its quit as any session's do. The predecessor ends at the Commit and removes none.
+        // under the IDs its layout names are its own live sessions', which their eventual rows
+        // or a saved layout keep. The predecessor ends at the Commit and removes none.
         // The sweep is one-shot for those IDs, so it waits for the session table's load: before
         // it every result is held, and would be kept for good.
         let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
         if !self.handoff_successor {
-            let (tasks, store) = (tasks.clone(), self.store.clone());
-            table.when_loaded(move || tasks.sweep(&store));
+            let sweep = crate::task_launch::PendingRestoredSweep::new(tasks.clone(), &self.store);
+            self.restored_tasks_sweep = Some(sweep.clone());
+            table.when_loaded(move || sweep.run());
         }
         self.seamless_held.clear();
         self.seamless_held_shown.clear();
@@ -1858,6 +1866,8 @@ impl App {
             let ws = &mut **route_guard_ws;
             ws.restore_regrid_owed = None;
             ws.restore_maximize_asked = false;
+            // Marked only: the park pays it, outside this scope (`App::settle_dock_fall`).
+            ws.dock.restore_settled();
         }
         self.resize_panes_scoped(wid, false);
     }
@@ -2018,6 +2028,7 @@ impl App {
             && let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
             && crate::app_window::restored_position_on_screen(window, x, y)
         {
+            let (x, y) = self.restored_origin(wid, window, x, y);
             window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
         }
         if !cfg!(windows)
@@ -2099,6 +2110,8 @@ impl App {
         host.scale = self.unattached_window_scale();
         let frame = crate::app_window::CarriedFrame::of(&wl);
         host.take_carried_frame(frame.map(|frame| frame.inner_px));
+        host.dock.pref = wl.dock;
+        host.dock.birth = crate::app_window::DockBirth::of_row(&wl);
         host.restore_maximize_asked = wl.maximized == Some(true);
         Some(FillingWindow {
             wid,
@@ -2620,7 +2633,7 @@ impl App {
                 restored
                     .iter()
                     .filter_map(|(sid, ..)| {
-                        g.by_sid(&aterm_session::SessionId::new(sid))
+                        g.by_sid(&aterm_session::SessionId::parse(sid)?)
                             .map(|h| h.local_id)
                     })
                     .collect()
@@ -2996,8 +3009,11 @@ impl App {
         }
         let mut minted_any = false;
         for ((src, dst), ops) in pairs {
-            let src = SessionId::new(src);
-            let dst = SessionId::new(dst);
+            // A connection joins two sessions: a row whose ends do not read as sessions' IDs
+            // names no edge to mint or to audit.
+            let (Some(src), Some(dst)) = (SessionId::parse(&src), SessionId::parse(&dst)) else {
+                continue;
+            };
             let dst_ctx = {
                 let store = self.store.read().unwrap_or_else(|p| p.into_inner());
                 let src_live = store.by_sid(&src).is_some();
@@ -3083,6 +3099,8 @@ impl App {
                 let ws = &mut **route_guard_ws;
                 let frame = crate::app_window::CarriedFrame::of(&wl);
                 ws.take_carried_frame(frame.map(|frame| frame.inner_px));
+                ws.dock.pref = wl.dock;
+                ws.dock.birth = crate::app_window::DockBirth::of_row(&wl);
                 ws.restore_maximize_asked = maximized == Some(true);
             }
             #[cfg(any(windows, target_os = "linux"))]
@@ -3107,6 +3125,7 @@ impl App {
                 && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
                 && crate::app_window::restored_position_on_screen(w, x, y)
             {
+                let (x, y) = self.restored_origin(wid, w, x, y);
                 w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
             }
             if !cfg!(windows)
@@ -3141,6 +3160,7 @@ impl App {
             None,
             crate::app_window::CarriedFrame::of(&wl),
             (outer, maximized),
+            (wl.dock, crate::app_window::DockBirth::of_row(&wl)),
         );
         drop(restoring);
         let Some(wid) = created else {
@@ -3162,6 +3182,7 @@ impl App {
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
             && crate::app_window::restored_position_on_screen(w, x, y)
         {
+            let (x, y) = self.restored_origin(wid, w, x, y);
             w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
         }
         if !cfg!(windows)
@@ -4273,8 +4294,13 @@ impl App {
         let _ = meta.set("role", leaf.role.clone());
         let _ = meta.set("attention", leaf.attention.clone());
         let _ = meta.set("questions", leaf.questions.clone());
-        let _ = meta.set_autopilot(leaf.autopilot.clone(), leaf.carried_land_at());
-        meta.autopilot_set_by = leaf.carried_set_by().filter(|_| meta.autopilot.is_some());
+        // An Autopilot word aterm wrote on this session as its record was seeded stands, as a
+        // driver's write stands against a graft (`session_timeline::restore_carried_meta`): the
+        // Off of a disk worker an earlier build left (`task_record::retire_session`).
+        if !meta.driver_wrote(crate::session_timeline::MetaField::Autopilot) {
+            let _ = meta.set_autopilot(leaf.autopilot.clone(), leaf.carried_land_at());
+            meta.autopilot_set_by = leaf.carried_set_by().filter(|_| meta.autopilot.is_some());
+        }
         meta.pinned = leaf.pinned;
         drop(meta);
         crate::session_timeline::keep_worker_autopilot(&session.ctx);
@@ -4338,8 +4364,8 @@ impl App {
                 }
             }
         }
-        // A disk worker kept as a tab carries no record, and is as disposable as a parked one: its
-        // agent's folder says what it is.
+        // A disk worker an earlier build left, kept as a tab, carries no record, and is as
+        // disposable as a parked one: its agent's folder says what it is.
         if leaf.task.is_none() && !filled_by_a_live_shell {
             not_resumed |= leaf.agent.as_ref().is_some_and(|agent| {
                 crate::task_record::disposable_worker(Some(agent.cwd.as_str()))
@@ -4405,8 +4431,7 @@ impl App {
                 aterm_log::info!("restore: the reattached shell keeps its agent; not relaunched");
             } else if !self.handoff_successor && not_resumed {
                 aterm_log::info!(
-                    "restore: the disk worker is not resumed after aterm ended; a later need \
-                     starts a new one"
+                    "restore: a disk worker an earlier build left is not resumed after aterm ended"
                 );
             } else if !self.handoff_successor {
                 let session = match &filling {
@@ -5646,6 +5671,10 @@ mod tests;
 #[cfg(test)]
 #[path = "app_restore_drain_tests.rs"]
 mod drain_tests;
+
+#[cfg(test)]
+#[path = "app_restore_dock_tests.rs"]
+mod dock_tests;
 
 #[cfg(test)]
 #[path = "app_restore_cursor_tests.rs"]

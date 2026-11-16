@@ -7,6 +7,11 @@
 //! [`Rest::settle`] applies the configured period; `None` keeps the window awake.
 //! [`Rest::deck_moves`] holds deck motion while resting and until a reading lands after a wake.
 //! A touch attends the window for [`ATTENTION`]; output alone does not attend it.
+//! Unless a page on screen reads them, a focused window that rests or is unattended no longer
+//! keeps the shared readings on the focused cadence (`App::vitals_audience`;
+//! [`crate::vitals_host::BACKGROUND_PERIOD`] says what they slow to, and an open stats lens keeps
+//! its own cadence, `Audience::cadence`), and the touch that attends
+//! it again asks a reading at once when it is focused or the touch focuses it (`App::touch_rest`).
 //!
 //! This state owns timestamps and creates no timer. The event loop chooses when to call it.
 
@@ -119,9 +124,10 @@ impl Rest {
 
     /// Whether the window's deck may move, given when the last reading `landed`: not while it
     /// rests or is unattended, and after a wake (or the touch that attends it again) only once
-    /// a reading has landed since. A focused window's wake or touch asks that reading at once,
-    /// and its frame redraws the deck anyway, so the deck's motion comes back there rather than
-    /// in the frame of the key or output that woke the window.
+    /// a reading has landed since. A focused window's wake while it is attended, or the touch
+    /// that attends it again, asks that reading at once, and its frame redraws the deck anyway,
+    /// so the deck's motion comes back there rather than in the frame of the key or output that
+    /// woke the window.
     pub(crate) fn deck_moves(&self, landed: Option<Instant>) -> bool {
         !self.resting
             && self.attended

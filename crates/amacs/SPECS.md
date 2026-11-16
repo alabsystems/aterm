@@ -17,8 +17,9 @@ checked-arithmetic assert) are the gaps of `docs/TRUST-LANE.md`,
 ## 1. The lane
 
 ```sh
-targo --unverified ship trust run -p amacs --obligations   # rows in target-trust.noindex/logs/amacs@<ver>.log{,.oblig.tsv}
+targo --unverified ship trust run -p amacs --obligations   # rows in target-trust.noindex/logs/amacs@<ver>.log{.zst,.oblig.tsv}
 targo --unverified ship trust run -p amacs --update-ratchet
+targo --unverified ship trust log amacs                    # its log, decompressed
 targo --unverified verify test -p aterm-contract-probe     # before changing a contract
 ```
 

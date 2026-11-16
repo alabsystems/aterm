@@ -1543,6 +1543,13 @@ fn home_default_email(home: &Path) -> Option<String> {
     )
 }
 
+/// Whether the default login's profile under the person's home `home` names `email`: a known
+/// match ([`accounts::email_matches`]). A profile that names another account, does not read or
+/// names none answers no (`login_adoption::Witnesses`).
+pub(super) fn default_profile_names(home: &Path, email: &str) -> bool {
+    home_default_email(home).is_some_and(|found| accounts::email_matches(email, &found))
+}
+
 /// Match a checked default login to its current row without trusting its label
 /// as provider identity. A row with no expected identity denotes the default
 /// login itself; named identities require a readable matching provider record.
@@ -2508,6 +2515,40 @@ fn transcript_rows(path: &Path, roster: &Roster, now: i64, budget: &mut u64) -> 
     rows
 }
 
+/// The transcripts a scan reads: the [`TRANSCRIPT_SCAN_FILES`] most recently written under
+/// `claude_dir`'s `projects`, newest first, each with when it was last written; `None` where
+/// that directory cannot be listed.
+fn newest_transcripts(claude_dir: &Path) -> Option<Vec<(std::time::SystemTime, PathBuf)>> {
+    let projects = claude_dir.join("projects");
+    let entries = fs::read_dir(&projects).ok()?;
+    let mut files_with_mtime: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for proj in entries.flatten() {
+        if !proj.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(proj.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = file
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files_with_mtime.push((mtime, path));
+        }
+    }
+    files_with_mtime.sort_by_key(|a| std::cmp::Reverse(a.0));
+    files_with_mtime.truncate(TRANSCRIPT_SCAN_FILES);
+    Some(files_with_mtime)
+}
+
+/// How many transcripts one scan reads ([`newest_transcripts`]).
+const TRANSCRIPT_SCAN_FILES: usize = 16;
+
 /// Scan recent transcripts and attribute standing quota walls to active account rows.
 ///
 /// A transcript's rows are booked to the row its last `session_context` names (before any, the
@@ -2550,32 +2591,9 @@ pub fn find_transcript_walls_by_email(
     spans: impl FnOnce() -> Option<BTreeMap<String, accounts::LoginDirSpans>>,
     now: i64,
 ) -> BTreeMap<String, upgrade::StandingWall> {
-    let projects = claude_dir.join("projects");
-    let Ok(entries) = fs::read_dir(&projects) else {
+    let Some(files_with_mtime) = newest_transcripts(claude_dir) else {
         return BTreeMap::new();
     };
-    let mut files_with_mtime: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for proj in entries.flatten() {
-        if !proj.file_type().is_ok_and(|ft| ft.is_dir()) {
-            continue;
-        }
-        let Ok(files) = fs::read_dir(proj.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let mtime = file
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            files_with_mtime.push((mtime, path));
-        }
-    }
-    files_with_mtime.sort_by_key(|a| std::cmp::Reverse(a.0));
-    files_with_mtime.truncate(16);
 
     let mut budget = TRANSCRIPT_WALLS_SCAN_BYTES;
     let read: Vec<(Option<String>, Vec<TranscriptRow>)> = files_with_mtime
@@ -8224,7 +8242,6 @@ fn run_vault_sync(
     cmd.args(["secrets", "sync", "--diagnostic"])
         .env("HOME", home);
     let ran = match scope {
-        #[cfg(unix)]
         Some(scope) => {
             if scope.cancelled() {
                 return Vault::Failed("account work was cancelled".to_owned());
@@ -8237,7 +8254,7 @@ fn run_vault_sync(
                 super::align::Ended::Stopped => Err("account work was cancelled".to_owned()),
             })
         }
-        _ => super::align::capture_bounded_owned(cmd, VAULT_SYNC_BUDGET, 16 * 1024),
+        None => super::align::capture_bounded_owned(cmd, VAULT_SYNC_BUDGET, 16 * 1024),
     };
     match ran {
         Ok(ran) => Vault::of_sync(&String::from_utf8_lossy(&ran.stdout), ran.code),
@@ -8814,6 +8831,7 @@ fn upkeep(
     (roster_path, now, step): (&Path, i64, UpkeepStep),
     fx: &UpkeepEffects<'_>,
 ) -> Upkept {
+    super::accounts_upkeep_counts::count(super::accounts_upkeep_counts::Event::Pass);
     if fx
         .scope
         .as_ref()
@@ -8926,6 +8944,20 @@ fn upkeep_claude(
     if step.syncs() {
         heal_default_login_in_upkeep(home, state_dir, roster_path, now, fx);
     }
+    // Before any renewal, and whether or not the ladder signs rows in: a login a person made
+    // in a tab, or one a tab was served by, since its sign-out was recorded is adopted here,
+    // with no tab supervisor and whatever any tab's Autopilot says (plan package FL-174). The
+    // pass reads its witnesses once, here, and the ladder below asks the same ones.
+    let live = super::login_adoption::Pass::default();
+    if step.renews() {
+        adopt_live_logins_in_upkeep(
+            (home, state_dir, roster_path),
+            now,
+            fx.renew_guard,
+            &live,
+            &*fx.log,
+        );
+    }
     // Before any renewal and whatever it starts: a row needs no renewal for its mailbox's
     // arrival to end the lab's ask for it.
     if step.renews() {
@@ -8952,7 +8984,7 @@ fn upkeep_claude(
             || {
                 signs_in
                     && roster_path.is_file()
-                    && auto_renew_next_account(home, state_dir, roster_path, now, fx)
+                    && auto_renew_next_account_in(home, state_dir, roster_path, now, fx, &live)
             },
             RenewalDispatch::progressed,
         );
@@ -8967,7 +8999,7 @@ fn upkeep_claude(
         roster_path.exists()
     };
     let renewal = pending.map_or_else(
-        || signs_in && auto_renew_next_account(home, state_dir, roster_path, now, fx),
+        || signs_in && auto_renew_next_account_in(home, state_dir, roster_path, now, fx, &live),
         RenewalDispatch::progressed,
     );
     Upkept::Configured {
@@ -8975,6 +9007,269 @@ fn upkeep_claude(
         roster,
         renewal,
     }
+}
+
+/// THE UPKEEP'S ADOPTION STEP AND WHAT IT ENDS: adopts each Claude Code login the credential-free
+/// files show live after its recorded sign-out (`login_adoption::adopt_live_logins`, from
+/// `live`'s witnesses), then settles what the step did ([`settle_adoption`]); returns the step.
+fn adopt_live_logins_in_upkeep(
+    (home, state_dir, roster_path): (&Path, &Path, &Path),
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    live: &super::login_adoption::Pass,
+    log: &dyn Fn(&str),
+) -> super::login_adoption::Step {
+    let step =
+        super::login_adoption::adopt_live_logins(home, state_dir, roster_path, now, live, log);
+    settle_adoption(renew_guard, &step, live, log);
+    step
+}
+
+/// WHAT FOLLOWS AN ADOPTION STEP: each lift ends that account's running unattended sign-in
+/// ([`supersede_unattended`]), and each row a file shows live that the step could not lift
+/// (`login_adoption::Refusal`: no later pass ends that by itself) is noted in `live`, so
+/// evidence hides it from no ladder (`login_adoption::retain_not_live`), and its reason is
+/// logged once per change, by label alone. A lift the accounts lock held up says nothing: the
+/// next pass makes it. Baselines that could not be kept are logged once, until they are. A
+/// step that could not read the records asked about no row and settles nothing.
+fn settle_adoption(
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    step: &super::login_adoption::Step,
+    live: &super::login_adoption::Pass,
+    log: &dyn Fn(&str),
+) {
+    use super::login_adoption::Lift;
+    if step.unread {
+        return;
+    }
+    let mut lifted = Vec::new();
+    let mut lines = Vec::new();
+    {
+        let mut guard = renew_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // What this step was refused replaces what the last one was: a row with no refusal
+        // now is said again if one comes back.
+        let mut refused = BTreeMap::new();
+        for (label, lift) in &step.lifts {
+            match lift {
+                Lift::Landed(_) => lifted.push(label.clone()),
+                Lift::Refused(why) => {
+                    live.refuse(label);
+                    refused.insert(label.clone(), why.words());
+                }
+                // Neither says the reason is over: what was said of the row stands.
+                Lift::Busy | Lift::Already => {
+                    if let Some(said) = guard.adoption_refused.get(label) {
+                        refused.insert(label.clone(), said.clone());
+                    }
+                }
+            }
+        }
+        for (label, why) in &refused {
+            if guard.adoption_refused.get(label) != Some(why) {
+                lines.push(format!(
+                    "account {label}: a tab on its login looks live again, but its recorded \
+                     sign-out stands: {why}; the sign-in ladder goes on"
+                ));
+            }
+        }
+        guard.adoption_refused = refused;
+        if step.baselines_unkept && !guard.baselines_unkept_said {
+            lines.push(
+                "accounts: the usage-tap baselines could not be kept, so no login a tab is \
+                 served by is adopted until they can be"
+                    .to_owned(),
+            );
+        }
+        guard.baselines_unkept_said = step.baselines_unkept;
+    }
+    for line in &lines {
+        log(line);
+    }
+    supersede_unattended(renew_guard, &lifted, log);
+}
+
+/// A pass's witnesses for a caller with no adoption step of its own (a person's click that
+/// names no row, a Next selection): it knows the rows the upkeep's last step could not lift
+/// ([`settle_adoption`]), so evidence hides none of them from it either.
+fn live_logins_known(
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+) -> super::login_adoption::Pass {
+    super::login_adoption::Pass::knowing(
+        renew_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .adoption_refused
+            .keys()
+            .cloned(),
+    )
+}
+
+/// An unattended sign-in the upkeep's ladder started and that runs now, as a lift of its
+/// account ends it ([`supersede_unattended`]). Only the ladder's own runs are marked: a
+/// sign-in a person started (a click, a pin request, a saved choice, a Next selection) is never
+/// marked, so nothing here can cancel it.
+#[derive(Clone)]
+struct UnattendedRun {
+    /// Set once the run is superseded; its worker then counts it neither failed nor blocked.
+    superseded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Ends the run's work and nothing else: the cancellation of the run's own operation
+    /// ([`RunMark::scope`], a child of the upkeep step that started it), which its capture
+    /// watches and ends its child on, by the child's own identity
+    /// (`align::capture_bounded_owned_watching`); the opener's end closes its window. `None`
+    /// where the run was started under no scope.
+    cancel: Option<super::account_work::Cancellation>,
+}
+
+/// The mark of one unattended run in the guard, removed when its work ends or is dropped unrun.
+struct RunMark {
+    guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    label: String,
+    run: UnattendedRun,
+    /// THE RUN'S OWN OPERATION (`account_work::Scope::child`): the scope its work runs under
+    /// in place of its upkeep step's, so cancelling it ends this one sign-in and leaves the
+    /// rest of that step (its fetch, its vault refresh, another CLI's saved choice) running,
+    /// while everything that stops the step still stops the run. `None` where the run was
+    /// started under no scope.
+    scope: Option<super::account_work::Scope>,
+}
+
+impl RunMark {
+    /// Marks the ladder's own run of `label` (`unattended`) in `guard`, entering its own
+    /// operation under `scope`; `None` for a run a person started, which is never marked.
+    fn of(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+        label: &str,
+        unattended: bool,
+        scope: Option<&super::account_work::Scope>,
+    ) -> Option<Self> {
+        if !unattended {
+            return None;
+        }
+        // A scope whose count cannot grow gives no child: the run then keeps the step's
+        // scope, and a lift marks it superseded without ending it.
+        let scope = scope.and_then(super::account_work::Scope::child);
+        let run = UnattendedRun {
+            superseded: std::sync::Arc::default(),
+            cancel: scope.as_ref().map(super::account_work::Scope::cancellation),
+        };
+        guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unattended_runs
+            .insert(label.to_owned(), run.clone());
+        Some(Self {
+            guard: std::sync::Arc::clone(guard),
+            label: label.to_owned(),
+            run,
+            scope,
+        })
+    }
+
+    /// Whether a lift of the account superseded this run.
+    fn superseded(&self) -> bool {
+        self.run
+            .superseded
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for RunMark {
+    fn drop(&mut self) {
+        let mut guard = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard
+            .unattended_runs
+            .get(&self.label)
+            .is_some_and(|run| std::sync::Arc::ptr_eq(&run.superseded, &self.run.superseded))
+        {
+            guard.unattended_runs.remove(&self.label);
+        }
+    }
+}
+
+/// A LIFT CANCELS THAT ACCOUNT'S RUNNING UNATTENDED UPKEEP SIGN-IN (plan package FL-174): each
+/// marked run ([`RunMark`]) of a label in `lifted` is superseded: its own operation is
+/// cancelled (the staging child ends by its own identity and its window closes with it;
+/// nothing else its upkeep step started is touched) and `sign-in superseded` is logged. Its
+/// worker then records no failure, and gives its spacing back where it never reached the
+/// provider. A sign-in a person started carries no mark and is never touched.
+fn supersede_unattended(
+    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    lifted: &[String],
+    log: &dyn Fn(&str),
+) {
+    for label in lifted {
+        let Some(run) = guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unattended_runs
+            .get(label)
+            .cloned()
+        else {
+            continue;
+        };
+        if run
+            .superseded
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            continue;
+        }
+        if let Some(cancel) = &run.cancel {
+            cancel.cancel();
+        }
+        log(&format!(
+            "account {label}: automatic sign-in superseded: its login is live again, so the \
+             unattended sign-in is ended"
+        ));
+    }
+}
+
+/// THE LAST ASK BEFORE AN UNATTENDED SIGN-IN STARTS, made under the sign-in lock (plan package
+/// FL-174): whether `label`'s own login was signed in or served after its recorded sign-out
+/// (`login_adoption::Witnesses::live_login_here`, from the pass's witnesses `live`) AND its
+/// record can be lifted. Where the files show it live, the adoption step runs now
+/// ([`adopt_live_logins_in_upkeep`]) and nothing starts only where the lift landed, another
+/// process had made it, or the accounts lock held it up (the next pass makes it). A row the
+/// step is refused (`login_adoption::Refusal`) is signed out on record and stays so: its
+/// sign-in starts, and the reason is in the log.
+fn login_live_again(
+    (home, state_dir, roster_path): (&Path, &Path, &Path),
+    label: &str,
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    live: &super::login_adoption::Pass,
+    log: &dyn Fn(&str),
+) -> bool {
+    use super::login_adoption::Lift;
+    if live.refused(label) {
+        return false;
+    }
+    let store = accounts::Store::at_for(state_dir, Cli::Claude, home);
+    let Ok(records) = store.read_account_records(Some(roster_path), now) else {
+        return false;
+    };
+    if live
+        .live(
+            (home, state_dir),
+            &store,
+            (&records.roster, &records.state),
+            label,
+            now,
+        )
+        .is_none()
+    {
+        return false;
+    }
+    let step =
+        adopt_live_logins_in_upkeep((home, state_dir, roster_path), now, renew_guard, live, log);
+    matches!(
+        step.lift_of(label),
+        Some(Lift::Landed(_) | Lift::Already | Lift::Busy)
+    )
 }
 
 /// Whether the config at `config` lets the harness sign `cli`'s rows in by itself: no switch
@@ -11304,7 +11599,7 @@ fn sync_cli_with(
     now: i64,
     reads: (&Fetch<'_>, &[Duration]),
 ) -> Result<CliSync, String> {
-    sync_cli_with_replan(cli, paths, source, false, now, reads, || {})
+    sync_cli_with_replan(cli, paths, source, SyncCaller::Person, now, reads, || {})
         .map_err(SyncError::into_message)
 }
 
@@ -11370,7 +11665,7 @@ fn sync_cli_with_replan(
     cli: Cli,
     (home, state_dir, config): (&Path, &Path, &Path),
     (source, machine_override): (Option<&str>, Option<&str>),
-    automatic: bool,
+    caller: SyncCaller,
     now: i64,
     (fetch, ladder): (&Fetch<'_>, &[Duration]),
     after_unlock: impl FnOnce(),
@@ -11380,22 +11675,61 @@ fn sync_cli_with_replan(
         cli,
         (home, state_dir, config),
         (source, machine_override),
-        automatic,
+        caller,
         now,
         (&env, fetch, ladder),
         after_unlock,
     )
 }
 
+/// Who started a pool's sync ([`sync_cli_in_env`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncCaller {
+    /// A person's verb (`aterm harness accounts sync --cli`), or a test standing in for one.
+    Person,
+    /// `aterm init`'s accounts item, the setup pass's resync and the sync that follows a vault
+    /// verb ([`sync_cli_accounts_with`]): no person named this pool; the first two report what
+    /// the sync came to, and fail on its error.
+    Init,
+    /// The window's upkeep ([`upkeep_pools`]): no person named this pool, and what the sync
+    /// came to is read by the quiet rule alone ([`default_sync_settled`]).
+    Upkeep,
+}
+
+impl SyncCaller {
+    /// Whether no person asked for this pool's sync: [`accounts_sync_off`] stops it, and its
+    /// source is captured as an automatic one ([`ProviderSource::capture`]).
+    fn automatic(self) -> bool {
+        self != Self::Person
+    }
+
+    /// Which plans this caller's roster publication asks its source's receipt guard to
+    /// admit ([`accounts::Admits`]). The upkeep's sync asks only for a plan that changes
+    /// something: what its sync came to is read by [`default_sync_settled`] alone, which
+    /// answers the same for "nothing changed" and for an admission's retryable refusal.
+    /// So its "nothing changed" is the captured source's, not the registry's: it stands
+    /// for as long as the source this process holds lags the registry or the registry
+    /// refuses a strict read, and a later pass plans from a move only once its capture
+    /// carries it. A person's verb and init's sync report what the sync came to, so their
+    /// "nothing changed" comes from a source the guard admitted.
+    fn admits(self) -> accounts::Admits {
+        match self {
+            Self::Person | Self::Init => accounts::Admits::EveryPlan,
+            Self::Upkeep => accounts::Admits::Changes,
+        }
+    }
+}
+
 fn sync_cli_in_env(
     cli: Cli,
     (home, state_dir, config): (&Path, &Path, &Path),
     (source, machine_override): (Option<&str>, Option<&str>),
-    automatic: bool,
+    caller: SyncCaller,
     now: i64,
     (env, fetch, ladder): (&Env, &Fetch<'_>, &[Duration]),
     after_unlock: impl FnOnce(),
 ) -> Result<CliSync, SyncError> {
+    let automatic = caller.automatic();
     let product = cli.connector().product;
     if automatic && accounts_sync_off(env.config.as_deref()) {
         return Err(ACCOUNTS_SYNC_OFF.into());
@@ -11697,13 +12031,19 @@ fn sync_cli_in_env(
         } else {
             // The receipt also owns missing login directories. Equal roster
             // bytes alone do not establish that materialization is complete.
+            let guard = captured.receipt_guard()?;
+            if caller == SyncCaller::Upkeep && guard.is_some() {
+                super::accounts_upkeep_counts::count(
+                    super::accounts_upkeep_counts::Event::PoolSyncGuarded,
+                );
+            }
             store.transact_roster_admitted_held(
                 &lock,
                 now,
                 &mut None,
                 target,
                 retire,
-                captured.receipt_guard()?,
+                (guard, caller.admits()),
             )?
         };
         let rows_changed = RowChanges::between(&existing.rows, &merged_existing);
@@ -12570,7 +12910,7 @@ pub(super) fn run_cli_accounts_sync_with(
         cli,
         (home, &env.state, config),
         (source, machine_override),
-        false,
+        SyncCaller::Person,
         env.now,
         (env, fetch, &sync_lock_ladder()),
         || {},
@@ -13012,7 +13352,7 @@ fn sync_cli_accounts_with(
                 cli,
                 (home, state_dir, &config),
                 (None, None),
-                true,
+                SyncCaller::Init,
                 now,
                 (fetch, &ladder),
                 || {},
@@ -13155,11 +13495,14 @@ fn upkeep_pools(
                 || !by_default
                     .is_some_and(|inputs| default_sync_holds(fx.rediscovery, cli, &inputs))
             {
+                super::accounts_upkeep_counts::count(
+                    super::accounts_upkeep_counts::Event::PoolSync,
+                );
                 let synced = sync_cli_with_replan(
                     cli,
                     (home, state_dir, &config),
                     (None, None),
-                    true,
+                    SyncCaller::Upkeep,
                     now,
                     (fx.fetch, &[]),
                     || {},
@@ -13366,8 +13709,16 @@ fn renew_pool_due(
     if !cli.renews_headlessly() {
         return recovered;
     }
-    let Ok(candidates) = read_renewal_candidates(cli, &store, (home, state_dir), roster_path, now)
-    else {
+    // Another CLI's rows: the liveness reading is of Claude Code's logins alone, so its pass
+    // reads no witness.
+    let Ok(candidates) = read_renewal_candidates(
+        cli,
+        &store,
+        (home, state_dir),
+        roster_path,
+        now,
+        &super::login_adoption::Pass::default(),
+    ) else {
         return recovered;
     };
     for (_, row) in candidates.tiered {
@@ -13529,6 +13880,15 @@ struct AutoRenewGuard {
     active_login: Option<ActiveLogin>,
     /// Manual operation observations, partitioned by exact account namespace and subject.
     manual_selections: BTreeMap<(PathBuf, Cli, ManualSubject), QueuedOwner>,
+    /// The ladder's own sign-ins that run now, by label ([`RunMark`]): what a lift of the
+    /// account ends ([`supersede_unattended`]). A person's sign-in is never here.
+    unattended_runs: BTreeMap<String, UnattendedRun>,
+    /// Each row a file shows live that the last adoption step could not lift, by label, with
+    /// the reason as it was logged ([`settle_adoption`]): said once per change.
+    adoption_refused: BTreeMap<String, String>,
+    /// The last adoption step could not keep its baselines, and that was logged
+    /// ([`settle_adoption`]).
+    baselines_unkept_said: bool,
     /// What the token upkeep remembers in this process ([`upkeep_tokens`]).
     #[cfg(unix)]
     token_tier: TokenTier,
@@ -15668,7 +16028,10 @@ struct RenewalCandidates {
 
 /// Keep candidate ranking and the worker's captured policy in the same completed
 /// account publication. Credential presence and sign-in task history remain
-/// independent observations, as in the existing ranking policy.
+/// independent observations, as in the existing ranking policy. A Claude Code row whose own
+/// login the credential-free files show live after its recorded sign-out is ranked nowhere
+/// (`login_adoption::retain_not_live`, asked of the pass's witnesses `live`); evidence that is
+/// not newer hides no row, and neither does evidence of a row an adoption step could not lift.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -15683,6 +16046,7 @@ fn read_renewal_candidates(
     (home, state_dir): (&Path, &Path),
     roster_path: &Path,
     now: i64,
+    live: &super::login_adoption::Pass,
 ) -> Result<RenewalCandidates, accounts::RosterReadError> {
     let records = store.read_account_records(Some(roster_path), now)?;
     let others = rows_of_other_macs_at(
@@ -15692,7 +16056,7 @@ fn read_renewal_candidates(
         (&records.raw_roster, &records.logins),
         now,
     );
-    let tiered = auto_renew_candidates_tiered(
+    let mut tiered = auto_renew_candidates_tiered(
         cli,
         Some(store),
         &records.raw_roster,
@@ -15701,11 +16065,49 @@ fn read_renewal_candidates(
         &others,
         now,
     );
+    // Every route that could start a sign-in asks first (plan package FL-174): a row whose own
+    // login served or was signed in after its recorded sign-out is no candidate, whoever has
+    // or has not written that down yet. The upkeep's step lifts the record
+    // (`login_adoption::adopt_live_logins`); this read writes nothing.
+    retain_not_live(
+        cli,
+        &mut tiered,
+        (home, state_dir),
+        store,
+        &records,
+        now,
+        live,
+    );
     Ok(RenewalCandidates {
         records,
         others,
         tiered,
     })
+}
+
+/// `login_adoption::retain_not_live` over the ranking `tiered` of `records`, for Claude Code's
+/// rows alone: the one filter [`read_renewal_candidates`] applies and every ranking made after
+/// it from the same records applies again ([`auto_renew_next_account_in`]'s ranking with a
+/// shared authority installed), so no re-rank puts back a row the files show live.
+fn retain_not_live(
+    cli: Cli,
+    tiered: &mut Vec<(u8, accounts::Row)>,
+    paths: (&Path, &Path),
+    store: &accounts::Store,
+    records: &accounts::AccountRecords,
+    now: i64,
+    live: &super::login_adoption::Pass,
+) {
+    if cli == Cli::Claude {
+        super::login_adoption::retain_not_live(
+            tiered,
+            paths,
+            store,
+            (&records.roster, &records.state),
+            now,
+            live,
+        );
+    }
 }
 
 /// [`rows_of_other_macs`] for a reader that holds the paths an [`Env`] is made from.
@@ -17093,6 +17495,31 @@ fn recover_interrupted_staging_renewals_checked(
     any_recovered
 }
 
+/// [`auto_renew_next_account_in`] as a pass of its own, with no adoption step before it (the
+/// ladder pass a sync that found rows to sign in ends with): it reads its own witnesses, and
+/// knows the rows the upkeep's last step could not lift ([`live_logins_known`]).
+fn auto_renew_next_account(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> bool {
+    auto_renew_next_account_in(
+        home,
+        state_dir,
+        roster_path,
+        now,
+        fx,
+        &live_logins_known(fx.renew_guard),
+    )
+}
+
+/// One upkeep pass's sign-in ladder for Claude Code's rows: starts at most one row's sign-in
+/// ([`spawn_row_renewal`]); whether one started or an interrupted one was recovered. `live`
+/// is the pass's witnesses, which the adoption step before it read
+/// ([`adopt_live_logins_in_upkeep`]): each ranking here and the last ask under the sign-in
+/// lock ask those, and open no file again.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -17101,12 +17528,13 @@ fn recover_interrupted_staging_renewals_checked(
         project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
     )
 )]
-fn auto_renew_next_account(
+fn auto_renew_next_account_in(
     home: &Path,
     state_dir: &Path,
     roster_path: &Path,
     now: i64,
     fx: &UpkeepEffects<'_>,
+    live: &super::login_adoption::Pass,
 ) -> bool {
     if fx
         .scope
@@ -17131,29 +17559,55 @@ fn auto_renew_next_account(
             roster_path,
         ),
     );
-    let Ok(mut candidates) =
-        read_renewal_candidates(Cli::Claude, &store, (home, state_dir), roster_path, now)
-    else {
+    // The pass's ranking: what the read ranked, or, with a shared authority installed (as the
+    // app installs one), every row that authority may renew too. Either way no row the files
+    // show live after its recorded sign-out is in it: the re-rank is filtered as the read's
+    // own ranking was, by the same witnesses.
+    let ranked = |candidates: &mut RenewalCandidates| {
+        if fx.shared.authority.is_some() {
+            candidates.tiered = rank_renewal_candidates(
+                Cli::Claude,
+                Some(&store),
+                &candidates.records.raw_roster,
+                &candidates.records.state,
+                &candidates.records.logins,
+                &candidates.others,
+                now,
+            );
+            retain_not_live(
+                Cli::Claude,
+                &mut candidates.tiered,
+                (home, state_dir),
+                &store,
+                &candidates.records,
+                now,
+                live,
+            );
+        }
+    };
+    let Ok(mut candidates) = read_renewal_candidates(
+        Cli::Claude,
+        &store,
+        (home, state_dir),
+        roster_path,
+        now,
+        live,
+    ) else {
         return recovered;
     };
-    if fx.shared.authority.is_some() {
-        candidates.tiered = rank_renewal_candidates(
-            Cli::Claude,
-            Some(&store),
-            &candidates.records.raw_roster,
-            &candidates.records.state,
-            &candidates.records.logins,
-            &candidates.others,
-            now,
-        );
-    }
-    let ladder = LadderCtx::of(fx, roster_path);
+    ranked(&mut candidates);
+    let ladder = LadderCtx::of(fx, roster_path).asking(live);
     for (_, planned_row) in candidates.tiered {
         // A previous row's route observation can create a binding. Start each
         // independent background attempt from current eligibility and custody.
-        let Ok(mut current) =
-            read_renewal_candidates(Cli::Claude, &store, (home, state_dir), roster_path, now)
-        else {
+        let Ok(mut current) = read_renewal_candidates(
+            Cli::Claude,
+            &store,
+            (home, state_dir),
+            roster_path,
+            now,
+            live,
+        ) else {
             return recovered;
         };
         if current.records.raw_roster.row(&planned_row.label)
@@ -17161,17 +17615,7 @@ fn auto_renew_next_account(
         {
             continue;
         }
-        if fx.shared.authority.is_some() {
-            current.tiered = rank_renewal_candidates(
-                Cli::Claude,
-                Some(&store),
-                &current.records.raw_roster,
-                &current.records.state,
-                &current.records.logins,
-                &current.others,
-                now,
-            );
-        }
+        ranked(&mut current);
         let Some((_, next_row)) = current
             .tiered
             .into_iter()
@@ -17668,8 +18112,14 @@ fn auto_renew_next_account_interactive_with(
             roster_path,
         ),
     );
-    let Ok(candidates) = read_renewal_candidates(cli, &store, (home, state_dir), roster_path, now)
-    else {
+    let Ok(candidates) = read_renewal_candidates(
+        cli,
+        &store,
+        (home, state_dir),
+        roster_path,
+        now,
+        &live_logins_known(fx.renew_guard),
+    ) else {
         return recovered;
     };
     // A person's click that names no row starts what the upkeep's door admits (a row a session
@@ -18230,8 +18680,14 @@ fn manual_next_after_turn(
     {
         return RenewalDispatch::Held;
     }
-    let candidates = match read_renewal_candidates(cli, &store, (home, state_dir), roster_path, now)
-    {
+    let candidates = match read_renewal_candidates(
+        cli,
+        &store,
+        (home, state_dir),
+        roster_path,
+        now,
+        &live_logins_known(fx.renew_guard),
+    ) {
         Ok(candidates) => candidates,
         Err(_) => return RenewalDispatch::Fenced,
     };
@@ -18645,6 +19101,10 @@ struct LadderCtx<'a> {
     hosts: usize,
     /// The vault route's read ([`UpkeepEffects::tokens_here`]).
     tokens_here: TokensRead,
+    /// The pass's witnesses of which logins are live, where the pass read some
+    /// ([`Self::asking`]): the last ask under the sign-in lock reads those
+    /// ([`login_live_again`]), and its own where there are none.
+    live: Option<&'a super::login_adoption::Pass>,
 }
 
 impl<'a> LadderCtx<'a> {
@@ -18665,6 +19125,15 @@ impl<'a> LadderCtx<'a> {
                 .hosts
                 .len(),
             tokens_here: fx.tokens_here,
+            live: None,
+        }
+    }
+
+    /// This, asking the pass's witnesses `live`.
+    fn asking(self, live: &'a super::login_adoption::Pass) -> Self {
+        Self {
+            live: Some(live),
+            ..self
         }
     }
 }
@@ -19814,6 +20283,8 @@ pub(super) fn write_check_stop(store: &accounts::Store, check: &PendingCheck) ->
 /// together. Only a check of the account `row` names whose second is the record's ends: a later
 /// check of the account (a sign-in's met since) keeps the stop standing, as does one of another
 /// account. Whether it ended; nothing is written where it did not.
+// Read only by the unix-only `accounts_tokens` (`CheckedRow::end_after`).
+#[cfg(unix)]
 pub(super) fn end_token_check(
     store: &accounts::Store,
     roster_path: &Path,
@@ -20231,6 +20702,29 @@ fn spawn_row_renewal(
     } else {
         None
     };
+    // Under the sign-in lock, the last ask (plan package FL-174): the ladder starts no sign-in
+    // for a login that was signed in or served after its recorded sign-out and whose record
+    // is, or is about to be, lifted. A person's own request is theirs to make and is not asked.
+    let own_witnesses;
+    let live = match ladder.and_then(|ctx| ctx.live) {
+        Some(live) => live,
+        None => {
+            own_witnesses = live_logins_known(renew_guard);
+            &own_witnesses
+        }
+    };
+    if let Some((_, _, _, log)) = unattended.as_ref()
+        && login_live_again(
+            (home, state_dir, roster_path),
+            &next_label,
+            now,
+            renew_guard,
+            live,
+            &**log,
+        )
+    {
+        return RenewalDispatch::Held;
+    }
     if let Err(disposition) = spacing_admits(&sign_in, &store, now) {
         return disposition;
     }
@@ -20272,6 +20766,10 @@ fn spawn_row_renewal(
     };
     permit.wake_pending = Some(state_dir.to_path_buf());
     permit.attribute_row(&store, cli, &next_row, &raw_workflow, now, logins);
+    // The ladder's own run is marked for as long as its work lives, so a lift of its account
+    // ends it; a person's is not (`RunMark::of`). A marked run works under its own operation,
+    // a child of this step's, so ending it ends nothing else the step started.
+    let run_mark = RunMark::of(renew_guard, &next_label, unattended.is_some(), scope);
     let home_owned = home.to_path_buf();
     let state_owned = state_dir.to_path_buf();
     let roster_owned = roster_path.to_path_buf();
@@ -20286,7 +20784,10 @@ fn spawn_row_renewal(
     let run_seam = ladder.and_then(|ctx| ctx.run_attempt.clone());
     let shared_host = ladder.and_then(|ctx| ctx.shared.host.clone());
     let captured_logins = logins.clone();
-    let worker_scope = scope.cloned();
+    let worker_scope = run_mark
+        .as_ref()
+        .and_then(|mark| mark.scope.clone())
+        .or_else(|| scope.cloned());
     let scope = worker_scope.clone();
     let started = start_auto_renew(
         permit,
@@ -20299,6 +20800,16 @@ fn spawn_row_renewal(
                 .as_ref()
                 .is_some_and(super::account_work::Scope::cancelled)
             {
+                // Superseded before its work began: it loaded nothing the provider counts, so
+                // its spacing goes back and no cooldown is left on its row.
+                if run_mark.as_ref().is_some_and(RunMark::superseded) {
+                    _signin.refund_spacing(&store);
+                    ladder_guard
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .last_attempt
+                        .remove(&next_label);
+                }
                 return;
             }
             if !queued_pin_admitted(
@@ -20316,6 +20827,10 @@ fn spawn_row_renewal(
                 return;
             }
             let deferred = std::cell::Cell::new(false);
+            // Whether this work started its provider's step (a run of `claude auth login`, or
+            // a shared custody's): from there on its sign-in page may have loaded, which the
+            // provider counts, so a run that got that far keeps its spacing however it ends.
+            let reached = std::cell::Cell::new(false);
             // What the last run's opener's headless sign-in met (its outcome file), which the
             // backoff below reads.
             let met: std::cell::RefCell<Option<super::open_url::Met>> =
@@ -20480,6 +20995,7 @@ fn spawn_row_renewal(
                         &next_row,
                         Some(route),
                     );
+                    reached.set(true);
                     let result = super::cli::shared_renewal::background(
                         &env,
                         shared_host
@@ -20560,6 +21076,7 @@ fn spawn_row_renewal(
                         &next_row,
                         Some(route),
                     );
+                    reached.set(true);
                     match &run_seam {
                         Some(run) => run(browser, force_headless),
                         None => live_attempt(browser, force_headless, snapshot),
@@ -20606,6 +21123,7 @@ fn spawn_row_renewal(
             // makes its token there.
             #[cfg(unix)]
             let signed_in = std::cell::Cell::new(None);
+            let sleep_watch = super::wake_deadline::SleepWatch::start();
             let ran = (|| -> Result<Renewal, String> {
                 store
                     .check_signin_state(now)
@@ -20666,11 +21184,56 @@ fn spawn_row_renewal(
                 }
                 Err(how(result))
             })();
-            if deferred.get()
+            // A run a lift of its account superseded, and an unattended one the Mac slept
+            // across, made no login and say nothing of the sign-in (plan package FL-174):
+            // neither is counted failed or blocked and neither starts a backoff. A run that
+            // made its login stands whatever happened beside it. A row's unattended runs are
+            // waived for a sleep only so many times in a row
+            // (`sign_in_ladder::MOST_INTERRUPTED_RUNS`): the next one a sleep spans is counted
+            // as it ended, below, and its backoff holds the one after.
+            let superseded = ran.is_err() && run_mark.as_ref().is_some_and(RunMark::superseded);
+            let withdrawn = deferred.get()
                 || scope
                     .as_ref()
-                    .is_some_and(super::account_work::Scope::cancelled)
-            {
+                    .is_some_and(super::account_work::Scope::cancelled);
+            let slept = sleep_watch.slept();
+            let by_sleep = !superseded
+                && !withdrawn
+                && super::sign_in_ladder::interrupted_by_sleep(
+                    slept,
+                    ran.is_ok(),
+                    met.borrow().as_ref().is_some_and(|met| met.stopped()),
+                );
+            // Only the ladder's own run is ever waived for a sleep, and only its runs are
+            // counted: the next pass starts one again by itself, and the count bounds that. A
+            // run a person started (a click, a saved choice, a Next selection) is counted as
+            // it ended, sleep or no sleep, and its request is retired below: left pending, a
+            // saved choice is resumed by every pass with no cooldown and no spacing against
+            // its own account, so waiving it would load one sign-in page per wake of a Mac
+            // asleep with its lid shut.
+            let interrupted = unattended.is_some()
+                && ladder_guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ladder
+                    .run_ended(
+                        &next_label,
+                        super::sign_in_ladder::slept_across(slept),
+                        by_sleep,
+                    );
+            // Only a run that never started its provider's step gives its spacing back: one
+            // that did may have loaded a sign-in page the provider counts.
+            if (superseded || interrupted) && !reached.get() {
+                _signin.refund_spacing(&store);
+            }
+            if interrupted && let Some((_, _, _, log)) = unattended.as_ref() {
+                log(&format!(
+                    "account {next_label}: automatic sign-in interrupted: {}; it is tried again and \
+                     counted against nothing",
+                    super::sign_in_ladder::Unfinished::Interrupted.words()
+                ));
+            }
+            if withdrawn || superseded || interrupted {
                 ladder_guard
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -20678,6 +21241,7 @@ fn spawn_row_renewal(
                     .remove(&next_label);
                 return;
             }
+            drop(run_mark);
             let renewed = matches!(&ran, Ok(Renewal::Renewed));
             let published = ran.is_ok();
             let now_done = crate::supervise::limit::unix_now().max(now);
@@ -22165,6 +22729,11 @@ mod dashboard_tests;
 #[path = "accounts_renewal_read_tests.rs"]
 mod renewal_read_tests;
 
+/// A login made in a tab nobody supervises is adopted by the upkeep (plan package FL-174).
+#[cfg(test)]
+#[path = "accounts_sync_login_adopted_tests.rs"]
+mod login_adopted_tests;
+
 #[cfg(test)]
 #[path = "accounts_shared_selection_tests.rs"]
 mod shared_selection_tests;
@@ -22204,6 +22773,14 @@ pub fn account_shared_recovery_environment() {
         machine = "AccountRenewalRead",
         action = "LaterChange",
         reason = "Native fixture selection for publication after candidate capture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountRenewalRead",
+        action = "LoginEvidence",
+        reason = "Native fixture selection of usage-tap evidence newer or not newer than the sign-out."
     )
 )]
 #[doc(hidden)]

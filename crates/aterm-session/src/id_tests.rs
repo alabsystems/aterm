@@ -81,9 +81,11 @@ fn session_id_generate_mints_the_t_form() {
     let borrowed: &str = a.borrow();
     assert_eq!(borrowed, a.as_str());
     assert_eq!(a.to_string(), a.as_str());
-    let chosen = SessionId::new("human");
-    assert!(!chosen.is_minted());
-    assert_ne!(a, chosen);
+    assert_eq!(
+        SessionId::parse("human"),
+        None,
+        "NEGATIVE CONTROL: a chosen name is no session"
+    );
 }
 
 #[test]
@@ -136,9 +138,33 @@ fn mint_draws_again_while_taken_knows_the_id() {
         refused.iter().all(|r| r.as_str() != kept.as_str()),
         "NEGATIVE CONTROL: a taken ID is never the one minted: {sid} {refused:?}"
     );
-    // A wrapped name that is no tab ID has none.
+    // A legacy tab's ID names a session but no tab ID.
     assert_eq!(
-        SessionId::new("human").tab().map(|t| t.as_str().to_owned()),
+        SessionId::parse("s-0123456789abcdef0123")
+            .expect("a legacy tab's id")
+            .tab()
+            .map(|t| t.as_str().to_owned()),
         None
     );
+}
+
+#[test]
+fn from_tab_names_the_tab_it_was_given() {
+    use aterm_types::tab_id::TabId;
+
+    for id in [
+        TabId::from_bits(0),
+        TabId::from_bits(0x1234_5678),
+        TabId::parse("tqn5r6e0148").expect("a tab id"),
+    ] {
+        let sid = SessionId::from_tab(id);
+        assert_eq!(
+            sid.tab().map(|t| t.as_str().to_owned()),
+            Some(id.as_str().to_owned()),
+            "{sid}"
+        );
+        assert_eq!(sid.as_str(), id.as_str());
+        assert!(sid.is_minted(), "{sid}");
+        assert_eq!(SessionId::parse(id.as_str()), Some(sid));
+    }
 }

@@ -29,7 +29,7 @@ fn a_held_pass_and_an_error_reach_a_shipped_builds_log() {
         Outcome::Refreshed { mac: "mc-1".into() },
         Vec::new(),
     )));
-    let refused = aterm_db::alab::register::model_key("no such model!").map(|_| Registered {
+    let refused = aterm_db::alab::register::model_key("?!").map(|_| Registered {
         outcome: Outcome::Unchanged,
         findings: Vec::new(),
         records: 0,
@@ -49,7 +49,7 @@ fn a_held_pass_and_an_error_reach_a_shipped_builds_log() {
 
 /// This Mac's real readings make a row the schema takes, and the IOPlatformUUID stays out of
 /// it. It only reads; the plan is computed and thrown away.
-/// NEGATIVE CONTROL: with `probe` reading `hw.model` as `no such model!`, `plan` refuses it.
+/// NEGATIVE CONTROL: with `probe` reading `hw.model` as `?!`, `plan` refuses it.
 #[cfg(target_os = "macos")]
 #[test]
 fn this_macs_real_readings_make_a_row() {
@@ -83,8 +83,9 @@ fn this_macs_real_readings_make_a_row() {
     }));
 }
 
-/// The readers' arithmetic: a chip's clusters, a disk rounded (the OS's first number is
-/// `aterm_sysprobe::MachineWords::os_major`'s, tested there).
+/// The readers' arithmetic: a chip's clusters (a disk's rounding is
+/// `aterm_db::alab::register::gigabytes`', and the OS's first number is
+/// `aterm_sysprobe::MachineWords::os_major`'s, each tested there).
 /// NEGATIVE CONTROL: with `core_counts` counting every cluster as performance cores, the
 /// first assertion reads `(Some(14), Some(0))`.
 #[cfg(target_os = "macos")]
@@ -102,5 +103,4 @@ fn the_readers_arithmetic() {
         (Some(10), Some(4))
     );
     assert_eq!(core_counts(&CpuLayout::single(8)), (None, None));
-    assert_eq!(gigabytes(994_662_584_320), 995);
 }

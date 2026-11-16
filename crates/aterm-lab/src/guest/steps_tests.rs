@@ -134,6 +134,7 @@ fn a_repair_sums_what_its_home_took() {
             sent: 7,
             received: 3,
             deferred: 0,
+            added: 0,
         },
         Some(table),
     );
@@ -142,6 +143,7 @@ fn a_repair_sums_what_its_home_took() {
             sent: 0,
             received: 1,
             deferred: 4,
+            added: 0,
         },
         None,
     );

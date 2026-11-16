@@ -3,7 +3,7 @@
 
 //! Disk watch and cleanup (design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §5.5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use aterm_json::{Map, Value};
@@ -19,11 +19,11 @@ pub const DEFAULT_TARGET_STALE_DAYS: i64 = 1;
 pub const DEFAULT_APPLY: bool = false;
 
 /// THE DISK WATCH'S DEVELOPMENT SEAM. A window that runs under a private state root
-/// (`ATERM_STATE_HOME`) measures and removes nothing, and takes no part in the ask
-/// (`disk-free@v1`). With this seam set, admitted only there and only over a scratch home, the
-/// window drops that one reason, and the others still stand: it is the owner's watch only where
-/// its home lies on a volume of its own, never on the account home's, as the sparse image of
-/// `lab disk-ask` is. Only a development build reads it.
+/// (`ATERM_STATE_HOME`) measures and removes nothing. With this seam set, admitted only there
+/// and only over a scratch home, the window drops that one reason, and the others still stand:
+/// it is the owner's watch only where its home lies on a volume of its own, never on the
+/// account home's, as a lab's home image (`LAB_HOME_IMAGE`) is. Only a development build reads
+/// it.
 pub const WATCH_SEAM: &str = "ATERM_DEBUG_DISK_WATCH";
 
 /// The volume's lines (the warning, the floor, the emergency) are one definition, which the tools that admit a disk need read too (`aterm_capacity::floor`, `docs/DESIGN-adaptive-build-2026-10-24.md` CAP-1); [`Config`] carries the owner's knobs into it.
@@ -61,14 +61,8 @@ pub mod idle;
 #[path = "disk_versions.rs"]
 pub mod versions;
 
-#[path = "disk_ask.rs"]
-pub mod ask;
-
 #[path = "disk_free.rs"]
 pub mod free;
-
-#[path = "disk_fence.rs"]
-pub mod fence;
 
 #[path = "disk_fill.rs"]
 pub mod fill;
@@ -76,6 +70,11 @@ pub mod fill;
 /// The look's worktree step: a merged, clean worktree no session uses goes, with its branch.
 #[path = "disk_worktree.rs"]
 pub mod worktree;
+
+/// The daily upkeep's branch-name step: a stale name goes once the commits it alone names are
+/// pinned under `refs/orphans/` and pushed.
+#[path = "disk_refs.rs"]
+pub mod refs;
 
 /// The pressure scheduling rule shared by automatic watches.
 #[path = "disk_cadence.rs"]
@@ -101,8 +100,8 @@ pub mod watch;
 pub(crate) mod win;
 
 pub use target::{
-    CARGO_LOCKS, Held, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, PROJECTED_MIN_IDLE_S, Profile,
-    TargetDir,
+    CARGO_LOCKS, ENTRY_BOUND, ENTRY_BOUND_CLEAR, Held, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S,
+    PROJECTED_MIN_IDLE_S, Profile, TargetDir,
 };
 
 /// `disk.idle_build_dirs`.
@@ -250,9 +249,10 @@ pub struct Config {
     /// `disk.idle_build_dirs`: may an idle build directory go whole (tier 3, and a merged,
     /// quiet worktree's that stays, [`worktree::Facts::build_dirs`])?
     pub idle_build_dirs: bool,
-    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]), and, where
-    /// it is longer than seven days, how long a merged worktree's build directory is unwritten
-    /// before it goes; below 1 turns both off.
+    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]) and the
+    /// outside caches' step's ([`free::pass`]), and, where it is longer than seven days, how long
+    /// a merged worktree's build directory is unwritten before it goes; below 1 turns all three
+    /// off.
     pub idle_build_days: i64,
     /// `disk.cap_used_gib`: the cap the rebuildable budget is counted against ([`Self::budget`]). No line or level reads it; over it the budget's pass takes only what no live session's builds use ([`budget`]), and the pressure pass's discovery cycle is scoped on [`Self::removal_view`], which leaves it out.
     pub cap_used_gib: Cap,
@@ -302,7 +302,10 @@ impl Config {
                 "unset (measured: the second-largest daily two-hour fall of the week)".to_owned()
             }
             "idle_build_dirs" => d.idle_build_dirs.to_string(),
-            "idle_build_days" => format!("{} (below 1: tier 3 off)", d.idle_build_days),
+            "idle_build_days" => format!(
+                "{} (below 1: tier 3 and the outside caches' step off)",
+                d.idle_build_days
+            ),
             "cap_used_gib" => format!("unset ({CAP_USED_PCT}% of the volume; 0: budget off)"),
             _ => return None,
         })
@@ -316,7 +319,7 @@ impl Config {
             "auto_free_gib" => "0: the automatic removal is off".to_owned(),
             "warn_free_gib" => format!("the default, {}", d.warn_free_gib),
             "target_stale_days" => format!("the default, {}", d.target_stale_days),
-            "idle_build_days" => "below 1: tier 3 is off".to_owned(),
+            "idle_build_days" => "below 1: tier 3 and the outside caches' step are off".to_owned(),
             _ => return None,
         })
     }
@@ -335,14 +338,15 @@ impl Config {
     }
 
     /// Whether the volume is PRESSED: `free` bytes below the automatic floor, or a projection
-    /// standing (`docs/DESIGN-disk-free-ask-2026-10-24.md` §8.2), with the floor on.
+    /// standing ([`fill::Fill::pressing`]), with the floor on. Wherever the pass and the window's
+    /// look read "below the floor" as a reason to pass, they read this.
     #[must_use]
     pub fn pressed(&self, free: Option<u64>, projected: Option<&fill::Projection>) -> bool {
         self.below_auto_floor(free) || (self.auto_free_gib > 0 && projected.is_some())
     }
 
     /// The free bytes a tier with a target reclaims up to under `projected`: the floor plus what
-    /// the fill takes over the horizon plus [`PRESSURE_MARGIN_GIB`] (§8.2).
+    /// the fill takes over the horizon plus [`PRESSURE_MARGIN_GIB`].
     #[must_use]
     pub fn projected_target(&self, projected: &fill::Projection) -> u64 {
         self.pressure_target_bytes().saturating_add(projected.need)
@@ -352,6 +356,13 @@ impl Config {
     #[must_use]
     pub fn below_warn(&self, free: Option<u64>) -> bool {
         free.is_some_and(|f| f < self.warn_free_gib.saturating_mul(GIB))
+    }
+
+    /// The free bytes a pass reclaims up to for an agent's `need`: the need above the floor
+    /// ([`pass_plan`]'s idle tiers, and the outside caches' step of a pressed look).
+    #[must_use]
+    pub const fn demand_target(&self, need: u64) -> u64 {
+        need.saturating_add(self.auto_free_gib.saturating_mul(GIB))
     }
 
     /// The free bytes the idle tiers (2 and 3) reclaim up to ([`pass_plan`]).
@@ -517,6 +528,19 @@ impl Thresholds {
         }
     }
 
+    /// These thresholds as the volume's lines ([`aterm_capacity::floor::lines`], whose figures
+    /// they are): what `aterm_capacity::floor::custody_writes_wait` reads.
+    #[must_use]
+    pub const fn lines(&self) -> aterm_capacity::floor::Lines {
+        aterm_capacity::floor::Lines {
+            warn: self.warn,
+            floor: self.floor,
+            target: self.target,
+            emergency: self.emergency,
+            files_emergency: self.files_emergency,
+        }
+    }
+
     /// The free bytes below which [`Self::level`] reads `short` or worse by bytes alone: the
     /// floor, or with the floor at 0 what writes need.
     #[must_use]
@@ -592,8 +616,9 @@ pub struct Survey {
     pub targets: Vec<TargetDir>,
     /// The input batch exceeded the target assessment bound, before deduplication or reads.
     pub target_input_cut: bool,
-    /// Current registered caches measured outside broad discovery's budget. These are
-    /// diagnostic holders only, never additional targets or removal witnesses.
+    /// Current registered caches and the shared dependency store, measured outside broad
+    /// discovery's budget. These are diagnostic holders only, never additional targets or
+    /// removal witnesses.
     pub registered_holders: Vec<Hog>,
     /// Vendor version directories.
     pub versions: Vec<VersionDir>,
@@ -621,7 +646,7 @@ pub struct Survey {
     pub mounts: Option<aterm_sysprobe::volumes::Table>,
     /// The free bytes an agent's wait needs and the pass adopted (a DEMAND, `await sys free>=`).
     pub demand: Option<u64>,
-    /// The projection standing on the volume ([`fill::Fill`]): pressure now (§8.2).
+    /// The projection standing on the volume ([`fill::Fill`]): pressure now.
     pub projected: Option<fill::Projection>,
     /// The free bytes a budget pass stops at ([`budget::Over::free_target`]), where one runs.
     pub budget: Option<u64>,
@@ -791,6 +816,16 @@ impl Witness {
                     "a metadata folder a compile was writing, no process inside it"
                 },
                 target::human_age(*age_s)
+            ),
+            Witness::StaleBuildDir {
+                marker,
+                profiles: 0,
+                leaves,
+                ..
+            } => format!(
+                "{marker} present; it holds only what an earlier disk pass already took and moved aside ({}), which goes now — nothing a build reads{}",
+                target::STAGE,
+                leaving(leaves)
             ),
             Witness::StaleBuildDir {
                 marker,
@@ -1018,8 +1053,8 @@ pub struct Report {
     pub demand: Option<u64>,
     /// The projection the pass ran under ([`Survey::projected`]).
     pub projected: Option<fill::Projection>,
-    /// What a budget pass may take ([`budget::ask`]), where one runs: [`pass_plan`] then plans
-    /// its rows alone.
+    /// What a budget pass ([`budget::ask`]) or an entry-bound look ([`budget::bound_ask`]) may
+    /// take, where one runs: [`pass_plan`] then plans its rows alone.
     pub budget: Option<budget::Ask>,
     /// The rebuildable bytes the survey saw on the measured volume ([`seen_rebuildable`]).
     pub seen: Rebuildable,
@@ -1038,8 +1073,7 @@ pub struct Hog {
     pub bytes_partial: bool,
     /// What it is, and what frees it.
     pub why: String,
-    /// The checkout or workspace whose builds it holds, where its origin says one: a session
-    /// working under it is the one to ask to free it ([`ask`]).
+    /// The checkout or workspace whose builds it holds, where its origin says one.
     pub serves: Option<PathBuf>,
     /// Seconds from the newest write into any of its profiles ([`target::Profile::last_used`])
     /// to the report: a build that stopped hours ago reads apart from one writing now. `None`
@@ -1113,7 +1147,7 @@ const HOG_PATH_MIN: usize = 24;
 fn display_home(path: &Path, home: Option<&Path>) -> String {
     fn plain(p: &Path) -> std::borrow::Cow<'_, Path> {
         if cfg!(windows) {
-            aterm_sysprobe::paths::plain(p)
+            aterm_path::plain(p)
         } else {
             std::borrow::Cow::Borrowed(p)
         }
@@ -1450,7 +1484,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
             )),
             None => {}
         }
-        if own.profiles.is_empty() && !t.profiles.is_empty() {
+        if own.profiles.is_empty() && own.stages.is_empty() && !t.profiles.is_empty() {
             notes.push(format!(
                 "cargo-targets: {} — every profile in it is in a build directory named inside it, which decides it",
                 t.path.display()
@@ -2162,7 +2196,7 @@ fn pressure_rows(
     }
     let below = config.below_auto_floor(survey.free_bytes);
     let projected = projected.filter(|_| !below).copied();
-    // Above the floor a projection takes only profiles unwritten for an hour (§8.2): a session
+    // Above the floor a projection takes only profiles unwritten for an hour: a session
     // paused between builds keeps its cache, and its rebuild never reads as a fill aterm made.
     let min_idle_s = if projected.is_some() {
         PROJECTED_MIN_IDLE_S
@@ -2305,7 +2339,7 @@ fn pressure_rows(
 
 /// Is `path` at or under `dir`, where a miss must never be read as "not under" (S1, the one path rule).
 pub(crate) fn placed_under(path: &Path, dir: &Path) -> Option<bool> {
-    if let Some(placed) = aterm_sysprobe::paths::is_under(path, dir) {
+    if let Some(placed) = aterm_path::is_under(path, dir) {
         return Some(placed);
     }
     let want = aterm_sysprobe::volumes::file_id(dir, true)?;
@@ -2320,7 +2354,7 @@ pub(crate) fn placed_under(path: &Path, dir: &Path) -> Option<bool> {
 fn under_transcripts(path: &Path, root: &Path) -> Option<bool> {
     #[cfg(windows)]
     {
-        let keyed = aterm_sysprobe::paths::is_under(path, root);
+        let keyed = aterm_path::is_under(path, root);
         if keyed == Some(true) {
             return Some(true);
         }
@@ -2345,7 +2379,7 @@ fn under_transcripts(path: &Path, root: &Path) -> Option<bool> {
 
 fn same_place(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
-        let key = aterm_sysprobe::paths::windows_key;
+        let key = aterm_path::windows_key;
         key(a).is_some_and(|a| key(b).is_some_and(|b| a == b))
     } else {
         a == b
@@ -2367,6 +2401,8 @@ fn decided_by(t: &TargetDir, at: Option<usize>, deciding: &[&Path]) -> (TargetDi
     };
     own.profiles
         .retain(|p| speaker(deciding, &p.path) == Some(at));
+    own.stages
+        .retain(|s| speaker(deciding, &s.path) == Some(at));
     let leaves = deciding
         .iter()
         .filter(|d| !same_place(d, &t.path) && placed_under(d, &t.path) != Some(false))
@@ -2532,7 +2568,10 @@ pub fn denial_row(now: i64, sid: &str, refusal: &Refusal) -> String {
         .unwrap_or_else(|_| "{\"kind\":\"denial\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// One intent row, written before a row's removal starts.
+/// One intent row, written before a row's removal starts. It is all the journal holds of a
+/// removal until its outcome row: every stage that removal makes or finishes
+/// ([`target::STAGE`]) lies inside the row's path, so a pass that stopped partway is this row
+/// with no outcome, and the next pass finds what it left by walking that path.
 #[must_use]
 pub fn intent_row(now: i64, sid: &str, row: &Row) -> String {
     let mut o = Map::new();
@@ -2691,7 +2730,7 @@ pub fn report_row_naming(
         .unwrap_or_else(|_| "{\"kind\":\"report\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// A projection's `projected_rate_bps` and `projected_eta_s`, when one pressed the pass (§8.6).
+/// A projection's `projected_rate_bps` and `projected_eta_s`, when one pressed the pass.
 fn projection_fields(o: &mut Map, projected: Option<&fill::Projection>) {
     if let Some(p) = projected {
         o.insert("projected_rate_bps".to_owned(), Value::from(p.rate_bps));
@@ -2804,7 +2843,8 @@ fn guard_path(survey_transcripts: Option<&Path>, path: &Path) -> Result<(), Refu
 pub struct Removed {
     /// Bytes it released.
     pub bytes: u64,
-    /// What went, each a directory that is gone (a profile's `incremental/`, or the row's own directory).
+    /// What went, each a directory that is gone (a profile's `incremental/`, or the row's own
+    /// directory), or a stage an earlier pass left ([`target::STAGE`]), finished by this one.
     pub units: Vec<PathBuf>,
     /// What was left alone, and why (a profile a build holds, a lock that could not be created).
     pub skipped: Vec<(PathBuf, String)>,
@@ -2986,6 +3026,13 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
             span(idle),
             span(after)
         ),
+        Unused::SharedUnits { units, idle, after } => format!(
+            "{units} unit(s) of the shared dependency store targo fills, the most recently \
+             used of them unused for {} (the sweep takes one unused {}), least recently used \
+             first; no build held its lock, and the next build that needs one builds it again",
+            span(idle),
+            span(after)
+        ),
         Unused::Leftover {
             idle,
             after,
@@ -3061,6 +3108,9 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
             }
         }
         Unused::Tooling { idle, .. } => format!("a tool unused {}", sweep_span(idle)),
+        Unused::SharedUnits { idle, .. } => {
+            format!("a shared dependency unit unused {}", sweep_span(idle))
+        }
         Unused::Leftover { idle, finished, .. } => format!(
             "a {} cache unwritten {}",
             if finished {
@@ -3226,6 +3276,7 @@ pub fn sweep_row(
         } => "kept in its stage",
         atpkg::build_cache::Unused::Refused { .. } => "kept whole",
         atpkg::build_cache::Unused::Tooling { .. } => "a pinned tool, whole",
+        atpkg::build_cache::Unused::SharedUnits { .. } => "a shared dependency unit, whole",
         atpkg::build_cache::Unused::GivenUp => "a tooling scratch, whole",
         atpkg::build_cache::Unused::Leftover { .. } => "a leftover cache, whole",
         _ => "a build cache, whole",
@@ -3268,21 +3319,7 @@ pub struct WorktreeRow<'a> {
 /// stays; [`SweepAction::Kept`], `bytes` 0 and what kept it in `text`).
 #[must_use]
 pub fn worktree_row(now: i64, action: SweepAction, row: &WorktreeRow<'_>) -> String {
-    let mut o = Map::new();
-    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
-    o.insert("sid".to_owned(), Value::from(String::new()));
-    o.insert("kind".to_owned(), Value::from(WORKTREE_ROW_KIND.to_owned()));
-    o.insert("action".to_owned(), Value::from(action.as_str().to_owned()));
-    o.insert("path".to_owned(), Value::from(path_text(row.path)));
-    o.insert("checkout".to_owned(), Value::from(path_text(row.checkout)));
-    o.insert(
-        "branch".to_owned(),
-        Value::from(
-            row.branch
-                .map(|b| truncate_bytes(b, ROW_TEXT_CAP).to_owned()),
-        ),
-    );
-    o.insert("head".to_owned(), Value::from(row.head.to_owned()));
+    let mut o = worktree_row_head(now, action.as_str(), row);
     match action {
         SweepAction::Removing => {
             o.insert("bytes".to_owned(), Value::from(row.bytes));
@@ -3309,6 +3346,47 @@ pub fn worktree_row(now: i64, action: SweepAction, row: &WorktreeRow<'_>) -> Str
     );
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| format!("{{\"kind\":\"{WORKTREE_ROW_KIND}\"}}"))
+}
+
+/// The `action` of the `worktree` row that says a worktree's pins wait for room
+/// ([`worktree_deferred_row`]).
+pub const WORKTREE_DEFERRED: &str = "deferred";
+
+/// One `worktree` row of the disk ledger ([`worktree::step`]), a record and never an alert: a
+/// worktree whose session is gone stays, nothing of it pinned or pushed, while its volume reads
+/// under its emergency line (`aterm_capacity::floor::custody_writes_wait`, DC-06d); `bytes` 0, and
+/// why in `text`. It is taken up at the first look that reads the volume above the line.
+#[must_use]
+pub fn worktree_deferred_row(now: i64, row: &WorktreeRow<'_>) -> String {
+    let mut o = worktree_row_head(now, WORKTREE_DEFERRED, row);
+    o.insert("bytes".to_owned(), Value::from(0u64));
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(row.text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{WORKTREE_ROW_KIND}\"}}"))
+}
+
+/// The fields every `worktree` row opens with: when, its kind and `action` word, and the
+/// worktree, its checkout, its branch and its HEAD.
+fn worktree_row_head(now: i64, action: &str, row: &WorktreeRow<'_>) -> Map {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert("kind".to_owned(), Value::from(WORKTREE_ROW_KIND.to_owned()));
+    o.insert("action".to_owned(), Value::from(action.to_owned()));
+    o.insert("path".to_owned(), Value::from(path_text(row.path)));
+    o.insert("checkout".to_owned(), Value::from(path_text(row.checkout)));
+    o.insert(
+        "branch".to_owned(),
+        Value::from(
+            row.branch
+                .map(|b| truncate_bytes(b, ROW_TEXT_CAP).to_owned()),
+        ),
+    );
+    o.insert("head".to_owned(), Value::from(row.head.to_owned()));
+    o
 }
 
 /// The `kind` of the row that says a pass cannot hold the volume to its cap
@@ -3412,6 +3490,304 @@ pub fn cannot_meet_row(now: i64, row: &CannotMeetRow<'_>) -> String {
     );
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| format!("{{\"kind\":\"{CANNOT_MEET_ROW_KIND}\"}}"))
+}
+
+/// The `kind` of the disk ledger's entry-bound rows ([`entry_bound_row`]).
+pub const ENTRY_BOUND_ROW_KIND: &str = "entry-bound";
+
+/// What one `entry-bound` row of the disk ledger says ([`entry_bound_row`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryBoundRow {
+    /// The build directory.
+    pub dir: PathBuf,
+    /// Its fullest profile `deps/`.
+    pub deps: PathBuf,
+    /// How many entries that `deps/` holds, counted once the look ended.
+    pub entries: u32,
+    /// Why the disk pass leaves it.
+    pub why: String,
+    /// Its build cache's own sweep ran at this look. A fact of the look, not of why the
+    /// directory stays: it is not part of [`Self::why`], so a sweep that runs at one look and
+    /// not the next is no change of reason ([`BoundMemo::news`]).
+    pub swept: bool,
+}
+
+/// One `entry-bound` row of the disk ledger: a build directory over the entry bound
+/// ([`target::entry_bound`]) that the disk pass leaves, and why. A record, not a request: no
+/// alert reads it, and it asks nothing of anyone.
+#[must_use]
+pub fn entry_bound_row(now: i64, row: &EntryBoundRow) -> String {
+    let (bound, ..) = target::entry_bound();
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert(
+        "kind".to_owned(),
+        Value::from(ENTRY_BOUND_ROW_KIND.to_owned()),
+    );
+    o.insert("path".to_owned(), Value::from(path_text(&row.dir)));
+    o.insert("deps".to_owned(), Value::from(path_text(&row.deps)));
+    o.insert("entries".to_owned(), Value::from(u64::from(row.entries)));
+    o.insert("bound".to_owned(), Value::from(u64::from(bound)));
+    o.insert(
+        "why".to_owned(),
+        Value::from(truncate_bytes(&row.why, ROW_TEXT_CAP).to_owned()),
+    );
+    o.insert("swept".to_owned(), Value::from(row.swept));
+    let text = format!(
+        "{} holds {} entries; the disk pass leaves it: {}{}",
+        row.deps.display(),
+        row.entries,
+        row.why,
+        if row.swept {
+            "; its build cache's own sweep ran at this look"
+        } else {
+            ""
+        }
+    );
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(&text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{ENTRY_BOUND_ROW_KIND}\"}}"))
+}
+
+/// The record of the build directories over the entry bound that the disk pass left, in the
+/// harness state directory ([`BoundMemo`]).
+pub const ENTRY_BOUND_FILE: &str = "disk-entry-bound.json";
+
+/// The most bytes of [`ENTRY_BOUND_FILE`] read: every directory it may keep
+/// ([`ENTRY_BOUND_KEPT`]), each with two paths and a reason.
+const ENTRY_BOUND_FILE_MAX: u64 = 2 * 1024 * 1024;
+
+/// The most build directories [`ENTRY_BOUND_FILE`] keeps: as many as one look reads
+/// ([`MAX_TARGETS`]), so a look's directories all fit and none is put out for another.
+const ENTRY_BOUND_KEPT: usize = MAX_TARGETS;
+
+/// One build directory of [`BoundMemo`]: what its last `entry-bound` row said, and when a look
+/// last assessed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundEntry {
+    /// The build directory.
+    pub dir: PathBuf,
+    /// Its fullest `deps/`.
+    pub deps: PathBuf,
+    /// How many entries that `deps/` held when its last row was written: what a later count is
+    /// compared with ([`BoundMemo::news`], [`EntryBound::fresh`]), so a count that drifts a few
+    /// entries a look never adds up to a row.
+    pub entries: u32,
+    /// Why the disk pass left it, in its last look's words.
+    pub why: String,
+    /// Unix second of the look that last assessed it.
+    pub at: i64,
+}
+
+/// [`ENTRY_BOUND_FILE`]'s record: each build directory over the entry bound that the disk pass
+/// left, as its last row stated it. It holds a directory over the bound until its `deps/` falls
+/// under [`ENTRY_BOUND_CLEAR`] ([`EntryBound::raised`]), keeps a look from sizing it again within
+/// [`budget::REPLAN_AFTER_S`] while its count stays within a step of that row's
+/// ([`EntryBound::settled`]), and says whether a row is news ([`Self::news`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundMemo {
+    /// The build directories, by path.
+    pub folders: Vec<BoundEntry>,
+}
+
+impl BoundMemo {
+    /// The record in `state`'s [`ENTRY_BOUND_FILE`]; empty where there is none or it is not one
+    /// (a corrupt one then costs one more row a directory, after which it is whole again).
+    #[must_use]
+    pub fn read(state: &Path) -> Self {
+        aterm_uds::atomic_file::read_regular_text(
+            &state.join(ENTRY_BOUND_FILE),
+            ENTRY_BOUND_FILE_MAX,
+        )
+        .ok()
+        .and_then(|text| Self::decode(&text))
+        .unwrap_or_default()
+    }
+
+    /// Write the record into `state`'s [`ENTRY_BOUND_FILE`]: at most [`ENTRY_BOUND_KEPT`]
+    /// directories ([`Self::set`] keeps no more).
+    ///
+    /// # Errors
+    ///
+    /// `state` could not be made, or the record could not be written.
+    pub fn save(&self, state: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(state)?;
+        aterm_uds::atomic_file::write_checked(
+            &state.join(ENTRY_BOUND_FILE),
+            self.encode().as_bytes(),
+            0o600,
+            || Ok(()),
+        )
+    }
+
+    /// What a look at unix second `now` reads of it: every directory it holds stays over the
+    /// bound down to the clear count, and each assessed within [`budget::REPLAN_AFTER_S`] is
+    /// settled at the count its last row stated.
+    #[must_use]
+    pub fn view(&self, now: i64) -> EntryBound {
+        EntryBound {
+            raised: self.folders.iter().map(|f| f.dir.clone()).collect(),
+            settled: self
+                .folders
+                .iter()
+                .filter(|f| f.at <= now && now.saturating_sub(f.at) < budget::REPLAN_AFTER_S)
+                .map(|f| (f.dir.clone(), f.entries))
+                .collect(),
+        }
+    }
+
+    /// The record's entry for the directory at `dir`.
+    #[must_use]
+    pub fn of(&self, dir: &Path) -> Option<&BoundEntry> {
+        self.folders.iter().find(|f| f.dir == dir)
+    }
+
+    /// Whether `row` is news against this record: it holds no row for the directory, or the
+    /// count has moved by a step (`step`) or more from the one its last row stated, or the
+    /// reason has changed (its words up to the first figure or path: an age that grows is not a
+    /// new reason). A count that swings a few entries either side of a line is not news.
+    #[must_use]
+    pub fn news(&self, row: &EntryBoundRow, step: u32) -> bool {
+        self.of(&row.dir).is_none_or(|prev| {
+            prev.entries.abs_diff(row.entries) >= step.max(1)
+                || reason_key(&prev.why) != reason_key(&row.why)
+        })
+    }
+
+    /// Set the directory at `dir`'s entry to `entry` (`None`: gone from the record), and say
+    /// whether the record holds it after. A directory it already holds is replaced where it
+    /// stands; a new one is added only while the record holds fewer than [`ENTRY_BOUND_KEPT`]
+    /// and only where its paths are text the record's file gives back unchanged. No directory
+    /// is put out for another: one the record cannot take is assessed again at the next look
+    /// and gets no row, where putting out the oldest would write a row for each of the two at
+    /// every look.
+    pub fn set(&mut self, dir: &Path, entry: Option<BoundEntry>) -> bool {
+        let at = self.folders.iter().position(|f| f.dir == dir);
+        match (at, entry) {
+            (Some(i), Some(entry)) => {
+                self.folders[i] = entry;
+                true
+            }
+            (Some(i), None) => {
+                self.folders.remove(i);
+                false
+            }
+            (None, Some(entry))
+                if self.folders.len() < ENTRY_BOUND_KEPT
+                    && entry.dir.to_str().is_some()
+                    && entry.deps.to_str().is_some() =>
+            {
+                self.folders.push(entry);
+                true
+            }
+            (None, _) => false,
+        }
+    }
+
+    fn encode(&self) -> String {
+        let folders = self
+            .folders
+            .iter()
+            .map(|f| {
+                let mut o = Map::new();
+                o.insert("dir".to_owned(), Value::from(f.dir.display().to_string()));
+                o.insert("deps".to_owned(), Value::from(f.deps.display().to_string()));
+                o.insert("entries".to_owned(), Value::from(u64::from(f.entries)));
+                o.insert(
+                    "why".to_owned(),
+                    Value::from(truncate_bytes(&f.why, ROW_TEXT_CAP).to_owned()),
+                );
+                o.insert("at".to_owned(), Value::from(f.at));
+                Value::Object(o)
+            })
+            .collect();
+        let mut o = Map::new();
+        o.insert("schema".to_owned(), Value::from(1u64));
+        o.insert("folders".to_owned(), Value::Array(folders));
+        aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let v = aterm_json::from_str::<Value>(text).ok()?;
+        if v.get("schema").and_then(Value::as_u64) != Some(1) {
+            return None;
+        }
+        let folders = v
+            .get("folders")?
+            .as_array()?
+            .iter()
+            .take(ENTRY_BOUND_KEPT)
+            .map(|f| {
+                Some(BoundEntry {
+                    dir: PathBuf::from(f.get("dir")?.as_str()?),
+                    deps: PathBuf::from(f.get("deps")?.as_str()?),
+                    entries: u32::try_from(f.get("entries")?.as_u64()?).ok()?,
+                    why: f.get("why")?.as_str()?.to_owned(),
+                    at: f.get("at")?.as_i64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { folders })
+    }
+}
+
+/// A reason's words up to its first ASCII digit or `/`: what [`BoundMemo::news`] compares, so
+/// an age, a count or a path in it does not make a row news.
+fn reason_key(why: &str) -> &str {
+    why.split(|c: char| c.is_ascii_digit() || c == '/')
+        .next()
+        .unwrap_or(why)
+}
+
+/// The `kind` of the branch-name step's rows in the disk ledger ([`ref_row`]).
+pub const REF_ROW_KIND: &str = "branch-ref";
+
+/// What one `branch-ref` row of the disk ledger says of one branch name ([`ref_row`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RefRow<'a> {
+    /// The checkout whose repository holds the name.
+    pub checkout: &'a Path,
+    /// The name (the full `refs/heads/…` or `refs/remotes/origin/…`).
+    pub name: &'a str,
+    /// The commit it names.
+    pub oid: &'a str,
+    /// The pin that holds its commits (`refs/orphans/…`), where one does.
+    pub pin: Option<&'a str>,
+    /// Why it is pinned or pruned, or what kept it.
+    pub text: &'a str,
+}
+
+/// One `branch-ref` row of the disk ledger ([`refs::step`]), a record and never an alert:
+/// `pinning`, the intent to pin the commits a stale name alone holds (written before the pin);
+/// `pruning`, the intent to delete the name (written before it is deleted); `pruned`, it went;
+/// `kept`, an intent that did not happen, why in `text`.
+#[must_use]
+pub fn ref_row(now: i64, action: &str, row: &RefRow<'_>) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert("kind".to_owned(), Value::from(REF_ROW_KIND.to_owned()));
+    o.insert("action".to_owned(), Value::from(action.to_owned()));
+    o.insert("checkout".to_owned(), Value::from(path_text(row.checkout)));
+    o.insert(
+        "ref".to_owned(),
+        Value::from(truncate_bytes(row.name, ROW_TEXT_CAP).to_owned()),
+    );
+    o.insert("head".to_owned(), Value::from(row.oid.to_owned()));
+    o.insert(
+        "pin".to_owned(),
+        Value::from(row.pin.map(|p| truncate_bytes(p, ROW_TEXT_CAP).to_owned())),
+    );
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(row.text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{REF_ROW_KIND}\"}}"))
 }
 
 /// The `kind` of the worktree step's push rows in the disk ledger ([`worktree_push_row`]).
@@ -3568,7 +3944,11 @@ impl Applied {
             } else if matches!(row.witness, Witness::IdleWhole { .. }) {
                 went.idle_whole += 1;
             } else if !matches!(row.witness, Witness::OwnerGone { .. }) {
-                went.profiles += removed.units.len();
+                went.profiles += removed
+                    .units
+                    .iter()
+                    .filter(|u| !target::is_stage_path(u))
+                    .count();
             } else if removed.units.contains(&row.path) {
                 went.whole += 1;
             } else {
@@ -3616,9 +3996,7 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
     }
     let low = c.below_warn(Some(free));
     let short = c.pressed(Some(free), rep.projected.as_ref());
-    let demand = rep
-        .demand
-        .map(|need| need.saturating_add(c.auto_free_gib.saturating_mul(GIB)));
+    let demand = rep.demand.map(|need| c.demand_target(need));
     if !low && !short && demand.is_none() {
         return None;
     }
@@ -3659,8 +4037,13 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
 /// THE BUDGET PASS'S PLAN ([`pass_plan`] of a report with [`Report::budget`]): the removable
 /// tier 1, 2 and 3 rows of the build directories `ask` makes eligible, in the report's order
 /// (cheapest first), each stopping at `ask`'s free target, tier 1's too: the measure before
-/// each row is where the pass stands down. Tier 4 is never the budget's.
+/// each row is where the pass stands down. Tier 4 is never the budget's. An entry-bound ask
+/// plans [`bound_plan`]'s one row instead.
 fn budget_plan(rep: &Report, ask: &budget::Ask) -> Vec<Planned> {
+    let free_target = match ask.admit {
+        budget::Admit::Budget { free_target } => free_target,
+        budget::Admit::EntryBound => return bound_plan(rep, ask),
+    };
     rep.rows
         .iter()
         .filter(|r| r.class == Class::CargoTargets && r.removable)
@@ -3673,7 +4056,84 @@ fn budget_plan(rep: &Report, ask: &budget::Ask) -> Vec<Planned> {
         .filter(|r| row_dir(r).is_some_and(|dir| ask.eligible.contains(dir)))
         .map(|r| Planned {
             row: r.clone(),
-            target: Some(ask.free_target),
+            target: Some(free_target),
+        })
+        .collect()
+}
+
+/// THE ENTRY-BOUND PASS'S PLAN: the first removable tier 3 row of a build directory `ask` makes
+/// eligible (one [`over_bound`] found), whole, with no free-space target: one directory a look,
+/// whatever the volume's level.
+fn bound_plan(rep: &Report, ask: &budget::Ask) -> Vec<Planned> {
+    rep.rows
+        .iter()
+        .filter(|r| r.class == Class::CargoTargets && r.removable)
+        .filter(|r| r.tier() == Some(Tier::IdleWhole))
+        .filter(|r| row_dir(r).is_some_and(|dir| ask.eligible.contains(dir)))
+        .take(1)
+        .map(|r| Planned {
+            row: r.clone(),
+            target: None,
+        })
+        .collect()
+}
+
+/// One build directory an entry-bound look found over the bound ([`over_bound`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverBound {
+    /// The build directory.
+    pub dir: PathBuf,
+    /// Its fullest `deps/` ([`TargetDir::deps_peak`]).
+    pub deps: PathBuf,
+    /// How many entries that `deps/` held.
+    pub entries: u32,
+    /// Is it a build cache's to retire ([`TargetDir::cache_custody`]): its cache's own sweep
+    /// answers for it, never tier 3.
+    pub cache_custody: bool,
+    /// Why the look's report keeps it, or `None`: its tier 3 row is removable.
+    pub kept: Option<String>,
+}
+
+/// The build directories of `survey` over `bound` and not settled at their count
+/// ([`EntryBound::fresh`]) that a build tool marked or that a build cache holds, each with why
+/// `rep` keeps it: a folder that holds source, or that no build tool marked, is never one.
+#[must_use]
+pub fn over_bound(survey: &Survey, rep: &Report, bound: &EntryBound) -> Vec<OverBound> {
+    survey
+        .targets
+        .iter()
+        .take(MAX_TARGETS)
+        .filter(|t| bound.fresh(t))
+        .filter(|t| t.holds_source.is_none() && (t.marker.is_some() || t.cache_custody()))
+        .filter_map(|t| {
+            let (deps, entries) = t.deps_peak()?;
+            let row = rep.rows.iter().find(|r| {
+                r.class == Class::CargoTargets
+                    && r.path == t.path
+                    && r.tier() == Some(Tier::IdleWhole)
+            });
+            let kept = match (row, &t.idle, t.fences()) {
+                (Some(r), ..) if r.removable => None,
+                (Some(r), ..) => Some(r.blocked.clone().unwrap_or_else(|| "blocked".to_owned())),
+                (None, Some(Err(why)), _) => Some(why.clone()),
+                (None, _, Err(why)) => Some(why),
+                (None, Some(Ok(_)), Ok(_)) => {
+                    Some("the volume it is on could not be identified".to_owned())
+                }
+                (None, None, Ok(_)) if t.cache_custody() => {
+                    Some("a build cache holds it, and its cache's own sweep retires it".to_owned())
+                }
+                (None, None, Ok(_)) => {
+                    Some("tier 3 takes only a git checkout's build directory".to_owned())
+                }
+            };
+            Some(OverBound {
+                dir: t.path.clone(),
+                deps,
+                entries,
+                cache_custody: t.cache_custody(),
+                kept,
+            })
         })
         .collect()
 }
@@ -3773,7 +4233,8 @@ fn remove_rows(
     let tier_of = |p: &Planned| p.row.tier().map(Tier::number);
     // Each tier counts what it released against the shortfall its first measure read. A budget
     // pass's rows all stop at one free target, so its tiers count as one run: a free figure that
-    // lags its removals stops the pass once the shortfall is released, not once a tier.
+    // lags its removals stops the pass once the shortfall is released, not once a tier. An
+    // entry-bound look's one row has no target, so it counts against nothing.
     let one_run = rep.budget.is_some();
     let run_of = |p: &Planned| (!one_run).then(|| tier_of(p));
     let mut runs: BTreeMap<Option<Option<u8>>, TierRun> = BTreeMap::new();
@@ -4064,7 +4525,7 @@ pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
     )
 }
 
-/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it), presenting `token` ([`super::upgrade_drive::harness_client`]: a window's harness token reads `by=harness`) and naming `lane` ([`super::agent_image::Lane::DiskResume`] or [`super::agent_image::Lane::DiskFree`]), which the observe gate does not exempt.
+/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it), presenting `token` ([`super::upgrade_drive::harness_client`]: a window's harness token reads `by=harness`) and naming `lane` ([`super::agent_image::Lane::DiskResume`]), which the observe gate does not exempt.
 ///
 /// `"typed"` when it went in, [`super::agent_image::WITHHELD`] when the server's observe gate
 /// refused it (the agent's image is unconfirmed, and nothing was typed: the caller spends the
@@ -4096,6 +4557,66 @@ pub fn type_resume(
         }
         Err(why) => format!("wait:{}", why.word()),
     }
+}
+
+/// Which build directories an entry-bound look takes on ([`Roots::entry_bound`], [`over_bound`]):
+/// those whose fullest `deps/` holds the bound or more ([`target::entry_bound`]), or the clear
+/// count or more once raised, and of those the ones not settled at their count.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntryBound {
+    /// The build directories an earlier look left over the bound: they stay over it down to the
+    /// clear count.
+    pub raised: BTreeSet<PathBuf>,
+    /// The build directories a look assessed within [`budget::REPLAN_AFTER_S`], each with the
+    /// count its last row stated: none is sized or assessed again until its count is a step or
+    /// more from that.
+    pub settled: BTreeMap<PathBuf, u32>,
+}
+
+impl EntryBound {
+    /// Is `t` over the bound: its fullest `deps/` ([`TargetDir::deps_peak`]) holds the bound or
+    /// more, or the clear count or more once raised ([`TargetDir::count_deps`] read it)?
+    #[must_use]
+    pub fn over(&self, t: &TargetDir) -> bool {
+        let (bound, clear, _) = target::entry_bound();
+        t.deps_peak()
+            .is_some_and(|(_, n)| n >= bound || (n >= clear && self.raised.contains(&t.path)))
+    }
+
+    /// Is `t` over the bound and not settled: no look assessed it within the day, or its count
+    /// is a step or more from the one its last row stated. What the look sizes and assesses.
+    #[must_use]
+    pub fn fresh(&self, t: &TargetDir) -> bool {
+        let (.., step) = target::entry_bound();
+        self.over(t)
+            && t.deps_peak().is_some_and(|(_, n)| {
+                self.settled
+                    .get(&t.path)
+                    .is_none_or(|said| said.abs_diff(n) >= step.max(1))
+            })
+    }
+}
+
+/// The files that builds before the disk ask's removal left in the harness state folder, which
+/// no build writes now: the ask's machine-wide lease and the lock its writers held.
+pub const RETIRED_ASK_FILES: &[&str] = &["disk-ask.json", "disk-ask.lock"];
+
+/// Remove what an earlier build's disk ask left in the harness state folder `state`: each of
+/// [`RETIRED_ASK_FILES`] that is a plain file. No link is followed and nothing else is read. The
+/// `disk-worker` folder an earlier build started its disk worker in stays: a shell a cold restart
+/// brought back may still stand in it, and removing it would leave that shell in a deleted
+/// folder, while an empty folder costs nothing. The paths that went.
+pub fn retire_ask_files(state: &Path) -> Vec<PathBuf> {
+    let mut went = Vec::new();
+    for name in RETIRED_ASK_FILES {
+        let path = state.join(name);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file())
+            && std::fs::remove_file(&path).is_ok()
+        {
+            went.push(path);
+        }
+    }
+    went
 }
 
 /// Where to look.
@@ -4151,6 +4672,10 @@ pub struct Roots {
     /// The free bytes a budget pass stops at ([`Survey::budget`]): a build directory whose
     /// owner is gone is then probed for a build's locks as under pressure, for tier 1.
     pub budget: Option<u64>,
+    /// An entry-bound look's view ([`EntryBound`]): every build directory's profile `deps/` is
+    /// counted, and only those over the bound and not settled are sized and assessed for tier
+    /// 3; nothing else is sized and no registered cache is measured.
+    pub entry_bound: Option<EntryBound>,
 }
 
 /// Measure one machine into a [`Survey`]: the one function here that touches a filesystem.
@@ -4224,6 +4749,17 @@ pub fn scan_with(
     )
     .placed(roots.placing.clone());
     s.target_input_cut = roots.targets.len().saturating_add(roots.found.len()) > MAX_TARGETS;
+    // An entry-bound look reads the live sessions' working directories once, as tier 3 does.
+    let bound_cwds: Vec<idle::SessionCwd> = if roots.entry_bound.is_some() {
+        roots
+            .session_cwds
+            .iter()
+            .map(|c| idle::SessionCwd::on(c, roots.mounts.as_ref()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut fresh: BTreeSet<PathBuf> = BTreeSet::new();
     for (t, origin) in named.chain(found).take(MAX_TARGETS) {
         let Ok(canonical) = std::fs::canonicalize(t) else {
             continue;
@@ -4237,6 +4773,50 @@ pub fn scan_with(
         if let Some(mut td) = scan_target(&canonical, now, config.target_stale_days, probe) {
             td.owned = owned;
             td.origin = origin;
+            let over = roots.entry_bound.as_ref().map(|bound| {
+                td.count_deps();
+                bound.fresh(&td)
+            });
+            // A checkout's build directory a build wrote into within the idle window, or that a
+            // live session may work in, is one tier 3 keeps whatever else it reads: an
+            // entry-bound look says so without sizing or walking it, so a directory a person
+            // builds in every hour costs that look its profile clocks alone.
+            if over == Some(true)
+                && let Some(checkout) = idle::checkout_of(&td.origin, &td.path)
+                && let Err(why) = idle::unwritten(
+                    &td,
+                    now,
+                    config.idle_build_days.max(1).saturating_mul(DAY_S),
+                )
+                .map(|_| ())
+                .and_then(|()| {
+                    idle::sessions_clear(
+                        &bound_cwds,
+                        roots.session_cwd_unknown.as_deref(),
+                        &checkout,
+                        &td.path,
+                        roots.mounts.as_ref(),
+                    )
+                })
+            {
+                td.idle = Some(Err(why));
+                s.targets.push(td);
+                aterm_uds::progress::tick();
+                continue;
+            }
+            if over == Some(true) {
+                fresh.insert(td.path.clone());
+            }
+            // An entry-bound look sizes only what its tier 3 row could take, a checkout's build
+            // directory over the bound: a build cache's leaf of a few hundred thousand entries
+            // is its cache's own sweep's, which reads no size from here.
+            if let Some(is_fresh) = over
+                && !(is_fresh && idle::checkout_of(&td.origin, &td.path).is_some())
+            {
+                s.targets.push(td);
+                aterm_uds::progress::tick();
+                continue;
+            }
             let (total, foreign) = target::total_bytes_owned(&td.path);
             td.total = Some(total);
             // What a died build left is read only where a pressure pass could take it: on the
@@ -4252,7 +4832,8 @@ pub fn scan_with(
                 }
             }
             let whole = matches!(td.owned, discover::Owned::Gone { .. })
-                || (roots.idle_whole && idle::checkout_of(&td.origin, &td.path).is_some());
+                || ((roots.idle_whole || over == Some(true))
+                    && idle::checkout_of(&td.origin, &td.path).is_some());
             td.foreign = foreign.or_else(|| {
                 (whole && total.1)
                     .then(|| target::foreign_beyond(&td.path))
@@ -4263,9 +4844,13 @@ pub fn scan_with(
         }
     }
     if roots.idle_whole {
-        assess_idle_whole(&mut s, roots, config, now, processes);
+        assess_idle_whole(&mut s, roots, config, now, processes, None);
+    } else if !fresh.is_empty() {
+        assess_idle_whole(&mut s, roots, config, now, processes, Some(&fresh));
     }
-    observe_registered_holders(&mut s);
+    if roots.entry_bound.is_none() {
+        observe_registered_holders(&mut s);
+    }
     if let Some(why) = &roots.claude_unread
         && s.targets
             .iter()
@@ -4317,14 +4902,46 @@ fn observe_registered_holders(survey: &mut Survey) {
         });
         aterm_uds::progress::tick();
     }
+    for store in atpkg::build_cache::shared_units::roots(home) {
+        observe_shared_store(survey, store, deadline);
+    }
 }
 
+/// The shared dependency store targo fills (`atpkg::build_cache::shared_units`), a holder of
+/// rebuildable bytes beside the registered caches: no build directory the survey finds reaches
+/// `<cargo home>/trust/native-dependencies-v1`, so without it the rebuildable total
+/// ([`seen_rebuildable`]) would leave the store out.
+fn observe_shared_store(survey: &mut Survey, store: PathBuf, deadline: std::time::Instant) {
+    if !std::fs::symlink_metadata(&store).is_ok_and(|meta| meta.is_dir())
+        || survey
+            .volume_device
+            .is_some_and(|device| target::dev_of(&store) != Some(device))
+        || survey.registered_holders.iter().any(|h| h.path == store)
+        || measured_target_covers(survey, &store)
+    {
+        return;
+    }
+    let (bytes, bytes_partial) = target::total_bytes_until(&store, deadline);
+    survey.registered_holders.push(Hog {
+        path: store,
+        bytes,
+        bytes_partial,
+        why: "Trust's shared dependency store; aterm's cache sweep evicts its units by last use"
+            .into(),
+        serves: None,
+        built_s_ago: None,
+    });
+}
+
+/// Tier 3's verdict on each build directory of `s` (only those in `only`, when it is given),
+/// every one of them still counted as found.
 fn assess_idle_whole(
     s: &mut Survey,
     roots: &Roots,
     config: Config,
     now: i64,
     processes: discover::Processes<'_>,
+    only: Option<&BTreeSet<PathBuf>>,
 ) {
     let mounts = s.mounts.clone();
     let links = idle::inbound_links(&roots.link_dirs, mounts.as_ref());
@@ -4348,7 +4965,9 @@ fn assess_idle_whole(
     let fences = |t: &TargetDir| whole_fences(t, mounts.as_ref());
     let mut candidates: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
     for (i, t) in s.targets.iter_mut().enumerate() {
-        if idle::checkout_of(&t.origin, &t.path).is_none() {
+        if only.is_some_and(|only| !only.contains(&t.path))
+            || idle::checkout_of(&t.origin, &t.path).is_none()
+        {
             continue;
         }
         let verdict = idle::assess(t, &cx, &fences);
@@ -4610,3 +5229,7 @@ pub(crate) mod tests;
 #[path = "disk_pressure_tests.rs"]
 #[cfg(all(test, unix))]
 pub(crate) mod pressure_tests;
+
+#[path = "disk_entry_bound_tests.rs"]
+#[cfg(all(test, unix))]
+mod entry_bound_tests;

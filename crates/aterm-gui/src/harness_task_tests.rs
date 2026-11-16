@@ -101,19 +101,18 @@ fn a_landing_under_land_is_a_record_and_no_other_move_is() {
     host.shutdown_and_join();
 }
 
-/// A WORKER WITH ITS OWN REPORT OF ITS END HAS THAT ONE ALONE, A LANDING TOO: the disk worker's
-/// disk-worker record and a credit claim worker's claim-worker record, so no landing record goes
-/// beside either. NEGATIVE CONTROL: a worker in any other folder lands with its record.
+/// A WORKER WITH ITS OWN REPORT OF ITS END HAS THAT ONE ALONE, A LANDING TOO: a credit claim
+/// worker's claim-worker record, and none for a disk worker an earlier build left that a person
+/// put under Land again, so no landing record goes beside either. Each record is a live one, as
+/// a spawn makes it: a carried one that names the retired disk worker's folder is over at its
+/// seed. NEGATIVE CONTROL: a worker in any other folder lands with its record.
 #[test]
 fn a_worker_with_its_own_report_lands_with_no_landing_record() {
-    use crate::task_record::{TaskMark, TaskState, seed_carried};
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
     let folder = |name: &str| format!("/state/aterm/{}/{name}", aterm_agent::harness::cli::HARNESS);
     let host = idle_host();
     for (trusted, recorded) in [
-        (
-            folder(aterm_agent::harness::disk::fence::WORKER_FOLDER),
-            false,
-        ),
+        (folder("disk-worker"), false),
         (
             folder(aterm_agent::harness::credit_offers::CLAIM_FOLDER),
             false,
@@ -124,11 +123,11 @@ fn a_worker_with_its_own_report_lands_with_no_landing_record() {
         app.harness = Some(host.clone());
         let sid = under(&mut app, "land");
         let ctx = app.pool.get(0).unwrap().ctx.clone();
-        let mut working = TaskMark::new(TaskState::Working)
-            .apply(None, &Default::default(), Instant::now(), 1_000)
-            .0;
-        working.trusted_cwd = Some(trusted.clone());
-        seed_carried(&ctx, Some(&working.carry_row(Instant::now())));
+        mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working)).expect("unfenced");
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .set_task_worker(aterm_phase::Program::Claude, Some(trusted.clone()));
         tell(&mut app, &sid, Some(TaskFace::Open));
         tell(&mut app, &sid, Some(TaskFace::Landed));
         assert_eq!(

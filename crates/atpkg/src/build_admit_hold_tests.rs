@@ -33,10 +33,12 @@ fn a_holders_words_read_back_whole() {
         claim: "/l/0000000000001-4242-0.claim".into(),
         key: key(),
         own: Some("/s/verify/targo-memory.json".into()),
+        leaf: Some("/c/w/.cargo-build".into()),
     };
     assert_eq!(Words::parse(&words.render()), Some(words.clone()));
     let bookless = Words {
         own: None,
+        leaf: None,
         ..words.clone()
     };
     assert_eq!(Words::parse(&bookless.render()), Some(bookless));
@@ -46,12 +48,13 @@ fn a_holders_words_read_back_whole() {
         (2, "l/0000000000001-4242-0.claim"),
         (3, "{\"stage\":1}"),
         (4, "s/targo-memory.json"),
+        (5, "c/w/.cargo-build"),
     ] {
         let mut bad = words.render();
         bad[at] = word.into();
         assert_eq!(Words::parse(&bad), None, "{at}: {word}");
     }
-    assert_eq!(Words::parse(&words.render()[..4]), None, "a word short");
+    assert_eq!(Words::parse(&words.render()[..5]), None, "a word short");
 }
 
 /// THE METER'S FIRST READ IS VOUCHED FOR BY THE FRONT'S IDENTITY READ AFTER IT: the meter starts
@@ -370,6 +373,7 @@ fn claim(dir: &std::path::Path) -> (Ledger, super::super::Held) {
         key: key(),
         own: None,
         cohort: false,
+        build_dir: None,
     };
     (ledger, held)
 }
@@ -394,6 +398,7 @@ fn a_killed_builds_claim_is_kept_for_its_survivors_and_no_longer() {
         claim: held.claim.path().to_path_buf(),
         key: key(),
         own: None,
+        leaf: None,
     };
     let mut tell = root.stdin.take().expect("the survivor's stdin");
     root.kill().expect("the root killed");
@@ -427,6 +432,7 @@ fn a_killed_builds_claim_is_kept_for_its_survivors_and_no_longer() {
         claim: held.claim.path().to_path_buf(),
         key: key(),
         own: None,
+        leaf: None,
     };
     lone.kill().expect("killed");
     lone.wait().expect("reaped");
@@ -454,6 +460,7 @@ fn an_idle_survivor_lets_its_claim_go() {
         claim: held.claim.path().to_path_buf(),
         key: key(),
         own: None,
+        leaf: None,
     };
     let tell = root.stdin.take().expect("the child's stdin");
     root.kill().expect("the root killed");
@@ -580,4 +587,241 @@ fn the_holder_steps_its_claim_down_once_its_tree_runs_what_its_build_made() {
     tell.write_all(b"done\n").expect("told");
     drop(tell);
     root.wait().expect("reaped");
+}
+
+/// A unit of the build directory `leaf`'s `debug` profile in the layout that keeps one folder per
+/// unit: a test build of `aterm-grid` under `hash`, 64 KiB, nothing written in it for `ago`.
+fn grid_unit(leaf: &std::path::Path, hash: &str, ago: std::time::Duration) -> std::path::PathBuf {
+    let dir = leaf.join("debug/build/aterm-grid").join(hash);
+    std::fs::create_dir_all(dir.join("fingerprint")).unwrap();
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::write(dir.join("fingerprint/test-lib-aterm_grid"), b"h").unwrap();
+    std::fs::write(
+        dir.join("fingerprint/test-lib-aterm_grid.json"),
+        b"{\"rustc\":2,\"features\":\"[]\"}",
+    )
+    .unwrap();
+    let out = dir.join(format!("out/aterm_grid-{hash}"));
+    std::fs::write(&out, vec![7u8; 64 << 10]).unwrap();
+    let at = std::time::SystemTime::now() - ago;
+    for path in [
+        dir.join("fingerprint/test-lib-aterm_grid"),
+        dir.join("fingerprint/test-lib-aterm_grid.json"),
+        out,
+        dir.join("fingerprint"),
+        dir.join("out"),
+        dir.clone(),
+    ] {
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+    dir
+}
+
+/// `targo`'s receipt of the selection `name` in `leaf`: a build begun `ago` that used `hash`.
+fn receipt_of(leaf: &std::path::Path, name: &str, hash: &str, ago: std::time::Duration) {
+    let began = (std::time::SystemTime::now() - ago)
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let dir = leaf.join(crate::build_cache::stale::RECEIPTS);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{name}.json")),
+        format!(
+            "{{\"began_ms\":{began},\"built\":{{}},\"incremental\":{{}},\"members\":[\"aterm-grid\"],\
+             \"output_bytes\":0,\"profiles\":{{\"debug\":[\"{hash}\"]}},\"receipt\":1,\
+             \"selection\":{{}}}}"
+        ),
+    )
+    .unwrap();
+}
+
+/// THE HOLDER TRIMS ITS BUILD'S DIRECTORY WHEN THE BUILD ENDS (DC-12d, [`build_ended`] with the
+/// run-end trim, `crate::build_cache::trim_run_end`): a selection's first build, two hours ago,
+/// used the test unit `1111…`, and another selection's build the unit `3333…`; its holder takes
+/// their receipts into the build directory's record and trims nothing. The selection's second
+/// build, ten minutes ago, used `2222…` in `1111…`'s place; its holder retires `1111…`, an hour
+/// old, and the trim removes it whole and frees its bytes, while the unit the second build used,
+/// the other selection's unit, the profile's lock, the record and the receipts stay. NEGATIVE
+/// CONTROLS: a build directory with no receipt is left exactly as it was (no record is written,
+/// nothing goes); a second build whose receipt is torn takes it for none, retires nothing, and
+/// `1111…` stays; and a build directory that is a link is not read.
+#[test]
+fn the_holder_trims_its_builds_directory_when_the_build_ends() {
+    use crate::build_cache::stale;
+    const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+    let (old, new, other) = ("1111111111111111", "2222222222222222", "3333333333333333");
+    let (selection, scoped) = ("00000000000000a1", "00000000000000b2");
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("build-hold-trim-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let world = |name: &str| {
+        let leaf = scratch.path().join(name);
+        std::fs::create_dir_all(leaf.join("debug")).unwrap();
+        std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+        let units = [
+            grid_unit(&leaf, old, 60 * MINUTE),
+            grid_unit(&leaf, new, 5 * MINUTE),
+            grid_unit(&leaf, other, 60 * MINUTE),
+        ];
+        (leaf, units)
+    };
+    let trim = |dir: &std::path::Path| {
+        crate::build_cache::trim_run_end(dir, std::time::SystemTime::now(), &|| true)
+    };
+
+    let (bare, units) = world("bare");
+    assert_eq!(build_ended(&bare, &trim), None, "no receipt");
+    assert!(!bare.join(stale::USED).exists(), "no record written");
+    assert!(units.iter().all(|u| u.is_dir()));
+
+    let (leaf, [first_only, second, others]) = world("built");
+    receipt_of(&leaf, scoped, other, 180 * MINUTE);
+    receipt_of(&leaf, selection, old, 120 * MINUTE);
+    assert_eq!(
+        build_ended(&leaf, &trim),
+        None,
+        "the first take retires nothing"
+    );
+    assert_eq!(stale::Kept::read(&leaf).receipts.len(), 2);
+    receipt_of(&leaf, selection, new, 10 * MINUTE);
+    let trimmed = build_ended(&leaf, &trim).expect("the second build retired a unit");
+    assert_eq!(
+        trimmed
+            .went
+            .iter()
+            .map(|(_, why)| why.clone())
+            .collect::<Vec<_>>(),
+        vec![crate::build_cache::Unused::Stale {
+            incremental: 0,
+            units: 0,
+            superseded: 1,
+            after: crate::build_cache::RECLAIM_STALE,
+        }],
+        "{trimmed:?}"
+    );
+    assert!(trimmed.freed >= 64 << 10, "{trimmed:?}");
+    assert!(!first_only.exists(), "the unit only the first build used");
+    assert!(second.is_dir() && others.is_dir());
+    assert!(leaf.join("debug/.cargo-build-lock").is_file() && leaf.join(stale::USED).is_file());
+    assert_eq!(stale::Receipts::read(&leaf).runs.len(), 2);
+
+    let (torn, [kept_old, _, _]) = world("torn");
+    receipt_of(&torn, selection, old, 120 * MINUTE);
+    assert_eq!(build_ended(&torn, &trim), None);
+    std::fs::write(
+        torn.join(stale::RECEIPTS).join(format!("{selection}.json")),
+        b"{\"began_ms\":",
+    )
+    .unwrap();
+    assert_eq!(build_ended(&torn, &trim), None, "a torn receipt is none");
+    assert!(kept_old.is_dir());
+
+    let link = scratch.path().join("linked");
+    std::os::unix::fs::symlink(&torn, &link).unwrap();
+    assert_eq!(build_ended(&link, &trim), None, "a link is not read");
+}
+
+/// A SHIM'S PLACEMENT IS READ BACK AS THE BUILD DIRECTORY ITS RECEIPTS ARE IN ([`receipt_leaf`]):
+/// a placement under a target directory names the target directory, whose quiet build folder
+/// (`<target>/.ubd/build.noindex`) is where the build writes, so that folder is read; a
+/// placement with no such folder is the build directory itself. NEGATIVE CONTROL: a quiet build
+/// folder that is a link is not followed, and the placement stands.
+#[test]
+fn a_shims_placement_is_read_back_as_the_build_directory_its_receipts_are_in() {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("build-hold-leaf-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let plain = scratch.path().join("cache/w/.cargo-build");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert_eq!(receipt_leaf(&plain), plain);
+    let target = scratch.path().join("w/target");
+    let quiet = target.join(crate::build_cache::target_build_relative());
+    std::fs::create_dir_all(&quiet).unwrap();
+    assert_eq!(receipt_leaf(&target), quiet);
+    let linked = scratch.path().join("v/target");
+    let at = linked.join(crate::build_cache::target_build_relative());
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&quiet, &at).unwrap();
+    assert_eq!(receipt_leaf(&linked), linked, "a link is not followed");
+}
+
+/// A HOLDER'S WORDS CARRY ITS BUILD'S BUILD DIRECTORY BOTH WAYS ([`Words::of`], `Words::held`):
+/// the words a front hands its holder name the build directory its claim holds
+/// (`Held::build_dir`), and the claim the holder holds from those words names it again, so the
+/// holder's end ([`at_end`]) trims the directory the front read from the placement. NEGATIVE
+/// CONTROL: a claim with no build directory hands `-`, and the holder's claim names none.
+#[test]
+fn a_holders_words_carry_its_builds_build_directory_both_ways() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    for build_dir in [Some(std::path::PathBuf::from("/c/w/.cargo-build")), None] {
+        let (_ledger, mut held) = claim(dir.path());
+        held.build_dir.clone_from(&build_dir);
+        let words = Words::of(&held, 4242, 7);
+        assert_eq!(words.leaf, build_dir);
+        assert_eq!(
+            (words.pid, words.serial, words.claim.as_path()),
+            (4242, 7, held.claim.path())
+        );
+        assert_eq!(Words::parse(&words.render()), Some(words.clone()));
+        let (claim, _ended) = held.into_epoch_parts();
+        let back = words.held(claim);
+        assert_eq!(back.build_dir, build_dir);
+        assert_eq!(Words::of(&back, 4242, 7), words);
+    }
+}
+
+/// THE HOLDER'S END TRIMS THE BUILD DIRECTORY ITS CLAIM NAMES ([`at_end`]): once a build ends,
+/// its claim is let go, and the receipts of the build directory its claim names are taken: a
+/// selection's second build replaced the first's receipt, so the unit only the first used goes.
+/// NEGATIVE CONTROL: the same end of a claim that names no build directory takes no receipt and
+/// trims nothing, and the unit stays; its claim is let go all the same.
+#[test]
+fn the_holders_end_trims_the_build_directory_its_claim_names() {
+    use crate::build_cache::stale;
+    const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+    let (old, new) = ("1111111111111111", "2222222222222222");
+    let selection = "00000000000000a1";
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("build-hold-end-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    for named in [true, false] {
+        let leaf = scratch.path().join(format!("named-{named}"));
+        std::fs::create_dir_all(leaf.join("debug")).unwrap();
+        std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+        let first_only = grid_unit(&leaf, old, 60 * MINUTE);
+        let second = grid_unit(&leaf, new, 5 * MINUTE);
+        receipt_of(&leaf, selection, old, 120 * MINUTE);
+        let none = |_: &std::path::Path| -> crate::build_cache::Trimmed {
+            panic!("the first take retires nothing")
+        };
+        assert_eq!(build_ended(&leaf, &none), None);
+        receipt_of(&leaf, selection, new, 10 * MINUTE);
+        let (ledger, mut held) = claim(scratch.path());
+        held.build_dir = named.then(|| leaf.clone());
+        let trimmed = at_end(held, crate::build_admit::BuildEnd::Unknown, None, || 0);
+        assert!(ledger.list().expect("listed").is_empty(), "let go");
+        assert!(second.is_dir());
+        if named {
+            let trimmed = trimmed.expect("the end trimmed its build directory");
+            assert!(trimmed.freed >= 64 << 10, "{trimmed:?}");
+            assert!(!first_only.exists(), "the unit only the first build used");
+        } else {
+            assert!(trimmed.is_none());
+            assert!(
+                first_only.is_dir(),
+                "no build directory named: nothing taken"
+            );
+            assert_eq!(stale::Kept::read(&leaf).receipts.len(), 1);
+        }
+    }
 }

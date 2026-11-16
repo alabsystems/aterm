@@ -36,7 +36,8 @@ use std::time::Duration;
 use crate::items::{Ctx, Item};
 use crate::model::Probe;
 use crate::port::{Cmd, System};
-use aterm_uds::services::{Look, Service};
+use aterm_process_facts::services::Service;
+use aterm_uds::services::Look;
 use aterm_vitals::services::{FSEVENTSD, Size, followed_from, large_bar, size};
 use aterm_vitals::words::mem;
 

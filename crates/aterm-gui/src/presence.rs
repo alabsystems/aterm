@@ -17,8 +17,14 @@ pub(crate) use aterm_messages::presence::Level;
 pub(crate) use aterm_messages::presence::{
     ChipLevel, Hand, HoldFact, Link, NeedFact, NeedSeverity, StopCause, StoryVerb,
     TOLD_TEXT_MAX_BYTES, TurnFact, WallAnswer, fmt_dur, prompt_band_word, prompt_kind_words,
-    short_sid, state_line,
+    state_line,
 };
+
+/// A session ID as the window shows it: a tab ID at five characters, longer only where two this
+/// Mac knows share them ([`crate::tab_ids::shown`]).
+pub(crate) fn short_sid(sid: &str) -> String {
+    crate::tab_ids::shown(sid)
+}
 
 /// The engine's presence slot, pinned to this host's seam.
 pub(crate) type Slot = aterm_messages::presence::Slot<Native>;

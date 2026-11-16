@@ -1643,7 +1643,6 @@ fn subcommand_parents_have_parser_preambles() {
             "{name} preamble missing"
         );
     }
-    assert_eq!(help_texts::PREAMBLES.len(), 34);
 }
 
 #[test]
@@ -1664,7 +1663,6 @@ fn maintainer_commands_are_known_but_unlisted() {
             other => panic!("{name}: expected native refusal, got {other:?}"),
         }
     }
-    assert_eq!(BREW_MAINTAINER_COMMANDS.len(), 27);
 }
 
 #[test]

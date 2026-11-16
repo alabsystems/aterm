@@ -172,7 +172,12 @@ pub struct LogWitness {
 /// below. And every record the node published on the log since it met it lies at or above
 /// `head`: it publishes on a log only once it attached to it, and a move that cut below `head`
 /// brought it down to the fork, below which the moved generation still holds what the earlier
-/// one held.
+/// one held. But not every record the node published BEFORE it met the log: one a carried cut
+/// kept, on a log astream reminted keeping its records, lies below `head`, so since
+/// ATERM-KI-1114-1414 a read back on a log that continues none starts anywhere
+/// ([`Head::Anywhere`]), but for a keyed re-post's entry, whose key's sequence every re-post of
+/// it shares, which still starts here ([`Met::floor`]; its pin keeps the attach's head,
+/// `StateDir::forget_log_offsets`), as `Mutant::ReadBackFromTheAttachHead` starts every one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Met {
     /// The log met.
@@ -276,7 +281,9 @@ impl Met {
     /// too short to reach it, or a move told without one, leaves unrelated): a head kept there
     /// lies above records of the line that landed before it, and the meeting's head below them.
     /// There the record is published again at its pin, and astream's dedup answers a copy whose
-    /// key stands.
+    /// key stands. Read for a keyed re-post's read back, and by
+    /// `Mutant::ReadBackFromTheAttachHead` for every one, the rule before ATERM-KI-1114-1414
+    /// ([`Met`]).
     #[must_use]
     pub fn floor(
         &self,
@@ -830,7 +837,7 @@ pub struct StateDir {
     #[cfg(test)]
     pin_head_gone_on_another_log: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    heads_from_the_logs_start: std::sync::atomic::AtomicBool,
+    heads_at_the_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -889,6 +896,56 @@ pub(crate) struct PublishIdentity {
     pub digest: String,
 }
 
+/// WHERE A READ BACK STARTS: a pin's or an entry's head ([`PublishPin::at`], [`InFlight::at`]).
+/// `From(n)`: at or above offset `n` of the log it was kept on, where every attempt's record
+/// lands. `Anywhere` (ATERM-KI-1114-1414): on a log that continues none of that one, which may
+/// hold the attempt's record at any offset, since astream gives a log that kept its records
+/// another id where its identity sidecar does not read. A read from there pages the post's face
+/// from 0 and takes a row only where its words and its origin are the post's
+/// (`Bridge::found_since`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Head {
+    From(u64),
+    Anywhere,
+}
+
+impl Head {
+    /// This head on a log that continues the one it was kept on up to `cap`: an offset comes
+    /// down to `cap`, and `Anywhere` stays anywhere.
+    #[must_use]
+    pub(crate) fn min(self, cap: u64) -> Self {
+        match self {
+            Self::From(at) => Self::From(at.min(cap)),
+            Self::Anywhere => Self::Anywhere,
+        }
+    }
+
+    /// The offset a read from this head starts at: its own, or 0 for `Anywhere`.
+    #[must_use]
+    pub(crate) const fn start(self) -> u64 {
+        match self {
+            Self::From(at) => at,
+            Self::Anywhere => 0,
+        }
+    }
+
+    /// Its word in a journal record's tail ([`journal`]'s A RECORD'S TAIL): the offset, or `any`.
+    pub(crate) fn word(self) -> String {
+        match self {
+            Self::From(at) => at.to_string(),
+            Self::Anywhere => "any".to_string(),
+        }
+    }
+
+    /// The head `word` names ([`Head::word`]), `None` for a word this build did not write.
+    pub(crate) fn of_word(word: &str) -> Option<Self> {
+        if word == "any" {
+            return Some(Self::Anywhere);
+        }
+        journal::number(word).map(Self::From)
+    }
+}
+
 /// A sequence reservation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PublishPin {
@@ -909,8 +966,9 @@ pub(crate) struct PublishPin {
     /// earlier build skips), and a stop's hand-off beside the files
     /// ([`StateDir::hand_posts_to_files`]); a receipt's is kept in a file beside its pin's,
     /// with its pin's sequence and the log it is an offset of ([`ACK_HEADS`]), and a key's pin
-    /// file holds none.
-    pub at: Option<u64>,
+    /// file holds none. [`Head::Anywhere`] once a change of log met one that continues none of
+    /// the pin's ([`StateDir::publication_offset_resets`]).
+    pub at: Option<Head>,
 }
 
 impl PublishPin {
@@ -1118,7 +1176,7 @@ pub(crate) struct InFlight {
     /// before it publishes again (`Bridge::landed_since`), since astream's dedup reaches
     /// only the records at or above the base retention leaves. Kept as [`PublishPin::at`] is:
     /// never in the text form.
-    pub at: Option<u64>,
+    pub at: Option<Head>,
 }
 
 impl PublishPin {
@@ -1506,11 +1564,11 @@ pub(crate) const ACK_HEADS: &str = "ack-heads";
 /// A head file's text ([`ACK_HEADS`]): `<seq> <log> <at>`, the pin's sequence, the log its head
 /// is an offset of and the head, and the newline every write ends with, or `None` for anything
 /// else (a torn write among it).
-fn parse_head(text: &str) -> Option<(u64, astream_broker::LogIdentity, u64)> {
+fn parse_head(text: &str) -> Option<(u64, astream_broker::LogIdentity, Head)> {
     let mut words = text.strip_suffix('\n')?.split(' ');
     let seq = crate::parse_uint(words.next()?)?;
     let log = astream_broker::LogIdentity::parse(words.next()?)?;
-    let at = crate::parse_uint(words.next()?)?;
+    let at = Head::of_word(words.next()?)?;
     words.next().is_none().then_some((seq, log, at))
 }
 
@@ -1781,7 +1839,7 @@ impl StateDir {
             #[cfg(test)]
             pin_head_gone_on_another_log: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            heads_from_the_logs_start: std::sync::atomic::AtomicBool::new(false),
+            heads_at_the_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1891,12 +1949,12 @@ impl StateDir {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// The negative control of a pin's head on a log that continues none, which goes to 0, the
-    /// log's start, as ATERM-KI-1111-4's rule took it on another id, not to the head the attach
-    /// read ([`crate::sim::world::Mutant::ReadBackFromTheLogsStart`]).
+    /// The negative control of a pin's head on a log that continues none, which goes to the head
+    /// the attach read, as every build from critic review F1 to ATERM-KI-1114-1414 took it, not
+    /// anywhere ([`crate::sim::world::Mutant::ReadBackFromTheAttachHead`]).
     #[cfg(test)]
-    pub(crate) fn heads_from_the_logs_start(&self, on: bool) {
-        self.heads_from_the_logs_start
+    pub(crate) fn heads_at_the_attach(&self, on: bool) {
+        self.heads_at_the_attach
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -3581,7 +3639,7 @@ impl StateDir {
         sid: &str,
         rid: u64,
         seq: u64,
-    ) -> io::Result<Option<(astream_broker::LogIdentity, u64)>> {
+    ) -> io::Result<Option<(astream_broker::LogIdentity, Head)>> {
         Ok(self
             .read_reservation(&format!("{ACK_HEADS}/{sid}.{rid}"))?
             .as_deref()
@@ -3604,7 +3662,9 @@ impl StateDir {
         let head = format!("{ACK_HEADS}/{sid}.{rid}");
         match (pin.at, log) {
             _ if !self.keeps_receipt_heads() => {}
-            (Some(at), Some(log)) => self.write(&head, &format!("{} {log} {at}", pin.seq))?,
+            (Some(at), Some(log)) => {
+                self.write(&head, &format!("{} {log} {}", pin.seq, at.word()))?;
+            }
             _ => self.remove_head(&head)?,
         }
         self.write(&format!("acks/{sid}.{rid}"), &pin.render())
@@ -3746,35 +3806,40 @@ impl StateDir {
     /// What a change of log resets in the reservations: each `original-off` the new log does
     /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each
     /// head ([`PublishPin::at`]; not a receipt's, kept with its log, [`ACK_HEADS`]) brought to
-    /// where it stands on the new log, whose head the attach read is `head`. A head is an offset
-    /// of the log the pin was made on. Past the fork `keep_below` where the new log continues
-    /// the old, the new log's offsets name records published since, a copy a retry published
-    /// there among them, so the head comes down to the fork (aterm-link B05 review). On a log
-    /// that continues none (another id, the same id continuing nothing, a lineage unknown) it
-    /// goes to `head`: every record that landed before the attach, a sender's earlier post of
-    /// the same words among them, lies below it if that log holds it at all, and every copy a
-    /// retry or the attach's replay publishes there lands at or above it. Not to 0: astream
-    /// gives a log that kept its records another id too (a fresh one where its identity sidecar
-    /// does not read, one derived from its records where the sidecar is gone), and a read back
-    /// from 0 there settled the post on that earlier record and never published it (critic
-    /// review F1, 2026-11-13). Nor taken out, as every build before ATERM-KI-1111-4 took it: the
-    /// retry read nothing back, and an attempt the attach's replay published on the new log, its
-    /// answer unknown (a poisoned broker's), its dedup key cut, was published a second time (the
-    /// lossy-log sim's seed 2201).
+    /// where it stands on the new log. A head is an offset of the log the pin was made on, or
+    /// [`Head::Anywhere`]. Past the fork `keep_below` where the new log continues the old, the
+    /// new log's offsets name records published since, a copy a retry published there among
+    /// them, so an offset comes down to the fork (aterm-link B05 review), and `Anywhere` stays.
+    /// On a log that continues none (another id, the same id continuing nothing, a lineage
+    /// unknown) it goes ANYWHERE (ATERM-KI-1114-1414): astream gives a log that kept its records
+    /// another id too (a fresh one where its identity sidecar does not read, one derived from
+    /// its records where the sidecar is gone), so an attempt's record may stand at any offset of
+    /// it, below the head the attach read among them, where a cut carried it and dropped its
+    /// dedup key; the retry's read pages the face from 0 and takes a row only where its words
+    /// and its origin are the post's, so a sender's earlier post of the same words is not taken
+    /// for it (critic review F1, 2026-11-13). Not to `head`, the head the attach read, as every
+    /// build from F1 to ATERM-KI-1114-1414 took it: a carried copy below it went unread and the
+    /// post landed a second one. Nor taken out, as every build before ATERM-KI-1111-4 took it:
+    /// the retry read nothing back, and an attempt the attach's replay published on the new log,
+    /// its answer unknown (a poisoned broker's), its dedup key cut, was published a second time
+    /// (the lossy-log sim's seed 2201). A KEYED RE-POST'S PIN (`via_key`) still goes to `head`:
+    /// every re-post of a key takes the key's sequence, so an earlier re-post of its words
+    /// stands under the same origin, and a read from anywhere would take it for this one's
+    /// attempt (ATERM-KI-1114-1414's step S3 reads the key's newest record instead).
     fn publication_offset_resets(
         &self,
         keep_below: Option<u64>,
         head: u64,
     ) -> io::Result<OffsetResets> {
         #[cfg(test)]
-        let (head_gone, from_start) = (
+        let (head_gone, at_the_attach) = (
             self.pin_head_gone_on_another_log
                 .load(std::sync::atomic::Ordering::SeqCst),
-            self.heads_from_the_logs_start
+            self.heads_at_the_attach
                 .load(std::sync::atomic::Ordering::SeqCst),
         );
         #[cfg(not(test))]
-        let (head_gone, from_start) = (false, false);
+        let (head_gone, at_the_attach) = (false, false);
         let reset = |pin: &mut PublishPin| -> bool {
             let stale = pin
                 .original_off
@@ -3783,8 +3848,8 @@ impl StateDir {
             let at = pin.at.and_then(|at| match keep_below {
                 Some(fork) => Some(at.min(fork)),
                 None if head_gone => None,
-                None if from_start => Some(0),
-                None => Some(head),
+                None if at_the_attach || pin.via_key => Some(Head::From(head)),
+                None => Some(Head::Anywhere),
             });
             let moved = at != pin.at;
             pin.at = at;
@@ -5981,9 +6046,10 @@ impl StateDir {
     }
 
     /// Record the witness of a log the attach judged to replace the one before it, on the media
-    /// before this returns. The head the node met that log at ([`Met`]) is the floor of every read
-    /// back of a head kept on an earlier log (`Bridge::read_back_from`), and the attach's replay
-    /// publishes above it next: a witness a power cut took back to the earlier log would have the
+    /// before this returns. The head the node met that log at ([`Met`]) is the floor of a keyed
+    /// re-post's read back of a head kept on an earlier log (`Bridge::read_back_from`'s `keyed`;
+    /// every other read back there starts anywhere), and the attach's replay publishes above it
+    /// next: a witness a power cut took back to the earlier log would have the
     /// next attach meet the log again, at a later head above the copies that replay published.
     pub fn rebase_log_witness(&self, witness: &LogWitness) -> io::Result<()> {
         self.write_durable("bus-log", &witness.render())

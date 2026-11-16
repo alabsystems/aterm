@@ -465,9 +465,9 @@ impl<'a> Remote<'a> {
                 Ok(Some(sha.to_owned()))
             }
             Kind::Github(slug) => {
-                let name = reference
-                    .strip_prefix("refs/")
-                    .ok_or("remote ref must start with refs/")?;
+                if !reference.starts_with("refs/") {
+                    return Err("remote ref must start with refs/".into());
+                }
                 let out = read_step(ReadStep::GithubRef, || {
                     success(
                         Tool::Agh,
@@ -493,8 +493,9 @@ impl<'a> Remote<'a> {
                 if found.next().is_some() || !aterm_land_trailer::object_id(sha) {
                     return Err("agh did not return one exact commit ID".into());
                 }
-                // The ref can advance after observation; import the immutable snapshot itself.
-                self.agh_commit(slug, sha, &format!("refs/agh/verify/{name}"))?;
+                // Import the immutable observation without publishing a shared cache ref:
+                // sibling readers may import different snapshots at the same time.
+                self.agh_commit(slug, sha, None)?;
                 Ok(Some(sha.to_owned()))
             }
         }
@@ -531,24 +532,27 @@ impl<'a> Remote<'a> {
                 })?;
                 self.require_commit(sha)
             }
-            Kind::Github(slug) => self.agh_commit(slug, sha, into),
+            Kind::Github(slug) => self.agh_commit(slug, sha, Some(into)),
         }
     }
 
-    /// Import commit `sha` from GitHub's `slug` through agh into ref `into`, then require that
-    /// the object arrived as a commit.
-    fn agh_commit(&self, slug: &str, sha: &str, into: &str) -> Result<(), String> {
+    /// Import commit `sha` from GitHub's `slug`, optionally publishing the requested ref,
+    /// then require that the object arrived as a commit.
+    fn agh_commit(&self, slug: &str, sha: &str, into: Option<&str>) -> Result<(), String> {
         let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
         let input = dir.path().join("fetch.json");
-        std::fs::write(
-            &input,
-            json!([{"source":sha,"into":into,"expected_oid":sha}]).to_string(),
-        )
-        .map_err(|e| e.to_string())?;
+        let (flag, payload) = match into {
+            Some(into) => (
+                "--input",
+                json!([{"source":sha,"into":into,"expected_oid":sha}]),
+            ),
+            None => ("--objects", json!([sha])),
+        };
+        std::fs::write(&input, payload.to_string()).map_err(|e| e.to_string())?;
         let mut args = words(&["repo", "fetch", slug]);
         args.extend([
             self.root.as_os_str().to_owned(),
-            "--input".into(),
+            flag.into(),
             input.into_os_string(),
         ]);
         read_step(ReadStep::GithubSnapshot, || {
@@ -645,8 +649,10 @@ impl<'a> Remote<'a> {
         }
     }
 
-    /// Observe only the exact foreign journal entry which refused our pre-send attempt. The
-    /// caller owns the deadline; neither journal reads nor superseding writers extend it.
+    /// Observe only the exact foreign journal entry which refused our pre-send attempt, until
+    /// it is closed or agh's next atomic write would close it (`closable`: its writer can send
+    /// nothing more and its window is over), when the push is made again. The caller owns the
+    /// deadline; neither journal reads nor superseding writers extend it.
     #[cfg(unix)]
     pub(crate) fn wait_for_intent(
         &self,
@@ -667,6 +673,9 @@ impl<'a> Remote<'a> {
                 op: String,
                 key: String,
                 open: bool,
+                /// agh's next atomic write closes it (`agh::Journal::closable`).
+                #[serde(default)]
+                closable: bool,
             }
             let doc: Intent = aterm_json::from_slice(&bytes)
                 .map_err(|_| "agh intent returned invalid JSON".to_owned())?;
@@ -677,7 +686,7 @@ impl<'a> Remote<'a> {
             {
                 return Err("agh intent identity does not match the refused atomic push".into());
             }
-            if !doc.open {
+            if !doc.open || doc.closable {
                 return Ok(());
             }
             pause()?;

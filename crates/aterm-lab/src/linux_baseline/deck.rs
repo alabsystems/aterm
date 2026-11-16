@@ -16,7 +16,11 @@ use crate::linux_proof::{self as proof, Gui};
 /// `stats_deck::FOLDED_PT`.
 pub const DECK_PT: f64 = 62.0;
 
-/// Fixed Network State headroom reserved under the stats bars: aterm-gui's
+/// Fixed Disk Custody headroom reserved under the stats bars: aterm-gui's
+/// `stats_lens::disk_band::HEIGHT_PT`.
+pub const DISK_PT: f64 = 30.0;
+
+/// Fixed Network State headroom reserved under the Disk Custody band: aterm-gui's
 /// `network_deck::HEIGHT_PT`.
 pub const NETWORK_PT: f64 = 30.0;
 
@@ -210,6 +214,7 @@ impl Dims {
 
     fn deck_want(&self) -> usize {
         (DECK_PT * self.scale).round() as usize
+            + (DISK_PT * self.scale).round().max(0.0) as usize
             + (NETWORK_PT * self.scale).round().max(0.0) as usize
     }
 
@@ -273,10 +278,10 @@ fn session_checks(s: &Session<'_>, presenter: &'static str, on: &str) -> Vec<Che
 
 fn head(d: &Dims) -> Result<String, String> {
     let want = d.deck_want();
-    let pts = DECK_PT + NETWORK_PT;
+    let pts = DECK_PT + DISK_PT + NETWORK_PT;
     if d.deck_h != want || d.deck_y != 0 || d.head < d.deck_h {
         return Err(format!(
-            "deck_y={} deck_h={} in head={}, where the Deck's {pts} pt ({DECK_PT}+{NETWORK_PT}) \
+            "deck_y={} deck_h={} in head={}, where the Deck's {pts} pt ({DECK_PT}+{DISK_PT}+{NETWORK_PT}) \
              at scale {:.2} is {want} px at the head's top",
             d.deck_y, d.deck_h, d.head, d.scale
         ));

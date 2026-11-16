@@ -14,10 +14,10 @@ use crate::task_record::{TaskMark, TaskState};
 /// The longest a test waits for what must happen (a hang detector, never a latency budget).
 const HANG: Duration = Duration::from_secs(60);
 
-/// A key-shaped value the redaction tests put after `token=`, written in two pieces and bound
-/// apart from that keyword so no source line here has a secret's shape (the export scan's
-/// gitleaks reads such a line as a key).
-const LIVE: &str = concat!("sk-live-", "0123456789abcdef");
+/// The synthetic redaction input, its prefix and suffix separate in the source.
+fn redaction_fixture() -> String {
+    ["sk-live-", "0123456789abcdef"].concat()
+}
 
 /// A scratch directory of the test's own for its table's rows.
 fn scratch(prefix: &str) -> aterm_tempfile::TempDir {
@@ -119,12 +119,10 @@ fn an_ended_sessions_row_survives_a_quit_with_who_and_why() {
     let sid = {
         let store = store_at(dir.path());
         let handle = opened(&store, 7, aterm_slog::Actor::Human, 1_000);
-        handle
-            .ctx
-            .meta
-            .lock()
-            .unwrap()
-            .set("title", Some(format!("deploy token={LIVE}")));
+        handle.ctx.meta.lock().unwrap().set(
+            "title",
+            Some(format!("deploy token={}", redaction_fixture())),
+        );
         let table = loaded(&store);
         assert!(!table.holds(&handle.sid), "CONTROL: no row before the end");
         assert_eq!(
@@ -318,7 +316,7 @@ fn row_file(dir: &std::path::Path, sid: &SessionId) -> std::path::PathBuf {
 #[test]
 fn rows_of_both_id_forms_read_back_and_a_stray_file_is_left() {
     let dir = scratch("aterm-table-forms");
-    let earlier = SessionId::new("s-0123456789abcdef0123");
+    let earlier = SessionId::parse("s-0123456789abcdef0123").expect("a legacy tab's id");
     let minted = SessionId::generate();
     assert!(
         earlier.is_minted() && minted.is_minted() && minted.as_str().starts_with('t'),
@@ -761,6 +759,7 @@ fn the_budget_waits_for_the_launchs_sessions_before_it_judges_what_they_protect(
         table.write(bare_row(&manager));
         table.write(bare_row(&other));
         assert!(table.flush());
+        assert!(table.loaded_within(HANG));
         let ids: Vec<SessionId> = table
             .exits_since(0)
             .expect("loaded")
@@ -980,7 +979,7 @@ fn a_rows_task_line_is_redacted_as_its_title_is() {
         .task()
         .cloned()
         .expect("a task");
-    task.line = Some(format!("deploy with token={LIVE}"));
+    task.line = Some(format!("deploy with token={}", redaction_fixture()));
     assert!(
         task.line
             .as_deref()
@@ -1003,7 +1002,17 @@ fn a_rows_task_line_is_redacted_as_its_title_is() {
         untitled: true,
         ..at_close(None, "make deploy", TitleStands::CommandLine, None)
     };
+    let mut launch = claude_launch(handle.sid.as_str(), "0b22c0de-1111-4222-8333-444455556666");
+    launch.argv.extend([
+        "--".to_owned(),
+        format!("deploy with token={}", redaction_fixture()),
+    ]);
+    crate::harness_host::publish_snapshot_for_test(handle.sid.as_str(), Some(&launch));
     let row = row_at_close(&handle.sid, &ended, &at);
+    assert!(
+        row.launch.is_some(),
+        "the prompt-bearing launch was captured"
+    );
     assert_eq!(row.title_from, TitleFrom::Task);
     let line = row
         .task
@@ -1066,8 +1075,202 @@ fn what_waits_for_the_load_runs_once_it_ends() {
         "it ran once the load ended, when such a result is held no longer"
     );
     let (ran, seen) = std::sync::mpsc::channel();
+    let caller = std::thread::current().id();
     table.when_loaded(move || {
-        let _ = ran.send(());
+        let _ = ran.send(std::thread::current().id());
     });
-    assert_eq!(seen.try_recv(), Ok(()), "a loaded table runs it at once");
+    assert_ne!(
+        seen.recv_timeout(HANG).expect("the callback runs"),
+        caller,
+        "a loaded table also sweeps off the window thread"
+    );
+}
+
+/// A coarse timestamp's recent listing must be repeated once the tick has passed.
+#[test]
+fn session_table_rechecks_a_recent_listing_after_the_tick() {
+    let dir = scratch("aterm-table-tick");
+    let table = SessionTable::at(dir.path().to_path_buf());
+    assert!(table.loaded_within(HANG));
+    let first = SessionId::generate();
+    std::fs::write(row_file(dir.path(), &first), bare_row(&first).encode()).unwrap();
+    let tick = std::fs::metadata(dir.path()).unwrap().modified().unwrap();
+    table.shared.refresh_at(tick);
+    assert!(table.shared.lock().heads.contains_key(first.as_str()));
+    let second = SessionId::generate();
+    std::fs::write(row_file(dir.path(), &second), bare_row(&second).encode()).unwrap();
+    std::fs::remove_file(row_file(dir.path(), &first)).unwrap();
+    let mut directory = std::fs::OpenOptions::new();
+    directory.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // SetFileTime needs FILE_WRITE_ATTRIBUTES; a directory needs BACKUP_SEMANTICS.
+        directory.access_mode(0x0000_0100).custom_flags(0x0200_0000);
+    }
+    directory
+        .open(dir.path())
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(tick))
+        .unwrap();
+    table
+        .shared
+        .refresh_at(tick + MTIME_TICK + Duration::from_secs(1));
+    let state = table.shared.lock();
+    assert!(
+        state.heads.contains_key(second.as_str()),
+        "the second write in the tick is seen"
+    );
+    assert!(
+        !state.heads.contains_key(first.as_str()),
+        "the removal in the tick is seen"
+    );
+}
+
+/// An amendment's stale file copy cannot undo the load's renumbering.
+#[test]
+fn session_table_amend_keeps_the_current_id() {
+    let table = SessionTable::default();
+    let sid = SessionId::generate();
+    table.write(bare_row(&sid));
+    let stale = table.row(&sid).unwrap();
+    let current = stale.id + 100;
+    {
+        let mut state = table.shared.lock();
+        let mut row = stale.clone();
+        row.id = current;
+        state.index(row.head(0));
+        state.rows.insert(sid.as_str().to_owned(), row);
+    }
+    assert!(table.shared.amend(stale, |row| {
+        row.told_end = true;
+        true
+    }));
+    assert_eq!(table.row(&sid).unwrap().id, current);
+    assert_eq!(table.head(&sid).unwrap().id, current);
+}
+
+/// The first park settles a launch with no layout, so subsequent writes run the budget.
+#[test]
+fn session_table_a_launch_without_restore_runs_the_budget() {
+    let dir = scratch("aterm-table-no-restore");
+    let mut app = crate::App::headless_for_test();
+    let table = SessionTable::at_with(
+        dir.path().to_path_buf(),
+        Budget {
+            bytes: u64::MAX,
+            rows: 1,
+        },
+        None,
+    );
+    table.serve(&app.store);
+    assert!(table.loaded_within(HANG));
+    assert!(!app.restore_pass_queued());
+    assert!(!app.restore_pass_due_at_park(false, std::time::Instant::now()));
+    let first = SessionId::generate();
+    let second = SessionId::generate();
+    table.write(bare_row(&first));
+    table.write(bare_row(&second));
+    assert!(table.flush());
+    assert!(!table.holds(&first));
+    assert!(table.holds(&second));
+}
+
+/// All pre-load ends retain their order when a past-clock row raises their floor.
+#[test]
+fn session_table_merge_renumbers_in_end_order() {
+    let table = SessionTable::default();
+    for _ in 0..32 {
+        table.write(bare_row(&SessionId::generate()));
+    }
+    // Deliberately give the hash iteration the reverse end order. The map's slots are unchanged.
+    let order: Vec<String> = table.shared.lock().heads.keys().cloned().collect();
+    {
+        let mut state = table.shared.lock();
+        for (i, sid) in order.iter().enumerate() {
+            state.heads.get_mut(sid).unwrap().id = 100 - i as u64;
+            state.rows.get_mut(sid).unwrap().id = 100 - i as u64;
+        }
+        state.order = state
+            .heads
+            .values()
+            .map(|h| (h.id, h.sid.as_str().to_owned()))
+            .collect();
+    }
+    let mut ahead = bare_row(&SessionId::generate());
+    ahead.id = 4_000_000_000_000_000;
+    table.shared.merge(vec![ahead.head(0)]);
+    let mut expected = order;
+    expected.reverse();
+    let actual: Vec<String> = table
+        .exits_since(ahead.id)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.sid.as_str().to_owned())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+/// Stat runs outside the index mutex, and a write while it runs invalidates the removal.
+#[test]
+fn session_table_forget_stats_outside_the_lock_and_rechecks_the_generation() {
+    for amend in [false, true] {
+        let table = SessionTable::default();
+        let sid = SessionId::generate();
+        table.write(bare_row(&sid));
+        let before = table.row(&sid).unwrap();
+        table.shared.lock().rows.clear();
+        let mut checked = false;
+        table.shared.forget_if(sid.as_str(), || {
+            checked = true;
+            assert!(
+                table.shared.state.try_lock().is_ok(),
+                "stat has no index guard"
+            );
+            if amend {
+                assert!(table.shared.amend(before.clone(), |row| {
+                    row.told_end = true;
+                    true
+                }));
+                assert_eq!(
+                    table.head(&sid).unwrap().id,
+                    before.id,
+                    "an edit keeps its id"
+                );
+            } else {
+                table.write(bare_row(&sid));
+            }
+            // The worker's write finished before the stat's caller takes the lock again.
+            table.shared.lock().rows.clear();
+            true
+        });
+        assert!(checked);
+        assert!(
+            table.head(&sid).is_some(),
+            "a newer write cannot be forgotten (amend={amend})"
+        );
+    }
+}
+
+/// Cold exec retries a failed queued row before it replaces the process.
+#[cfg(unix)]
+#[test]
+fn session_table_cold_exec_flushes_pending_rows() {
+    let root = scratch("aterm-table-cold");
+    let blocker = root.path().join("state");
+    std::fs::write(&blocker, "blocked").unwrap();
+    let dir = blocker.join("sessions");
+    let table = SessionTable::at(dir.clone());
+    assert!(table.loaded_within(HANG));
+    let sid = SessionId::generate();
+    table.write(bare_row(&sid));
+    assert!(!table.flush(), "the first write cannot land");
+    std::fs::remove_file(&blocker).unwrap();
+    let mut app = crate::App::headless_for_test();
+    table.serve(&app.store);
+    app.prepare_cold_exec(7, true, false);
+    assert!(
+        row_file(&dir, &sid).is_file(),
+        "cold exec's barrier retries the row"
+    );
 }

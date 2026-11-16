@@ -345,6 +345,19 @@ struct UndoRecord {
     after_text: Arc<str>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Snapshots [`VersionedConfigService::snapshot`] cloned on this thread: each copies the
+    /// config text and every value.
+    static CONFIG_SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many config snapshots this test thread cloned so far.
+#[cfg(test)]
+pub(crate) fn config_snapshots_on_this_thread() -> u64 {
+    CONFIG_SNAPSHOTS.with(std::cell::Cell::get)
+}
+
 /// Single-writer reducer owned by the `App`; callers clone only immutable snapshots.
 pub(crate) struct VersionedConfigService {
     text: String,
@@ -500,7 +513,14 @@ impl VersionedConfigService {
         })
     }
 
+    /// The revision [`Self::snapshot`] would carry, without copying the config.
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn snapshot(&self) -> ConfigSnapshot {
+        #[cfg(test)]
+        CONFIG_SNAPSHOTS.with(|taken| taken.set(taken.get().saturating_add(1)));
         ConfigSnapshot {
             revision: self.revision,
             analysis_generation: self.analysis_generation,

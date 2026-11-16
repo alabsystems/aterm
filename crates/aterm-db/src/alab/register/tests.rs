@@ -1129,6 +1129,59 @@ fn a_birth_waits_for_a_round_and_lands_with_its_machine_and_model() {
     assert_eq!(written_row(&plan)["label"], json!("m1"));
 }
 
+/// A Mac born while the owner has retired its model's row is born without a `model`: a live
+/// machine born naming a retired model would have the rules every write passes refuse the pass
+/// (`typed::check::names_not_live`), and every later pass that planned the birth again. The
+/// birth passes those rules and births no model either.
+/// NEGATIVE CONTROL: with `machine_birth` writing `model` whatever its row says, the birth names
+/// the retired model and the rules refuse it: `` assertion `left == right` failed: the birth
+/// passes the rules every write passes left: Some(Refused { collection: "machine", pk: "mc-…",
+/// column: "model", rule: "names model row Mac16-8, which is not live; point it at a live row,
+/// leave it empty, or make that row live first" }) right: None ``.
+#[test]
+fn a_mac_whose_model_the_owner_retired_is_born_without_it() {
+    let retired = apply(&[vec![
+        cell::change(
+            &MODEL,
+            CellKey {
+                pk: "Mac16-8",
+                col: "row",
+                elem: None,
+            },
+            &CellValue::owner(MODEL.version, json!("retired")),
+        )
+        .unwrap(),
+    ]]);
+    let born = run(&me(), &probe(), &[ME], true, &retired, &facts(&[]));
+    let pk = keys::machine_pk(ME);
+    assert_eq!(born.outcome, Outcome::Born { mac: pk.clone() });
+    let mut view = crate::typed::View::empty_for_test();
+    view.cells = retired;
+    assert_eq!(
+        crate::typed::check::refused(
+            &super::super::registry::REGISTRY_3,
+            &[born
+                .changes
+                .iter()
+                .filter(|c| c.collection != MACHINE_FACTS.name)
+                .cloned()
+                .collect()],
+            &view,
+            super::super::seeds::compiled,
+        ),
+        None,
+        "the birth passes the rules every write passes"
+    );
+    assert!(
+        !born
+            .changes
+            .iter()
+            .any(|c| c.key == format!("{pk}.model") || c.collection == MODEL.name),
+        "{:?}",
+        born.changes
+    );
+}
+
 /// A bound Mac whose machine row's label is in conflict keeps the label its facts row states,
 /// whatever its seat is called: a writer successor is seated under a later label (`m381` for
 /// m22) and its lineage is read only until it is bound, so its seat's label must not be written
@@ -4992,4 +5045,269 @@ fn a_mac_born_and_adopted_on_registry_4_holds_its_hosts_as_members() {
             mac: by_host.into()
         }
     );
+}
+
+/// A Linux machine's fixture tree: a DMI product name, a chip, eight threads on four cores, 32
+/// GB less the kernel's reserve, the names its owner set, and its machine id.
+fn linux_tree(machine_id: Option<&str>) -> aterm_tempfile::TempDir {
+    let root = aterm_tempfile::tempdir().expect("scratch root");
+    let mut files = vec![
+        (
+            "sys/class/dmi/id/product_name".to_owned(),
+            "Precision 5570\n".to_owned(),
+        ),
+        (
+            "proc/device-tree/model".to_owned(),
+            "Not the model\0".to_owned(),
+        ),
+        (
+            "proc/cpuinfo".to_owned(),
+            "processor\t: 0\nmodel name\t: 12th Gen Intel(R) Core(TM) i7-12800H\n".to_owned(),
+        ),
+        (
+            "proc/meminfo".to_owned(),
+            "MemTotal:       32617000 kB\n".to_owned(),
+        ),
+        (
+            "sys/devices/system/cpu/present".to_owned(),
+            "0-7\n".to_owned(),
+        ),
+        (
+            "sys/devices/system/cpu/online".to_owned(),
+            "0-7\n".to_owned(),
+        ),
+        (
+            "etc/machine-info".to_owned(),
+            "PRETTY_HOSTNAME=\"Bench Box\"\n".to_owned(),
+        ),
+        ("etc/hostname".to_owned(), "m31\n".to_owned()),
+    ];
+    for id in 0..8 {
+        files.push((
+            format!("sys/devices/system/cpu/cpu{id}/topology/core_cpus_list"),
+            format!("{},{}\n", id % 4, id % 4 + 4),
+        ));
+    }
+    if let Some(id) = machine_id {
+        files.push(("etc/machine-id".to_owned(), format!("{id}\n")));
+    }
+    for (rel, text) in files {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("dirs");
+        std::fs::write(path, text).expect("a fixture file");
+    }
+    root
+}
+
+const MACHINE_ID: &str = "4f1c0e2a9b7d4c3e8a6f5b2d1c0e9f8a";
+
+/// LT-C6: a Linux machine states its own facts. Its readings under a root (`Probe::linux`) make
+/// a probe whose model maps into the key grammar, and a pass on a real lab births one machine
+/// row, named by the host name its owner set, that its facts row binds; its hint is the keyed
+/// hint of its machine id, which no record carries. A second pass writes nothing.
+/// NEGATIVE CONTROL: with `model_key` refusing a space as it did, the pass refuses
+/// `the machine's model makes no model key`; with `Probe::linux` returning `None`, the probe
+/// assertion fails.
+#[test]
+fn a_linux_machines_readings_under_a_root_make_a_probe_and_its_pass_births_one_machine_row_its_facts_row_binds()
+ {
+    let tree = linux_tree(Some(MACHINE_ID));
+    let probe = Probe {
+        node: Some(NODE.into()),
+        ..Probe::linux(&aterm_sysprobe::linux::Root::new(tree.path()))
+            .expect("a Linux machine with a model and a machine id states itself")
+    };
+    assert_eq!(probe.hw_model, "Precision 5570");
+    assert_eq!(probe.chip.as_deref(), Some("12th Gen Intel Core i7-12800H"));
+    assert_eq!((probe.cores_p, probe.cores_e), (Some(4), None));
+    assert_eq!(probe.ram_gb, Some(32));
+    assert!(probe.disk_gb.is_some());
+    assert_eq!(probe.arch.as_deref(), Some(std::env::consts::ARCH));
+    assert_eq!((probe.gpu_cores, probe.os_major), (None, None));
+    assert_eq!(probe.hosts, ["Bench Box", "m31"]);
+    assert_eq!(probe.platform_uuid, MACHINE_ID);
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry.seed().unwrap();
+    repair_commons(&lab, 6);
+    let before: BTreeSet<String> = registry
+        .view()
+        .unwrap()
+        .project(&MACHINE)
+        .rows
+        .into_keys()
+        .collect();
+    let done = registry
+        .register(&lab_config(&lab, 0), &probe, true, NOW)
+        .unwrap();
+    let Outcome::Born { mac } = done.outcome else {
+        panic!("a Linux machine with no row is born: {:?}", done.outcome);
+    };
+    assert!(done.findings.is_empty(), "{:?}", done.findings);
+    let view = registry.view().unwrap();
+    let machines = view.project(&MACHINE);
+    let born: Vec<&String> = machines
+        .rows
+        .keys()
+        .filter(|pk| !before.contains(*pk))
+        .collect();
+    assert_eq!(born, [&mac], "one machine row is born");
+    let row = &machines.rows[&mac];
+    assert_eq!(row.get("label"), Some(&json!("m31")));
+    assert_eq!(row.get("model"), Some(&json!("Precision-5570")));
+    assert_eq!(row.get("node"), Some(&json!(NODE)));
+    assert!(view.project(&MODEL).rows.contains_key("Precision-5570"));
+    let uuid = keys::uuid32(&machine_of(&lab, 0));
+    let facts = &view.owned[MACHINE_FACTS.name].rows[&uuid].value;
+    assert_eq!(facts["mac"], json!(mac));
+    assert_eq!(facts["hw_model"], json!("Precision-5570"));
+    assert_eq!(facts["chip"], json!("12th Gen Intel Core i7-12800H"));
+    assert_eq!(facts["cores_p"], json!(4));
+    assert_eq!(facts["ram_gb"], json!(32));
+    assert_eq!(facts["hosts"], json!(["Bench Box", "m31"]));
+    assert!(facts.get("os_major").is_none_or(Value::is_null));
+    assert!(facts.get("gpu_cores").is_none_or(Value::is_null));
+    let trust = lab.bootstrap(0).trust();
+    assert_eq!(
+        facts["hw_hint"],
+        json!(keys::hw_hint(&trust.network, MACHINE_ID))
+    );
+    for op in &view.ops {
+        let written = aterm_json::to_string(&op.changes)
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(!written.contains(MACHINE_ID), "the machine id never leaves");
+    }
+    let again = registry
+        .register(&lab_config(&lab, 0), &probe, true, NOW)
+        .unwrap();
+    assert_eq!((again.outcome, again.records), (Outcome::Unchanged, 0));
+}
+
+/// A Linux machine with no `/etc/machine-id` states nothing, as a Mac with no IOPlatformUUID:
+/// its row needs a hint, and a pass never runs without one. A model that is only a placeholder
+/// states nothing either.
+/// NEGATIVE CONTROL: with `Probe::linux` reading a missing id as empty, the first assertion
+/// gets a probe.
+#[test]
+fn a_linux_machine_without_a_machine_id_or_a_model_states_nothing() {
+    let none = linux_tree(None);
+    assert!(Probe::linux(&aterm_sysprobe::linux::Root::new(none.path())).is_none());
+    let placeholder = linux_tree(Some(MACHINE_ID));
+    std::fs::write(
+        placeholder.path().join("sys/class/dmi/id/product_name"),
+        "To Be Filled By O.E.M.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        placeholder.path().join("proc/device-tree/model"),
+        "System Product Name\0",
+    )
+    .unwrap();
+    assert!(Probe::linux(&aterm_sysprobe::linux::Root::new(placeholder.path())).is_none());
+}
+
+/// A model key keeps a Mac's as it was and maps any other model into the grammar: each run of
+/// other characters one `-`, none at either end; a longer name keeps its head and closes with
+/// six hex digits of its SHA-256; nothing left is refused.
+/// NEGATIVE CONTROL: with `model_key` replacing only `,`, `Precision 5570` is refused.
+#[test]
+fn a_model_maps_into_the_key_grammar_and_a_macs_key_is_unchanged() {
+    for (model, key) in [
+        ("Mac16,8", "Mac16-8"),
+        ("MacBookPro18,3", "MacBookPro18-3"),
+        ("VirtualMac2,1", "VirtualMac2-1"),
+        (" Precision 5570\n", "Precision-5570"),
+        ("21K9CTO1WW", "21K9CTO1WW"),
+        ("MS-7D25", "MS-7D25"),
+        (
+            "Standard PC (Q35 + ICH9, 2009)",
+            "Standard-PC-Q35-ICH9-2009",
+        ),
+        (
+            "Raspberry Pi 5 Model B Rev 1.0",
+            "Raspberry-Pi-5-Mode-901a49",
+        ),
+        ("ABCDEFGHIJKLMNOPQRSTUVWXY Z", "ABCDEFGHIJKLMNOPQRS-667cb9"),
+        ("ThinkCentre—M70q", "ThinkCentre-M70q"),
+        ("a_b", "a_b"),
+    ] {
+        assert_eq!(model_key(model).unwrap(), key, "{model:?}");
+    }
+    for refused in ["", "  ", "?!", ", ,", "日本"] {
+        assert!(model_key(refused).is_err(), "{refused:?}");
+    }
+    assert_eq!(gigabytes(994_662_584_320), 995);
+}
+
+/// Two models that differ only past the key's length are two keys, each in the grammar, and a
+/// name that maps alike (punctuation only) is the same key.
+/// NEGATIVE CONTROL: with `model_key` cutting a long name to `MAX_PK` as it did, both Compute
+/// Modules key `Raspberry-Pi-Compute-Modul`.
+#[test]
+fn models_that_differ_past_the_keys_length_are_two_keys() {
+    for (one, other) in [
+        (
+            "Raspberry Pi Compute Module 4 Rev 1.0",
+            "Raspberry Pi Compute Module 5 Rev 1.0",
+        ),
+        (
+            "Apple MacBook Pro (14-inch, M1 Pro, 2021)",
+            "Apple MacBook Pro (14-inch, M2 Pro, 2023)",
+        ),
+        (
+            "Apple MacBook Air (13-inch, M1, 2020)",
+            "Apple MacBook Air (13-inch, M2, 2022)",
+        ),
+        (
+            "HP ZBook Studio 16 inch G10 Mobile Workstation PC",
+            "HP ZBook Studio 16 inch G11 Mobile Workstation PC",
+        ),
+        (
+            "Raspberry Pi 5 Model B Rev 1.0",
+            "Raspberry Pi 5 Model B Rev 1.1",
+        ),
+    ] {
+        let (a, b) = (model_key(one).unwrap(), model_key(other).unwrap());
+        assert_ne!(a, b, "{one:?} and {other:?}");
+        for key in [&a, &b] {
+            assert!(pk_grammar(key) && key.len() <= MAX_PK, "{key:?}");
+        }
+    }
+    assert_eq!(
+        model_key("Raspberry Pi 5 Model B, Rev 1.0").unwrap(),
+        model_key("Raspberry Pi 5 Model B Rev 1.0").unwrap()
+    );
+}
+
+/// The installed memory a Linux kernel's `MemTotal` stands for: what the page map, the firmware
+/// and a crash kernel take is given back, to the step module sizes sum to.
+/// NEGATIVE CONTROL: with `installed_gib` rounding `MemTotal` up to whole GiB, a 64 GiB machine
+/// reads 63.
+#[test]
+fn a_linux_kernels_memory_total_reads_as_the_memory_installed() {
+    let kib = |gib: f64| (gib * 1_048_576.0) as u64;
+    for (total, installed) in [
+        (kib(62.8), 64),
+        (kib(31.1), 32),
+        (kib(15.4), 16),
+        (kib(7.6), 8),
+        (kib(3.7), 4),
+        (kib(0.9), 1),
+        (kib(23.3), 24),
+        (kib(19.4), 20),
+        (kib(46.9), 48),
+        (kib(94.0), 96),
+        (kib(125.4), 128),
+        (kib(188.0), 192),
+        (kib(251.0), 256),
+        (kib(4.8), 5),
+        (kib(13.7), 14),
+        (kib(32.0), 32),
+        (0, 0),
+    ] {
+        assert_eq!(installed_gib(total), installed, "{total} KiB");
+    }
 }

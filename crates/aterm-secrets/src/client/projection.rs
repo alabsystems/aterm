@@ -266,6 +266,9 @@ impl<'a> Projection<'a> {
         inputs: ConvergenceInputs,
     ) -> Self {
         let begun = Instant::now();
+        // A new starter's first look starts a runner whatever it finds, and that runner reads
+        // everything applied before it: a pass left owed until now is that one.
+        let _ = super::converge_inputs::take_owed(paths);
         Self {
             running: Mutex::new(Running {
                 due: Due::default(),
@@ -465,9 +468,9 @@ impl<'a> Projection<'a> {
         });
     }
 
-    pub(super) fn after_pass(&self, outcome: &SyncOutcome, source: SourceSaid) {
+    pub(super) fn after_pass(&self, outcome: &SyncOutcome, owed: bool, source: SourceSaid) {
         self.update(|due, now, routes, last| {
-            converge_after_pass(due, outcome, now, routes, last, source)
+            converge_after_pass(due, outcome, owed, now, routes, last, source)
         });
     }
 

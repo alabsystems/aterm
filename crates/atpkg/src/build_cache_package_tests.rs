@@ -1235,50 +1235,6 @@ fn preserve_markers_and_replaced_or_unowned_parents_never_authorize_retirement()
     assert!(super::super::identity_for(parent, uid.wrapping_add(1)).is_none());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
-fn a_proven_running_image_keeps_current_and_pending_package_generations() {
-    use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes, kill_within};
-    use aterm_uds::spawnfd::{Child, Stdio};
-    struct Running(Child);
-    impl Drop for Running {
-        fn drop(&mut self) {
-            kill_within(&mut self.0, std::time::Duration::from_secs(60));
-        }
-    }
-    let directory = aterm_tempfile::tempdir().unwrap().keep();
-    let mut custody = KeptUntilRan::new(directory);
-    let mut world = World::in_home(custody.path().canonicalize().unwrap().join("home"), None);
-    world.admit(FIRST, 1).unwrap();
-    world.output(32 << 10);
-    world.settle(FIRST, false).unwrap();
-    let image = world.target.join("debug/deps/cat");
-    ad_hoc_copy(Path::new("/bin/cat"), &image);
-    let mut child = aterm_uds::spawnfd::command(&image)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let input = cat_echoes(&mut child);
-    custody.ran();
-    let child = Running(child);
-    let processes = |dirs: &[PathBuf], _: &[u32]| {
-        aterm_uds::holders::scan_path_users_of(&[child.0.id()], dirs, &[])
-    };
-    world.held.take();
-    assert!(world.reclaim(&Fence::new(&processes)).is_empty());
-    assert!(image.exists());
-    let stage = world.cache.join("retiring.noindex");
-    // The child proved execution above, so this identity-preserving rename is now safe.
-    super::super::stage_for_process_test(&world.home, &world.target, &stage);
-    assert!(world.reclaim(&Fence::new(&processes)).is_empty());
-    assert!(stage.join("cache.noindex/debug/deps/cat").exists());
-    drop(input);
-    drop(child);
-    assert_eq!(world.reclaim(&Fence::default()).len(), 1);
-    assert!(!stage.exists());
-}
-
 #[test]
 fn oversized_first_success_learns_once_and_warm_work_reuses_then_retires_whole() {
     let mut world = World::new();
@@ -1753,7 +1709,7 @@ fn a_completed_stage_removal_recovers_its_receipt_after_a_crash_but_never_a_repl
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn a_real_closed_descriptor_mapping_keeps_the_whole_package_root_until_unmapped() {
+fn a_real_closed_descriptor_mapping_keeps_the_current_and_pending_package_root_until_unmapped() {
     use std::os::fd::AsFd as _;
     let mut world = World::new();
     world.admit(FIRST, 1).unwrap();
@@ -1780,8 +1736,15 @@ fn a_real_closed_descriptor_mapping_keeps_the_whole_package_root_until_unmapped(
     assert!(world.reclaim(&Fence::new(&processes)).is_empty());
     assert!(world.target.exists());
     assert!(world.receipt().pending.is_none());
+    // The pending generation: the root staged for retirement keeps the mapping's path, so
+    // the same holder keeps the stage too.
+    let stage = world.cache.join("retiring.noindex");
+    super::super::stage_for_process_test(&world.home, &world.target, &stage);
+    assert!(world.reclaim(&Fence::new(&processes)).is_empty());
+    assert!(stage.join("cache.noindex/debug/deps/mapped").exists());
     drop(region);
     assert_eq!(world.reclaim(&Fence::new(&processes)).len(), 1);
+    assert!(!stage.exists());
 }
 
 #[test]

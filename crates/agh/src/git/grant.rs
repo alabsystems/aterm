@@ -2,13 +2,17 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The grants (design §6.9): `<state>/agh/grants-v2/<nonce>.json`, 0600, written by the agh
-//! process that spawns a git child for a release-tier repository, read by the helper,
-//! removed when the child exits. The folder is the version-2 record's own
-//! (`Dirs::grants`): an agh that knows only version 1 sweeps `<state>/agh/grants` and removes
-//! what it cannot read there, so a version-2 grant is never written to it.
+//! The grants (design §6.9): `<state>/agh/grants-v<GRANT_VERSION>/<nonce>.json`, 0600,
+//! written by the agh process that spawns a git child for a release-tier repository, read by
+//! the helper, removed when the child exits. The folder belongs to the record's version
+//! (`Dirs::grants` is built from [`GRANT_VERSION`]), because two installed agh versions share
+//! agh's state directory: an agh that knows only version 1 (aterm 0.201.0 and earlier) sweeps
+//! `<state>/agh/grants` and removes what it cannot read there. So a record that changes again
+//! moves to a folder of its own by construction, and a folder holds one version's records.
+//! A record of another version this agh meets in its own folder is refused and never
+//! removed: it is not this agh's to judge.
 //!
-//! A grant's file name is its nonce, so a process of the same user that lists `grants-v2/`
+//! A grant's file name is its nonce, so a process of the same user that lists the folder
 //! learns the live nonces. A hidden name would close nothing: the nonce is also in the git
 //! child's environment (`AGH_GIT_GRANT`), which a process of the same user can read, and the
 //! token files are that user's to read anyway. What bounds a grant is the helper's check,
@@ -28,6 +32,11 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::slug::Slug;
 
+/// The grant record's version: the `v` every grant file holds, and the folder's name
+/// (`Dirs::grants` is `<state>/grants-v<GRANT_VERSION>`). A change to the record changes it,
+/// and with it the folder.
+pub const GRANT_VERSION: u64 = 2;
+
 /// The most bytes a grant file may hold.
 #[cfg(unix)]
 const GRANT_FILE_MAX: usize = 4096;
@@ -42,8 +51,8 @@ const GRANT_SUFFIX: &str = ".json";
 #[cfg(unix)]
 const TMP_SUFFIX: &str = ".tmp";
 
-/// One grant file's contents:
-/// `{"expires_at":N,"pid":N,"profile":"…","slug":"…","start":N,"credential_binding":"…","v":2}`.
+/// One grant file's contents, `v` being [`GRANT_VERSION`]:
+/// `{"expires_at":N,"pid":N,"profile":"…","slug":"…","start":N,"credential_binding":"…","v":N}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Grant {
@@ -84,20 +93,20 @@ impl Grant {
             "slug": self.slug.to_string(),
             "start": self.start,
             "credential_binding": aterm_codec::hex::encode_lower(&self.credential_binding),
-            "v": 2,
+            "v": GRANT_VERSION,
         })
         .to_string()
     }
 
-    /// The grant `nonce`'s file holds, or `None` for anything that is not one agh wrote:
-    /// not JSON, another `v`, a field missing or of the wrong type, or a slug that does not
-    /// parse.
+    /// The grant `nonce`'s file holds, or `None` for anything that is not one this agh wrote:
+    /// not JSON, a `v` other than [`GRANT_VERSION`], a field missing or of the wrong type, or a
+    /// slug that does not parse.
     #[cfg(any(unix, test, debug_assertions))]
     fn from_json(nonce: &str, bytes: &[u8]) -> Option<Grant> {
         let aterm_json::Value::Object(mut map) = aterm_json::from_slice(bytes).ok()? else {
             return None;
         };
-        if map.get("v")?.as_u64()? != 2 {
+        if map.get("v")?.as_u64()? != GRANT_VERSION {
             return None;
         }
         let binding = map.get("credential_binding")?.as_str()?;
@@ -134,8 +143,8 @@ fn is_nonce(nonce: &str) -> bool {
     aterm_codec::hex::is_lower(nonce, 32)
 }
 
-/// What the helper reads grants through. The live view reads `<state>/agh/grants-v2` and the
-/// process table. A test's view is a map with no file and no process.
+/// What the helper reads grants through. The live view reads `dirs.grants()` and the process
+/// table. A test's view is a map with no file and no process.
 pub trait GrantView {
     /// The grant `nonce` names, when it is live for `slug`: not expired at `now`, its
     /// spawner `(pid, start)` an ancestor of this process within `ANCESTRY_DEPTH`, and its
@@ -185,7 +194,7 @@ fn read_grant(dir: &std::path::Path, nonce: &str) -> Option<Grant> {
     None
 }
 
-/// The grant `nonce`'s file name in `grants-v2/`: `{nonce}.json`.
+/// The grant `nonce`'s file name in `dirs.grants()`: `{nonce}.json`.
 #[cfg(any(unix, test, debug_assertions))]
 fn file_name(nonce: &str) -> String {
     format!("{nonce}{GRANT_SUFFIX}")
@@ -342,10 +351,11 @@ pub(crate) fn remove(dirs: &Dirs, grant: &Grant) {
     let _ = aterm_uds::private_file::remove_private(&dirs.grants(), &file_name(&grant.nonce));
 }
 
-/// Remove canonical grant or staging files only after their understood lifetime envelope
-/// establishes expiry. Version 1 and 2 both declare `expires_at`; recognizing that deadline
-/// grants no credential authority. Equality is live. Unsupported versions and payloads without
-/// an understood unsigned deadline are preserved.
+/// Remove canonical grant or staging files only after their lifetime envelope, read as this
+/// folder's version ([`GRANT_VERSION`]), establishes expiry; recognizing that deadline grants
+/// no credential authority. Equality is live. A record of another version and a payload
+/// without an understood unsigned deadline are preserved: another version's record is that
+/// version's agh to retire, never this one's.
 ///
 /// Each run reads at most 256 entries through the private reader, at most 4 KiB apiece.
 /// Refused files and incomplete staging payloads are left alone; file age alone cannot
@@ -390,19 +400,17 @@ pub(crate) fn sweep(dirs: &Dirs, now: u64) {
 }
 
 /// Retirement uses only the understood lifetime, independently of authorization parsing.
-/// Unsupported versions or unestablished deadlines never authorize removal.
+/// Another version or an unestablished deadline never authorizes removal.
 #[cfg(unix)]
 fn expired_lifetime_envelope(bytes: &[u8], now: u64) -> bool {
     let Ok(aterm_json::Value::Object(envelope)) = aterm_json::from_slice(bytes) else {
         return false;
     };
-    matches!(
-        envelope.get("v").and_then(aterm_json::Value::as_u64),
-        Some(1 | 2)
-    ) && envelope
-        .get("expires_at")
-        .and_then(aterm_json::Value::as_u64)
-        .is_some_and(|expiry| expiry < now)
+    envelope.get("v").and_then(aterm_json::Value::as_u64) == Some(GRANT_VERSION)
+        && envelope
+            .get("expires_at")
+            .and_then(aterm_json::Value::as_u64)
+            .is_some_and(|expiry| expiry < now)
 }
 
 /// The model's `grant` for the grant `nonce` names, read from `dirs.grants()` at `now`: 0 when

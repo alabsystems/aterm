@@ -6,15 +6,11 @@
 use std::time::{Duration, Instant};
 
 use aterm_vitals::Rates;
-use aterm_vitals::explain::episodes::CLAUSE_STALE_MS;
-use aterm_vitals::explain::{
-    CauseId, Context, Evidence, Lead, Part, Role, Voucher, WhySubject, account_of,
-};
 use aterm_vitals::history::{WEEK_BUCKET_S, WEEK_BUCKETS};
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{
     CpuView, DeedBy, DeedKind, DiskDeed, DiskFacts, HeatCell, LinkKind, Pressure, ProcScope,
-    Resource, ResourceView, Snapshot, StripEventKind,
+    Resource, ResourceView, Snapshot, StripEventKind, VolumeSample,
 };
 use aterm_vitals::ring::{Agg, Cell, GapKind};
 use aterm_vitals::sys::{exe_word, held};
@@ -1438,27 +1434,14 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     }
     let cols = t.vals.len().max(1);
     let pitch = (x1 - x0) / cols as f64;
-    let skies = trace_boxes(pen, t, (x0, y0, x1, y1), (lo, hi));
     // Plates first, the axis rules over them, then each column, tick and cap over the rules.
-    for sky in &skies {
-        let plate = Skyline {
-            plate: sky.plate,
-            ..Skyline::default()
-        };
-        pen.skyline(&plate);
-    }
-    for (k, l) in labels.iter().enumerate() {
-        let yy = y1 - ch * k as f64 / n as f64;
-        pen.rule(x0, yy, x1 - x0, rgba(inks.grid, 0xFF));
-        pen.text_end(x0 - 4.0, yy + 3.2, l, AXIS_PT, false, inks.words2);
-    }
-    for sky in &skies {
-        let rest = Skyline {
-            plate: None,
-            ..*sky
-        };
-        pen.skyline(&rest);
-    }
+    draw_columns(pen, t, (x0, y0, x1, y1), (lo, hi), |pen| {
+        for (k, l) in labels.iter().enumerate() {
+            let yy = y1 - ch * k as f64 / n as f64;
+            pen.rule(x0, yy, x1 - x0, rgba(inks.grid, 0xFF));
+            pen.text_end(x0 - 4.0, yy + 3.2, l, AXIS_PT, false, inks.words2);
+        }
+    });
     let mut rule_xs: Vec<f64> = Vec::with_capacity(t.events.len() + 1);
     if let Some((at, _)) = &t.mark {
         let fx = x0 + at * pitch;
@@ -1473,36 +1456,7 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
         }
     }
     let mut said: Vec<(f64, f64)> = Vec::new();
-    let mut j = 0;
-    while j < cols {
-        if t.vals.get(j).is_some_and(Option::is_some) {
-            j += 1;
-            continue;
-        }
-        let start = j;
-        while j < cols && t.vals.get(j).is_some_and(Option::is_none) {
-            j += 1;
-        }
-        let (xa, xb) = (x0 + start as f64 * pitch, x0 + j as f64 * pitch);
-        let gap_kind = t
-            .gaps
-            .iter()
-            .filter(|g| g.start < j as f64 + 0.5 && g.end > start as f64 - 0.5)
-            .map(|g| g.kind)
-            .max();
-        let hollow_ink = match gap_kind {
-            Some(GapKind::Crash) => rgba(inks.critical, 0xCC),
-            Some(GapKind::Sleep) => rgba(inks.words2, 0xAA),
-            _ => rgba(inks.hollow, 0xFF),
-        };
-        if pitch * pen.s >= 3.0 {
-            for k in start..j {
-                let xk = x0 + k as f64 * pitch;
-                pen.hollow(xk, y1 - 4.0, pitch, 4.0, hollow_ink);
-            }
-        } else {
-            pen.hollow(xa, y1 - 4.0, xb - xa, 4.0, hollow_ink);
-        }
+    for (xa, xb, gap_kind) in draw_unread_runs(pen, t, (x0, x1, y1), 4.0) {
         let (words, word_ink) = match gap_kind {
             Some(GapKind::Crash) => ("crash", inks.warn_text),
             Some(GapKind::Sleep) => ("asleep", inks.words2),
@@ -1606,10 +1560,95 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     // Each removal: a short 1 pt tick in a strip under the axis, ending above the labels under
     // it, so a removal reads by its shape and place and never by its heat alone; its ink is the
     // words ink this ground solved.
+    draw_removal_ticks(pen, t, (x0, x1), (y1 + 1.0, y1 + 4.0));
+}
+
+/// `t`'s read columns between `x0` and `x1`, from `y0` down to `y1` (pt), on the axis `lo..hi`
+/// ([`trace_boxes`]): each column's plate first, then what `between` draws over the plates (a
+/// chart's axis rules), then each column, tick and cap over that.
+fn draw_columns(
+    pen: &mut Pen<'_>,
+    t: &Trace,
+    (x0, y0, x1, y1): (f64, f64, f64, f64),
+    (lo, hi): (f64, f64),
+    between: impl FnOnce(&mut Pen<'_>),
+) {
+    let skies = trace_boxes(pen, t, (x0, y0, x1, y1), (lo, hi));
+    for sky in &skies {
+        let plate = Skyline {
+            plate: sky.plate,
+            ..Skyline::default()
+        };
+        pen.skyline(&plate);
+    }
+    between(pen);
+    for sky in &skies {
+        let rest = Skyline {
+            plate: None,
+            ..*sky
+        };
+        pen.skyline(&rest);
+    }
+}
+
+/// Each run of `t`'s unread columns between `x0` and `x1`, hollow along the foot `y1` (pt), `h`
+/// tall: a column each where a column is 3 device px or wider, else the run as one; in the
+/// crash or sleep ink where a gap of that kind overlaps it. Each run as `(from, to, its gap's
+/// kind)`, pt, left to right.
+fn draw_unread_runs(
+    pen: &mut Pen<'_>,
+    t: &Trace,
+    (x0, x1, y1): (f64, f64, f64),
+    h: f64,
+) -> Vec<(f64, f64, Option<GapKind>)> {
+    let inks = pen.inks;
+    let cols = t.vals.len().max(1);
+    let pitch = (x1 - x0) / cols as f64;
+    let mut runs = Vec::new();
+    let mut j = 0;
+    while j < cols {
+        if t.vals.get(j).is_some_and(Option::is_some) {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j < cols && t.vals.get(j).is_some_and(Option::is_none) {
+            j += 1;
+        }
+        let (xa, xb) = (x0 + start as f64 * pitch, x0 + j as f64 * pitch);
+        let gap_kind = t
+            .gaps
+            .iter()
+            .filter(|g| g.start < j as f64 + 0.5 && g.end > start as f64 - 0.5)
+            .map(|g| g.kind)
+            .max();
+        let hollow_ink = match gap_kind {
+            Some(GapKind::Crash) => rgba(inks.critical, 0xCC),
+            Some(GapKind::Sleep) => rgba(inks.words2, 0xAA),
+            _ => rgba(inks.hollow, 0xFF),
+        };
+        if pitch * pen.s >= 3.0 {
+            for k in start..j {
+                let xk = x0 + k as f64 * pitch;
+                pen.hollow(xk, y1 - h, pitch, h, hollow_ink);
+            }
+        } else {
+            pen.hollow(xa, y1 - h, xb - xa, h, hollow_ink);
+        }
+        runs.push((xa, xb, gap_kind));
+    }
+    runs
+}
+
+/// Each removal of `t` a 1 pt tick from `ya` down to `yb` (pt) at its column's place between `x0`
+/// and `x1`, in the words ink: a removal reads by its shape and place, never by its heat alone.
+fn draw_removal_ticks(pen: &mut Pen<'_>, t: &Trace, (x0, x1): (f64, f64), (ya, yb): (f64, f64)) {
+    let pitch = (x1 - x0) / t.vals.len().max(1) as f64;
+    let ink = rgba(pen.inks.words, 0xFF);
     for &at in &t.removals {
         let fx = x0 + at * pitch;
         if (x0..=x1).contains(&fx) {
-            pen.tick(fx, y1 + 1.0, y1 + 4.0, rgba(inks.words, 0xFF));
+            pen.tick(fx, ya, yb, ink);
         }
     }
 }
@@ -2216,6 +2255,11 @@ fn lab_network_doc(
 #[path = "stats_lens_network_tests.rs"]
 mod network_tests;
 
+/// The Disk Custody band under the Deck: the Disk lens's readings at a glance, drawn with its
+/// pen and its drawing functions.
+#[path = "stats_disk_band.rs"]
+pub(crate) mod disk_band;
+
 fn doc_for<'d>(c: Ctx<'d>, focus: Instrument) -> LensDoc<'d> {
     match focus {
         Instrument::Disk => disk_doc(c),
@@ -2314,16 +2358,7 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
     let d = watched(snap);
     let space =
         words::space_line(Resource::Disk, snap).unwrap_or_else(|| words::disk_space_line(&v));
-    let lines: Vec<(&str, u64, bool)> = d.map_or_else(Vec::new, |d| {
-        [
-            ("warn", d.warn, false),
-            ("clean", d.floor, false),
-            ("emergency", d.emergency, true),
-        ]
-        .into_iter()
-        .filter_map(|(w, b, critical)| b.map(|b| (w, b, critical)))
-        .collect()
-    });
+    let lines = level_lines(d);
     let legend: Vec<String> = if lines.is_empty() {
         Vec::new()
     } else {
@@ -2361,10 +2396,8 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
     });
     // What the used space is, from the rows Held by lists over the same volume, and the cap
     // the budget holds it to: both are readings, and neither moves the level or its lines.
-    let held = snap.facts.disk.as_ref().and_then(|d| d.held.as_deref());
-    let walk = held.map_or(held::Walk::Complete, |h| h.walk);
-    let spans = held.and_then(|h| class_spans(&held_lines(h, Some(v.used()), c.panes), h.walk));
-    let cap = d.and_then(|d| d.cap);
+    let (spans, walk) = volume_spans(snap, &v, c.panes);
+    let cap = d.and_then(DiskFacts::cap);
     let key = space_key(spans, walk, cap);
     let mut words = vec![space.clone()];
     words.extend(legend.first().cloned());
@@ -2407,46 +2440,7 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
         };
         draw_space_key(pen, beside, &key);
         let inks = pen.inks;
-        let (by, bh) = (p.y + 16.0, 10.0);
-        let total = v.total.max(1) as f64;
-        pen.rect(p.x, by, p.w, bh, 1.5, rgba(inks.track, 0xFF));
-        let used = p.w * (v.used() as f64 / total).clamp(0.0, 1.0);
-        let machine = pen.machine();
-        pen.rect(p.x, by, used, bh, 1.5, rgba(machine, 0xFF));
-        if let Some(spans) = spans {
-            // From the fill's end leftward: what a build makes again, solid; then what is costly
-            // to have again, the same hue hatched (`hatch_ink`). What is left of the fill is
-            // kept or not classified, in the machine's ink as before.
-            // A span with bytes is never narrower than `least`: two device px solid, and
-            // hatched a whole period, so a few costly bytes do not read as rebuildable.
-            let share = |bytes: u64, least: f64| {
-                if bytes == 0 {
-                    0.0
-                } else {
-                    (p.w * bytes as f64 / total).max(least)
-                }
-            };
-            let e2 = p.x + used;
-            let e1 = (e2 - share(spans.rebuildable, 2.0 / pen.s)).max(p.x);
-            let e0 = (e1 - share(spans.costly, HATCH_LEAST)).max(p.x);
-            let hue = class_hue(pen);
-            pen.rect(e0, by, e2 - e0, bh, 0.0, rgba(hue, 0xFF));
-            let stroke = hatch_ink(pen);
-            pen.hatch(e0, by, e1 - e0, bh, stroke);
-        }
-        for (_, b, critical) in &lines {
-            let lx = p.x + p.w * (1.0 - (*b as f64 / total).clamp(0.0, 1.0));
-            let ink = if *critical { inks.critical } else { inks.warn };
-            pen.tick(lx, by - 2.0, by + bh + 2.0, rgba(ink, 0xFF));
-        }
-        if let Some(cap) = cap {
-            // The cap counts used bytes, so it is measured from the bar's start. It is a reading,
-            // never a level, and no ink alone says so: where a level's line is a tick across the
-            // bar in its own ink, the cap is a caret under the bar in the secondary words' ink,
-            // on the shell's ground whatever fill the bar has above it.
-            let cx = p.x + p.w * (cap as f64 / total).clamp(0.0, 1.0);
-            pen.caret(cx, by + bh + 0.75, rgba(inks.words2, 0xFF));
-        }
+        draw_space_bar(pen, (p.x, p.y + 16.0, p.w, 10.0), &v, spans, &lines, cap);
         let base = p.y + 39.0;
         let s = pen.cut(&space, p.w, NOTE_PT, false);
         let lw = pen.text(p.x, base, &s, NOTE_PT, false, inks.words);
@@ -2467,6 +2461,89 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
         right: false,
         parts,
         forms: vec![full, line_form("Space", line)],
+    }
+}
+
+/// The level lines Space now's bar ticks while the disk watch runs (`d`): warn, clean and
+/// emergency, each its word, its bytes free and whether it is the critical one.
+fn level_lines(d: Option<&DiskFacts>) -> Vec<(&'static str, u64, bool)> {
+    d.map_or_else(Vec::new, |d| {
+        [
+            ("warn", d.warn, false),
+            ("clean", d.floor, false),
+            ("emergency", d.emergency, true),
+        ]
+        .into_iter()
+        .filter_map(|(w, b, critical)| b.map(|b| (w, b, critical)))
+        .collect()
+    })
+}
+
+/// The used bytes of `v` by class, from the rows Held by lists over the same volume
+/// ([`held_lines`], `panes` the front tab's sessions), and where the walks behind them stand:
+/// no spans where the host gathered no rows, whose walks then read complete.
+fn volume_spans(
+    snap: &Snapshot,
+    v: &VolumeSample,
+    panes: &[u64],
+) -> (Option<ClassSpans>, held::Walk) {
+    let held = snap.facts.disk.as_ref().and_then(|d| d.held.as_deref());
+    let walk = held.map_or(held::Walk::Complete, |h| h.walk);
+    let spans = held.and_then(|h| class_spans(&held_lines(h, Some(v.used()), panes), h.walk));
+    (spans, walk)
+}
+
+/// Space now's bar at `(x, by)`, `w` by `bh` pt, for the volume `v`: the track, the used fill in
+/// the machine's ink and over its end the classes of `spans` (rebuildable solid, costly hatched,
+/// in one hue), a tick across it at each of the level `lines` and the budget's `cap` as a caret
+/// under it. The Disk lens and the Disk Custody band ([`disk_band`]) draw this one bar.
+fn draw_space_bar(
+    pen: &mut Pen<'_>,
+    (x, by, w, bh): (f64, f64, f64, f64),
+    v: &VolumeSample,
+    spans: Option<ClassSpans>,
+    lines: &[(&str, u64, bool)],
+    cap: Option<u64>,
+) {
+    let inks = pen.inks;
+    let total = v.total.max(1) as f64;
+    pen.rect(x, by, w, bh, 1.5, rgba(inks.track, 0xFF));
+    let used = w * (v.used() as f64 / total).clamp(0.0, 1.0);
+    let machine = pen.machine();
+    pen.rect(x, by, used, bh, 1.5, rgba(machine, 0xFF));
+    if let Some(spans) = spans {
+        // From the fill's end leftward: what a build makes again, solid; then what is costly
+        // to have again, the same hue hatched (`hatch_ink`). What is left of the fill is
+        // kept or not classified, in the machine's ink as before.
+        // A span with bytes is never narrower than `least`: two device px solid, and
+        // hatched a whole period, so a few costly bytes do not read as rebuildable.
+        let share = |bytes: u64, least: f64| {
+            if bytes == 0 {
+                0.0
+            } else {
+                (w * bytes as f64 / total).max(least)
+            }
+        };
+        let e2 = x + used;
+        let e1 = (e2 - share(spans.rebuildable, 2.0 / pen.s)).max(x);
+        let e0 = (e1 - share(spans.costly, HATCH_LEAST)).max(x);
+        let hue = class_hue(pen);
+        pen.rect(e0, by, e2 - e0, bh, 0.0, rgba(hue, 0xFF));
+        let stroke = hatch_ink(pen);
+        pen.hatch(e0, by, e1 - e0, bh, stroke);
+    }
+    for (_, b, critical) in lines {
+        let lx = x + w * (1.0 - (*b as f64 / total).clamp(0.0, 1.0));
+        let ink = if *critical { inks.critical } else { inks.warn };
+        pen.tick(lx, by - 2.0, by + bh + 2.0, rgba(ink, 0xFF));
+    }
+    if let Some(cap) = cap {
+        // The cap counts used bytes, so it is measured from the bar's start. It is a reading,
+        // never a level, and no ink alone says so: where a level's line is a tick across the
+        // bar in its own ink, the cap is a caret under the bar in the secondary words' ink,
+        // on the shell's ground whatever fill the bar has above it.
+        let cx = x + w * (cap as f64 / total).clamp(0.0, 1.0);
+        pen.caret(cx, by + bh + 0.75, rgba(inks.words2, 0xFF));
     }
 }
 
@@ -2601,8 +2678,6 @@ const WEEKS: &[(f64, &str)] = &[
 
 /// The hours a three-week trace's column merges.
 const WEEK_MERGE: usize = 3;
-/// A three-week trace's columns.
-const WEEK_COLUMNS: usize = WEEK_BUCKETS / WEEK_MERGE;
 /// An hour, ms: a three-week bucket.
 const WEEK_HOUR_MS: i64 = WEEK_BUCKET_S * 1000;
 /// A three-week trace's column, ms.
@@ -2627,6 +2702,15 @@ fn weeks_removals(snap: &Snapshot, start_ms: i64) -> Vec<(i64, u64)> {
 /// holds is a tick under the axis at its hour's middle, and the largest is marked with its bytes
 /// and its day: `freed`, not `aterm freed`, since a tab removes too.
 fn weeks_trace(c: Ctx<'_>) -> (Trace, i64) {
+    weeks_trace_of(c, WEEK_MERGE)
+}
+
+/// [`weeks_trace`] with `merge` hours to a column (`1..=WEEK_BUCKETS`): the Disk Custody band's
+/// smaller strip merges more of them, each column the hour buckets in it merged as the lens's are.
+fn weeks_trace_of(c: Ctx<'_>, merge: usize) -> (Trace, i64) {
+    let merge = merge.clamp(1, WEEK_BUCKETS);
+    let columns = WEEK_BUCKETS / merge;
+    let column_ms = WEEK_HOUR_MS * merge as i64;
     let snap = c.snap;
     let now = snap.at_unix_ms;
     let total = snap
@@ -2635,13 +2719,13 @@ fn weeks_trace(c: Ctx<'_>) -> (Trace, i64) {
         .map(|v| v.total)
         .or_else(|| snap.free_weeks.volume().map(|v| v.total))
         .filter(|&t| t > 0);
-    let start = (now.div_euclid(WEEK_COLUMN_MS) + 1 - WEEK_COLUMNS as i64) * WEEK_COLUMN_MS;
+    let start = (now.div_euclid(column_ms) + 1 - columns as i64) * column_ms;
     let hours = snap.free_weeks.buckets(now);
     let first_hour = now.div_euclid(WEEK_HOUR_MS) + 1 - WEEK_BUCKETS as i64;
-    let merged: Vec<Option<Agg>> = (0..WEEK_COLUMNS)
+    let merged: Vec<Option<Agg>> = (0..columns)
         .map(|j| {
-            let from = start.div_euclid(WEEK_HOUR_MS) + (j * WEEK_MERGE) as i64;
-            (from..from + WEEK_MERGE as i64)
+            let from = start.div_euclid(WEEK_HOUR_MS) + (j * merge) as i64;
+            (from..from + merge as i64)
                 .filter_map(|h| {
                     let i = usize::try_from(h - first_hour).ok()?;
                     hours.get(i).copied().flatten()
@@ -2654,7 +2738,7 @@ fn weeks_trace(c: Ctx<'_>) -> (Trace, i64) {
         })
         .collect();
     let (vals, peaks, heat) = used_columns(&merged, total);
-    let at_col = |at: i64| (at + WEEK_HOUR_MS / 2 - start) as f64 / WEEK_COLUMN_MS as f64;
+    let at_col = |at: i64| (at + WEEK_HOUR_MS / 2 - start) as f64 / column_ms as f64;
     let removed = weeks_removals(snap, start);
     let removals = removed.iter().map(|&(at, _)| at_col(at)).collect();
     let mark = removed
@@ -2688,10 +2772,28 @@ fn weeks_trace(c: Ctx<'_>) -> (Trace, i64) {
 fn weeks_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let (trace, start) = weeks_trace(c);
+    let said = weeks_said(c, &trace, start);
+    let (growth, line) = filling_words(snap);
+    trace_section(
+        c,
+        "GB used, last 3 weeks",
+        growth,
+        trace,
+        said,
+        "Filling",
+        line,
+        false,
+    )
+}
+
+/// What [`weeks_trace`]'s chart `trace`, starting at `start` (unix ms), says to a reader: the
+/// used space over the 3 weeks, and its removals as the chart marks them, by the hour.
+fn weeks_said(c: Ctx<'_>, trace: &Trace, start: i64) -> String {
+    let snap = c.snap;
     let mut said = trace_said(
         "GB used over the last 3 weeks",
         "gigabytes",
-        &trace,
+        trace,
         (start, WEEK_COLUMN_MS),
         &c.loc,
     );
@@ -2715,17 +2817,7 @@ fn weeks_section(c: Ctx<'_>) -> Section<'_> {
             ));
         }
     }
-    let (growth, line) = filling_words(snap);
-    trace_section(
-        c,
-        "GB used, last 3 weeks",
-        growth,
-        trace,
-        said,
-        "Filling",
-        line,
-        false,
-    )
+    said
 }
 
 /// What the software did (`docs/DESIGN-disk-custody-2026-11-12.md` §4): the deeds the host read
@@ -2824,9 +2916,10 @@ fn deed_words(kind: &DeedKind, by: &DeedBy) -> String {
     }
 }
 
-/// A free-space ask's row (`aterm_agent::harness::disk::ask`) in words: its `said` word, read
-/// with the session it names as its subject where it names one (`session`), else as aterm's
-/// step; a word this build does not know reads as the row does, `free-ask` and its word.
+/// A free-space ask's row in words (`free-ask`: no build writes one now, and a ledger keeps
+/// those an earlier build wrote until its own bound drops them): its `said` word, read with the
+/// session it names as its subject where it names one (`session`), else as aterm's step; a word
+/// this build does not know reads as the row does, `free-ask` and its word.
 fn ask_words(said: &str, session: bool) -> String {
     let words = match (said, session) {
         ("quiet", _) => "found room on the disk",
@@ -2924,7 +3017,9 @@ impl Size {
 }
 
 /// One line of Held by: a holding as `sys disk held` prints it, or, last, the used bytes no
-/// holding names. It carries no path: the lens draws none.
+/// holding names. It carries no path, which the lens draws none of, only the name of the folder
+/// its folder is in (`Caches` for `~/Library/Caches/aterm`), which tells apart two holdings of
+/// one project and one kind where the Disk Custody band lists both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeldLine {
     project: String,
@@ -2944,6 +3039,8 @@ struct HeldLine {
     cut: bool,
     class: held::Class,
     next: held::Next,
+    /// The name of the folder its folder is in; empty where there is none (the last line).
+    parent: String,
 }
 
 impl HeldLine {
@@ -3005,6 +3102,11 @@ fn held_lines(h: &held::Holdings, used: Option<u64>, panes: &[u64]) -> Vec<HeldL
                 cut: shown.clamped,
                 class: row.class,
                 next: row.next,
+                parent: std::path::Path::new(&row.path)
+                    .parent()
+                    .and_then(std::path::Path::file_name)
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -3022,6 +3124,7 @@ fn held_lines(h: &held::Holdings, used: Option<u64>, panes: &[u64]) -> Vec<HeldL
             cut: false,
             class: held::Class::Unclassified,
             next: held::Next::Unknown,
+            parent: String::new(),
         });
     }
     lines
@@ -3575,6 +3678,25 @@ fn widest<'t>(pen: &Pen<'_>, texts: impl Iterator<Item = &'t str>) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// A holding's session mark at `x` on the baseline `base` ([`HeldCells::mark`]): a disc while its
+/// session is at work, in the front tab's ink where that session is the front tab's (`panes`),
+/// as its chips are; a ring once the session is gone; nothing where no session claims it.
+fn draw_held_mark(pen: &mut Pen<'_>, x: f64, base: f64, mark: Option<(bool, bool)>, panes: &[u64]) {
+    let Some((filled, mine)) = mark else {
+        return;
+    };
+    let inks = pen.inks;
+    let tab = panes
+        .first()
+        .map(|&pane| chip_ink(pen, ProcScope::Tab(pane), panes));
+    let ink = match (filled, mine) {
+        (true, true) => tab.unwrap_or(inks.words),
+        (true, false) => inks.words,
+        (false, _) => inks.words2,
+    };
+    pen.dot(x + 3.5, base - 3.4, 2.75, filled, ink);
+}
+
 /// Held by's `shown` lines under its heading at `p`'s top, one a pitch, in columns: the class's
 /// swatch, the project, the kind of folder, the session's mark and words, the class's word, the
 /// size ending its column, and last what the next pass does. That column is as wide as its
@@ -3667,18 +3789,7 @@ fn draw_held(pen: &mut Pen<'_>, p: Place, shown: &[HeldShown], panes: &[u64]) {
             pen.text(kind_x, base, &s, BODY_PT, false, inks.words2);
         }
         let at_work = matches!(cell.mark, Some((true, _)));
-        if let Some((filled, mine)) = cell.mark {
-            // The front tab's session takes the tab's ink, as its chips do.
-            let tab = panes
-                .first()
-                .map(|&pane| chip_ink(pen, ProcScope::Tab(pane), panes));
-            let ink = match (filled, mine) {
-                (true, true) => tab.unwrap_or(inks.words),
-                (true, false) => inks.words,
-                (false, _) => inks.words2,
-            };
-            pen.dot(mark_x + 3.5, base - 3.4, 2.75, filled, ink);
-        }
+        draw_held_mark(pen, mark_x, base, cell.mark, panes);
         if words {
             let s = pen.cut(&cell.session, session_w, BODY_PT, false);
             let ink = if at_work { inks.words } else { inks.words2 };
@@ -3926,9 +4037,8 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         }
         _ => vec!["not read yet".to_owned()],
     };
-    let why = why_now_section(c);
     let mut sections = vec![
-        cores_section(c, why.is_some()),
+        cores_section(c, false),
         busiest_section(c),
         line_section("Load", "Load", load, true),
         line_section("Over max", "Over max", vec![over_words], true),
@@ -3967,7 +4077,6 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
             );
         }
     }
-    sections.extend(why);
     sections.extend(cpu_accounting_section(c));
     LensDoc {
         name: "CPU",
@@ -4139,16 +4248,15 @@ fn busiest_line(c: Ctx<'_>) -> Option<String> {
         .map(|up| format!(", {up}"))
         .unwrap_or_default();
     Some(format!(
-        "{}{times}{who}, {} cores{up}",
+        "{}{times}{who}, {} reported cores{up}",
         aterm_vitals::jobs::wire::person_name(&b.name),
         words::cores(b.cores)
     ))
 }
 
-/// Busiest now: the busiest processes in the chosen scope.
+/// Processes ranked by reported counter growth in the chosen scope.
 fn busiest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
-    let n = snap.total_cores().unwrap_or(1).max(1) as f64;
     let mut programs: Vec<_> = snap
         .programs
         .iter()
@@ -4161,28 +4269,28 @@ fn busiest_section(c: Ctx<'_>) -> Section<'_> {
             chip: Some(t.scope),
             name: program_label(&t.name, t.n as usize),
             scope: Some(c.scope_word(t.scope)),
-            share: Some(f64::from(t.cores) / n),
-            figure: format!("{} cores", words::cores(t.cores)),
+            share: None,
+            figure: format!("{} reported cores", words::cores(t.cores)),
         })
         .collect();
-    let name = format!("Busiest now{}", c.suffix());
+    let name = format!("Largest reported CPU{}", c.suffix());
     let mut line: Vec<String> = busiest_line(c).into_iter().collect();
     line.extend(rows.first().map(Row::said));
     if rows.is_empty() {
-        line.push("nothing busy in this scope".into());
-        return line_section(&name, "Busiest", line, true);
+        line.push("no CPU counter growth reported in this scope".into());
+        return line_section(&name, "Reported CPU", line, true);
     }
     list_section(
         c,
         name,
         vec![
-            "cores-worth over the last reading".into(),
-            "cores-worth".into(),
+            "reported growth per second of read span".into(),
+            "reported cores".into(),
         ],
         rows,
         None,
         if c.two { 6 } else { 4 },
-        "Busiest",
+        "Reported CPU",
         line,
         true,
     )
@@ -4207,19 +4315,16 @@ fn cpu_accounting_section(c: Ctx<'_>) -> Option<Section<'_>> {
             if matches!(scope, ProcScope::Tab(0)) {
                 return None;
             }
-            let charge = words::cpu_charge_words(fig)?;
-            let actual = fig.now?;
-            let (prefix, shown) = if fig.unread > 0 {
-                ("≥", (actual * 100.0).floor() / 100.0)
-            } else {
-                ("", actual)
-            };
+            let reported = fig.now?;
+            let charge = words::cpu_charge_words(fig)
+                .map(|charge| format!(" · {charge}"))
+                .unwrap_or_default();
             Some(Row {
                 chip: Some(scope),
                 name: name.into(),
                 scope: None,
                 share: None,
-                figure: format!("{prefix}{shown:.2} confirmed · {charge}"),
+                figure: format!("{reported:.2} reported{charge}"),
             })
         })
         .collect();
@@ -4230,7 +4335,7 @@ fn cpu_accounting_section(c: Ctx<'_>) -> Option<Section<'_>> {
     Some(list_section(
         c,
         "CPU accounting".into(),
-        vec!["cores · confirmed CPU and counter charges".into()],
+        vec!["cores · reported counter growth".into()],
         rows,
         Some(words::CPU_CHARGE_NOTE.into()),
         2,
@@ -4238,337 +4343,6 @@ fn cpu_accounting_section(c: Ctx<'_>) -> Option<Section<'_>> {
         line,
         true,
     ))
-}
-
-/// Where a row's words start after the ∵ mark.
-const MARK_ADV: f64 = 11.0;
-
-/// Why now (RD §4.2), worded from the account [`account_of`] gives; `None` unless a covering
-/// episode is open on facts no older than [`CLAUSE_STALE_MS`].
-fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
-    let snap = c.snap;
-    let a = account_of(WhySubject::Cpu, c.panes, snap);
-    let f = a.facts.as_deref()?;
-    let age_ms = snap.at_ns.saturating_sub(f.at_ns) / 1_000_000;
-    let top = f.open.iter().find(|o| o.id.covering());
-    let top = top.filter(|_| age_ms <= CLAUSE_STALE_MS)?;
-    let held = a
-        .causes
-        .iter()
-        .find(|s| s.cause.id.covering() && s.opened_unix_ms.is_some())
-        .map(|s| {
-            let context = Context::ORDER
-                .into_iter()
-                .find(|c| s.cause.contexts.contains(c));
-            (
-                s.cause.id,
-                context,
-                s.cause.covers_mc,
-                Some(&s.cause.evidence),
-            )
-        });
-    let (id, context, covers_mc, evidence) = held.unwrap_or_else(|| {
-        let context = Context::ORDER
-            .into_iter()
-            .find(|c| top.contexts.contains(c));
-        (top.id, context, top.covers_mc, None)
-    });
-    let services = words::services_word(c.loc.platform.name());
-    let two = |mc: i64| cents((mc + 5).div_euclid(10));
-
-    let (marked, base, short) = match id {
-        CauseId::Activity(act) => {
-            let word = act.activity().word.to_owned();
-            (true, word.clone(), word)
-        }
-        CauseId::AppWork(coalition) => {
-            let lead = f
-                .split
-                .rows
-                .iter()
-                .find(|r| r.id == coalition)
-                .and_then(|r| r.lead.as_ref());
-            let name = lead.and_then(|l| l.exe.as_deref()).map_or_else(
-                || "an app".to_owned(),
-                aterm_vitals::jobs::wire::person_name,
-            );
-            let voucher = lead.map_or(Voucher::Unknown, |l| l.voucher);
-            let chip = match voucher {
-                Voucher::Apple => "Apple".to_owned(),
-                Voucher::DeveloperId => lead.and_then(Lead::team_id).map_or_else(
-                    || "Developer ID".to_owned(),
-                    |t| format!("Developer ID {t}"),
-                ),
-                Voucher::AdHoc => "ad-hoc".to_owned(),
-                v => v.word().to_owned(),
-            };
-            let whose = if voucher == Voucher::Apple {
-                "macOS (as you)"
-            } else {
-                "yours"
-            };
-            (true, format!("{name} \u{b7} {chip} \u{b7} {whose}"), name)
-        }
-        CauseId::TabWork(k) => {
-            let work = snap.tab(k).map_or_else(
-                || "a tab's work".to_owned(),
-                |t| format!("{}'s work", t.label),
-            );
-            (true, work.clone(), work)
-        }
-        CauseId::AtermWork => (
-            true,
-            "aterm outside tabs".to_owned(),
-            "aterm outside tabs".to_owned(),
-        ),
-        CauseId::Unexplained => {
-            let base = match evidence {
-                Some(Evidence::Uncovered { part }) => {
-                    let word = match part {
-                        Part::Services => services,
-                        Part::Others => "others",
-                        Part::Aterm => "aterm",
-                    };
-                    format!("no cause aterm can name: {word}")
-                }
-                Some(Evidence::Unaccounted) => "no cause aterm can name: unaccounted".to_owned(),
-                _ => "no cause aterm can name".to_owned(),
-            };
-            (false, base.clone(), base)
-        }
-        CauseId::Context(_) => return None,
-    };
-    let long = words::cause_words(&base, context);
-    let covers = if held.is_some() {
-        format!("{} cores", two(covers_mc))
-    } else {
-        format!("was {} cores", two(covers_mc))
-    };
-
-    let at_least = a.tab_at_least(snap);
-    let p = a.parts.unwrap_or_else(|| f.split.parts_of(&[]));
-    let [services_h, others_h, tab_h, rest_h, residual_h] = hundredths(
-        [p.services, p.others, p.tab, p.aterm_rest, p.unaccounted],
-        f.split.global_mc,
-    );
-    let tab_part = (!c.panes.is_empty()).then(|| match a.parts {
-        Some(_) => format!(
-            ", {} {}{}",
-            c.tab_label,
-            if at_least { "at least " } else { "" },
-            cents(tab_h)
-        ),
-        None => format!(", {} not read", c.tab_label),
-    });
-    let mut parts = [
-        (services, p.services, services_h, None),
-        ("others", p.others, others_h, None),
-        ("aterm", p.tab + p.aterm_rest, tab_h + rest_h, tab_part),
-    ];
-    parts.sort_by_key(|x| std::cmp::Reverse(x.1));
-    let residual = (residual_h != 0).then(|| {
-        let sign = if residual_h > 0 { "+" } else { "" };
-        format!("unaccounted {sign}{}", cents(residual_h))
-    });
-    let split_of = |tab: bool, residual: Option<&String>| {
-        let words = parts.iter().map(|(w, _, h, part)| {
-            let part = part.as_deref().filter(|_| tab).unwrap_or_default();
-            format!("{w} {}{part}", cents(*h))
-        });
-        words
-            .chain(residual.cloned())
-            .collect::<Vec<_>>()
-            .join(" \u{b7} ")
-    };
-    let split = split_of(true, residual.as_ref());
-    let splits = dedup(vec![
-        split.clone(),
-        split_of(false, residual.as_ref()),
-        split_of(false, None),
-    ]);
-    let busy = format!("{} cores", two(f.split.global_mc));
-
-    let y = &a.you;
-    let of = |mc: i64| {
-        format!(
-            "{}{} of {} cores",
-            if at_least { "at least " } else { "" },
-            words::cores(mc as f32 / 1000.0),
-            words::cores(f.split.global_mc as f32 / 1000.0)
-        )
-    };
-    let you = match (y.role, y.figure) {
-        (Role::Main, Some(t)) => format!("this tab is the main cause: {}", of(t)),
-        (Role::Minor, Some(t)) => {
-            let pct = y
-                .share_pm
-                .filter(|_| !at_least)
-                .map(|pm| format!(" ({:.1}%)", f64::from(pm) / 10.0))
-                .unwrap_or_default();
-            format!("this tab uses {}{pct}; it is not the cause", of(t))
-        }
-        (Role::Unavailable(_), Some(t)) => {
-            format!(
-                "this tab uses {}; whether it is the cause is not read now",
-                of(t)
-            )
-        }
-        _ => y.clause().to_owned(),
-    };
-    let trend = snap.cpu.as_ref().map_or("trend not read yet", |cpu| {
-        cpu.busy
-            .motion(words::CORES_GATE)
-            .word()
-            .unwrap_or("steady")
-    });
-
-    let step = if a.nothing_needed {
-        "nothing needed"
-    } else {
-        "no step offered yet"
-    };
-    let how = "measured per coalition";
-    let signed = match id {
-        CauseId::Activity(act) => format!(", {} by its code signature", act.activity().word),
-        _ => String::new(),
-    };
-
-    let rows: [(Vec<String>, Option<String>); 4] = [
-        (
-            dedup(vec![long.clone(), short.clone()]),
-            Some(covers.clone()),
-        ),
-        (splits, Some(busy.clone())),
-        (
-            dedup(vec![
-                format!("{you} \u{b7} {trend}"),
-                format!("{} \u{b7} {trend}", y.clause()),
-            ]),
-            None,
-        ),
-        (
-            dedup(vec![
-                format!("{step} \u{b7} {how}{signed}"),
-                format!("{step} \u{b7} {how}"),
-                step.to_owned(),
-            ]),
-            None,
-        ),
-    ];
-    let said = vec![
-        format!("{}{long}, {covers}.", if marked { "Why: " } else { "" }),
-        format!("{busy} busy: {split}."),
-        format!("{you}, {trend}."),
-        format!("{step}; {how}{signed}."),
-    ];
-    let window = window_words(f.window_ns);
-    let exact = if f.split.exact {
-        "exact, "
-    } else {
-        "partial, "
-    };
-    let subs = vec![
-        format!("{window} \u{b7} {exact}{} coalitions", f.split.listed),
-        window,
-    ];
-    let line = dedup(vec![
-        format!("{long}; {}", y.clause()),
-        format!("{short}; {}", y.clause()),
-        short,
-    ]);
-    let full = form(rows_h(rows.len(), false), move |pen, p| {
-        heading(pen, p, "Why now", &subs);
-        let ink = pen.inks.words2;
-        for (i, (forms, figure)) in rows.iter().enumerate() {
-            let base = p.y + ROW0_BASE + PITCH * i as f64;
-            let fig_w = figure.as_deref().map_or(0.0, |s| {
-                pen.text_end(p.x + p.w, base, s, BODY_PT, false, ink) + 8.0
-            });
-            let x = if i == 0 && marked {
-                cause_mark(pen, p.x, base);
-                MARK_ADV
-            } else {
-                0.0
-            };
-            let s = fit_cut(pen.m, forms, p.w - x - fig_w, BODY_PT, false);
-            pen.text(p.x + x, base, &s, BODY_PT, false, ink);
-        }
-    });
-    let one = Form {
-        h: LINE_H,
-        grow: false,
-        last: false,
-        label: Some("Why now".to_owned()),
-        draw: Box::new(move |pen, p| {
-            let base = p.y + HEAD_BASE;
-            let label = pen.cut("Why now", p.w, HEAD_PT, true);
-            let ink = pen.inks.words;
-            let lw = pen.text(p.x, base, &label, HEAD_PT, true, ink);
-            let mut x = tab_after(lw).max(pen.line_tab);
-            if marked {
-                cause_mark(pen, p.x + x, base);
-                x += MARK_ADV;
-            }
-            let s = fit_cut(pen.m, &line, p.w - x, BODY_PT, false);
-            let ink = pen.inks.words2;
-            pen.text(p.x + x, base, &s, BODY_PT, false, ink);
-        }),
-    };
-    Some(Section {
-        name: "Why now".into(),
-        words: said,
-        right: false,
-        parts: Vec::new(),
-        forms: vec![full, one],
-    })
-}
-
-/// The ∵ mark in the words2 ink ([`MARK_ADV`]).
-fn cause_mark(pen: &mut Pen<'_>, x: f64, base: f64) {
-    let ink = pen.inks.words2;
-    pen.mark(
-        WellMark::Cause,
-        x + 4.0,
-        base - 3.4,
-        BODY_PT,
-        crate::stats_paint::QUIET_ARC,
-        ink,
-    );
-}
-
-/// Millicores `mcs` in hundredths of a core.
-fn hundredths<const N: usize>(mcs: [i64; N], total_mc: i64) -> [i64; N] {
-    let mut out = mcs.map(|mc| mc.div_euclid(10));
-    let short = (total_mc + 5).div_euclid(10) - out.iter().sum::<i64>();
-    let mut order: [usize; N] = std::array::from_fn(|i| i);
-    order.sort_by_key(|&i| std::cmp::Reverse(mcs[i].rem_euclid(10)));
-    for &i in order.iter().take(usize::try_from(short).unwrap_or(0)) {
-        out[i] += 1;
-    }
-    out
-}
-
-/// Why now's window, `window_ns` long, as `1 s window` (`0.9 s window`):
-/// rounded to a tenth of a second first, then in whole seconds where that
-/// reads 1.0 s or more and with its one decimal under it, so a window that
-/// wobbles about a second (995 to 1,004 ms from one split tick to the next)
-/// keeps its words.
-fn window_words(window_ns: u64) -> String {
-    const SECOND_NS: u64 = 1_000_000_000;
-    const TENTH_NS: u64 = SECOND_NS / 10;
-    let tenths = window_ns.saturating_add(TENTH_NS / 2) / TENTH_NS;
-    if tenths >= 10 {
-        let secs = window_ns.saturating_add(SECOND_NS / 2) / SECOND_NS;
-        format!("{secs} s window")
-    } else {
-        format!("0.{tenths} s window")
-    }
-}
-
-/// Hundredths of a core `h` as `2.17` (`-0.05`).
-fn cents(h: i64) -> String {
-    let sign = if h < 0 { "-" } else { "" };
-    format!("{sign}{}.{:02}", h.abs() / 100, h.abs() % 100)
 }
 
 /// `forms` with each repeat of the one before it dropped.

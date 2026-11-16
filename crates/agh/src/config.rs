@@ -116,15 +116,17 @@ impl Dirs {
         self.state.join("journal")
     }
 
-    /// `<state>/grants-v2`: the git grants, whose records are version 2. The folder belongs to
-    /// the record's version. An agh from before that record (aterm 0.201.0 and earlier) keeps
-    /// its grants in `<state>/grants`, and before each of its git runs removes every
-    /// `{nonce}.json` there that it does not read as a version-1 record, a live version-2 grant
-    /// among them, whose push then ends `told us to quit`. So no later record is written to
-    /// that folder, and a record that changes again takes a folder of its own.
+    /// `<state>/grants-v<N>`, N being the grant record's version
+    /// (`crate::git::grant::GRANT_VERSION`): the git grants. The folder belongs to the record's
+    /// version. An agh from before the version-2 record (aterm 0.201.0 and earlier) keeps its
+    /// grants in `<state>/grants`, and before each of its git runs removes every `{nonce}.json`
+    /// there that it does not read as a version-1 record, a live version-2 grant among them,
+    /// whose push then ends `told us to quit`. So no later record is written to that folder,
+    /// and a record that changes again moves to a folder of its own by construction.
     #[must_use]
     pub fn grants(&self) -> PathBuf {
-        self.state.join("grants-v2")
+        self.state
+            .join(format!("grants-v{}", crate::git::grant::GRANT_VERSION))
     }
 
     /// `<state>/needs`: the need files.

@@ -6,11 +6,11 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's system-awareness model: what the machine, aterm and each tab are doing (per-core load with momentum and variance, GPU, memory, disk, scope attribution) and the words every surface prints. Pure: no clock, no platform, no dependencies; the host feeds it samples from aterm-sysprobe."
+description = "aterm's system-awareness model: what the machine, aterm and each tab are doing (per-core load with momentum and variance, GPU, memory, disk, scope attribution) and the words every surface prints. Pure: no clock or platform reads; the host feeds it observations."
 
 [dependencies]
-# None: a pure model. The host (aterm-gui's vitals_host) reads the machine
-# through aterm-sysprobe and hands this crate plain numbers.
+# Shared plain values; native readers never depend on this statistics model.
+aterm-process-facts = { workspace = true }
 
 [dev-dependencies]
 # The Tier-1 conformance of the stuck verdict
@@ -19,8 +19,8 @@ description = "aterm's system-awareness model: what the machine, aterm and each 
 # (tests/conformance_explain.rs) replays each against its model.
 aterm-models-misc.workspace = true
 aterm-spec.workspace = true
-# `sys::delta::fnv` is spelled out, so the crate still depends on nothing; its test holds it to
-# the workspace's FNV-1a.
+# `sys::delta::fnv` is spelled out; its test holds it to the workspace's FNV-1a
+# without adding the hash implementation to the model's normal dependencies.
 aterm-hash.workspace = true
 
 [lints]

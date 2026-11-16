@@ -1,14 +1,220 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::fixtures::{
-    Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, claude_reaped_1032,
-    exited_skewed_1510, exited_unseen_1510, finished_1032, idle_skewed_1510, lane_off_1032,
-    liar_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab2_build_1048,
-    wrapped_1218,
-};
+use std::sync::Arc;
+
+use super::fixtures::{Scene, calm_1510, spotlight_1032, tab};
 use super::*;
-use crate::model::{MemRates, MemSample, MemView, Pressure, Thermal, Throttle, Vitals};
+use crate::model::{MemSample, Pressure, ProcSample, Thermal, Throttle, Vitals};
+use crate::published_cpu::{CpuAccounting, CpuExecutionWindow};
+
+fn read_calm(scene: Scene) -> Scene {
+    let calm = calm_1510();
+    Scene {
+        mem: calm.mem,
+        thermal: calm.thermal,
+        ..scene
+    }
+}
+
+/// Two readings of one stable app process and one tab. Only the published tab counter changes;
+/// the caller specifies that growth independently of execution the producer does not expose.
+fn reported_tab_growth(growth_ns: u64) -> ScopeCpu {
+    reported_tab_read(Some(growth_ns), false)
+}
+
+fn reported_tab_read(growth_ns: Option<u64>, missing_identity: bool) -> ScopeCpu {
+    let mut state = WhyState::default();
+    let mut sample = Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 2_000_000,
+        self_pid: 100,
+        self_uid: Some(501),
+        tabs: vec![tab(1, 200)],
+        procs: Some(vec![
+            ProcSample {
+                pid: 100,
+                ppid: 1,
+                start: Some(1),
+                birth_ms: Some(1),
+                uid: Some(501),
+                cpu_ns: Some(0),
+                child_cpu_ns: Some(0),
+                ..ProcSample::default()
+            },
+            ProcSample {
+                pid: 200,
+                ppid: 100,
+                start: Some(2),
+                birth_ms: Some(2),
+                uid: Some(501),
+                cpu_ns: Some(10_000_000),
+                child_cpu_ns: Some(0),
+                ..ProcSample::default()
+            },
+        ]),
+        ..Sample::default()
+    };
+    let members = crate::model::attribute(sample.procs.as_deref().unwrap(), 100, &sample.tabs);
+    let owners = [None, None];
+    assert!(
+        state
+            .scope_cpu(&sample, Some((&members, &owners)))
+            .is_none()
+    );
+    sample.at_ns += 1_000_000_000;
+    sample.at_unix_ms += 1_000;
+    sample.procs.as_mut().unwrap()[1].cpu_ns = growth_ns.map(|growth| 10_000_000 + growth);
+    if missing_identity {
+        sample.procs.as_mut().unwrap()[1].start = None;
+    }
+    state
+        .scope_cpu(&sample, Some((&members, &owners)))
+        .expect("consecutive observations")
+}
+
+#[test]
+fn reported_cpu_delayed_publication_is_never_an_actual_window_floor() {
+    // Four ms executed before the first read remain unpublished; one ms executes after it.
+    // Publishing all five ms at the second read is indistinguishable from five fresh ms.
+    let actual_inside_ns = 1_000_000_u64;
+    let cpu = reported_tab_growth(4_000_000 + actual_inside_ns);
+    assert_eq!(cpu.window_ns, 1_000_000_000);
+    assert!(!cpu.missed);
+    assert_eq!(cpu.tabs.len(), 1);
+    assert!(!cpu.tabs[0].ambiguous && !cpu.tabs[0].missed);
+    assert_eq!(cpu.tabs[0].reported, 0.005);
+    assert_eq!(cpu.process_reported(), 0.005);
+    assert!(cpu.tabs[0].reported > actual_inside_ns as f64 / cpu.window_ns as f64);
+    assert_eq!(
+        cpu.cpu_accounting.execution_window,
+        CpuExecutionWindow::Unavailable
+    );
+}
+
+#[test]
+fn reported_cpu_zero_publication_does_not_establish_zero_execution() {
+    // Execution can remain in unpublished tails at both observations. The native DTO has no
+    // execution-epoch field that distinguishes this from a truly idle tab.
+    let cpu = reported_tab_growth(0);
+    assert!(!cpu.missed);
+    assert_eq!((cpu.process_reported(), cpu.tabs[0].reported), (0.0, 0.0));
+    assert_eq!(
+        cpu.cpu_accounting.execution_window,
+        CpuExecutionWindow::Unavailable
+    );
+    let split = CoalSplit {
+        coverage_complete: true,
+        tabs: vec![(1, 0)],
+        tab_reported: vec![(1, 0)],
+        ..CoalSplit::default()
+    };
+    assert_eq!(split.cpu_accounting, cpu.cpu_accounting);
+    assert!(split.coverage_complete && !split.ownership_incomplete);
+}
+
+#[test]
+fn reported_cpu_process_coalition_and_inherited_accounts_remain_independent() {
+    let mut cpu = reported_tab_growth(5_000_000);
+    cpu.own_charge = 20.0;
+    cpu.tabs[0].charge = 30.0;
+    for coalition_mc in [0, 1, 50_000] {
+        let facts = PreparedWhy {
+            lane: CoalLane::On,
+            facts: Some(WhyFacts {
+                lane: CoalLane::On,
+                at_ns: cpu.read_at_ns,
+                window_ns: cpu.window_ns,
+                split: CoalSplit {
+                    coverage_complete: true,
+                    aterm_mc: coalition_mc,
+                    delegated_mc: 40_000,
+                    ..CoalSplit::default()
+                },
+                ..WhyFacts::default()
+            }),
+        };
+        facts.apply_app(&Sample::default(), &mut cpu);
+        assert_eq!(cpu.coalition_reported, Some(coalition_mc as f64 / 1000.0));
+        assert!(!cpu.coalition_incomplete);
+        assert_eq!(cpu.process_reported(), 0.005);
+        assert_eq!(cpu.all_charge(), 50.0);
+        assert_eq!(cpu.cpu_accounting, CpuAccounting::PUBLISHED_COUNTERS);
+        let mut later = cpu.clone();
+        later.read_at_ns += 1;
+        later.coalition_reported = None;
+        facts.apply_app(&Sample::default(), &mut later);
+        assert_eq!(
+            later.coalition_reported, None,
+            "equal read spans do not prove equal observation endpoints"
+        );
+    }
+}
+
+#[test]
+fn reported_cpu_complete_or_missing_observations_never_open_cpu_causes() {
+    for incomplete in [false, true] {
+        let mut scene = spotlight_1032();
+        scene.unanswered = u32::from(incomplete);
+        scene.mem = None;
+        scene.thermal = None;
+        let mut model = Vitals::new();
+        let mut readings = 0;
+        let mut complete = false;
+        for sample in scene.series(8) {
+            let snapshot = model.absorb(&sample);
+            if let Some(facts) = snapshot.why {
+                readings += 1;
+                complete |= facts.split.coverage_complete;
+                assert!(facts.causes.is_empty());
+                assert!(facts.open.is_empty());
+                assert!(facts.clause.is_none());
+                assert_eq!(
+                    facts.split.cpu_accounting.execution_window,
+                    CpuExecutionWindow::Unavailable
+                );
+            }
+        }
+        assert!(readings > 0);
+        assert_eq!(complete, !incomplete);
+    }
+}
+
+#[test]
+fn machine_contexts_follow_current_readings_without_cpu_covering_claims() {
+    let mut samples = spotlight_1032().series(2);
+    let mut model = Vitals::new();
+    for sample in &samples[..3] {
+        model.absorb(sample);
+    }
+    samples[3].mem = Some(MemSample {
+        total: 64 << 30,
+        pressure: Pressure::Warn,
+        ..MemSample::default()
+    });
+    samples[3].thermal = Some(Thermal {
+        level: Throttle::Light,
+        ..Thermal::default()
+    });
+    let current = model.absorb(&samples[3]);
+    let account = account(WhySubject::Cpu, Some(1), &current);
+    assert_eq!(
+        account
+            .causes
+            .iter()
+            .map(|c| c.cause.id)
+            .collect::<Vec<_>>(),
+        [
+            CauseId::Context(Context::Throttled),
+            CauseId::Context(Context::Pressure)
+        ]
+    );
+    assert!(!account.nothing_needed);
+    samples[4].mem = None;
+    samples[4].thermal = None;
+    let current = model.absorb(&samples[4]);
+    assert!(causes(&current).is_empty());
+}
 
 /// The snapshot of `scene`'s second split tick, through a fresh model.
 fn snap(scene: &Scene) -> Snapshot {
@@ -17,48 +223,6 @@ fn snap(scene: &Scene) -> Snapshot {
     v.absorb(&base);
     v.absorb(&sweep);
     v.absorb(&now)
-}
-
-/// The snapshot of each split tick with a window, over `windows` windows of
-/// `scene`'s work, through a model with `fault` (if any).
-fn ticks(scene: &Scene, windows: u64, fault: Option<Fault>) -> Vec<Snapshot> {
-    let mut v = match fault {
-        Some(f) => Vitals::new().with_fault(f),
-        None => Vitals::new(),
-    };
-    let snaps: Vec<Snapshot> = scene.series(windows).iter().map(|s| v.absorb(s)).collect();
-    snaps.into_iter().skip(2).step_by(2).collect()
-}
-
-/// `scene` with process `pid`, its coalition and the busy figure `mc`
-/// millicores busier.
-fn busier(mut scene: Scene, pid: u32, mc: u64) -> Scene {
-    scene.busy_mc += mc;
-    let mut coalition = None;
-    for p in scene.procs.iter_mut().filter(|p| p.pid == pid) {
-        p.mc += mc;
-        p.fast_mc += mc;
-        coalition = Some(p.coalition);
-    }
-    for c in scene
-        .coalitions
-        .iter_mut()
-        .filter(|c| Some(c.id) == coalition)
-    {
-        c.mc += mc;
-    }
-    scene
-}
-
-/// `scene` with the calm Mac's memory and thermal readings: pressure normal,
-/// swap still, nominal, so what "nothing needed" rests on is read.
-fn read_calm(scene: Scene) -> Scene {
-    let calm = calm_1510();
-    Scene {
-        mem: calm.mem,
-        thermal: calm.thermal,
-        ..scene
-    }
 }
 
 /// The snapshot of the last of `readings`, through a fresh model.
@@ -72,607 +236,6 @@ fn causes(s: &Snapshot) -> Vec<CauseId> {
     s.why
         .as_ref()
         .map_or_else(Vec::new, |f| f.causes.iter().map(|c| c.id).collect())
-}
-
-fn cause(s: &Snapshot, id: CauseId) -> Candidate {
-    s.why
-        .as_ref()
-        .and_then(|f| f.causes.iter().find(|c| c.id == id).cloned())
-        .unwrap_or_else(|| panic!("no {id:?} in {:?}", causes(s)))
-}
-
-const SPOTLIGHT: CauseId = CauseId::Activity(ActivityId::Spotlight);
-const STARTUP: CauseId = CauseId::Context(Context::Startup);
-
-/// Spotlight covers `mds` and `mds_stores`, 1420 of 3300, 722 ‰ deferred, and runs after start-up.
-#[test]
-fn spotlight_holds_on_its_vouched_members_after_start_up() {
-    let s = snap(&spotlight_1032());
-    assert_eq!(causes(&s), [SPOTLIGHT, STARTUP]);
-    let c = cause(&s, SPOTLIGHT);
-    assert_eq!(
-        (c.covers_mc, c.coalitions.as_slice()),
-        (1420, &[307, 491][..])
-    );
-    assert_eq!(
-        c.evidence,
-        Evidence::Activity {
-            deferred_pm: Some(722),
-            read_bps: 22_900_000
-        }
-    );
-    assert_eq!(
-        c.since_ms,
-        Some(USERSPACE_MS),
-        "by the evidence, not the tick"
-    );
-    assert_eq!(c.contexts, [Context::Startup]);
-    assert_eq!(c.src(), ["signature", "kernel"]);
-    let start = cause(&s, STARTUP);
-    assert_eq!(
-        start.evidence,
-        Evidence::Startup {
-            userspace_ms: USERSPACE_MS,
-            wake: Some(WakeFact {
-                at_ms: USERSPACE_MS - 5_000,
-                reason: Some("RTP.multi-touch".into()),
-                slept_s: Some(3715),
-            }),
-        },
-        "the wake folds into start-up's evidence"
-    );
-    assert_eq!(start.covers_mc, 0);
-}
-
-/// The liar: `mds` and `mds_stores` under ad-hoc signatures with Apple's
-/// signing ids.
-#[test]
-fn a_claimed_signing_id_never_names_an_activity() {
-    let s = snap(&liar_1032());
-    assert_eq!(causes(&s), [CauseId::Unexplained, STARTUP]);
-    let c = cause(&s, CauseId::Unexplained);
-    assert_eq!(c.covers_mc, 2170);
-    assert_eq!(
-        c.evidence,
-        Evidence::Uncovered {
-            part: Part::Services
-        }
-    );
-    assert_eq!(c.src(), ["derived"]);
-
-    let mut unread = spotlight_1032();
-    unread.leads.clear();
-    assert!(
-        !causes(&snap(&unread)).contains(&SPOTLIGHT),
-        "unknown is not Apple"
-    );
-
-    let mut own = spotlight_1032();
-    own.busy_mc += 2000;
-    own.coalitions.push(Coal {
-        deferred_mc: 1500,
-        ..Coal::new(1335, 2000)
-    });
-    own.procs.push(Proc::new(
-        1160,
-        1,
-        501,
-        1335,
-        USERSPACE_MS + 160_000,
-        "mds",
-        2000,
-    ));
-    own.leads.push(LeadIdentity {
-        voucher: Voucher::AdHoc,
-        ..apple(1160, USERSPACE_MS + 160_000, "mds", "com.apple.mds")
-    });
-    let s = snap(&own);
-    assert_eq!(causes(&s), [CauseId::AppWork(1335), SPOTLIGHT, STARTUP]);
-    assert_eq!(cause(&s, SPOTLIGHT).coalitions, [307, 491]);
-    let row = s
-        .why
-        .as_ref()
-        .and_then(|f| f.split.rows.iter().find(|r| r.id == 1335).cloned());
-    assert_eq!(
-        row.and_then(|r| r.lead).map(|l| l.voucher),
-        Some(Voucher::AdHoc)
-    );
-    assert_eq!(
-        account(WhySubject::Cpu, Some(1), &s).headline,
-        Some((CauseId::AppWork(1335), None))
-    );
-}
-
-/// Tab 2's build 20 minutes after start-up, the boot daemons idle-busy:
-/// tab 2's work is the cause and never "after start-up", though userspace
-/// is young and every daemon was born with it; `mds` at 0.30 and 80 %
-/// deferred holds Spotlight's terms but not the floor.
-#[test]
-fn a_tabs_work_is_its_cause_and_never_after_start_up() {
-    let s = snap(&tab2_build_1048());
-    assert_eq!(causes(&s), [CauseId::TabWork(2), CauseId::Unexplained]);
-    let c = cause(&s, CauseId::TabWork(2));
-    assert_eq!((c.covers_mc, c.contexts.as_slice()), (6000, &[][..]));
-    let u = cause(&s, CauseId::Unexplained);
-    assert_eq!(
-        (u.covers_mc, u.contexts.as_slice(), u.coalitions.len()),
-        (1700, &[][..], 5)
-    );
-    assert_eq!(
-        u.evidence,
-        Evidence::Uncovered {
-            part: Part::Services
-        }
-    );
-    assert!(!CauseId::TabWork(2).takes_start() && !CauseId::AtermWork.takes_start());
-    let a = account(WhySubject::Cpu, Some(2), &s);
-    assert_eq!(a.headline, Some((CauseId::TabWork(2), None)));
-    assert!(!a.nothing_needed);
-    assert_eq!(a.cannot.first(), Some(&("remedy", "unsupported")));
-    assert!(!causes(&snap(&spotlight_1032())).contains(&CauseId::TabWork(1)));
-
-    let tab1 = snap(&busier(tab2_build_1048(), 1210, 400));
-    assert!(!causes(&tab1).contains(&CauseId::TabWork(1)), "600 of 8600");
-    let mut mds = busier(tab2_build_1048(), 387, 300);
-    for c in mds.coalitions.iter_mut().filter(|c| c.id == 307) {
-        c.deferred_mc = 480;
-    }
-    assert!(!causes(&snap(&mds)).contains(&SPOTLIGHT), "600 of 8500");
-}
-
-/// A tab's work above the floor beside a larger load no cause names:
-/// services' uncovered 3.79 cores are unexplained and the headline, never
-/// the tab's 0.72, which is minor.
-#[test]
-fn a_small_cause_never_stands_for_a_large_uncovered_load() {
-    let s = snap(&busier(busier(calm_1510(), 1210, 600), 430, 3600));
-    assert_eq!(causes(&s), [CauseId::Unexplained, CauseId::TabWork(1)]);
-    assert_eq!(cause(&s, CauseId::Unexplained).covers_mc, 3790);
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!(a.headline, Some((CauseId::Unexplained, None)));
-    assert_eq!(a.you.role, Role::Minor);
-    assert!(!a.nothing_needed);
-
-    let s = snap(&finished_1032());
-    assert_eq!(causes(&s), [CauseId::Unexplained, SPOTLIGHT, STARTUP]);
-    let u = cause(&s, CauseId::Unexplained);
-    assert_eq!(
-        (u.covers_mc, u.coalitions.as_slice(), u.contexts.as_slice()),
-        (3400, &[][..], &[][..])
-    );
-    assert_eq!(u.evidence, Evidence::Uncovered { part: Part::Aterm });
-    assert_eq!(
-        account(WhySubject::Cpu, Some(1), &s).headline,
-        Some((CauseId::Unexplained, None))
-    );
-}
-
-/// aterm itself as the largest part above the floor.
-#[test]
-fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
-    let mut scene = calm_1510();
-    scene.busy_mc += 1420;
-    for c in &mut scene.coalitions {
-        if c.id == 1342 {
-            c.mc += 1420;
-        }
-    }
-    for p in &mut scene.procs {
-        if p.pid == 1187 {
-            *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "aterm", 1500);
-        }
-    }
-    let s = snap(&scene);
-    assert_eq!(causes(&s), [CauseId::AtermWork]);
-    assert_eq!(cause(&s, CauseId::AtermWork).covers_mc, 1500);
-    assert!(!causes(&snap(&spotlight_1032())).contains(&CauseId::AtermWork));
-    let under = snap(&busier(scene, 430, 1910));
-    assert_eq!(causes(&under), [CauseId::Unexplained]);
-}
-
-#[test]
-fn work_outside_tabs_must_exceed_each_competing_owners_possible_cpu() {
-    for (tab, app_unknown, others, services, global_unknown) in [
-        (1000, 400, 0, 0, 400),
-        (0, 0, 1000, 0, 700),
-        (0, 0, 0, 1000, 700),
-    ] {
-        let own = 1500;
-        let tabs = if tab == 0 { Vec::new() } else { vec![(1, tab)] };
-        let mut facts = WhyFacts {
-            split: CoalSplit {
-                via: Via::Coalitions,
-                global_mc: own + tab + app_unknown + others + services,
-                aterm_mc: own + tab + app_unknown,
-                own_mc: own,
-                own_floor_mc: own,
-                tabs: tabs.clone(),
-                tab_floors: tabs,
-                unattributed_mc: app_unknown,
-                others_mc: others,
-                services_mc: services,
-                ..CoalSplit::default()
-            },
-            ..WhyFacts::default()
-        };
-        let holds = |facts: &WhyFacts| {
-            detect(facts, &Snapshot::default())
-                .iter()
-                .any(|cause| cause.id == CauseId::AtermWork)
-        };
-        assert!(
-            holds(&facts),
-            "the own floor exceeds every upper bound without global unknown CPU"
-        );
-        facts.split.global_mc += global_unknown;
-        facts.split.unaccounted_mc = global_unknown;
-        assert!(
-            !holds(&facts),
-            "unknown work could make a competing owner larger: {:?}",
-            facts.split
-        );
-    }
-}
-
-/// The busiest coalition outside aterm's, led by the user's app: app-work,
-/// since its lead's birth.
-#[test]
-fn app_work_is_the_busiest_coalition_outside_aterm_led_by_the_user() {
-    let mut scene = app_work_1510();
-    let s = snap(&scene);
-    assert_eq!(causes(&s), [CauseId::AppWork(896)]);
-    let c = cause(&s, CauseId::AppWork(896));
-    assert_eq!(
-        (c.covers_mc, c.since_ms),
-        (1500, Some(USERSPACE_MS + 8_000))
-    );
-    assert_eq!(c.coalitions, [896]);
-    assert!(
-        causes(&snap(&spotlight_1032()))
-            .iter()
-            .all(|c| !matches!(c, CauseId::AppWork(_)))
-    );
-    scene.at_ms = Some(USERSPACE_MS + 600_000);
-    let young = snap(&scene);
-    assert_eq!(causes(&young), [CauseId::AppWork(896)]);
-    assert_eq!(cause(&young, CauseId::AppWork(896)).contexts, []);
-}
-
-/// The calm Mac: 0.40 busy, Caffeine's 0.01 and every other coalition under
-/// the floor, so nothing holds, not even unexplained (under a core).
-#[test]
-fn a_calm_mac_holds_no_cause() {
-    let s = snap(&calm_1510());
-    assert_eq!(causes(&s), []);
-    assert_eq!(bare_subject(&s), Bare::Calm);
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!((a.headline, a.nothing_needed), (None, true));
-    assert_eq!(
-        (a.you.role, a.you.calm, a.you.figure, a.you.share_pm),
-        (Role::Minor, true, Some(120), Some(300)),
-        "0.12 of 0.40 is a third, under the floor: minor on a calm machine"
-    );
-}
-
-/// Work no coalition held past a core (coalition 2000 reaped inside the
-/// calm Mac's window after 1.50 cores): `unexplained` covers the residual,
-/// with no coalition and no context, so the reply never says nothing is
-/// needed and a bare `sys why` names the CPU. NEGATIVE CONTROLS: 0.90 cores
-/// of it holds nothing and nothing needs doing; and `unexplained` blind to
-/// the residual (`Fault::IgnoreUnaccounted`) leaves 1.50 cores uncovered
-/// beside "nothing needed", the defect the ruling closes.
-#[test]
-fn work_no_coalition_held_past_a_core_is_never_nothing_needed() {
-    let s = snap(&reaped_1510());
-    let f = s.why.as_deref().expect("a window");
-    assert_eq!((f.split.global_mc, f.split.unaccounted_mc), (1900, 1500));
-    assert_eq!(causes(&s), [CauseId::Unexplained]);
-    let u = cause(&s, CauseId::Unexplained);
-    assert_eq!(
-        (u.covers_mc, u.coalitions.as_slice(), u.contexts.as_slice()),
-        (1500, &[][..], &[][..])
-    );
-    assert_eq!(u.src(), ["derived"]);
-    assert_eq!(u.evidence, Evidence::Unaccounted);
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!(a.headline, Some((CauseId::Unexplained, None)));
-    assert!(!a.nothing_needed);
-    assert_eq!(a.cannot.first(), Some(&("remedy", "unsupported")));
-    assert_eq!(bare_subject(&s), Bare::Subject(WhySubject::Cpu));
-
-    let mut under = reaped_1510();
-    under.busy_mc -= 600;
-    for c in under.coalitions.iter_mut().filter(|c| c.id == 2000) {
-        c.mc = 900;
-    }
-    let s = snap(&under);
-    assert_eq!(s.why.as_deref().map(|f| f.split.unaccounted_mc), Some(900));
-    assert_eq!(causes(&s), []);
-    assert!(account(WhySubject::Cpu, Some(1), &s).nothing_needed);
-
-    let blind = ticks(&reaped_1510(), 1, Some(Fault::IgnoreUnaccounted))
-        .pop()
-        .expect("a window");
-    assert_eq!(causes(&blind), []);
-    assert!(account(WhySubject::Cpu, Some(1), &blind).nothing_needed);
-    assert_eq!(bare_subject(&blind), Bare::Calm);
-}
-
-/// `wake`: 2 minutes after a wake that restarted nothing, with a core of
-/// Spotlight's work deferred (931 + 94 mc).
-#[test]
-fn wake_holds_after_a_wake_when_start_up_does_not() {
-    let mut scene = wrapped_1218();
-    let at = scene.at_ms.expect("a wall clock");
-    if let Some(t) = scene.timeline.as_mut() {
-        t.sleep_ms = Some(at - 3_600_000);
-        t.wake_ms = Some(at - 120_000);
-    }
-    let s = snap(&scene);
-    assert_eq!(causes(&s), [SPOTLIGHT, CauseId::Context(Context::Wake)]);
-    assert_eq!(cause(&s, SPOTLIGHT).contexts, [Context::Wake]);
-    let w = cause(&s, CauseId::Context(Context::Wake));
-    assert_eq!(
-        w.evidence,
-        Evidence::Wake(WakeFact {
-            at_ms: at - 120_000,
-            reason: Some("RTP.multi-touch".into()),
-            slept_s: Some(3480),
-        })
-    );
-    assert_eq!(w.since_ms, None, "the wake's time is its evidence");
-    let old = snap(&wrapped_1218());
-    assert_eq!(causes(&old), [SPOTLIGHT], "neither start-up nor a wake");
-    assert!(!causes(&snap(&spotlight_1032())).contains(&CauseId::Context(Context::Wake)));
-    for c in scene.coalitions.iter_mut().filter(|c| c.id == 307) {
-        c.deferred_mc = 880;
-    }
-    assert_eq!(causes(&snap(&scene)), [SPOTLIGHT]);
-
-    // Future wake/userspace timestamps (backward wall-clock step) must not
-    // pass the age window or overflow i64, and extreme figures must not panic.
-    let mut skewed = wrapped_1218();
-    let skewed_at = skewed.at_ms.expect("a wall clock");
-    for p in skewed.procs.iter_mut().filter(|p| p.pid > 1) {
-        p.birth_ms = skewed_at + 5_000;
-    }
-    for l in &mut skewed.leads {
-        l.birth_ms = skewed_at + 5_000;
-    }
-    if let Some(t) = skewed.timeline.as_mut() {
-        t.wake_ms = Some(skewed_at + 5_000);
-    }
-    let skewed_causes = causes(&snap(&skewed));
-    assert_eq!(skewed_causes, [SPOTLIGHT]);
-    assert!(crate::explain::detect::above_floor(i64::MAX, i64::MAX));
-    assert_eq!(crate::explain::deferred_pm(i64::MAX, i64::MAX), Some(1000));
-}
-
-/// `startup` is weighed by CPU, never by count: Spotlight with
-/// `corespotlightd` restarted after start-up's first minute covers three
-/// coalitions, two of them start-up's, but only 1.42 of its 3.42 cores, so
-/// it runs since the wake instead.
-#[test]
-fn start_up_is_weighed_by_cpu_never_by_count() {
-    let s = snap(&spotlight_late_1032());
-    assert_eq!(causes(&s), [SPOTLIGHT, CauseId::Context(Context::Wake)]);
-    let c = cause(&s, SPOTLIGHT);
-    assert_eq!(
-        (c.covers_mc, c.coalitions.as_slice(), c.contexts.as_slice()),
-        (3420, &[1330, 307, 491][..], &[Context::Wake][..])
-    );
-}
-
-/// The wrapped pid space: pid 159, born at 12:16, changes neither when
-/// userspace started nor aterm's coalition's name, and start-up does not
-/// hold 110 minutes on.
-#[test]
-fn a_wrapped_pid_space_moves_neither_the_start_nor_a_name() {
-    let s = snap(&wrapped_1218());
-    let f = s.why.as_ref().expect("facts");
-    assert_eq!(f.userspace_ms, Some(USERSPACE_MS));
-    let aterm = f.split.rows.iter().find(|r| r.id == 1342).expect("aterm's");
-    assert_eq!(
-        aterm.lead.as_ref().map(|l| (l.pid, l.exe.as_deref())),
-        Some((1187, Some("aterm")))
-    );
-    assert!(!causes(&s).contains(&STARTUP));
-}
-
-/// The machine's contexts hold for every covering cause, and alone: memory
-/// pressure at warn, and a thermal throttle or Low Power Mode.
-#[test]
-fn pressure_and_throttle_are_contexts_of_the_machine() {
-    let mut scene = spotlight_1032();
-    scene.mem = Some(MemSample {
-        total: 64 << 30,
-        app: 40 << 30,
-        pressure: Pressure::Warn,
-        ..MemSample::default()
-    });
-    scene.thermal = Some(Thermal {
-        level: Throttle::Light,
-        ..Thermal::default()
-    });
-    let s = snap(&scene);
-    assert_eq!(
-        causes(&s),
-        [
-            SPOTLIGHT,
-            STARTUP,
-            CauseId::Context(Context::Throttled),
-            CauseId::Context(Context::Pressure)
-        ]
-    );
-    assert_eq!(
-        cause(&s, SPOTLIGHT).contexts,
-        [Context::Startup, Context::Throttled, Context::Pressure]
-    );
-    assert_eq!(
-        cause(&s, CauseId::Context(Context::Pressure)).evidence,
-        Evidence::Pressure {
-            level: Pressure::Warn,
-            swap_bps: None
-        }
-    );
-    let mem = account(WhySubject::Mem, Some(1), &s);
-    assert_eq!(
-        mem.causes.iter().map(|c| c.cause.id).collect::<Vec<_>>(),
-        [CauseId::Context(Context::Pressure)]
-    );
-    assert_eq!(
-        mem.headline,
-        Some((CauseId::Context(Context::Pressure), None))
-    );
-    assert_eq!(mem.cannot.first(), Some(&("remedy", "unsupported")));
-    assert!(!account(WhySubject::Cpu, Some(1), &s).nothing_needed);
-    assert_eq!(bare_subject(&s), Bare::Subject(WhySubject::Mem));
-
-    scene.mem = None;
-    scene.thermal = Some(Thermal {
-        low_power: Some(true),
-        ..Thermal::default()
-    });
-    assert!(causes(&snap(&scene)).contains(&CauseId::Context(Context::Throttled)));
-    scene.thermal = Some(Thermal::default());
-    assert_eq!(causes(&snap(&scene)), [SPOTLIGHT, STARTUP]);
-}
-
-/// With the lane off no coalition is read: the facts are by subtraction, no
-/// covering cause can hold, and the reply says why, on macOS and on an OS
-/// with no coalitions alike; the machine's contexts still hold, and the
-/// first is the headline.
-#[test]
-fn with_the_lane_off_only_the_machines_contexts_hold() {
-    for lane in [CoalLane::Off, CoalLane::Unsupported] {
-        let s = snap(&read_calm(Scene {
-            lane,
-            ..lane_off_1032()
-        }));
-        assert_eq!(s.why.as_ref().map(|f| f.split.via), Some(Via::Subtraction));
-        assert_eq!(causes(&s), []);
-        let a = account(WhySubject::Cpu, Some(1), &s);
-        assert_eq!(
-            a.cannot,
-            [
-                ("coalitions", "lane_off:coalitions"),
-                ("every_process_start", "not_sampled"),
-                ("between_sweep_orphans", "not_sampled"),
-                ("socket_delegation", "unsupported"),
-            ],
-            "{lane:?}"
-        );
-        assert_eq!((a.headline, a.nothing_needed), (None, true));
-    }
-    let linux = read_calm(Scene {
-        lane: CoalLane::Unsupported,
-        ..lane_off_1032()
-    });
-    let edits: [fn(&mut Scene); 2] = [
-        |s| {
-            if let Some(m) = s.mem.as_mut() {
-                m.pressure = Pressure::Unknown;
-            }
-        },
-        |s| s.thermal = None,
-    ];
-    for edit in edits {
-        let mut scene = linux.clone();
-        edit(&mut scene);
-        let s = snap(&scene);
-        let a = account(WhySubject::Cpu, Some(1), &s);
-        assert_eq!((a.headline, a.nothing_needed), (None, false));
-        assert_eq!(a.cannot.first(), Some(&("remedy", "unsupported")));
-    }
-    let mut scene = lane_off_1032();
-    scene.thermal = Some(Thermal {
-        level: Throttle::Heavy,
-        ..Thermal::default()
-    });
-    let s = snap(&scene);
-    assert_eq!(causes(&s), [CauseId::Context(Context::Throttled)]);
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!(
-        a.headline,
-        Some((CauseId::Context(Context::Throttled), None))
-    );
-    assert_eq!(
-        a.cannot,
-        [
-            ("remedy", "unsupported"),
-            ("coalitions", "lane_off:coalitions"),
-            ("every_process_start", "not_sampled"),
-            ("between_sweep_orphans", "not_sampled"),
-            ("socket_delegation", "unsupported"),
-        ]
-    );
-}
-
-/// Without machine CPU counters no split is made, but memory pressure and throttling remain
-/// current machine evidence. No absent CPU reading can establish that nothing is needed.
-#[test]
-fn with_no_split_the_machines_contexts_still_hold() {
-    let scene = Scene {
-        lane: CoalLane::Unsupported,
-        mem: Some(MemSample {
-            total: 64 << 30,
-            app: 40 << 30,
-            pressure: Pressure::Warn,
-            ..MemSample::default()
-        }),
-        thermal: Some(Thermal {
-            level: Throttle::Light,
-            ..Thermal::default()
-        }),
-        ..lane_off_1032()
-    };
-    let mut v = Vitals::new();
-    let [_, _, s] = scene.samples().map(|mut sample| {
-        sample.cores = None;
-        v.absorb(&sample)
-    });
-    assert!(s.why.is_none() && s.split.is_none());
-    let ids = |a: &Account| a.causes.iter().map(|c| c.cause.id).collect::<Vec<_>>();
-    let throttled = CauseId::Context(Context::Throttled);
-    let pressure = CauseId::Context(Context::Pressure);
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!(ids(&a), [throttled, pressure]);
-    assert_eq!(a.headline, Some((throttled, None)));
-    assert!(!a.nothing_needed);
-    assert_eq!(
-        a.cannot,
-        [
-            ("remedy", "unsupported"),
-            ("coalitions", "lane_off:coalitions")
-        ]
-    );
-    assert_eq!(
-        (a.parts, a.you.role),
-        (None, Role::Unavailable("not_sampled"))
-    );
-    let m = account(WhySubject::Mem, Some(1), &s);
-    assert_eq!(
-        (ids(&m), m.headline),
-        (vec![pressure], Some((pressure, None)))
-    );
-    assert!(!m.nothing_needed);
-    assert_eq!(bare_subject(&s), Bare::Subject(WhySubject::Mem));
-
-    for subject in [WhySubject::Cpu, WhySubject::Mem] {
-        let none = account(subject, None, &Snapshot::default());
-        assert_eq!(
-            (none.causes.len(), none.headline, none.nothing_needed),
-            (0, None, false),
-            "{subject:?}"
-        );
-        assert_eq!(none.cannot.first(), Some(&("remedy", "unsupported")));
-    }
-    assert_eq!(
-        account(WhySubject::Cpu, None, &Snapshot::default())
-            .you
-            .role,
-        Role::Unavailable("warming")
-    );
 }
 
 /// A coalition list cut short at either end is said; a sweep cut at its cap
@@ -704,778 +267,6 @@ fn a_cut_coalition_list_is_said() {
         assert!(cannot(edit).contains(&cut));
     }
     assert!(!cannot(|_, now| now.procs_truncated = true).contains(&cut));
-}
-
-/// macOS 27.0.1's QoS buckets sum 0.7–6 % past a coalition's CPU time, so a
-/// deferred share is of the buckets, never of the CPU time, and never past
-/// 1000 ‰: Spotlight's 1025 mc deferred of 1420 mc is 722 ‰ with the
-/// buckets equal to the time, 681 ‰ with them 6 % past it, and 498 ‰ (no
-/// Spotlight) with them 640 mc past it, where a share of the time would
-/// read 722 ‰ and open it.
-#[test]
-fn a_deferred_share_is_of_the_qos_buckets_and_never_past_one() {
-    let over = |mds: u64, stores: u64| {
-        let mut scene = spotlight_1032();
-        for c in &mut scene.coalitions {
-            match c.id {
-                307 => c.qos_over_mc = mds,
-                491 => c.qos_over_mc = stores,
-                _ => {}
-            }
-        }
-        snap(&scene)
-    };
-    let s = over(77, 8);
-    assert_eq!(
-        cause(&s, SPOTLIGHT).evidence,
-        Evidence::Activity {
-            deferred_pm: Some(681),
-            read_bps: 22_900_000
-        }
-    );
-    let mds = s
-        .why
-        .as_ref()
-        .and_then(|f| f.split.rows.iter().find(|r| r.id == 307).cloned());
-    assert_eq!(
-        mds.map(|r| (r.qos_mc, r.deferred_pm())),
-        Some((1367, Some(681)))
-    );
-    assert!(!causes(&over(640, 0)).contains(&SPOTLIGHT));
-    assert_eq!(deferred_pm(1100, 1000), Some(1000));
-    assert_eq!(deferred_pm(5, 0), None);
-    assert_eq!(deferred_pm(-5, 100), Some(0));
-}
-
-/// An episode opens on its second consecutive split tick, `since` from its
-/// evidence; a cold pull's first window prints its cause with no `opened=`.
-#[test]
-fn spotlight_opens_on_its_second_tick_and_the_clause_ten_seconds_on() {
-    let snaps = ticks(&spotlight_1032(), 5, None);
-    let opened = |s: &Snapshot| {
-        account(WhySubject::Cpu, Some(1), s)
-            .causes
-            .iter()
-            .find(|c| c.cause.id == SPOTLIGHT)
-            .map(|c| c.opened_unix_ms)
-    };
-    assert_eq!(opened(&snaps[0]), Some(None), "cold: holds, not open");
-    let second = snaps[1].at_unix_ms;
-    for s in &snaps[1..] {
-        assert_eq!(opened(s), Some(Some(second)));
-    }
-    let start = account(WhySubject::Cpu, Some(1), &snaps[1]);
-    assert_eq!(
-        start
-            .causes
-            .iter()
-            .find(|c| c.cause.id == STARTUP)
-            .map(|c| c.opened_unix_ms),
-        Some(None),
-        "a context says when by its evidence"
-    );
-    let open = &snaps[1].why.as_ref().expect("facts").open;
-    assert_eq!(
-        open.iter().map(|o| (o.id, o.since_ms)).collect::<Vec<_>>(),
-        [(SPOTLIGHT, Some(USERSPACE_MS))],
-        "a context keeps no episode"
-    );
-    let clause: Vec<Option<DeckCause>> = snaps.iter().map(deck_cause).collect();
-    let shown = Some(DeckCause {
-        activity: ActivityId::Spotlight,
-        word: "Spotlight",
-        context: Some(Context::Startup),
-    });
-    assert_eq!(clause, [None, None, None, shown, shown]);
-    assert_eq!(bare_subject(&snaps[0]), Bare::Subject(WhySubject::Cpu));
-}
-
-fn held(id: CauseId, covers_mc: i64) -> Candidate {
-    Candidate {
-        id,
-        covers_mc,
-        coalitions: Vec::new(),
-        since_ms: None,
-        evidence: Evidence::Measured,
-        contexts: Vec::new(),
-    }
-}
-
-/// An open episode closes once its cause has failed for 30 s; a gap of more
-/// than a minute between split ticks ends every episode.
-#[test]
-fn an_episode_closes_after_failing_for_thirty_seconds_or_a_gap() {
-    let mut e = Episodes::default();
-    let c = [held(CauseId::TabWork(2), 900)];
-    assert_eq!(e.step(0, 0, &c, false), []);
-    let open = e.step(5_000, 5, &c, false);
-    assert_eq!((open[0].opened_unix_ms, open[0].holds), (5, true));
-    for at in [10_000, 25_000, 39_999] {
-        let open = e.step(at, 0, &[], false);
-        assert_eq!(open.len(), 1, "open at {at}");
-        assert!(!open[0].holds);
-    }
-    assert_eq!(
-        e.step(40_000, 0, &[], false),
-        [],
-        "30 s after it first failed"
-    );
-
-    let mut e = Episodes::default();
-    e.step(0, 0, &c, false);
-    e.step(5_000, 0, &c, false);
-    assert_eq!(
-        e.step(66_000, 0, &c, false),
-        [],
-        "after a gap it starts cold"
-    );
-    assert_eq!(e.step(71_000, 7, &c, false)[0].opened_unix_ms, 7);
-}
-
-/// An open episode's `since` is the earliest its evidence said over the
-/// episode: a later tick whose earliest lead is gone does not move it.
-#[test]
-fn an_episodes_since_is_the_earliest_over_it() {
-    let at = |since_ms| Candidate {
-        since_ms: Some(since_ms),
-        ..held(SPOTLIGHT, 1420)
-    };
-    let mut e = Episodes::default();
-    e.step(0, 0, &[at(USERSPACE_MS)], false);
-    let open = e.step(5_000, 5, &[at(USERSPACE_MS + 150_000)], false);
-    assert_eq!(open[0].since_ms, Some(USERSPACE_MS));
-}
-
-/// On a tick whose sweep stopped at its cap a tab's work neither opens nor
-/// closes, however long the sweep stays cut; other causes run on.
-#[test]
-fn a_cut_sweep_neither_opens_nor_closes_a_tabs_work() {
-    let both = [
-        held(CauseId::TabWork(2), 900),
-        held(CauseId::AppWork(1335), 700),
-    ];
-    let tab = CauseId::TabWork(2);
-    let ids = |open: &[OpenCause]| open.iter().map(|o| o.id).collect::<Vec<_>>();
-    let mut e = Episodes::default();
-    e.step(0, 0, &both, false);
-    let open = e.step(5_000, 0, &both, true);
-    assert_eq!(ids(&open), [CauseId::AppWork(1335)], "not opened while cut");
-    assert_eq!(ids(&e.step(10_000, 0, &both[..1], false)).len(), 2);
-    for at in (15_000..=50_000).step_by(5_000) {
-        let open = e.step(at, 0, &[], true);
-        assert!(open.iter().any(|o| o.id == tab), "open at {at}, cut");
-    }
-    assert!(e.step(55_000, 0, &[], false).iter().any(|o| o.id == tab));
-    assert_eq!(e.step(85_000, 0, &[], false), [], "30 s failing, whole");
-
-    let mut v = Vitals::new();
-    let mut series = tab2_build_1048().series(3);
-    series[4].procs_truncated = true;
-    let snaps: Vec<Snapshot> = series.iter().map(|s| v.absorb(s)).collect();
-    let open = |k: usize| ids(&snaps[2 * k].why.as_ref().expect("facts").open);
-    assert_eq!(open(2), [CauseId::Unexplained]);
-    assert_eq!(open(3), [CauseId::TabWork(2), CauseId::Unexplained]);
-}
-
-/// Ten minutes with no split tick: the first after the gap only sets the base,
-/// evaluates nothing and carries no open episode and no clause; Spotlight
-/// then reopens on two evaluated ticks, and the clause shows 10 s after.
-#[test]
-fn after_a_gap_the_clause_waits_for_a_new_episode_and_its_hold() {
-    let all = spotlight_1032().series(130);
-    let kept = [&all[..=10], &all[251..]].concat();
-    let mut v = Vitals::new();
-    let snaps: Vec<Snapshot> = kept.iter().map(|s| v.absorb(s)).collect();
-    let tick = |k: usize| &snaps[if k <= 5 { 2 * k } else { 2 * (k - 120) }];
-    assert!(deck_cause(tick(5)).is_some());
-    let base = tick(126).why.as_ref().expect("the last facts");
-    assert_eq!((base.open.as_slice(), base.clause), (&[][..], None));
-    assert_eq!(deck_cause(tick(126)), None);
-    let opened = |k: usize| {
-        account(WhySubject::Cpu, Some(1), tick(k))
-            .causes
-            .iter()
-            .find(|c| c.cause.id == SPOTLIGHT)
-            .map(|c| c.opened_unix_ms.is_some())
-    };
-    assert_eq!(opened(127), Some(false), "cold: holds, not open");
-    assert_eq!(opened(128), Some(true));
-    let clause: Vec<bool> = (127..=130).map(|k| deck_cause(tick(k)).is_some()).collect();
-    assert_eq!(clause, [false, false, false, true]);
-}
-
-fn open_as(id: CauseId, covers_mc: i64, contexts: &[Context]) -> OpenCause {
-    OpenCause {
-        id,
-        opened_unix_ms: 0,
-        since_ms: None,
-        holds: true,
-        covers_mc,
-        contexts: contexts.to_vec(),
-    }
-}
-
-fn open(covers_mc: i64, contexts: &[Context]) -> OpenCause {
-    open_as(SPOTLIGHT, covers_mc, contexts)
-}
-
-/// The 10:32 split's outside-aterm busy: 2900 mc.
-fn outside() -> CoalSplit {
-    CoalSplit {
-        others_mc: 730,
-        services_mc: 2170,
-        ..CoalSplit::default()
-    }
-}
-
-/// The clause holds 10 s before it shows and 30 s before it goes: held 8 s,
-/// none; 10 s, the clause; a 29 s failure keeps it, 30 s drops it.
-#[test]
-fn the_clause_shows_after_ten_seconds_and_goes_after_thirty() {
-    let mut h = ClauseHold::default();
-    let o = [open(1420, &[Context::Startup])];
-    let split = outside();
-    assert_eq!(h.step(0, &o, &split), None);
-    assert_eq!(h.step(8_000, &o, &split), None, "8 s");
-    let shown = h.step(10_000, &o, &split).expect("10 s");
-    assert_eq!(
-        (shown.word, shown.context),
-        ("Spotlight", Some(Context::Startup))
-    );
-    for at in [15_000, 25_000, 35_000, 43_999] {
-        assert_eq!(h.step(at, &[], &split), Some(shown), "{at}");
-    }
-    assert_eq!(h.step(45_000, &[], &split), None, "30 s failing");
-
-    let mut h = ClauseHold::default();
-    for at in [0, 5_000, 10_000] {
-        h.step(at, &o, &split);
-    }
-    let plain = [open(1420, &[])];
-    assert_eq!(h.step(15_000, &plain, &split), Some(shown));
-    assert_eq!(h.step(20_000, &plain, &split), Some(shown));
-    let now = h.step(25_000, &plain, &split).expect("the new words");
-    assert_eq!(now.context, None);
-
-    let mut h = ClauseHold::default();
-    for at in [0, 5_000, 10_000] {
-        h.step(at, &o, &split);
-    }
-    assert_eq!(h.step(26_000, &o, &split), None);
-}
-
-/// The clause's floor: a core and 40 % of the busy CPU outside aterm.
-#[test]
-fn the_clause_needs_a_core_and_two_fifths_and_names_one_cause() {
-    let shown = |o: &[OpenCause], split: &CoalSplit| {
-        let mut h = ClauseHold::default();
-        for at in [0, 5_000] {
-            h.step(at, o, split);
-        }
-        h.step(10_000, o, split)
-    };
-    let split = outside();
-    assert_eq!(shown(&[open(1131, &[])], &split), None, "39 %");
-    assert!(shown(&[open(1160, &[])], &split).is_some(), "40 %");
-    let small = CoalSplit {
-        others_mc: 0,
-        services_mc: 1000,
-        ..CoalSplit::default()
-    };
-    assert_eq!(shown(&[open(900, &[])], &small), None, "0.9 core");
-    let app = |covers_mc| open_as(CauseId::AppWork(1335), covers_mc, &[]);
-    for two in [
-        [open(1218, &[Context::Wake]), app(1305)],
-        [app(1305), open(1218, &[Context::Wake])],
-    ] {
-        assert_eq!(shown(&two, &split), None, "an app's work is the largest");
-    }
-    for two in [
-        [open(1305, &[Context::Wake]), app(1218)],
-        [app(1218), open(1305, &[Context::Wake])],
-    ] {
-        assert_eq!(
-            shown(&two, &split).map(|c| c.context),
-            Some(Some(Context::Wake)),
-            "Spotlight is the largest"
-        );
-    }
-    let residual = |services_mc: i64, unaccounted_mc: i64| CoalSplit {
-        others_mc: 730,
-        services_mc,
-        unaccounted_mc,
-        ..CoalSplit::default()
-    };
-    assert!(
-        shown(&[open(1100, &[])], &residual(1870, 0)).is_some(),
-        "42 %"
-    );
-    assert_eq!(
-        shown(&[open(1100, &[])], &residual(1870, 300)),
-        None,
-        "38 %"
-    );
-    assert_eq!(
-        shown(&[open(1100, &[])], &residual(2170, -300)),
-        None,
-        "38 %, the negative residual left out"
-    );
-    let mut failing = open(1420, &[]);
-    failing.holds = false;
-    assert_eq!(
-        shown(&[failing], &split),
-        None,
-        "an open episode that fails"
-    );
-}
-
-/// The clause rides the facts while they are at most 15 s old.
-#[test]
-fn a_stale_clause_is_not_shown() {
-    let snaps = ticks(&spotlight_1032(), 4, None);
-    let mut s = snaps[3].clone();
-    assert!(deck_cause(&s).is_some());
-    s.at_ns += 15_000_000_000;
-    assert!(deck_cause(&s).is_some(), "15 s");
-    s.at_ns += 1_000_000;
-    assert_eq!(deck_cause(&s), None, "older than 15 s");
-}
-
-/// Every role by its share, its rank and the floor.
-#[test]
-fn a_tabs_role_is_by_its_share_its_rank_and_the_floor() {
-    assert_eq!(you_role(0, 3300, false, false), (Role::None, false));
-    assert_eq!(you_role(200, 3300, false, false), (Role::Minor, false));
-    assert_eq!(you_role(120, 400, false, false), (Role::Minor, true));
-    assert_eq!(you_role(700, 3300, false, true), (Role::Part, false));
-    assert_eq!(
-        you_role(1500, 3300, true, true),
-        (Role::Part, false),
-        "the largest, under half"
-    );
-    assert_eq!(
-        you_role(2000, 3300, false, true),
-        (Role::Part, false),
-        "over half, not the largest"
-    );
-    assert_eq!(you_role(2000, 3300, true, true), (Role::Main, false));
-    assert_eq!(
-        you_role(600, 3300, false, true),
-        (Role::Minor, false),
-        "under a fifth"
-    );
-}
-
-/// The `you` line on each scene: minor at 10:32 (6.1 %, no basis), main for
-/// tab 2's build, none for a tab with no work, `unavailable(truncated)` on
-/// a cut sweep (never none), and `unavailable(not_sampled)` where aterm's
-/// finished work could make the tab the cause: 0.20 live is minor, 3.20 with
-/// the 3.00 no member's reaped time holds is main; where claude reaped them,
-/// the tab's 3.20 is main.
-#[test]
-fn the_you_role_needs_a_whole_sweep_and_its_bound() {
-    let you = |scene: &Scene, tab: u64| account(WhySubject::Cpu, Some(tab), &snap(scene));
-    let a = you(&read_calm(spotlight_1032()), 1);
-    assert_eq!(
-        (a.you.role, a.you.calm, a.you.figure, a.you.share_pm),
-        (Role::Minor, false, Some(200), Some(61))
-    );
-    assert_eq!(
-        a.parts
-            .map(|p| (p.tab, p.aterm_rest, p.others, p.services, p.unaccounted)),
-        Some((200, 200, 730, 2170, 0))
-    );
-    assert_eq!(a.headline, Some((SPOTLIGHT, Some(Context::Startup))));
-    assert!(a.nothing_needed);
-    assert_eq!(a.you.unattributed_mc, None);
-    assert_eq!(
-        a.cannot,
-        [
-            ("every_process_start", "not_sampled"),
-            ("between_sweep_orphans", "not_sampled"),
-            ("socket_delegation", "unsupported"),
-            ("index_progress", "unsupported"),
-            ("index_folder", "needs_privilege:root")
-        ]
-    );
-    let b = you(&tab2_build_1048(), 2);
-    assert_eq!(
-        (b.you.role, b.you.figure, b.you.share_pm),
-        (Role::Main, Some(6000), Some(732))
-    );
-    assert_eq!(you(&wrapped_1218(), 2).you.role, Role::None);
-
-    let mut v = Vitals::new();
-    let [base, sweep, mut now] = spotlight_1032().samples();
-    now.procs_truncated = true;
-    v.absorb(&base);
-    v.absorb(&sweep);
-    let s = v.absorb(&now);
-    let t = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!(
-        (t.you.role, t.you.figure),
-        (Role::Unavailable("truncated"), None)
-    );
-    assert_eq!(
-        account(WhySubject::Mem, Some(1), &s).you.role,
-        Role::Unavailable("truncated")
-    );
-    let mut series = spotlight_1032().series(2);
-    series[2].procs_truncated = true;
-    let s = last(&series[..4]);
-    assert!(!s.procs_truncated);
-    assert_eq!(
-        account(WhySubject::Cpu, Some(1), &s).you.role,
-        Role::Unavailable("truncated")
-    );
-
-    let mut unread = snap(&spotlight_1032());
-    unread.aterm = None;
-    for subject in [WhySubject::Cpu, WhySubject::Mem] {
-        assert_eq!(
-            account(subject, Some(1), &unread).you.role,
-            Role::Unavailable("truncated"),
-            "{subject:?} with aterm unread"
-        );
-    }
-
-    let f = you(&finished_1032(), 1);
-    assert_eq!(
-        (f.you.role, f.you.figure, f.you.unattributed_mc),
-        (Role::Unavailable("not_sampled"), Some(200), Some(3000))
-    );
-    assert!(f.cannot.contains(&("finished_tab_work", "not_sampled")));
-    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
-    let r = you(&claude_reaped_1032(), 1);
-    assert_eq!(
-        (r.you.role, r.you.figure, r.you.unattributed_mc),
-        (Role::Unavailable("ambiguous_reap"), Some(200), Some(3000)),
-        "an unseen inherited charge cannot prove actual CPU"
-    );
-    assert!(!r.cannot.contains(&("finished_tab_work", "not_sampled")));
-    let mut build = tab2_build_1048();
-    build.busy_mc += 1000;
-    for c in build.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.mc += 1000;
-        c.reaped = 10;
-    }
-    let g = you(&build, 2);
-    assert_eq!(
-        (g.you.role, g.you.figure, g.you.unattributed_mc),
-        (Role::Main, Some(6000), Some(1000))
-    );
-    assert!(!g.cannot.contains(&("finished_tab_work", "not_sampled")));
-}
-
-#[test]
-fn a_current_stalled_sweep_keeps_its_reason_beside_carried_healthy_cpu_facts() {
-    let scene = spotlight_1032();
-    let mut v = Vitals::new();
-    let [base, sweep, now] = scene.samples();
-    v.absorb(&base);
-    v.absorb(&sweep);
-    let healthy = v.absorb(&now);
-    assert_eq!(
-        account(WhySubject::Cpu, Some(1), &healthy).you.role,
-        Role::Minor
-    );
-
-    let mut stalled = scene.reading(scene.window_ms + scene.sweep_ms, false);
-    stalled.procs = None;
-    stalled.stalled = vec![crate::lanes::LaneStall {
-        lane: crate::lanes::PROCS,
-        call: "proc_pid_rusage",
-        pid: Some(1210),
-        name: Some("claude".into()),
-        since_unix_ms: now.at_unix_ms,
-        for_ms: scene.sweep_ms,
-    }];
-    let current = v.absorb(&stalled);
-    assert_eq!(
-        current.why.as_ref().unwrap().at_ns,
-        healthy.why.as_ref().unwrap().at_ns
-    );
-    assert!(current.at_ns > current.why.as_ref().unwrap().at_ns);
-    assert!(current.aterm.is_none());
-    assert!(
-        !current.procs_truncated,
-        "the sweep stalled rather than reaching its list cap"
-    );
-    let you = account(WhySubject::Cpu, Some(1), &current).you;
-    assert_eq!(
-        (you.role, you.figure, you.share_pm),
-        (Role::Unavailable("stalled"), None, None)
-    );
-
-    let recovered = v.absorb(&scene.reading(2 * scene.window_ms, true));
-    assert_eq!(
-        account(WhySubject::Cpu, Some(1), &recovered).you.role,
-        Role::Minor
-    );
-}
-
-/// A tab the reap credit marked short of its work, over a window with no unattributed work, may
-/// hold any of the rest of aterm's side: where that much would make it the main user, its role
-/// is unread, never `minor`. NEGATIVE CONTROL: unmarked, the same figures read `minor`.
-#[test]
-fn a_short_tabs_role_is_bounded_by_the_rest_of_aterms_side() {
-    let you = |short: bool| {
-        let mut s = snap(&spotlight_1032());
-        let mut f = (**s.why.as_ref().expect("a window")).clone();
-        let split = &mut f.split;
-        split.tabs = vec![(1, 200)];
-        split.global_mc = 3300;
-        (split.aterm_mc, split.delegated_mc, split.others_mc) = (2400, 0, 500);
-        (
-            split.services_mc,
-            split.unaccounted_mc,
-            split.unattributed_mc,
-        ) = (400, 0, 0);
-        split.short_tabs = if short { vec![1] } else { Vec::new() };
-        s.why = Some(std::sync::Arc::new(f));
-        let a = account(WhySubject::Cpu, Some(1), &s);
-        (a.you.role, a.you.unattributed_mc)
-    };
-    assert_eq!(you(true), (Role::Unavailable("not_sampled"), Some(0)));
-    assert_eq!(you(false), (Role::Minor, None), "NEGATIVE CONTROL");
-}
-
-/// An idle tab beside aterm's coalition and its live work 0.30 mc apart
-/// (aterm's coalition 200.50 mc, aterm itself 200.20, a member made and
-/// reaped inside the window, so the gap may be finished work): rounded on
-/// their own they read a millicore apart, rounded once from their
-/// nanoseconds none, so the role stays `none` and no `finished_tab_work` is
-/// claimed. NEGATIVE CONTROL: 0.80 mc apart is a millicore no live process
-/// holds, and the bound rule reads `not_sampled`.
-#[test]
-fn the_parts_rounding_never_reads_as_unattributed_work() {
-    let idle = |coalition_ns: u64| {
-        let mut scene = calm_1510();
-        for c in scene.coalitions.iter_mut().filter(|c| c.id == 1342) {
-            c.mc = 200;
-        }
-        for p in scene.procs.iter_mut() {
-            match p.pid {
-                1187 => *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "aterm", 200),
-                1210 => *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "claude", 0),
-                _ => {}
-            }
-        }
-        let mut v = Vitals::new();
-        let [base, sweep, mut now] = scene.samples();
-        for r in now.coalitions.iter_mut().flat_map(|c| c.rows.iter_mut()) {
-            if r.id == 1342 {
-                r.cpu_ns += coalition_ns;
-                r.tasks_started += 1;
-                r.tasks_exited += 1;
-            }
-        }
-        for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1187) {
-            p.cpu_ns = p.cpu_ns.map(|ns| ns + 1_000_000);
-        }
-        v.absorb(&base);
-        v.absorb(&sweep);
-        let s = v.absorb(&now);
-        let f = s.why.as_deref().expect("a window");
-        assert_eq!(
-            (f.split.aterm_mc - f.split.own_mc, f.split.tabs.as_slice()),
-            (1, &[(1, 0)][..]),
-            "{coalition_ns} ns: the parts rounded on their own"
-        );
-        (
-            f.split.unattributed_mc,
-            account(WhySubject::Cpu, Some(1), &s),
-        )
-    };
-    let (unattributed, a) = idle(2_500_000);
-    assert_eq!(unattributed, 0);
-    assert_eq!((a.you.role, a.you.unattributed_mc), (Role::None, None));
-    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
-    let (unattributed, a) = idle(5_000_000);
-    assert_eq!(unattributed, 1);
-    assert_eq!(
-        (a.you.role, a.you.unattributed_mc),
-        (Role::Unavailable("not_sampled"), Some(1))
-    );
-    assert!(a.cannot.contains(&("finished_tab_work", "not_sampled")));
-}
-
-/// An idle tab over a window in which aterm's coalition's counter moved
-/// 3.26 ms past its members' times (`idle_skewed_1510`, the headless run's
-/// flip): its task counters show no member made or reaped and every member
-/// is swept and in a live figure, so none of it is finished work; it reads
-/// as the counters' skew and the role stays `none`. NEGATIVE CONTROLS: the
-/// same window with a member made and reaped, with a member in no live
-/// figure (a process of aterm's coalition reparented to launchd), with a
-/// member whose coalition went unread (the sweep found fewer than the
-/// counters hold), with a member whose CPU was not read at both ends (a
-/// root `sudo` in tab 1 at 500 mc), or with one whose user went unread at
-/// the window's end (tab 1's `claude` at 300 mc: its last second) keeps what
-/// no tab's figure holds as work, and the role `not_sampled` where that work
-/// could change it; so does a `git` that exited after 3 mc
-/// (`exited_skewed_1510`), whose 3 mc the shell's reaped time puts in its tab,
-/// with the skew unattributed, and a task of 3 mc no member reaped
-/// (`exited_unseen_1510`), which stays unattributed with it.
-#[test]
-fn the_counters_skew_never_reads_as_finished_work() {
-    let read = |scene: &Scene, tweak: fn(&mut Sample)| {
-        let mut v = Vitals::new();
-        let [base, sweep, mut now] = scene.samples();
-        tweak(&mut now);
-        v.absorb(&base);
-        v.absorb(&sweep);
-        let s = v.absorb(&now);
-        let split = s.why.as_deref().expect("a window").split.clone();
-        (split, account(WhySubject::Cpu, Some(1), &s))
-    };
-    let (split, a) = read(&idle_skewed_1510(), |_| {});
-    assert_eq!(
-        (
-            split.aterm_mc,
-            split.own_mc,
-            split.tabs.as_slice(),
-            split.skew_mc,
-            split.unattributed_mc
-        ),
-        (201, 200, &[(1, 0)][..], 1, 0)
-    );
-    assert_eq!((a.you.role, a.you.unattributed_mc), (Role::None, None));
-    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
-
-    let (split, a) = read(&idle_skewed_1510(), |now| {
-        for r in now.coalitions.iter_mut().flat_map(|c| c.rows.iter_mut()) {
-            if r.id == 1342 {
-                r.tasks_started += 1;
-                r.tasks_exited += 1;
-            }
-        }
-    });
-    assert_eq!(
-        (split.skew_mc, split.unattributed_mc),
-        (0, 1),
-        "a member reaped"
-    );
-    assert_eq!(
-        (a.you.role, a.you.unattributed_mc),
-        (Role::Unavailable("not_sampled"), Some(1))
-    );
-    let mut stray = idle_skewed_1510();
-    stray.procs.push(Proc::new(
-        1230,
-        1,
-        501,
-        1342,
-        USERSPACE_MS + 400_000,
-        "ssh-agent",
-        0,
-    ));
-    for c in stray.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.started += 1;
-    }
-    let (split, a) = read(&stray, |_| {});
-    assert_eq!(
-        (split.skew_mc, split.unattributed_mc),
-        (0, 0),
-        "a member in no live figure"
-    );
-    assert!(split.ownership_incomplete);
-    assert_ne!(a.you.role, Role::Main);
-    let (split, a) = read(&idle_skewed_1510(), |now| {
-        for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1210) {
-            p.coalition = None;
-        }
-    });
-    assert_eq!(
-        (split.skew_mc, split.unattributed_mc),
-        (0, 0),
-        "a member whose coalition went unread"
-    );
-    assert!(split.ownership_incomplete);
-    assert_ne!(a.you.role, Role::Main);
-    let mut root = idle_skewed_1510();
-    root.busy_mc += 500;
-    root.procs.push(Proc::new(
-        1240,
-        1200,
-        0,
-        1342,
-        USERSPACE_MS + 300_000,
-        "sudo",
-        500,
-    ));
-    for c in root.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.mc += 500;
-        c.started += 1;
-    }
-    let (split, a) = read(&root, |_| {});
-    assert_eq!(
-        (split.skew_mc, split.unattributed_mc),
-        (1, 0),
-        "a readable owned process keeps its CPU even under another UID"
-    );
-    assert_eq!(
-        (a.you.role, a.you.figure, a.you.unattributed_mc),
-        (Role::Main, Some(500), None)
-    );
-    let mut busy = idle_skewed_1510();
-    busy.busy_mc += 300;
-    for p in busy.procs.iter_mut().filter(|p| p.pid == 1210) {
-        *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "claude", 300);
-    }
-    for c in busy.coalitions.iter_mut().filter(|c| c.id == 1342) {
-        c.mc += 300;
-    }
-    let (split, a) = read(&busy, |now| {
-        for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1210) {
-            p.uid = None;
-        }
-    });
-    assert_eq!(
-        (split.skew_mc, split.unattributed_mc, split.tabs.as_slice()),
-        (1, 0, &[(1, 300)][..]),
-        "a proved member's readable CPU remains attributed when its UID is unread"
-    );
-    assert_eq!(
-        (a.you.role, a.you.unattributed_mc),
-        (Role::Minor, None),
-        "all independently read CPU is retained"
-    );
-
-    let (split, a) = read(&exited_skewed_1510(), |_| {});
-    assert_eq!(
-        (
-            split.aterm_mc,
-            split.tabs.as_slice(),
-            split.skew_mc,
-            split.unattributed_mc
-        ),
-        (204, &[(1, 3)][..], 0, 1),
-        "the git's 15 ms count in its tab, its last second by the shell's reaped time; the \
-         counters' 3.26 ms, with a member reaped, are unattributed"
-    );
-    assert_eq!(
-        (a.you.role, a.you.figure, a.you.unattributed_mc),
-        (Role::Minor, Some(2), Some(1)),
-        "the independently observed floor and whole-app upper bound both establish a minor role"
-    );
-    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
-
-    let (split, a) = read(&exited_unseen_1510(), |_| {});
-    assert_eq!(
-        (
-            split.aterm_mc,
-            split.tabs.as_slice(),
-            split.skew_mc,
-            split.unattributed_mc
-        ),
-        (204, &[(1, 0)][..], 0, 4),
-        "a task's 15 ms no member reaped and the counters' 3.26 ms, with a member reaped"
-    );
-    assert_eq!(
-        (a.you.role, a.you.figure, a.you.unattributed_mc),
-        (Role::Unavailable("not_sampled"), Some(0), Some(4))
-    );
-    assert!(a.cannot.contains(&("finished_tab_work", "not_sampled")));
 }
 
 /// Memory's `you`: the tab's footprint of used memory, minor under the
@@ -1761,104 +552,6 @@ fn memory_competition_uses_current_foreign_charge_without_counting_the_tab_twice
     }
 }
 
-/// The bare `sys why`: memory under pressure or swapping first; then the CPU
-/// throttled (Low Power Mode too) or with a core-sized cause, held or open;
-/// calm under a quarter of the cores with no cause and every deviation read;
-/// else the larger share of its capacity.
-#[test]
-fn a_bare_why_answers_for_what_deviates_most() {
-    assert_eq!(bare_subject(&snap(&calm_1510())), Bare::Calm);
-    assert_eq!(
-        bare_subject(&Snapshot::default()),
-        Bare::Subject(WhySubject::Cpu),
-        "unread is never calm"
-    );
-    let unread = |edit: fn(&mut Scene)| {
-        let mut scene = calm_1510();
-        edit(&mut scene);
-        bare_subject(&snap(&scene))
-    };
-    assert_eq!(unread(|s| s.mem = None), Bare::Subject(WhySubject::Cpu));
-    let edits: [fn(&mut Scene); 3] = [
-        |s| {
-            if let Some(m) = s.mem.as_mut() {
-                m.pressure = Pressure::Unknown;
-            }
-        },
-        |s| {
-            if let Some(m) = s.mem.as_mut() {
-                m.counters = None;
-            }
-        },
-        |s| s.thermal = None,
-    ];
-    for edit in edits {
-        assert_eq!(unread(edit), Bare::Subject(WhySubject::Mem));
-    }
-    assert_eq!(
-        bare_subject(&snap(&spotlight_1032())),
-        Bare::Subject(WhySubject::Cpu)
-    );
-    let mut hot = calm_1510();
-    hot.thermal = Some(Thermal {
-        level: Throttle::Light,
-        ..Thermal::default()
-    });
-    assert_eq!(bare_subject(&snap(&hot)), Bare::Subject(WhySubject::Cpu));
-    let mut small = calm_1510();
-    small.cores = 1;
-    let used = |app: u64| MemSample {
-        total: 100 << 30,
-        app: app << 30,
-        pressure: Pressure::Normal,
-        ..MemSample::default()
-    };
-    small.mem = Some(used(60));
-    assert_eq!(bare_subject(&snap(&small)), Bare::Subject(WhySubject::Mem));
-    small.mem = Some(used(10));
-    assert_eq!(bare_subject(&snap(&small)), Bare::Subject(WhySubject::Cpu));
-
-    let mut swapping = snap(&calm_1510());
-    swapping.mem = Some(MemView {
-        sample: used(10),
-        rates: Some(MemRates {
-            swapout_bps: 2_000_000.0,
-            ..MemRates::default()
-        }),
-        ..MemView::default()
-    });
-    assert_eq!(bare_subject(&swapping), Bare::Subject(WhySubject::Mem));
-    let mut lpm = calm_1510();
-    lpm.thermal = Some(Thermal {
-        low_power: Some(true),
-        ..Thermal::default()
-    });
-    assert_eq!(bare_subject(&snap(&lpm)), Bare::Subject(WhySubject::Cpu));
-    let held = snap(&busier(calm_1510(), 1210, 600));
-    assert_eq!(causes(&held), [CauseId::TabWork(1)]);
-    assert_eq!(bare_subject(&held), Bare::Subject(WhySubject::Mem));
-
-    let mut scene = spotlight_1032();
-    let calm = calm_1510();
-    (scene.mem, scene.thermal) = (calm.mem, calm.thermal);
-    let mut after = ticks(&scene, 3, None).pop().expect("a split tick");
-    let f = Arc::make_mut(after.why.as_mut().expect("facts"));
-    assert_eq!(f.open.len(), 1);
-    f.causes.clear();
-    for o in &mut f.open {
-        o.holds = false;
-    }
-    assert_eq!(
-        bare_subject(&after),
-        Bare::Subject(WhySubject::Cpu),
-        "open, failing"
-    );
-    Arc::make_mut(after.why.as_mut().expect("facts"))
-        .open
-        .clear();
-    assert_eq!(bare_subject(&after), Bare::Calm, "closed");
-}
-
 /// A bare `sys why` with the lane on and no window read yet is never calm:
 /// the coalitions are unread, so no cause is known not to hold.
 #[test]
@@ -1867,122 +560,6 @@ fn a_bare_why_before_the_lanes_first_window_is_never_calm() {
     let s = last(&[base, sweep]);
     assert!(s.why.is_none() && s.coal_lane.on());
     assert_eq!(bare_subject(&s), Bare::Subject(WhySubject::Cpu));
-}
-
-/// The machine's contexts are the snapshot's on every reading, never the
-/// last split tick's: a throttle that starts after the tick holds for the
-/// CPU's causes at once, as the bare `sys why` that answers for the CPU by
-/// it reads it, so the reply never says nothing is needed beside it; one
-/// that ended since the tick holds no more.
-#[test]
-fn the_machines_contexts_are_the_snapshots_not_the_windows() {
-    let light = Some(Thermal {
-        level: Throttle::Light,
-        ..Thermal::default()
-    });
-    let throttled = CauseId::Context(Context::Throttled);
-    let contexts = |a: &Account| {
-        a.causes
-            .iter()
-            .find(|c| c.cause.id == SPOTLIGHT)
-            .map(|c| c.cause.contexts.clone())
-    };
-    let mut series = read_calm(spotlight_1032()).series(2);
-    series[3].thermal = light;
-    let s = last(&series[..4]);
-    assert_eq!(bare_subject(&s), Bare::Subject(WhySubject::Cpu));
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert!(a.causes.iter().any(|c| c.cause.id == throttled));
-    assert_eq!(
-        contexts(&a),
-        Some(vec![Context::Startup, Context::Throttled])
-    );
-    assert!(!a.nothing_needed);
-
-    let mut series = read_calm(spotlight_1032()).series(2);
-    series[2].thermal = light;
-    let a = account(WhySubject::Cpu, Some(1), &last(&series[..4]));
-    assert!(a.causes.iter().all(|c| c.cause.id != throttled));
-    assert_eq!(contexts(&a), Some(vec![Context::Startup]));
-    assert!(a.nothing_needed);
-}
-
-/// With the lane off the facts are each whole reading's split by
-/// subtraction: a whole reading that makes none carries none, so the split
-/// and the tab's share read `not_sampled`.
-#[test]
-fn with_the_lane_off_a_reading_with_no_split_carries_no_facts() {
-    let mut series = read_calm(Scene {
-        lane: CoalLane::Unsupported,
-        ..lane_off_1032()
-    })
-    .series(2);
-    series[3].cores = None;
-    assert!(last(&series[..3]).why.is_some());
-    let s = last(&series[..4]);
-    assert!(s.split.is_none() && s.why.is_none());
-    let a = account(WhySubject::Cpu, Some(1), &s);
-    assert_eq!(
-        (a.parts, a.you.role),
-        (None, Role::Unavailable("not_sampled"))
-    );
-    assert_eq!(
-        (bare_subject(&s), a.nothing_needed),
-        (Bare::Subject(WhySubject::Cpu), false)
-    );
-}
-
-/// A tab the readings never read has no figure yet: on the CPU one opened
-/// after the last split tick, in memory one no sweep holds.
-#[test]
-fn a_tab_no_reading_read_is_unread_never_none() {
-    let mut series = read_calm(spotlight_1032()).series(2);
-    series[3].tabs.push(tab(2, 1300));
-    let s = last(&series[..4]);
-    let a = account(WhySubject::Cpu, Some(2), &s);
-    assert_eq!(
-        (a.parts, a.you.role, a.you.figure, a.you.share_pm),
-        (None, Role::Unavailable("warming"), None, None)
-    );
-    assert_eq!(account(WhySubject::Cpu, Some(1), &s).you.role, Role::Minor);
-    let m = account(WhySubject::Mem, Some(3), &s);
-    assert_eq!(
-        (m.you.role, m.you.figure, m.you.share_pm),
-        (Role::Unavailable("warming"), None, None)
-    );
-    series[3].procs_truncated = true;
-    let s = last(&series[..4]);
-    let a = account(WhySubject::Cpu, Some(2), &s);
-    assert_eq!(
-        (a.parts, a.you.role),
-        (None, Role::Unavailable("truncated"))
-    );
-    assert_eq!(
-        account(WhySubject::Mem, Some(2), &s).you.role,
-        Role::Unavailable("truncated")
-    );
-}
-
-/// A misread turns the lane off for good, and with it every episode and the
-/// clause.
-#[test]
-fn a_misread_ends_the_episodes_and_the_clause() {
-    let mut series = read_calm(spotlight_1032()).series(5);
-    for r in series[10]
-        .coalitions
-        .iter_mut()
-        .flat_map(|c| &mut c.rows)
-        .filter(|r| r.id == 307)
-    {
-        r.footprint = Some(1 << 41);
-    }
-    assert!(deck_cause(&last(&series[..9])).is_some());
-    let s = last(&series);
-    assert_eq!(s.coal_lane, CoalLane::Off);
-    let f = s.why.as_ref().expect("facts by subtraction");
-    assert_eq!(f.split.via, Via::Subtraction);
-    assert_eq!((f.open.as_slice(), f.clause), (&[][..], None));
-    assert_eq!(deck_cause(&s), None);
 }
 
 /// A lead kept from the last tick is the one built anew from the same reads
@@ -2094,4 +671,22 @@ fn a_coalitions_lead_is_named_anew_once_its_identity_moves() {
         id.voucher = Voucher::AdHoc;
     }
     assert_eq!(lead(&ids).voucher, Voucher::AdHoc, "its identity moved");
+}
+
+#[test]
+fn reported_cpu_unread_owned_counter_or_identity_never_claims_complete_coverage() {
+    for cpu in [
+        reported_tab_read(None, false),
+        reported_tab_read(Some(5_000_000), true),
+    ] {
+        assert!(cpu.missed, "{cpu:?}");
+        assert!(cpu.tabs[0].missed, "{cpu:?}");
+        assert_eq!(cpu.tabs[0].reported, 0.0);
+        assert_eq!(
+            cpu.cpu_accounting.execution_window,
+            crate::published_cpu::CpuExecutionWindow::Unavailable
+        );
+    }
+    let complete = reported_tab_growth(0);
+    assert!(!complete.missed && !complete.tabs[0].missed);
 }

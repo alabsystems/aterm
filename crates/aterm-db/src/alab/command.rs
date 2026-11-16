@@ -84,6 +84,9 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   import --compare-sheet <csv>\n\
                     what importing the sheet would do, by count, key and column, and how its\n\
                     password flags meet the registry's secret cells: never a value\n\
+  seed              write the provider, CLI and plan rows this build compiles and the registry\n\
+                    lacks: the importer's seed pass alone, no sheet read. Fills only cells\n\
+                    nothing has written; prints the records it added\n\
   check [--tsv]     preferences, labels, logins, aliases and mailboxes, then every conflict,\n\
                     dangling\n\
                     reference and unique clash, what this Mac's self-registration decides\n\
@@ -233,6 +236,23 @@ fn report_seeds(report: &mut Value, seeded: Result<crate::alab::Seeded>) {
     }
 }
 
+/// The seed pass alone: the compiled provider, CLI and plan rows this registry lacks, with no
+/// sheet read, so a build that compiles a new row can give it to a registry that already
+/// exists. Held to the importer's guard: a Mac that holds none of the registry while the lab
+/// does would seed every row again beside the lab's.
+///
+/// # Errors
+/// The guard refuses; the pass cannot write (no writer, this Mac's automatic records are
+/// spent, the deadline passes).
+fn seed(paths: &Paths, now_ms: u64) -> Result<Value> {
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let held = handle.view().map_or(0, |view| view.ops.len());
+    let catalog = empty_view_catalog(paths, held)?;
+    empty_view_guard(paths, held, catalog, now_ms)?;
+    let seeded = Registry::at(paths.clone()).seed_until(std::time::Instant::now() + IMPORT_PASS)?;
+    Ok(json!({ "seeds": seeded.records, "already": seeded.retried }))
+}
+
 /// The exit status of a report: 1 where an import wrote its rows but not what they name, so no
 /// script or person takes that for a finished import.
 fn exit_of(report: &Value) -> u8 {
@@ -323,8 +343,9 @@ fn whole(name: &str, raw: &std::ffi::OsStr) -> Result<u64> {
 }
 
 /// The verbs `run` takes.
-const VERBS: [&str; 21] = [
+const VERBS: [&str; 22] = [
     "import",
+    "seed",
     "check",
     "adopt",
     "merge",
@@ -591,6 +612,7 @@ pub fn run_io(
             })?;
             import(paths, &args, vendors, &mut *io.review, io.store, now_ms)
         }
+        "seed" => seed(paths, now_ms),
         "check" => {
             let handle = Handle::at(paths.clone(), &att::REGISTRY);
             let (view, usage) = match handle.usage() {
@@ -1675,6 +1697,7 @@ fn matches_registry(plan: &Plan) -> bool {
                     | Kind::OwnerKept
                     | Kind::Conflicted
                     | Kind::RetiredKept
+                    | Kind::TargetNotLive
                     | Kind::DumpConflicted
                     | Kind::ProtectedSecret
                     | Kind::Unmapped

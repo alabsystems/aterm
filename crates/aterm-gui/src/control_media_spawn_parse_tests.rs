@@ -21,7 +21,9 @@ fn a_spawn_whose_cwd_names_no_folder_is_refused_by_name() {
         Some(format!("ERR no such folder {gone}\n"))
     );
     assert_eq!(
-        refused(&format!("connected=controlled place=tab of=s-a cwd={gone}")),
+        refused(&format!(
+            "connected=controlled place=tab of=tqn5r6e0148 cwd={gone}"
+        )),
         Some(format!("ERR no such folder {gone}\n")),
         "the connected form too"
     );
@@ -138,7 +140,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
                 model: Some("claude-opus-4.1".to_string()),
                 effort: None,
                 autopilot: None,
-                from: Some(aterm_session::SessionId::new(parent)),
+                from: Some(aterm_session::SessionId::parse(parent).expect("a session id")),
             })
         );
         assert_eq!(
@@ -150,7 +152,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
                 model: Some("gemini-2.5-pro-".to_string()),
                 effort: None,
                 autopilot: None,
-                from: Some(aterm_session::SessionId::new(parent)),
+                from: Some(aterm_session::SessionId::parse(parent).expect("a session id")),
             })
         );
     }
@@ -195,7 +197,10 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
                 model: Some("m-1".to_string()),
                 effort: None,
                 autopilot: Some(alab_policy::config::Autopilot::Cruise),
-                from: Some(aterm_session::SessionId::new("s-0123456789abcdef0123")),
+                from: Some(
+                    aterm_session::SessionId::parse("s-0123456789abcdef0123")
+                        .expect("a legacy tab id")
+                ),
             }),
             "a worker of {program:?}"
         );
@@ -273,15 +278,15 @@ fn program_parses_as_a_program_worker_and_a_spawn_naming_none_is_refused() {
                     program: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), "echo it's done".to_string()],
                 },
-                Some(aterm_session::SessionId::new(parent)),
+                Some(aterm_session::SessionId::parse(parent).expect("a session id")),
             ))
         );
     }
     assert_eq!(
         program("program=/bin/sh from=s-0123456789abcdef0123 len=9").map(|(_, from)| from),
-        Some(Some(aterm_session::SessionId::new(
-            "s-0123456789abcdef0123"
-        ))),
+        Some(Some(
+            aterm_session::SessionId::parse("s-0123456789abcdef0123").expect("a legacy tab id")
+        )),
         "a legacy tab's exact ID"
     );
     assert_eq!(
@@ -476,19 +481,19 @@ fn plain_spawn_parses_with_and_without_cwd() {
 
 #[test]
 fn connected_spawn_requires_the_full_explicit_form() {
-    let full = parse_spawn_args("connected=controlled place=tab of=s-abc cwd=/w");
+    let full = parse_spawn_args("connected=controlled place=tab of=tqn5r6e0148 cwd=/w");
     assert_eq!(
         full,
         Ok(SpawnForm::Connected {
             kind: ConnectedSpawnKind::Controlled,
             place: ConnectedSpawnPlace::Tab,
-            origin: aterm_session::SessionId::new("s-abc"),
+            origin: aterm_session::SessionId::parse("tqn5r6e0148").expect("a tab id"),
             cwd: Some("/w".to_string()),
             theme: None,
         })
     );
     assert!(matches!(
-        parse_spawn_args("connected=controller place=window of=s-abc"),
+        parse_spawn_args("connected=controller place=window of=tqn5r6e0148"),
         Ok(SpawnForm::Connected {
             kind: ConnectedSpawnKind::Controller,
             place: ConnectedSpawnPlace::Window,
@@ -497,18 +502,25 @@ fn connected_spawn_requires_the_full_explicit_form() {
     ));
     for incomplete in [
         "connected=controlled place=tab",
-        "connected=controlled of=s-abc",
+        "connected=controlled of=tqn5r6e0148",
         "connected=controlled",
         "place=tab",
-        "of=s-abc",
+        "of=tqn5r6e0148",
     ] {
         assert_eq!(parse_spawn_args(incomplete), Err(None), "{incomplete}");
     }
     for (rest, word) in [
-        ("connected=owner place=tab of=s-abc", "connected=owner"),
-        ("connected=controlled place=pane of=s-abc", "place=pane"),
+        (
+            "connected=owner place=tab of=tqn5r6e0148",
+            "connected=owner",
+        ),
+        (
+            "connected=controlled place=pane of=tqn5r6e0148",
+            "place=pane",
+        ),
         ("connected=controlled place=tab of=", "of="),
         ("connected=controlled place=tab of=@s-abc", "of=@s-abc"),
+        ("connected=controlled place=tab of=s-abc", "of=s-abc"),
     ] {
         assert_eq!(parse_spawn_args(rest), Err(Some(word.to_owned())), "{rest}");
     }
@@ -520,7 +532,10 @@ fn connected_spawn_requires_the_full_explicit_form() {
         "identity=-",
     ] {
         assert!(
-            parse_spawn_args(&format!("connected=controlled place=tab of=s-abc {knob}")).is_err(),
+            parse_spawn_args(&format!(
+                "connected=controlled place=tab of=tqn5r6e0148 {knob}"
+            ))
+            .is_err(),
             "{knob}"
         );
     }
@@ -611,7 +626,7 @@ fn spawn_takes_one_req_and_refuses_it_on_the_connected_form() {
     }
     assert_eq!(
         parse_spawn_args(&format!(
-            "connected=controlled place=tab of=s-ab12 req={id}"
+            "connected=controlled place=tab of=tqn5r6e0148 req={id}"
         )),
         Err(None)
     );

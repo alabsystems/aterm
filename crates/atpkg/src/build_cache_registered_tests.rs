@@ -14027,7 +14027,7 @@ fn the_front_records_the_target_of_the_config_list_targo_merges() {
             .collect();
         let expected = if recorded { &named } else { &world.target };
         assert_eq!(verdict.ok(), Some(true), "{row}: {made:?}");
-        assert_eq!(made, [expected.clone()], "{row}");
+        assert_eq!(made.as_slice(), std::slice::from_ref(expected), "{row}");
     }
     // A help call through the alias builds nothing, whatever a variable names.
     let world = World::new();
@@ -14057,4 +14057,129 @@ fn the_front_records_the_target_of_the_config_list_targo_merges() {
         Some(false)
     );
     assert!(roots(&world.home).is_empty());
+}
+
+/// A CHECKOUT WHOSE CONFIG NAMES A TARGET ONLY IN AN ALIAS'S WORDS BUILDS UNREFUSED, as a fresh
+/// clone of trust-mc does (its `.cargo/config.toml` of 2026-11-15: `jobs`, a relative
+/// `rustc-wrapper`, `[net]`, `[env]` inline tables, a `cfg` target's `rustflags`, and
+/// `build-dev = "run --target-dir target/tools …"`): `test -p`, `check` and `fmt` name no
+/// output, so the shim's front places each in the shared cache, or leaves it as typed, and admits
+/// it owing no custody, making no `target`; `build-dev`, the alias run, names its target, which
+/// is made and owned. The protection stands: a call still owes custody where a config's `build`
+/// table names a target under HOME, and one standing unowned is refused, never adopted; and a
+/// line an alias this reader cannot tell may run (Trust's `TARGO_HOME` and Targo 16387's
+/// `CARGO_HOME` read apart) owes custody where a config's text spells a directory's key, as that
+/// alias's own words, unread, may. NEGATIVE CONTROL: before a config was read for what its
+/// `build` table names, the alias's words made every call from the checkout owe custody of a
+/// target it never named, and the front refused `test`, `check` and `fmt` alike: "build outputs
+/// are unmanaged or unsupported"; the untold row is admitted once its home's config spells no
+/// directory's key.
+#[test]
+fn a_checkout_whose_alias_names_a_target_builds_unrefused() {
+    use super::super::Tool;
+    const TRUST_MC: &str = "[build]\njobs = 12\nrustc-wrapper = \"scripts/trustc-private-wrapper.sh\"\n\n\
+                            [net]\ngit-fetch-with-cli = true\n\n\
+                            [alias]\n# Build trust-mc with development configuration.\n\
+                            build-dev = \"run --target-dir target/tools -p build-trust-mc -- build-dev\"\n\
+                            bundle = \"run -p build-trust-mc -- bundle\"\n\n\
+                            [env]\nRAYON_NUM_THREADS = { value = \"2\", force = true }\n\
+                            RUST_TEST_THREADS = { value = \"2\", force = true }\n\
+                            [target.'cfg(all())']\nrustflags = [ # Global lints.\n\
+                            \x20   \"-Aclippy::expect_fun_call\",\n]\n";
+    let words =
+        |words: &[&str]| -> Vec<String> { words.iter().map(|word| (*word).to_owned()).collect() };
+    let checkout = |text: &str| {
+        let world = World::new();
+        std::fs::create_dir(world.owner.join(".cargo")).unwrap();
+        std::fs::write(world.owner.join(".cargo/config.toml"), text).unwrap();
+        world
+    };
+    // The shim's front: the call as the block placed it, or as typed where it placed none.
+    let front = |world: &World, typed: &[&str]| {
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &|_| None,
+            read: &super::super::read_config,
+            read_manifest: &super::super::read_manifest,
+            writable: &super::super::writable,
+        };
+        let args = words(typed);
+        match super::super::placed_build_dir(&args, Tool::Targo, &machine) {
+            Some((_, placed)) => {
+                observe_shim_on(&placed, Tool::Targo, "config", &world.home, &machine, true)
+            }
+            None => observe_shim_on(&args, Tool::Targo, "-", &world.home, &machine, true),
+        }
+    };
+    let world = checkout(TRUST_MC);
+    for typed in [
+        &[
+            "--unverified",
+            "test",
+            "-p",
+            "build-trust-mc",
+            "--",
+            "a_sysroot_library_missing_a_path_dependency_is_not_chosen",
+        ][..],
+        &["--unverified", "check"],
+        &["fmt", "--check"],
+    ] {
+        assert!(!front(&world, typed).unwrap(), "{typed:?}");
+    }
+    assert!(roots(&world.home).is_empty());
+    assert!(!world.owner.join("target").exists());
+    // The alias run names its target: made and owned.
+    assert!(front(&world, &["--unverified", "build-dev"]).unwrap());
+    let records = roots(&world.home);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].root, world.owner.join("target/tools"));
+
+    // A `build` table naming a target that stands unowned refuses the plain call, adopting none.
+    let world = checkout(TRUST_MC);
+    let stands = world.home.join("stands");
+    std::fs::create_dir(&stands).unwrap();
+    std::fs::write(stands.join("keep"), b"another build's output").unwrap();
+    std::fs::create_dir(world.home.join(".cargo")).unwrap();
+    std::fs::write(
+        world.home.join(".cargo/config.toml"),
+        format!("[build]\ntarget-dir = \"{}\"\n", stands.display()),
+    )
+    .unwrap();
+    assert!(front(&world, &["--unverified", "check"]).is_err());
+    assert!(roots(&world.home).is_empty());
+    assert_eq!(
+        std::fs::read(stands.join("keep")).unwrap(),
+        b"another build's output"
+    );
+
+    // An alias this reader cannot tell, read beside a config whose text spells a directory's key.
+    for (text, owes) in [(TRUST_MC, true), ("[build]\njobs = 12\n", false)] {
+        let world = checkout(text);
+        let twin = world.home.join("twin-home");
+        std::fs::create_dir(&twin).unwrap();
+        std::fs::write(twin.join("config.toml"), "[alias]\nxb = \"build\"\n").unwrap();
+        let env = |name: &str| (name == "TARGO_HOME").then(|| twin.clone().into_os_string());
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &super::super::read_config,
+            read_manifest: &super::super::read_manifest,
+            writable: &|_| Some(true),
+        };
+        let typed = words(&["--unverified", "xb"]);
+        assert_eq!(
+            requires_managed_explicit(&typed, Tool::Targo, &world.home, &machine),
+            owes,
+            "{text:?}"
+        );
+        assert_eq!(
+            observe_for_producer(&typed, Tool::Targo, &world.home, &machine, true).is_err(),
+            owes,
+            "{text:?}"
+        );
+    }
 }

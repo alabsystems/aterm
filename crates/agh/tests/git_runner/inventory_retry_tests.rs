@@ -51,9 +51,8 @@ fn interleaved_claim_cas_refuses_a_winner_after_either_listing() {
         let batch = push_batch(&[(name, ABSENT, &main)])
             .observing_main(&main)
             .unwrap();
-        let error = gh
-            .run_git(&GitRun::push_refs(&slug, &source, batch, false))
-            .unwrap_err();
+        let error =
+            journaled_push(&gh, &GitRun::push_refs(&slug, &source, batch, false)).unwrap_err();
         assert_eq!(error.kind, Kind::Conflict, "boundary {boundary}: {error:?}");
         assert!(!matches!(error.sub, Sub::GitInventoryChanged { .. }));
         assert_eq!(host_git(&remote, &["rev-parse", name]), rival);
@@ -259,8 +258,7 @@ fn native_inventory_retry_marker_requires_unchanged_requested_refs_and_forward_m
                 &journal,
                 agh::git::GIT_BUDGET,
             )
-            .unwrap()
-            .into_result();
+            .and_then(agh::write::Outcome::into_result);
         {
             let error = result.unwrap_err();
             assert_eq!(
@@ -273,6 +271,10 @@ fn native_inventory_retry_marker_requires_unchanged_requested_refs_and_forward_m
                 "{mode}: {error:?}"
             );
             assert_eq!(error.side_effect, SideEffect::None);
+            assert!(
+                journal.read().unwrap().0.is_empty(),
+                "{mode}: preparation must not begin or settle an intent"
+            );
             assert_eq!(*reads.lock().unwrap(), 2);
             assert_eq!(
                 matches!(error.sub, Sub::GitInventoryChanged { .. }),

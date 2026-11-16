@@ -20,6 +20,10 @@
 //!   bytes grow, the live sessions change, or [`REPLAN_AFTER_S`] has passed since its last pass,
 //!   in which a hold may have lapsed ([`plans`]). The row is a record: nothing here raises,
 //!   holds a build or tells one anything.
+//! - **The entry-bound pass.** A look [`bound_admitted`] admits, at any `disk=` level and with
+//!   the budget off too, plans one tier 3 directory over the entry bound by the same
+//!   eligibility ([`bound_ask`], [`Admit::EntryBound`]); `disk.rs`'s `EntryBound` says which
+//!   directories are over it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -65,7 +69,7 @@ pub fn due(began: Option<i64>, now: i64) -> bool {
 }
 
 /// The rebuildable bytes the volume holds now: each registered build cache under `roots`'s
-/// home and each build directory a search from `roots` finds (under `search`), those
+/// home, its shared dependency stores (`atpkg::build_cache::shared_units::roots`) and each build directory a search from `roots` finds (under `search`), those
 /// `same_volume` places on the volume, sized by [`size`] before `deadline`, a registered cache
 /// counted only where its registration is still current once it was sized (as the report's
 /// holders are). The figure is a floor (`partial`) where the search was cut short, too.
@@ -83,20 +87,28 @@ pub fn rebuildable(
     let found = discover::discover(roots, discover::Budget { wall, ..search });
     let home = roots.home.as_deref();
     let registered = home.map_or_else(Vec::new, atpkg::build_cache::registered::roots);
+    let stores = home.map_or_else(Vec::new, atpkg::build_cache::shared_units::roots);
     let caches: Vec<PathBuf> = home.map_or_else(Vec::new, |home| {
         registered
             .iter()
             .filter(|cache| cache.is_current(home))
             .map(|cache| cache.root.clone())
+            .chain(
+                stores
+                    .iter()
+                    .filter(|store| std::fs::symlink_metadata(store).is_ok_and(|m| m.is_dir()))
+                    .cloned(),
+            )
             .collect()
     });
     let current = |root: &Path| {
-        home.is_some_and(|home| {
-            registered
-                .iter()
-                .find(|cache| cache.root == root)
-                .is_some_and(|cache| cache.is_current(home))
-        })
+        stores.iter().any(|store| store == root)
+            || home.is_some_and(|home| {
+                registered
+                    .iter()
+                    .find(|cache| cache.root == root)
+                    .is_some_and(|cache| cache.is_current(home))
+            })
     };
     let dirs: Vec<PathBuf> = found.found.into_iter().map(|f| f.path).collect();
     let mut sized = size(&caches, &dirs, same_volume, deadline, &current);
@@ -345,7 +357,17 @@ pub fn pass_admitted(
     cap: Cap,
     auto_free_gib: u64,
 ) -> bool {
-    owner && !demand && !projected && cap != Cap::Off && auto_free_gib > 0
+    bound_admitted(owner, demand, projected, auto_free_gib) && cap != Cap::Off
+}
+
+/// Whether a look may run the entry-bound pass ([`bound_ask`]): this process is the account's
+/// own watch (`owner`), no agent's demand and no fill projection stands (those looks belong to
+/// the pressure pass), and removal is on (`auto_free_gib`; an unreadable `[disk]` reads as 0).
+/// Neither the volume's level nor the budget's cap is read: it runs at any level, the budget off
+/// too. The hourly rule is [`due`]'s.
+#[must_use]
+pub fn bound_admitted(owner: bool, demand: bool, projected: bool, auto_free_gib: u64) -> bool {
+    owner && !demand && !projected && auto_free_gib > 0
 }
 
 /// A volume over its cap, as one sizing and a measure of free space now read it ([`over`]).
@@ -573,11 +595,30 @@ pub fn keeps_leaf(
     live.blind() || kept(live, leaf, workspace, table, now).is_some()
 }
 
-/// What a budget pass may take ([`ask`]).
+/// Which pass an [`Ask`] plans for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admit {
+    /// The budget's pass ([`ask`]): every row stops at `free_target` ([`Over::free_target`]).
+    Budget {
+        /// The free bytes every row of the pass stops at.
+        free_target: u64,
+    },
+    /// The entry-bound pass ([`bound_ask`]): one idle build directory over the entry bound,
+    /// whole, with no free-space target.
+    EntryBound,
+}
+
+impl Default for Admit {
+    fn default() -> Self {
+        Admit::Budget { free_target: 0 }
+    }
+}
+
+/// What a budget or entry-bound pass may take ([`ask`], [`bound_ask`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ask {
-    /// Where every row of the pass stops ([`Over::free_target`]).
-    pub free_target: u64,
+    /// Which pass plans by it, and where its rows stop.
+    pub admit: Admit,
     /// The build directories no live session keeps: the only ones whose rows the pass plans.
     pub eligible: BTreeSet<PathBuf>,
     /// The build directories a live session keeps, each with why.
@@ -591,11 +632,43 @@ pub struct Ask {
 /// [`Live::blind`].
 #[must_use]
 pub fn ask(survey: &Survey, live: &Live, free_target: u64, table: Option<&Table>, now: i64) -> Ask {
+    let admit = Admit::Budget { free_target };
+    eligibility(survey, live, admit, table, now, |_| true)
+}
+
+/// Which of `survey`'s build directories over the entry bound (`over`) the entry-bound pass may
+/// take: the one eligibility [`ask`] holds the budget's pass to, by `live` at unix second `now`.
+#[must_use]
+pub fn bound_ask(
+    survey: &Survey,
+    over: &BTreeSet<PathBuf>,
+    live: &Live,
+    table: Option<&Table>,
+    now: i64,
+) -> Ask {
+    let admit = Admit::EntryBound;
+    eligibility(survey, live, admit, table, now, |t| over.contains(&t.path))
+}
+
+/// The build directories of `survey` that `admits` names, each eligible or held by `live`.
+fn eligibility(
+    survey: &Survey,
+    live: &Live,
+    admit: Admit,
+    table: Option<&Table>,
+    now: i64,
+    admits: impl Fn(&TargetDir) -> bool,
+) -> Ask {
     let mut ask = Ask {
-        free_target,
+        admit,
         ..Ask::default()
     };
-    for t in survey.targets.iter().take(MAX_TARGETS) {
+    for t in survey
+        .targets
+        .iter()
+        .take(MAX_TARGETS)
+        .filter(|t| admits(t))
+    {
         let why = if live.blind() {
             Some(
                 live.cwd_unknown

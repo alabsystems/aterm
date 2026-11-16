@@ -1,107 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fleet relations: machines, accounts and agents, each a typed column list
-//! ([`Schema`]) and the row type the fold fills. One schema drives every face: `aterm db fleet`
-//! prints by it, and a sheet reads its columns, types and words from it.
+//! The fleet relations: machines, accounts and agents, each a [`Schema`] of the shared relation
+//! types (`crate::relation`) and the row type the fold fills. `aterm db fleet` prints by them,
+//! and a sheet reads their columns, types and words.
 //!
-//! A column is a `typed::Column` (the ATT/1 value types, so a value is checked as a registry
-//! cell is) and the words that say what it holds. Integers only: a percentage is tenths
-//! (`_x10`), a core count hundredths (`_x100`), a time Unix milliseconds.
+//! Integers only: a percentage is tenths (`_x10`), a core count hundredths (`_x100`), a time
+//! Unix milliseconds.
 //!
 //! A measure is a pair of columns, how much is used and how much there is, each in the
 //! measure's own unit; the share is derived where it is drawn. A cell that was not read is
-//! [`Cell::Unread`], which prints `?` and is JSON `null`, never a zero; a cell that is known to
-//! hold nothing (a machine that answered has no reason for silence) is [`Cell::Empty`].
+//! [`Cell::Unread`], never a zero; a cell that is known to hold nothing (a machine that answered
+//! has no reason for silence) is [`Cell::Empty`].
 
 use super::read::{At, Harness, How, Pair, State, Tally, Task};
-use crate::typed::{Column, Member, Ty};
+use crate::relation::{Cell, Row, Schema, col, opt};
+use crate::typed::{Member, Ty};
 use aterm_json::{Value, json};
-
-/// One column: its typed definition and what it holds.
-#[derive(Clone, Copy, Debug)]
-pub struct Col {
-    pub column: Column,
-    pub doc: &'static str,
-}
-
-/// A column every row holds a value in.
-const fn col(name: &'static str, ty: Ty, doc: &'static str) -> Col {
-    Col {
-        column: Column::new(name, ty),
-        doc,
-    }
-}
-
-/// A column a row may hold no value in.
-const fn opt(name: &'static str, ty: Ty, doc: &'static str) -> Col {
-    Col {
-        column: Column::new(name, ty).null(),
-        doc,
-    }
-}
-
-/// One relation: its name, its key, its order and its columns.
-#[derive(Clone, Copy, Debug)]
-pub struct Schema {
-    pub name: &'static str,
-    pub doc: &'static str,
-    /// The columns that name a row.
-    pub key: &'static [&'static str],
-    /// The order rows come in, in words.
-    pub order: &'static str,
-    pub columns: &'static [Col],
-}
-
-impl Schema {
-    /// The position of the column `name`.
-    pub fn position(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.column.name == name)
-    }
-}
-
-/// One cell of a row.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Cell {
-    /// A value of the column's type.
-    Value(Value),
-    /// Nobody read it: `?`, JSON `null`. Never a zero.
-    Unread,
-    /// It is known to hold nothing: an empty cell, JSON `null`.
-    Empty,
-}
-
-impl Cell {
-    /// A read value, else unread.
-    fn read<T: Into<Value>>(value: Option<T>) -> Self {
-        value.map_or(Self::Unread, |v| Self::Value(v.into()))
-    }
-
-    /// A value, else known empty.
-    fn known<T: Into<Value>>(value: Option<T>) -> Self {
-        value.map_or(Self::Empty, |v| Self::Value(v.into()))
-    }
-
-    fn of<T: Into<Value>>(value: T) -> Self {
-        Self::Value(value.into())
-    }
-
-    /// The JSON value: `null` for a cell with none.
-    pub fn json(&self) -> Value {
-        match self {
-            Self::Value(value) => value.clone(),
-            Self::Unread | Self::Empty => Value::Null,
-        }
-    }
-}
-
-/// A row of a fleet relation.
-pub trait Row {
-    /// Its relation.
-    const SCHEMA: &'static Schema;
-    /// Its cells, one per column of [`Self::SCHEMA`], in order.
-    fn cells(&self) -> Vec<Cell>;
-}
 
 /// The status words of a machine row: the registry's, `retired` for a row its owner retired,
 /// and `unregistered` for a machine that answered and that no registry row names.
@@ -663,6 +578,10 @@ pub struct AccountRow {
     /// registry states. Beside a stated plan it differs from it is a mismatch: both are shown,
     /// and an observation is never written over what a person stated.
     pub plan_observed: Option<Fact<String>>,
+    /// Whether the stated plan and the observed one differ, as the fold judged them
+    /// (`fold::plans_differ`: a stated plan that adds a tier to the observed one agrees with
+    /// it); `None` where either is missing, since a mismatch is between two plans.
+    pub plan_mismatch: Option<bool>,
     pub w5h: WindowRow,
     pub w7d: WindowRow,
     /// Whether a wall stands; `None` where the journal says nothing of the account.
@@ -807,7 +726,8 @@ pub static ACCOUNTS: Schema = Schema {
         opt(
             "plan_mismatch",
             Ty::Bool,
-            "the set plan and the observed one differ; unread where either is missing",
+            "the set plan is neither the observed one nor a tier of it; unread where either is \
+             missing",
         ),
         opt(
             "observed",
@@ -927,13 +847,7 @@ impl Row for AccountRow {
         cells.push(Cell::read(self.last_use_on.clone()));
         cells.push(Cell::read(self.plan_source.map(PlanSource::word)));
         fact(&mut cells, self.plan_observed.as_ref());
-        // A mismatch is between two plans: with either missing there is none to say.
-        cells.push(Cell::read(match (self.plan_source, &self.plan_observed) {
-            (Some(PlanSource::Set), Some(observed)) => {
-                Some(self.plan.as_deref() != Some(observed.v.as_str()))
-            }
-            _ => None,
-        }));
+        cells.push(Cell::read(self.plan_mismatch));
         cells.push(Cell::read(self.observed.map(ObservedState::word)));
         match (self.observed, &self.observed_read) {
             // Nothing was seen, and that is known: no evidence, so none to date or to credit.

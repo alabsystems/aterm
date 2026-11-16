@@ -54,3 +54,37 @@ fn a_claimed_or_reserved_id_is_known_and_never_kept_twice() {
         "a word that is no tab ID is never kept"
     );
 }
+
+#[test]
+fn an_id_sharing_a_known_ones_five_characters_is_never_minted_and_both_are_shown_longer() {
+    let mut known = Known::default();
+    let held = TabId::parse("tw7k2aaaaaa").expect("a tab id");
+    let twin = TabId::parse("tw7k2abbbbb").expect("a tab id");
+    let apart = TabId::parse("tw7k3aaaaaa").expect("a tab id");
+    // NEGATIVE CONTROL: before this registry holds `held`, nothing refuses its twin.
+    assert!(!known.holds(&twin));
+    known.here.insert(held);
+    assert!(
+        known.holds(&twin),
+        "a draw shown as a held ID is shown is drawn again"
+    );
+    assert!(
+        !known.holds(&apart),
+        "one that differs within five characters is free"
+    );
+    assert_eq!(
+        apart.shown(known.ids()),
+        "tw7k3",
+        "an ID no other shares is shown at five"
+    );
+    // Two Macs can mint a pair before either sees the other's: each is then shown as far as
+    // tells it apart.
+    known.here.insert(twin);
+    assert_eq!(held.shown(known.ids()), "tw7k2aa");
+    assert_eq!(twin.shown(known.ids()), "tw7k2ab");
+    assert_eq!(
+        shown("human"),
+        "human",
+        "a word that is no tab ID is cut as the hand slot cuts it"
+    );
+}

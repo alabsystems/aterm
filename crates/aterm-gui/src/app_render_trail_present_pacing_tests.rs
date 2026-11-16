@@ -774,3 +774,114 @@ fn a_mixed_tab_charges_acquire_backpressure_to_the_shed_latch() {
         "an acquire waiting three frames each mixed frame trips effect shedding"
     );
 }
+
+/// The term of a slot nobody served goes with the slot: a park, and a present that takes the
+/// pending slot ([`acknowledge_successful_present`]), each leave no term and book no fire. `trail
+/// status` prints the pending slot's term as `lane_term=` (`none` with no slot armed) and the
+/// window's served slots as `lane_fires=`.
+///
+/// NEGATIVE CONTROL: the park kept the term (`self.trail_tick_term = None;` removed from
+/// `park_terminal_effect_scheduler`): "a park forgets the term with the slot" failed (left
+/// Some(Deco), right None).
+/// NEGATIVE CONTROL: the present kept the term (`state.trail_tick_term = None;` removed from
+/// `acknowledge_successful_present`): "a present that takes the pending slot forgets its term"
+/// failed (left Some(Deco), right None).
+#[test]
+fn a_slot_nobody_served_leaves_no_term_and_trail_status_prints_the_lane() {
+    use crate::effect_lane_tally::LaneTerm;
+    let id = WindowId(0);
+    let lane = |app: &App| {
+        let status = app.trail_status().expect("a front window exists");
+        let field = |key: &str| {
+            status
+                .split(' ')
+                .find_map(|word| word.strip_prefix(key))
+                .unwrap_or_else(|| panic!("no {key} in {status}"))
+                .to_string()
+        };
+        (field("lane_term="), field("lane_fires="))
+    };
+    let fires = |deco: u32| {
+        format!(
+            "fade:0,deco:{deco},pet:0,celebration:0,body:0,glow:0,cursor_fx:0,streak:0,static_cat:0"
+        )
+    };
+    let mut app = App::headless_for_test();
+    assert_eq!(
+        lane(&app),
+        ("none".to_string(), fires(0)),
+        "a quiet lane: no term and no fire"
+    );
+
+    let t0 = Instant::now();
+    let mut ws = app.windows.get_mut(&id).expect("the headless window");
+    ws.note_deco_animating(t0);
+    let d = ws
+        .plan_terminal_effect_lane(t0, false, true)
+        .expect("a decoration's hold arms the lane");
+    drop(ws);
+    assert_eq!(
+        lane(&app),
+        ("deco".to_string(), fires(0)),
+        "lane_term= names the pending slot's term"
+    );
+    let mut ws = app.windows.get_mut(&id).expect("the headless window");
+    assert!(
+        ws.service_due_terminal_effect_tick(d),
+        "fixture: the slot is served"
+    );
+    drop(ws);
+    assert_eq!(
+        lane(&app),
+        ("none".to_string(), fires(1)),
+        "a served slot is booked under its term, and its term is spent"
+    );
+
+    let mut ws = app.windows.get_mut(&id).expect("the headless window");
+    assert!(
+        ws.plan_terminal_effect_lane(d, false, true).is_some(),
+        "fixture: the hold arms the next slot"
+    );
+    assert_eq!(ws.trail_tick_term, Some(LaneTerm::Deco), "fixture: armed");
+    ws.park_terminal_effect_scheduler();
+    assert_eq!(
+        ws.trail_tick_term, None,
+        "a park forgets the term with the slot"
+    );
+    drop(ws);
+    assert_eq!(
+        lane(&app),
+        ("none".to_string(), fires(1)),
+        "…and books no fire"
+    );
+
+    let t1 = d + Duration::from_secs(1);
+    let mut ws = app.windows.get_mut(&id).expect("the headless window");
+    ws.note_deco_animating(t1);
+    assert!(
+        ws.plan_terminal_effect_lane(t1, false, true).is_some(),
+        "fixture: the hold arms a slot again"
+    );
+    assert_eq!(ws.trail_tick_term, Some(LaneTerm::Deco), "fixture: armed");
+    let frame = t1 + Duration::from_millis(1);
+    let _ = acknowledge_successful_present(
+        &mut ws,
+        Duration::from_millis(16),
+        frame,
+        frame + Duration::from_millis(1),
+    );
+    assert_eq!(
+        ws.next_trail_tick, None,
+        "fixture: the present took the pending slot"
+    );
+    assert_eq!(
+        ws.trail_tick_term, None,
+        "a present that takes the pending slot forgets its term"
+    );
+    drop(ws);
+    assert_eq!(
+        lane(&app),
+        ("none".to_string(), fires(1)),
+        "…and books no fire"
+    );
+}

@@ -122,6 +122,7 @@ fn a_window_is_full_only_where_the_vendors_figure_is_100() {
         pid: Some("77".to_string()),
         login: None,
         home: None,
+        route: None,
     };
     let five = |pct: &str| {
         let payload = format!(
@@ -158,6 +159,7 @@ fn a_repeat_written_after_the_walls_first_read_times_it() {
         pid: Some("77".to_string()),
         login: None,
         home: None,
+        route: None,
     };
     let at_429 = Reading::of_stdin(&payload, &vars, FIRST - 1).expect("a reading");
     let repeat = Reading::of_stdin(&payload, &vars, FIRST + 9).expect("a reading");

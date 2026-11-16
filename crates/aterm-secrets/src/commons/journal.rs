@@ -302,6 +302,24 @@ impl Views {
     }
 }
 
+/// The answer for a roster that is not on the selected history this journal holds: it opens no
+/// historical read under that history ([`crate::ErrorKind::HistoryUnopened`]).
+fn outside_selected_history() -> Error {
+    Error::of_kind(
+        crate::ErrorKind::HistoryUnopened,
+        "roster is outside the selected control history",
+    )
+}
+
+/// `node`'s payload, opened for a historical read by `identity`. Every refusal of [`Node::open`]
+/// is a fact of the node's own bytes and of `identity` (a foundation or recovery node, which
+/// carries no payload; a payload sealed to other devices; one past its bound), so each is
+/// [`crate::ErrorKind::HistoryUnopened`]: no later ask of the same node opens it.
+fn opened_historical(node: &Node, identity: &Identity) -> Result<SecretBytes> {
+    node.open(identity)
+        .map_err(|refused| Error::of_kind(crate::ErrorKind::HistoryUnopened, refused.0))
+}
+
 fn verify(trust: Trust, wire: &[u8]) -> Result<Node> {
     #[cfg(test)]
     tests::VERIFIED.with(|count| count.set(count.get() + 1));
@@ -718,12 +736,17 @@ impl Journal {
     /// Open a data snapshot on the selected history, for historical validation
     /// only. A recovery's unselected parents remain evidence, not positive grants.
     /// The roster consumer must separately establish current local membership.
+    ///
+    /// # Errors
+    /// The journal is not ready; `id` is not on its selected history, or `identity` cannot open
+    /// it ([`crate::ErrorKind::HistoryUnopened`]); or an ancestor or a constraint of it does not
+    /// read.
     pub(crate) fn historical(&self, id: Digest, identity: &Identity) -> Result<Current> {
         let (node, constraints) = self.historical_source(id)?;
         Ok(Current {
             head: id,
             basis: id,
-            payload: node.open(identity)?,
+            payload: opened_historical(node, identity)?,
             constraints,
         })
     }
@@ -738,12 +761,20 @@ impl Journal {
         })
     }
 
+    /// [`Self::historical`] of a node this journal retains, on its selected history or, before
+    /// the journal is ready, among the payload nodes it retains.
+    ///
+    /// # Errors
+    /// An uncertain append this journal has not been reopened since; `id` is neither on its
+    /// selected history nor, before the journal is ready, a payload node it retains, or
+    /// `identity` cannot open it ([`crate::ErrorKind::HistoryUnopened`]); or an ancestor or a
+    /// constraint of it does not read.
     pub(crate) fn retained_historical(&self, id: Digest, identity: &Identity) -> Result<Current> {
         let (node, constraints) = self.retained_historical_source(id)?;
         Ok(Current {
             head: id,
             basis: id,
-            payload: node.open(identity)?,
+            payload: opened_historical(node, identity)?,
             constraints,
         })
     }
@@ -772,7 +803,7 @@ impl Journal {
             return self.historical_source(id);
         }
         if !self.retained_payload_node(id) {
-            return Err(Error::new("roster is outside the selected control history"));
+            return Err(outside_selected_history());
         }
         let ancestors = self.ancestors(id)?;
         Ok((
@@ -793,7 +824,7 @@ impl Journal {
             ));
         };
         if !self.selected_ancestor(id, head) {
-            return Err(Error::new("roster is outside the selected control history"));
+            return Err(outside_selected_history());
         }
         let ancestors = self.ancestors(id)?;
         Ok((

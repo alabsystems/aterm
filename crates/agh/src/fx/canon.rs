@@ -622,6 +622,7 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
         GitOp::LsRemote {
             reference,
             anonymous,
+            peeled,
         } => {
             let mut text = match reference {
                 Some(reference) => format!("git ls-remote {slug}\nref {reference}"),
@@ -629,6 +630,9 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
             };
             if *anonymous {
                 text.push_str("\nanonymous true");
+            }
+            if *peeled {
+                text.push_str("\npeeled true");
             }
             text
         }

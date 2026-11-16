@@ -54,6 +54,12 @@
 //! text aterm gives a refused contract-4 claim is not designed yet; the fake's
 //! is its own.
 //!
+//! The optional C3 child protocol is enabled only when [`FakeAterm::set_info`]
+//! advertises `child-proof=1` and, for the pre-spawn barrier, `child-start=1`.
+//! The fake retains synthetic tuples and generation acknowledgements; explicit
+//! [`FakeAterm::set_child_live`] data models the old-child refusal. It reads no
+//! kernel identity and proves no process or output authority.
+//!
 //! **The session stream.** [`FakeAterm::serve_stream`] serves `stream @<sid> v=1` on the
 //! connection that holds a contract-4 claim, as aterm does from HX-15b1 (the HX-15 plan's
 //! D4, D5 and D8) and sends its own records as it does from HX-15c. Until then the verb is
@@ -414,15 +420,17 @@ pub struct ClaimWords {
     pub vendor: Option<String>,
     /// `login=`, when named.
     pub login: Option<String>,
-    /// `child=`, when named (contract 4 only).
+    /// `child=`, when named (contract 4 or negotiated contract 3).
     pub child: Option<String>,
+    /// The optional negotiated C3 child-start generation; never a C4 word.
+    pub child_start: Option<String>,
 }
 
 impl ClaimWords {
     /// Read the text after `meta set supervisor `. A claim with no
     /// `contract=` word is an uncontracted (v2) claim and its other words are
     /// not read. A contracted claim takes `contract=`, `scope=`, `version=`,
-    /// `vendor=`, `child=` and `login=`, each once, and nothing else; the arm
+    /// `vendor=`, `child=`, `child-start=` and `login=`, each once, and nothing else; the arm
     /// of its contract judges which of them it may name.
     ///
     /// # Errors
@@ -455,6 +463,7 @@ impl ClaimWords {
                 "vendor" => &mut claim.vendor,
                 "login" => &mut claim.login,
                 "child" => &mut claim.child,
+                "child-start" => &mut claim.child_start,
                 _ => {
                     return Err(usage(
                         "a v3 claim takes contract= scope= version= vendor= login=",
@@ -520,6 +529,13 @@ struct State {
     status: Vec<(String, String)>,
     claim: Option<Claim>,
     revision: u64,
+    /// Synthetic C3 generations by claimant: high-water and optional bound tuple.
+    /// This is protocol data, not a kernel observation or an authority proof.
+    child_generations: Vec<(String, u64, Option<String>)>,
+    /// A reply override for negotiated C3 begin requests only.
+    child_start_reply: Option<String>,
+    /// Synthetic old-child liveness, supplied explicitly by a functional test.
+    child_live: bool,
     /// Every addressed request, without its `@<sid> `, in arrival order.
     verbs: Vec<String>,
     subscriptions: usize,
@@ -849,6 +865,28 @@ impl State {
             word(claim.and_then(|claim| claim.words.version.as_ref())),
             word(claim.and_then(|claim| claim.words.vendor.as_ref())),
         ));
+        let mode = crate::c3_child::Mode::parse(&self.info()).unwrap_or_default();
+        if mode != crate::c3_child::Mode::Absent {
+            line.push_str(&format!(
+                " supervisor_child={}",
+                word(claim.and_then(|claim| claim.words.child.as_ref()))
+            ));
+        }
+        if mode == crate::c3_child::Mode::Start {
+            let generation = if let Some(claim) = claim {
+                self.child_generations
+                    .iter()
+                    .find(|(holder, _, _)| *holder == claim.words.holder)
+                    .map_or(0, |(_, n, _)| *n)
+            } else {
+                self.child_generations
+                    .iter()
+                    .map(|(_, n, _)| *n)
+                    .max()
+                    .unwrap_or(0)
+            };
+            line.push_str(&format!(" supervisor_child_start={generation}"));
+        }
         line
     }
 
@@ -888,6 +926,32 @@ impl State {
         let row = self.row_of(&words.holder);
         let served = self.served();
         let contract = words.contract.as_deref();
+        let mode = crate::c3_child::Mode::parse(&self.info()).unwrap_or_default();
+        if contract == Some("3") {
+            if mode != crate::c3_child::Mode::Absent
+                && words
+                    .version
+                    .as_deref()
+                    .is_some_and(|version| !crate::claim::claim_version(version))
+            {
+                return usage("invalid native claim version");
+            }
+            if words.child.is_some() && mode == crate::c3_child::Mode::Absent {
+                return usage("a v3 claim takes contract= scope= version= vendor= login=");
+            }
+            if words.child_start.is_some() && mode != crate::c3_child::Mode::Start {
+                return usage("child-start was not negotiated");
+            }
+            if words
+                .child
+                .as_deref()
+                .is_some_and(|child| !native_child_word(child))
+            {
+                return usage("invalid native child tuple");
+            }
+        } else if words.child_start.is_some() {
+            return usage_4("child-start is not a contract-4 word");
+        }
         if contract.is_some_and(|named| !served.iter().any(|n| n.to_string() == named)) {
             return usage("a scoped claim names a contract aterm serves");
         }
@@ -912,6 +976,44 @@ impl State {
         {
             return format!("ERR busy supervisor={}", other.words.holder);
         }
+        let generation_update = if let Some(named) = &words.child_start {
+            let Some(generation) = crate::claim::canonical_u64(named).filter(|n| *n > 0) else {
+                return usage("invalid child generation");
+            };
+            let previous = self
+                .child_generations
+                .iter()
+                .find(|(holder, _, _)| *holder == words.holder);
+            if let Some(child) = &words.child {
+                if !previous.is_some_and(|(_, highest, bound)| {
+                    *highest == generation && bound.as_ref().is_none_or(|bound| bound == child)
+                }) {
+                    return usage("child completion is not the current generation");
+                }
+            } else {
+                if let Some(reply) = &self.child_start_reply {
+                    return reply.clone();
+                }
+                if self.child_live
+                    && self
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.words.child.is_some())
+                {
+                    return "ERR old native child is still live".to_string();
+                }
+                // An acknowledged pending generation can be continued after
+                // release or reconnect; a completed generation cannot reset.
+                let same_pending = previous
+                    .is_some_and(|(_, highest, bound)| *highest == generation && bound.is_none());
+                if previous.is_some_and(|(_, highest, _)| generation <= *highest) && !same_pending {
+                    return usage("new child attempt must advance the generation");
+                }
+            }
+            Some((words.holder.clone(), generation, words.child.clone()))
+        } else {
+            None
+        };
         let four = contract == Some("4");
         if four && !self.registered {
             return UNPROVEN_4.to_string();
@@ -932,6 +1034,18 @@ impl State {
         } else {
             "OK".to_string()
         };
+        // Commit protocol bookkeeping only after the complete claim was admitted.
+        if let Some(update) = generation_update {
+            if let Some(previous) = self
+                .child_generations
+                .iter_mut()
+                .find(|(holder, _, _)| *holder == update.0)
+            {
+                *previous = update;
+            } else {
+                self.child_generations.push(update);
+            }
+        }
         self.claim = Some(claim);
         self.revision += 1;
         // A claim placed on another connection closes the stream (HX-15b1).
@@ -1031,11 +1145,8 @@ impl State {
 
 /// A contract-3 claim's scope words as aterm stores them: named, each known
 /// to contract 3 and once, each allowed by the holder's roster `row` when it
-/// has one, in aterm's order. Contract 3 has no `child=`.
+/// has one, in aterm's order. Optional native words are checked by the negotiated claim arm.
 fn contract_3_scope(words: &ClaimWords, row: Option<&[Scope]>) -> Result<Vec<Scope>, &'static str> {
-    if words.child.is_some() {
-        return Err("a v3 claim takes contract= scope= version= vendor= login=");
-    }
     let Some(scope) = words.scope.as_deref() else {
         return Err("a v3 claim names its scope=");
     };
@@ -1055,6 +1166,17 @@ fn contract_3_scope(words: &ClaimWords, row: Option<&[Scope]>) -> Result<Vec<Sco
     }
     scopes.sort_unstable();
     Ok(scopes)
+}
+
+/// A canonical native C3 tuple in the admitted pid and birth ranges.
+fn native_child_word(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(pid, birth)| {
+        let pid = crate::claim::canonical_u64(pid).and_then(|pid| u32::try_from(pid).ok());
+        let birth = crate::claim::canonical_u64(birth);
+        pid.zip(birth)
+            .and_then(|(pid, birth)| crate::claim::NativeChild::from_native(pid, birth))
+            .is_some()
+    })
 }
 
 /// Whether `value` is a `child=` value: `<pid>:<start>`, each a canonical
@@ -1194,6 +1316,9 @@ impl FakeAterm {
                 .collect(),
             claim: None,
             revision: 0,
+            child_generations: Vec::new(),
+            child_start_reply: None,
+            child_live: false,
             verbs: Vec::new(),
             subscriptions: 0,
             events: Vec::new(),
@@ -1489,6 +1614,18 @@ impl FakeAterm {
     /// not prove.
     pub fn set_claim_reply(&self, reply: &str) {
         lock(&self.state).claim_reply = reply.to_string();
+    }
+
+    /// Override only a negotiated C3 pre-spawn begin reply. The fake establishes
+    /// no process or output authority and performs no kernel observation.
+    pub fn set_child_start_reply(&self, reply: Option<&str>) {
+        lock(&self.state).child_start_reply = reply.map(str::to_string);
+    }
+
+    /// Set the old-child liveness fact used to refuse C3 begin requests. This is
+    /// synthetic functional-test data; the fake inspects and signals no process.
+    pub fn set_child_live(&self, live: bool) {
+        lock(&self.state).child_live = live;
     }
 
     /// Answer `meta unset supervisor` with exactly `reply`, the claim left

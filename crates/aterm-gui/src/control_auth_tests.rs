@@ -16,17 +16,14 @@ fn client_named_paths_are_named_only_for_server_minted_ids() {
     }
 
     let dir = Path::new("/c/integration");
-    let sid = aterm_session::SessionId::new("s-09035e075d6ee9388965".to_string());
+    let sid = aterm_session::SessionId::parse("s-09035e075d6ee9388965").expect("a legacy tab's id");
     assert_eq!(
         sid_file_in(dir, &sid),
         Some(dir.join("s-09035e075d6ee9388965"))
     );
+    // A name that is no session's never becomes one, so no file is named for it.
     for bad in ["../x", "s-", "s-zz", "s-12/../../etc", "abc"] {
-        assert_eq!(
-            sid_file_in(dir, &aterm_session::SessionId::new(bad.to_string())),
-            None,
-            "{bad}"
-        );
+        assert_eq!(aterm_session::SessionId::parse(bad), None, "{bad}");
     }
 }
 

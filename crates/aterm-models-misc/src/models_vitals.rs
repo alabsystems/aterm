@@ -387,220 +387,78 @@ pub fn scope_balance_model() -> Model {
     }
 }
 
-/// THE EXPLANATION'S HONESTY. `live` and `bound`: the caller tab's role
-/// at its measured figure, and with unresolved app work and the global
-/// unaccounted residual added to its possible share. Unresolved global work
-/// may change that bound even when aterm's own member census is complete;
-/// `role` 5 abstracts an unavailable role when those endpoints differ, including
-/// missing work and ambiguous inherited counter charge, whose actual figure is
-/// its independently measured own-CPU floor;
-/// `lost`: the split's unaccounted residual
-/// (work no coalition held) is at least a core and over the floor;
-/// `settled`: pressure and the thermal state are read, neither holds, and no
-/// covering cause but a named activity holds, the residual aside; `none`:
-/// the reply prints `do class=none`.
+/// Published CPU counters never qualify physical execution inside their read interval.
+///
+/// `prior` is execution from before the first read that can publish later; `actual` is
+/// execution inside the interval, and `reported` is independently published counter growth.
+/// Complete ownership (`complete`) cannot establish an execution window (`window`). The
+/// diagnostic growth and independent machine context stay visible, while physical CPU roles,
+/// shares, covering causes, residual bounds, absence claims and retained clauses do not.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn explain_honesty_model() -> Model {
     aterm_spec::ty_model! {
         ExplainHonesty {
             const Buggy = 0;
-            const Work = 2;
-            var n = 0;
-            var claims = 1;
-            var vouched = 1;
-            var terms = 1;
-            var above = 1;
-            var tab = 1;
-            var young = 1;
-            var bycpu = 1;
-            var bycount = 1;
-            var swept = 1;
-            var live = 1;
-            var bound = 1;
-            var lowpid = 0;
-            var other = 0;
+            var prior = 0;
+            var actual = 0;
+            var reported = 0;
+            var complete = 1;
+            var context = 0;
             var fresh = 0;
-            var shown = 0;
-            var tabshown = 0;
+            var window = 0;
             var role = 0;
-            var start = 0;
-            var actstart = 0;
-            var tabstart = 0;
-            var cand = 0;
-            var held = 0;
-            var fail = 0;
-            var clause = 0;
-            var was = 0;
-            var lost = 0;
-            var settled = 1;
+            var share = 0;
+            var cause = 0;
+            var residual = 0;
             var none = 0;
+            var clause = 0;
+            var diagnostic = 0;
+            var shown_context = 0;
 
-            action Claims when (n <= Work - 1) {
-                n = n + 1;
-                claims = 1 - claims;
+            action DeferBefore when (prior == 0 && actual == 0 && reported == 0) {
+                prior = 4;
                 fresh = 0;
             }
-            action Vouched when (n <= Work - 1) {
-                n = n + 1;
-                vouched = 1 - vouched;
+            action ExecuteUnpublished when (2 > actual) {
+                actual = actual + 1;
                 fresh = 0;
             }
-            action Terms when (n <= Work - 1) {
-                n = n + 1;
-                terms = 1 - terms;
+            action PublishOne when (prior + actual > reported) {
+                reported = reported + 1;
                 fresh = 0;
             }
-            action Above when (n <= Work - 1) {
-                n = n + 1;
-                above = 1 - above;
+            action IncompleteCoverage when (complete == 1) {
+                complete = 0;
                 fresh = 0;
             }
-            action TabMoves when (n <= Work - 1) {
-                n = n + 1;
-                tab = 3 - tab;
+            action MachineContext when (context == 0) {
+                context = 1;
                 fresh = 0;
             }
-            action Young when (n <= Work - 1) {
-                n = n + 1;
-                young = 1 - young;
-                fresh = 0;
-            }
-            action ByCpu when (n <= Work - 1) {
-                n = n + 1;
-                bycpu = 1 - bycpu;
-                fresh = 0;
-            }
-            action ByCount when (n <= Work - 1) {
-                n = n + 1;
-                bycount = 1 - bycount;
-                fresh = 0;
-            }
-            action Swept when (n <= Work - 1) {
-                n = n + 1;
-                swept = 1 - swept;
-                fresh = 0;
-            }
-            action LiveUp when (n <= Work - 1 && live <= 2) {
-                n = n + 1;
-                live = live + 1;
-                fresh = 0;
-            }
-            action LiveDown when (n <= Work - 1 && live > 0) {
-                n = n + 1;
-                live = live - 1;
-                fresh = 0;
-            }
-            action BoundUp when (n <= Work - 1 && bound <= 2) {
-                n = n + 1;
-                bound = bound + 1;
-                fresh = 0;
-            }
-            action BoundDown when (n <= Work - 1 && bound > 0) {
-                n = n + 1;
-                bound = bound - 1;
-                fresh = 0;
-            }
-            action LowPidBirth when (n <= Work - 1) {
-                n = n + 1;
-                lowpid = 1 - lowpid;
-                fresh = 0;
-            }
-            action OtherBirth when (n <= Work - 1) {
-                n = n + 1;
-                other = 1 - other;
-                fresh = 0;
-            }
-            action Lost when (n <= Work - 1) {
-                n = n + 1;
-                lost = 1 - lost;
-                fresh = 0;
-            }
-            action Settled when (n <= Work - 1) {
-                n = n + 1;
-                settled = 1 - settled;
-                fresh = 0;
-            }
-
-            action Detect when (fresh == 0) {
-                shown = if (claims == 1
-                    && (vouched == 1 || Buggy == 2)
-                    && (terms == 1 || Buggy == 1)
-                    && (above == 1 || Buggy == 6))
-                {
-                    1
-                } else {
-                    0
-                };
-                tabshown = if (tab == 2 || Buggy == 6) { 1 } else { 0 };
-                role = if (swept == 0) {
-                    if (Buggy == 8) { 0 } else { 4 }
-                } else {
-                    if (live == bound || Buggy == 7) { live } else { 5 }
-                };
-                start = if (swept == 0) {
-                    if (Buggy == 8) { 0 } else { 2 }
-                } else {
-                    if (Buggy == 3 || lowpid <= other) { lowpid } else { other }
-                };
-                none = if (settled == 1 && (lost == 0 || Buggy == 10)) { 1 } else { 0 };
+            action Evaluate when (fresh == 0) {
+                window = if (Buggy == 7 && complete == 1) { 1 } else { 0 };
+                role = if (Buggy == 1) { 1 } else { 0 };
+                share = if (Buggy == 2) { 1 } else { 0 };
+                cause = if (Buggy == 3) { 1 } else { 0 };
+                residual = if (Buggy == 4) { 1 } else { 0 };
+                none = if (Buggy == 5 && reported == 0) { 1 } else { 0 };
+                clause = if (Buggy == 6) { 1 } else { 0 };
+                diagnostic = if (Buggy == 8) { 0 } else { reported };
+                shown_context = if (Buggy == 9) { 0 } else { context };
                 fresh = 1;
             }
-            action Attach when (fresh == 1) {
-                actstart = if (shown == 1
-                    && young == 1
-                    && swept == 1
-                    && ((Buggy == 4 && bycount == 1) || (bycpu == 1 && (Buggy <= 3 || Buggy > 4))))
-                {
-                    1
-                } else {
-                    0
-                };
-                tabstart = if (Buggy == 5 && tabshown == 1 && young == 1) { 1 } else { 0 };
-                fresh = 2;
-            }
 
-            action Hold {
-                was = clause;
-                clause = if (clause == 1 || (cand == 1 && held > 0) || Buggy == 9) { 1 } else { 0 };
-                held = if (cand == 1) { if (held <= 1) { held + 1 } else { 2 } } else { 0 };
-                fail = 0;
-                cand = 1;
-            }
-            action Fail {
-                was = clause;
-                clause = if (Buggy == 9) {
-                    0
-                } else {
-                    if (clause == 1 && (cand == 1 || fail <= 4)) { 1 } else { 0 }
-                };
-                fail = if (clause == 1) {
-                    if (cand == 1) { 0 } else { if (fail <= 5) { fail + 1 } else { 6 } }
-                } else {
-                    0
-                };
-                held = 0;
-                cand = 0;
-            }
-
-            invariant CauseOnlyWithEvidence: fresh == 0 || shown == 0 || terms == 1;
-            invariant ClaimNeverVouches: fresh == 0 || shown == 0 || vouched == 1;
-            invariant StartIsEarliestBirth:
-                fresh == 0
-                    || swept == 0
-                    || (start <= lowpid && start <= other && (start == lowpid || start == other));
-            invariant ContextOnlyWhereItHolds:
-                fresh <= 1
-                    || ((actstart == 0 || (shown == 1 && young == 1 && bycpu == 1)) && tabstart == 0);
-            invariant CauseNeedsFloor:
-                fresh == 0 || ((shown == 0 || above == 1) && (tabshown == 0 || tab == 2));
-            invariant RoleNeedsBound:
-                fresh == 0 || swept == 0 || role == 5 || (role == live && role == bound);
-            invariant UnknownNeverZero: fresh == 0 || swept == 1 || (role == 4 && start == 2);
-            invariant ClauseNeverFlickers:
-                (was == 1 || clause == 0 || held == 2) && (was == 0 || clause == 1 || fail == 6);
-            invariant LostWorkNeverNothingNeeded: fresh == 0 || lost == 0 || none == 0;
-            bound Box: n <= Work;
+            invariant OwnershipDoesNotQualifyExecutionWindow: window == 0;
+            invariant NoRoleWithoutExecutionWindow: fresh == 0 || role == 0;
+            invariant NoShareWithoutExecutionWindow: fresh == 0 || share == 0;
+            invariant NoCoveringCauseWithoutExecutionWindow: fresh == 0 || cause == 0;
+            invariant NoPhysicalResidualWithoutExecutionWindow: fresh == 0 || residual == 0;
+            invariant ZeroReportedNeverProvesNoWork: fresh == 0 || reported > 0 || none == 0;
+            invariant NoRetainedPhysicalCpuCause: fresh == 0 || clause == 0;
+            invariant ReportedFigureRetained: fresh == 0 || diagnostic == reported;
+            invariant IndependentMachineContextRetained: fresh == 0 || shown_context == context;
+            bound CounterBox: prior <= 4 && actual <= 2 && reported <= 6;
         }
     }
 }

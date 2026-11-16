@@ -240,8 +240,8 @@ impl Kept {
         let adopted: Vec<_> = tail
             .entries
             .iter()
-            .filter(|entry| entry.receipt.offset >= acknowledged.count)
-            .map(|entry| (entry.receipt.offset, entry.conflict, entry.wire.clone()))
+            .filter(|entry| entry.offset >= acknowledged.count)
+            .map(|entry| (entry.offset, entry.conflict, entry.wire.clone()))
             .collect();
         let witness = tail.witness;
         let catalog = scope == crate::catalog::scope(scope.trust());
@@ -293,15 +293,16 @@ impl Kept {
             }
             // The journal's records after the kept ones, as an open replays them.
             for entry in tail.entries {
+                let receipt = entry.receipt();
                 let (stored, class) = replay::restore(
                     batch,
-                    entry.receipt,
+                    receipt,
                     entry.wire,
                     acknowledged.count,
                     catalog,
                     read_only,
                 )?;
-                if store.records.contains_key(&entry.receipt.id) {
+                if store.records.contains_key(&receipt.id) {
                     return Err(Error::new("duplicate physical table record"));
                 }
                 store.admit(&stored.header, stored.wire.len())?;
@@ -318,7 +319,7 @@ impl Kept {
                         .map_err(|_| Error::new("invalid table replay header"))?;
                 }
                 store.operation_bytes += stored.wire.len();
-                store.hold(entry.receipt.id, stored);
+                store.hold(receipt.id, stored);
                 if let Entry::Vacant(slot) = classes.entry(class) {
                     slot.insert(batch.class_verdict(&class)?);
                 }

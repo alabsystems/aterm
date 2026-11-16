@@ -1094,20 +1094,20 @@ pub enum Settled {
 /// turn and no longer.
 pub const SETTLE_TURN_SECS: u64 = 30 * 60;
 
-/// The seat whose turn it is at `now` (unix seconds) to settle a pair split since `split_at` (the
-/// latest of its siblings' drafts, by its writer's clock): `first` where one is named (the
+/// The seat whose turn it is at `now` (unix seconds, this Mac's clock) to settle a pair whose
+/// turns run from `since` (by the same clock, [`turns_since`]): `first` where one is named (the
 /// writer of the pair [`settle`] keeps, where the siblings carry different tokens), then each
 /// other of `writers` (the siblings' current writers), then each other of `members` (every
 /// current seat), each group in seat order, every turn [`SETTLE_TURN_SECS`] long, round and round
-/// from the split on. Every Mac that reads the same siblings reads the same order and the same
-/// turn (their clocks apart by less than a turn), so one seat settles at a time; a seat whose turn
-/// passes unsettled hands it on. Seats, never labels, take turns: two Macs can share a label, and
-/// one seat is one Mac. `None` where no seat is current.
+/// from `since` on. Every Mac that reads the same siblings reads the same order, and where their
+/// `since`s mark one moment they read the same turn, so one seat settles at a time; a seat whose
+/// turn passes unsettled hands it on. Seats, never labels, take turns: two Macs can share a
+/// label, and one seat is one Mac. `None` where no seat is current.
 pub(crate) fn settle_turn(
     first: Option<MemberId>,
     writers: &BTreeSet<MemberId>,
     members: &BTreeSet<MemberId>,
-    split_at: u64,
+    since: u64,
     now: u64,
 ) -> Option<MemberId> {
     let order: Vec<MemberId> = first
@@ -1121,8 +1121,235 @@ pub(crate) fn settle_turn(
         )
         .collect();
     let turns = u64::try_from(order.len()).ok().filter(|turns| *turns > 0)?;
-    let turn = now.saturating_sub(split_at) / SETTLE_TURN_SECS % turns;
+    let turn = now.saturating_sub(since) / SETTLE_TURN_SECS % turns;
     order.get(usize::try_from(turn).ok()?).copied()
+}
+
+/// How far apart two moments by two clocks, or by one Mac's callers, are taken to be at most
+/// while they mark one moment: two Macs' clocks (synced, they differ by far less), a sighting and
+/// the draft it saw where this Mac was awake and syncing, and a `now` a caller read a little
+/// before another caller's. Less than a turn, so a Mac whose first look comes this late still
+/// looks in the turn the split began with.
+pub const CLOCK_SLACK_SECS: u64 = 10 * 60;
+
+/// The moment, by this Mac's clock, its turns to settle a split pair run from ([`settle_turn`]):
+/// this Mac's first sighting of the split, `sighted` ([`sighted`]), unless it comes more than
+/// [`CLOCK_SLACK_SECS`] after `drafted`, the latest draft of the writes the siblings stand for by
+/// its writer's clock; then `drafted`.
+///
+/// Neither clock alone serves. A sighting is this Mac's clock only, so Macs whose clocks differ
+/// by minutes, and a writer whose clock runs ahead, leave every Mac that saw the split together
+/// on one turn; but a Mac that first looks late (asleep when the split came, aterm closed, its
+/// upkeep not yet run) would start a first turn of its own then, and where its seat comes first
+/// write beside the seat whose turn it really is. A draft's time is the writer's clock, so a Mac
+/// that looks late reads the turn every other Mac reads (clocks synced), but a clock apart from
+/// the writer's moves every boundary by as much. A sighting no later than the slack after the
+/// draft is taken as clocks apart, and kept; a later one as a late look, and the draft's time
+/// taken. Turns then disagree only where a clock and a writer's differ by more than the slack (by
+/// that much, as when each Mac measured from the draft alone), or where a look is late by no more
+/// than the slack (by at most that much, and only for a seat whose turn its late look did not
+/// find: one whose look finds its own turn settles there).
+pub(crate) fn turns_since(sighted: u64, drafted: u64) -> u64 {
+    if sighted > drafted.saturating_add(CLOCK_SLACK_SECS) {
+        drafted
+    } else {
+        sighted
+    }
+}
+
+/// The file, beside this Mac's vault state, that keeps when this Mac first saw each account's
+/// pair split ([`sighted`]).
+const SIGHTINGS: &str = "claude-token-sightings.json";
+
+/// The lock a sighting's writer takes.
+const SIGHTINGS_LOCK: &str = "claude-token-sightings.lock";
+
+/// The largest sightings file read. It holds one row per account whose pair is split now, so it
+/// stays far below this; one that grew past it reads as none and is written afresh.
+const MAX_SIGHTINGS: usize = 1 << 16;
+
+/// The sightings file's schema.
+const SIGHTINGS_SCHEMA: i64 = 1;
+
+/// When this Mac first saw an account's pair in the split `split` ([`split_of`]): unix seconds by
+/// this Mac's clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Sighting {
+    split: String,
+    at: u64,
+}
+
+/// The split the account `key`'s pair is in, as `opened` holds it: a digest, in lower-case hex, of
+/// the writes its two registers' ops stand for
+/// ([`stands_for`](crate::membership_log::entries::OpenedAudienceEntries::stands_for), so a
+/// reseal's carries leave it as it was), sorted. `None` where neither register holds two ops.
+fn split_of(
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    key: &Key,
+) -> Option<String> {
+    let ops = [
+        opened.everyone_ops(&key.entry()),
+        opened.everyone_ops(&key.meta_entry()),
+    ];
+    if ops.iter().all(|ops| ops.len() < 2) {
+        return None;
+    }
+    let writes: BTreeSet<crate::membership_log::RecordId> = ops
+        .iter()
+        .flatten()
+        .map(|op| opened.stands_for(op))
+        .collect();
+    let bytes: Vec<u8> = writes.iter().flatten().copied().collect();
+    Some(aterm_codec::hex::encode_lower(
+        &aterm_digest::Sha256::digest(&bytes),
+    ))
+}
+
+/// This Mac's sightings by account key ([`Sighting`]). A file that is absent or does not read
+/// holds none: each split pair is then seen afresh at its next settle.
+fn sightings(paths: &Paths) -> BTreeMap<String, Sighting> {
+    let Ok(Some(bytes)) = crate::fsx::read_private(&paths.dir.join(SIGHTINGS), MAX_SIGHTINGS)
+    else {
+        return BTreeMap::new();
+    };
+    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(bytes.as_slice()) else {
+        return BTreeMap::new();
+    };
+    if value.get("schema").and_then(aterm_json::Value::as_i64) != Some(SIGHTINGS_SCHEMA) {
+        return BTreeMap::new();
+    }
+    value
+        .get("sighted")
+        .and_then(aterm_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let key = Key::parse(row.get("key")?.as_str()?)?;
+            let split = row.get("split")?.as_str()?.to_owned();
+            let at = row
+                .get("at")?
+                .as_i64()
+                .and_then(|n| u64::try_from(n).ok())?;
+            Some((key.0, Sighting { split, at }))
+        })
+        .collect()
+}
+
+/// Of `rows`, those whose account's pair `opened` still holds in the split the row names: a row
+/// of a pair since settled, or split again by other writes, is dropped.
+fn live_sightings(
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    rows: &BTreeMap<String, Sighting>,
+) -> BTreeMap<String, Sighting> {
+    rows.iter()
+        .filter(|(key, row)| {
+            Key::parse(key)
+                .and_then(|key| split_of(opened, &key))
+                .as_ref()
+                == Some(&row.split)
+        })
+        .map(|(key, row)| (key.clone(), row.clone()))
+        .collect()
+}
+
+/// Writes `rows` as this Mac's sightings, under the lock its caller holds.
+fn write_sightings(paths: &Paths, rows: &BTreeMap<String, Sighting>) -> Result<()> {
+    let rows: Vec<aterm_json::Value> = rows
+        .iter()
+        .map(|(key, row)| aterm_json::json!({"key": key, "split": row.split, "at": row.at}))
+        .collect();
+    let text =
+        aterm_json::to_string(&aterm_json::json!({"schema": SIGHTINGS_SCHEMA, "sighted": rows}))
+            .map_err(|e| crate::Error::new(format!("{SIGHTINGS}: {e}")))?;
+    crate::fsx::write_atomic(&paths.dir.join(SIGHTINGS), text.as_bytes(), 0o600)
+}
+
+/// WHEN THIS MAC FIRST SAW THE ACCOUNT `key`'S PAIR IN THE SPLIT `split` ([`split_of`] of
+/// `opened`), by this Mac's own clock: where it is not late, the moment [`settle_turn`] measures
+/// turns from ([`turns_since`]), so only time elapsed on one clock counts, never a writer's clock
+/// against this one. The first look records `now`, kept beside this Mac's vault state, keyed by
+/// the account and its split; every later look at the same split reads it back, a look whose
+/// `now` lies before it by no more than [`CLOCK_SLACK_SECS`] included: a caller's moment read a
+/// little before another caller recorded the sighting (a reading's tap holds the moment it began
+/// while the accounts upkeep records it), which reads the first turn, as the moment it stands for
+/// did. A clock set back further before the recorded sighting records `now` again, so turns run
+/// on from where the clock now stands rather than holding the first turn for as long as the
+/// clock was set back. Each write keeps only the rows whose pairs `opened` still holds in the
+/// split they name ([`live_sightings`]), so the file holds one row per account split now. `None`
+/// where another writer held the lock past `by`.
+///
+/// # Errors
+/// This Mac's vault state folder or the sightings file cannot be written, or the sightings lock
+/// cannot be taken for any reason but another writer holding it (anything but a regular file at
+/// its path, a refused open).
+fn sighted(
+    paths: &Paths,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    key: &Key,
+    split: &str,
+    now: u64,
+    by: Instant,
+) -> Result<Option<u64>> {
+    let seen = |rows: &BTreeMap<String, Sighting>| {
+        rows.get(key.as_str())
+            .filter(|row| row.split == split && row.at <= now.saturating_add(CLOCK_SLACK_SECS))
+            .map(|row| row.at)
+    };
+    if let Some(at) = seen(&sightings(paths)) {
+        return Ok(Some(at));
+    }
+    crate::fsx::ensure_private_dir(&paths.dir)?;
+    let lock_path = paths.dir.join(SIGHTINGS_LOCK);
+    let _held = match aterm_uds::file_lock::LockFile::take(
+        &lock_path,
+        by,
+        "another sighting is being recorded",
+    ) {
+        Ok(held) => held,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(crate::Error::new(format!("{}: {e}", lock_path.display()))),
+    };
+    let rows = sightings(paths);
+    if let Some(at) = seen(&rows) {
+        return Ok(Some(at));
+    }
+    let mut rows = live_sightings(opened, &rows);
+    rows.insert(
+        key.0.clone(),
+        Sighting {
+            split: split.to_owned(),
+            at: now,
+        },
+    );
+    write_sightings(paths, &rows)?;
+    Ok(Some(now))
+}
+
+/// Drops every row of this Mac's sightings whose pair `opened` no longer holds in the split it
+/// names ([`live_sightings`]): a settle that found its own pair whole. Housekeeping only, so it
+/// never waits past `by` and a failure leaves the rows for the next sighting's write to drop.
+fn forget_settled(
+    paths: &Paths,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    by: Instant,
+) {
+    let rows = sightings(paths);
+    if live_sightings(opened, &rows).len() == rows.len() {
+        return;
+    }
+    let Ok(_held) = aterm_uds::file_lock::LockFile::take(
+        &paths.dir.join(SIGHTINGS_LOCK),
+        by,
+        "another sighting is being recorded",
+    ) else {
+        return;
+    };
+    let rows = sightings(paths);
+    let live = live_sightings(opened, &rows);
+    if live.len() != rows.len() {
+        // Best effort, as above: the next sighting's write drops what this one could not.
+        let _ = write_sightings(paths, &live);
+    }
 }
 
 /// The meta of `metas` (each opened, beside its op) a settle keeps where the siblings carry one
@@ -1194,20 +1421,58 @@ fn opened_values(values: &[Option<SecretBytes>]) -> Option<Vec<&[u8]>> {
 ///   holds a `Put` this Mac does not open (which may be the token beside it), the pair is not
 ///   this Mac's to settle: it writes nothing, and a Mac that opens it settles it.
 ///
-/// Whose turn it is to write is a seat's ([`settle_turn`], at `now`, unix seconds): first the
-/// writer of the kept pair where the tokens differ, then the siblings' current writers,
-/// then every other current seat, each in seat order for [`SETTLE_TURN_SECS`] from the split, so
-/// a Mac that never settles (off the LAN, asleep, on a build with no settle) holds the pair for
-/// one turn. A writer the log now removes takes no turn. This Mac writes where the turn is its
-/// own seat; any other reads [`Settled::Theirs`] and writes nothing. It never mints, never waits
-/// for a vault pass (busy past `by`, it writes nothing; the next reading settles), and nothing of
-/// a value leaves it.
+/// Whose turn it is to write is a seat's ([`settle_turn`], at `now`, unix seconds by this Mac's
+/// clock): first the writer of the kept pair where the tokens differ, then the siblings' current
+/// writers, then every other current seat, each in seat order for [`SETTLE_TURN_SECS`] from this
+/// Mac's first sighting of the split ([`sighted`]), or from the split's draft where that sighting
+/// came late ([`turns_since`]). So a Mac that never settles (off the LAN, asleep, on a build with
+/// no settle) holds the pair for one turn, and no writer's clock, however far ahead, holds it
+/// longer; one that sleeps through its turn and looks late reads the turn the other Macs read,
+/// never a first turn of its own, where its clock and the writer's differ by no more than
+/// [`CLOCK_SLACK_SECS`]. A writer the log now removes takes no turn. This Mac writes where
+/// the turn is its own seat; any other reads [`Settled::Theirs`] and writes nothing. It never
+/// mints, never waits for a vault pass (busy past `by`, it writes nothing; the next reading
+/// settles), and nothing of a value leaves it.
 ///
 /// # Errors
 /// This Mac's state or records cannot be read or written, or a record addressed to it does not
 /// open.
 pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled> {
-    let held = |why: &str| Ok(Settled::Held(why.to_owned()));
+    Ok(match plan(paths, key, now, by)? {
+        Plan::Done(settled) => settled,
+        Plan::Write(entries) => {
+            Settled::Written(member_write(paths, &entries, OnBusy::Refuse(by))?)
+        }
+    })
+}
+
+/// Records this Mac's sighting of the account `key`'s split pair at `now` ([`sighted`]), as a
+/// [`settle`] there would, and writes nothing: a test's way to have a Mac see the split at a
+/// moment when its settle would write, standing for a Mac whose turn passes unsettled.
+///
+/// # Errors
+/// As [`settle`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_sight_split(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<()> {
+    plan(paths, key, now, by).map(drop)
+}
+
+/// What a [`settle`] of an account's pair comes to before it writes.
+pub(crate) enum Plan {
+    /// Nothing to write, and why.
+    Done(Settled),
+    /// This Mac's turn: the token's entry and the meta's, in one draft standing on every
+    /// sibling read.
+    Write([MemberEntry; 2]),
+}
+
+/// [`settle`] up to its write: what it reads, which pair it keeps and whose turn it is, recording
+/// this Mac's first sighting of the split on the way ([`sighted`]).
+///
+/// # Errors
+/// As [`settle`].
+pub(crate) fn plan(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Plan> {
+    let held = |why: &str| Ok(Plan::Done(Settled::Held(why.to_owned())));
     let (entry, meta_entry) = (key.entry(), key.meta_entry());
     let Some(snapshot) = read_claude_token_until(paths, &[&entry, &meta_entry], by)? else {
         return held("this Mac's vault state could not be read just now");
@@ -1220,9 +1485,18 @@ pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled
         opened.everyone_ops(&entry),
         opened.everyone_ops(&meta_entry),
     ];
-    if ops.iter().all(|ops| ops.len() < 2) {
-        return Ok(Settled::Nothing);
-    }
+    let Some(split) = split_of(&opened, key) else {
+        forget_settled(paths, &opened, by);
+        return Ok(Plan::Done(Settled::Nothing));
+    };
+    // The turns run from this Mac's first sighting of the split, by its own clock, where it came
+    // with the split's draft ([`turns_since`]): two Macs' clocks apart by some minutes would
+    // otherwise read different turns for those minutes after each boundary, both writing, and a
+    // writer's clock ahead of this one would hold every Mac on the first turn for as long as it
+    // ran ahead.
+    let Some(sighting) = sighted(paths, &opened, key, &split, now, by)? else {
+        return held("this Mac's sighting of the split could not be recorded just now");
+    };
     let (tokens, metas) = (
         log.everyone_values(&opened, &entry, &ops[0])?,
         log.everyone_values(&opened, &meta_entry, &ops[1])?,
@@ -1243,8 +1517,10 @@ pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled
     let membership = log.membership_ref();
     let current = |seat: &MemberId| membership.removal(seat).is_none();
     // The writers a current Mac is (a removed one settles nothing, so its turn never comes), and
-    // when the latest sibling was drafted.
-    let (mut writers, mut split_ms) = (BTreeSet::new(), 0);
+    // when the latest of the writes the siblings stand for was drafted, by its writer's clock (a
+    // reseal's carry counts as the write it carries, as the split does, so a reseal moves it no
+    // more than it moves the sighting).
+    let (mut writers, mut drafted_ms) = (BTreeSet::new(), 0);
     for id in ops.iter().flatten() {
         let Some((actor, authored_ms, _)) = draft_of(id) else {
             return held("a write of the pair is a removal, or does not open here");
@@ -1252,8 +1528,10 @@ pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled
         if current(&actor) {
             writers.insert(actor);
         }
-        split_ms = split_ms.max(authored_ms);
+        let write = log.get(&opened.stands_for(id));
+        drafted_ms = drafted_ms.max(write.map_or(authored_ms, |write| write.authored_ms()));
     }
+    let since = turns_since(sighting, drafted_ms / 1_000);
     let one_token = tokens.iter().all(|token| aterm_digest::ct_eq(token, first));
     // Each meta beside the token its draft wrote with it, by that token's first place among the
     // token register's ops: the draft of the write the meta stands for (a reseal's carry stands
@@ -1340,11 +1618,11 @@ pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled
         .copied()
         .filter(current)
         .collect();
-    let Some(turn) = settle_turn(first_turn, &writers, &members, split_ms / 1_000, now) else {
+    let Some(turn) = settle_turn(first_turn, &writers, &members, since, now) else {
         return held("the pair has no current seat to settle it");
     };
     if own_actor(log, identity) != Some(turn) {
-        return Ok(Settled::Theirs(seat_label(log, &turn)));
+        return Ok(Plan::Done(Settled::Theirs(seat_label(log, &turn))));
     }
     let put =
         |name: String, value: &[u8], settles: &[crate::membership_log::RecordId]| MemberEntry {
@@ -1356,12 +1634,10 @@ pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled
             read_as: None,
             settles: Some(settles.iter().copied().collect()),
         };
-    let entries = [put(entry, token, &ops[0]), put(meta_entry, meta, &ops[1])];
-    Ok(Settled::Written(member_write(
-        paths,
-        &entries,
-        OnBusy::Refuse(by),
-    )?))
+    Ok(Plan::Write([
+        put(entry, token, &ops[0]),
+        put(meta_entry, meta, &ops[1]),
+    ]))
 }
 
 /// Remove the account `key`'s token and meta, both in one draft under a fresh `[everyone]` epoch

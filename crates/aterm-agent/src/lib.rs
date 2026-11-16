@@ -89,6 +89,9 @@ pub mod name_cli;
 pub mod service_activation;
 /// Bounded signed service repair over the native fleet Drive transport.
 pub mod service_repair_rpc;
+/// The notification a fleet verb run in this process posts for its state home.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use fleet_member::announced_here as fleet_access_announced_here;
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use fleet_member::test_sync_from_vault_at;
 /// `aterm members`: Macs joining ALab and the members that let them in.

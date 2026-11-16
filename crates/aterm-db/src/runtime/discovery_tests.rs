@@ -1276,7 +1276,7 @@ fn an_audit(
         let due = hints.next_at(peer);
 
         let walked = start + Duration::from_secs(200);
-        hints.moved(Subject::Table(moved), [], walked);
+        hints.moved(Subject::Table(moved), None, [], walked);
         let (address, repair) = hints.next(walked).expect("the walk dials it");
         assert!(repair.leads(&moved) && !repair.audited());
         let led = crate::replica::Report {
@@ -1598,6 +1598,16 @@ fn completes(
     hints.finish(address, repair, outcome, now);
 }
 
+/// A move seen now of a subject no look found a store of, as [`may_take`] reads it.
+fn unheld() -> Hot {
+    Hot {
+        since: Instant::now(),
+        held: None,
+        cold: 0,
+        tried: Default::default(),
+    }
+}
+
 /// `body`'s result with the mutant `flag`, if any, on for this thread.
 fn under<R>(
     flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
@@ -1627,7 +1637,7 @@ fn table_walk(
         let rest = hints.next_at(seats[4].0);
         let mut now = start + Duration::from_secs(1);
         assert!(hints.next(now).is_none(), "every seat rests");
-        hints.moved(Subject::Table(table), [(seats[0].1, now)], now);
+        hints.moved(Subject::Table(table), None, [seats[0].1], now);
         let mut walked = Vec::new();
         for _ in 0..10 {
             let Some((address, repair)) = hints.next(now) else {
@@ -1695,7 +1705,7 @@ fn a_control_move_reaches_every_seat() {
             let start = Instant::now();
             let seats = seats(&mut hints, 5, start);
             let now = start + Duration::from_secs(1);
-            hints.moved(subject, [], now);
+            hints.moved(subject, None, [], now);
             let mut walked = Vec::new();
             while let Some((address, repair)) = hints.next(now) {
                 assert!(!repair.pending(), "no table moved");
@@ -1720,7 +1730,7 @@ fn a_control_move_reaches_every_seat() {
     let mut hints = hints();
     let now = Instant::now();
     for table in 0..=u8::try_from(MAX_HOT).unwrap() {
-        hints.moved(Subject::Table([table; 32]), [], now);
+        hints.moved(Subject::Table([table; 32]), None, [], now);
     }
     assert_eq!(hints.hot_count(), MAX_HOT);
 }
@@ -1748,7 +1758,7 @@ fn a_round_begun_before_a_move_settles_nothing_for_it() {
         let began = hints.next_at(seat.0);
         assert_eq!(hints.next(began).unwrap().0, seat.0, "its own turn");
         let seen = began + Duration::from_secs(1);
-        hints.moved(Subject::Table(table), [], seen);
+        hints.moved(Subject::Table(table), None, [], seen);
         assert!(hints.next(seen).is_none(), "its round is in flight");
         let ended = seen + Duration::from_secs(1);
         let offered = under(mutant, || {
@@ -1795,7 +1805,7 @@ fn a_seat_handed_a_table_is_settled_by_its_round_whatever_table_it_took() {
         let start = Instant::now();
         let seat = seats(&mut hints, 1, start)[0];
         let now = start + Duration::from_secs(1);
-        hints.moved(Subject::Table(table), [], now);
+        hints.moved(Subject::Table(table), None, [], now);
         let (address, repair) = hints.next(now).unwrap();
         assert!(address == seat.0 && repair.pending());
         under(mutant.then_some(&LED_UNSETTLED), || {
@@ -1826,7 +1836,7 @@ fn a_seat_that_dials_in_is_settled_by_a_round_over_the_table() {
         let start = Instant::now();
         let seats = seats(&mut hints, 2, start);
         let now = start + Duration::from_secs(1);
-        hints.moved(Subject::Table(table), [], now);
+        hints.moved(Subject::Table(table), None, [], now);
         let round = Repair::heard_from(seats[0].1).applied(over(taken, 0));
         hints.settle(seats[0].1, None, now, &round);
         assert_eq!(
@@ -1933,7 +1943,7 @@ fn an_unfinished_round_settles_its_seat_for_the_control_journal_alone() {
         let seat = seats(&mut hints, 1, start)[0];
         let now = start + Duration::from_secs(1);
         for subject in [Subject::Control, Subject::Members, Subject::Table(table)] {
-            hints.moved(subject, [], now);
+            hints.moved(subject, None, [], now);
         }
         let (address, repair) = hints.next(now).unwrap();
         assert!(address == seat.0 && repair.leads(&table));
@@ -1969,38 +1979,163 @@ fn an_unfinished_round_settles_its_seat_for_the_control_journal_alone() {
     }
 }
 
-/// A seat a move was received from is tried for it only where its round began once the
-/// subject's earlier move, still offered, was seen: a round that began before that could not
-/// have carried it, so the walk still offers the subject to that seat. One whose round began
-/// after it holds both and is not walked.
-/// MUTANT (`STALE_SOURCE_TRIED`): every source is tried, and the walk dials nobody.
+/// A move the walk passed by because the lists of the last round with its one untried seat said
+/// the seat does not take it is parked, and offered again once a later round's lists say the seat
+/// takes it ([`Hints::reoffer`]): the seat took the table up and listed it in a round of its own
+/// that was still in flight when the move was seen, or in the round of a dial of this Mac's to it,
+/// in flight then too, whose lists come only as it ends. That round began before the move was
+/// seen and settles nothing of it ([`Hints::settle`]).
+/// MUTANT (`PARKS_NOTHING`): the move is dropped, and no walk dials the seat for it, in flight or
+/// not.
 #[test]
-fn a_source_whose_round_began_before_an_earlier_move_is_still_walked() {
-    for mutant in [false, true] {
-        let mut hints = hints();
-        let start = Instant::now();
-        let seats = seats(&mut hints, 2, start);
-        let stale = start + Duration::from_secs(1);
-        let first = start + Duration::from_secs(2);
-        let fresh = start + Duration::from_secs(3);
-        let second = start + Duration::from_secs(4);
-        hints.moved(Subject::Control, [], first);
-        under(mutant.then_some(&STALE_SOURCE_TRIED), || {
-            hints.moved(
-                Subject::Control,
-                [(seats[0].1, stale), (seats[1].1, fresh)],
-                second,
+fn a_move_passed_by_on_a_seats_older_lists_is_offered_once_its_lists_take_it() {
+    let table = [7; 32];
+    for (mutant, in_flight) in [(false, false), (false, true), (true, false), (true, true)] {
+        under(mutant.then_some(&PARKS_NOTHING), || {
+            let mut hints = hints();
+            let start = Instant::now();
+            let (address, actor) = seats(&mut hints, 1, start)[0];
+            let quiet = Outcome::Repaired { transferred: false };
+            // The seat's last lists leave out the table this Mac listed.
+            assert!(
+                hints
+                    .peers
+                    .get_mut(&address)
+                    .unwrap()
+                    .remember_lists(&Repair::heard_from(actor).listing_at([table], [table], start))
             );
+            let mut now = start + Duration::from_secs(1);
+            let dial = if in_flight {
+                // A walk for the control journal has a dial of the seat in flight.
+                hints.moved(Subject::Control, None, [], now);
+                let (dialled, repair) = hints.next(now).expect("the control journal's walk");
+                assert_eq!(dialled, address);
+                Some(repair)
+            } else {
+                None
+            };
+            hints.moved(Subject::Table(table), Some(start), [], now);
+            assert!(
+                hints.next(now).is_none(),
+                "the seat's lists leave the table out"
+            );
+            assert_eq!(
+                hints.hot_count(),
+                usize::from(in_flight),
+                "the table is not offered, the control journal is while its dial flies"
+            );
+            let listed = now + Duration::from_millis(100);
+            if let Some(repair) = dial {
+                // As `Transport::finish` takes a dial's end.
+                let ended = repair.listing_at([table], [], listed);
+                hints.settle(actor, Some(address), now, &ended);
+                hints.finish(address, ended, quiet, now);
+                now += WALK_GAP;
+            } else {
+                // The seat's round, which began before the move was seen, ends.
+                let incoming = Repair::heard_from(actor).listing_at([table], [], listed);
+                hints.settle(actor, None, start, &incoming);
+            }
+            let walked = hints.next(now);
+            if mutant {
+                assert!(
+                    walked.is_none(),
+                    "MUTANT: never walked (in flight {in_flight})"
+                );
+                return;
+            }
+            let (dialled, repair) = walked.expect("the seat is walked for the table");
+            assert_eq!(dialled, address);
+            assert!(repair.leads(&table), "in flight {in_flight}");
         });
-        let mut walked = Vec::new();
-        while let Some((address, _)) = hints.next(second) {
-            walked.push(address);
-            let seat = *seats.iter().find(|(known, _)| *known == address).unwrap();
-            completes(&mut hints, seat, None, second, second);
-            assert!(walked.len() <= seats.len(), "a seat was dialled twice");
+    }
+}
+
+/// A later round's lists widen what the walk offers a seat and never narrow what this Mac's own
+/// last dial there found both sides listing ([`Peer::own`], [`may_take`]). Here a round the seat
+/// began since left out a table both listed in this Mac's own round, as one does while its owner
+/// excludes the table; the seat's selection may take the table again with no round between,
+/// which nothing would tell this Mac, so a write here is walked to the seat as it was before
+/// those lists. At rest, the endpoint's own lists take the move at once. With a dial of this
+/// Mac's to the seat in flight and the seat's round, begun after it, ending first, the lists of
+/// this Mac's earlier dial stand while the dial flies, so the move stays offered; where no
+/// earlier dial traded lists, the move is parked while the dial flies and offered again as the
+/// dial ends with lists that found both listing the table ([`Hints::reoffer`]), though they
+/// are older than the seat's.
+/// MUTANT (`LATER_LISTS_NARROW`, as 2c91654df0d had it): the newest lists alone tell, the move is
+/// parked, and no walk dials the seat for it, in flight or not; the write would wait for the next
+/// round with the seat, at rest an audit.
+#[test]
+fn a_later_rounds_lists_never_narrow_what_this_macs_own_round_found_a_seat_taking() {
+    let table = [7; 32];
+    let quiet = Outcome::Repaired { transferred: false };
+    for mutant in [false, true] {
+        for (in_flight, earlier) in [(false, true), (true, true), (true, false)] {
+            under(mutant.then_some(&LATER_LISTS_NARROW), || {
+                let mut hints = hints();
+                let start = Instant::now();
+                let (address, actor) = seats(&mut hints, 1, start)[0];
+                let case =
+                    format!("MUTANT {mutant}, in flight {in_flight}, earlier dial {earlier}");
+                if earlier {
+                    // This Mac's own dial found both listing the table.
+                    hints.finish(
+                        address,
+                        Repair::heard_from(actor)
+                            .applied(crate::replica::Report::default())
+                            .listing_at([table], [], start),
+                        quiet,
+                        start,
+                    );
+                }
+                let mut now = start + Duration::from_secs(1);
+                let dial = if in_flight {
+                    // A walk for the control journal has a dial of the seat in flight.
+                    hints.moved(Subject::Control, None, [], now);
+                    let (dialled, repair) = hints.next(now).expect("the control journal's walk");
+                    assert_eq!(dialled, address, "{case}");
+                    Some(repair)
+                } else {
+                    None
+                };
+                // The seat's round, begun after the dial, ends first, its lists leaving the
+                // table out.
+                let later = now + Duration::from_millis(200);
+                let left_out = Repair::heard_from(actor).listing_at([table], [table], later);
+                hints.settle(actor, None, now, &left_out);
+                hints.moved(Subject::Table(table), Some(start), [], now);
+                if let Some(repair) = dial {
+                    assert!(hints.next(now).is_none(), "{case}: the seat's dial flies");
+                    let offered = earlier && !mutant;
+                    let moved = Subject::Table(table);
+                    assert_eq!(
+                        (
+                            hints.hot.contains_key(&moved),
+                            hints.parked.contains_key(&moved)
+                        ),
+                        (offered, !offered),
+                        "{case}: the table stays offered where an earlier dial's lists stand, and \
+                         is parked where none does"
+                    );
+                    // As `Transport::finish` takes a dial's end: its lists were read before the
+                    // seat's.
+                    let ended = repair
+                        .applied(crate::replica::Report::default())
+                        .listing_at([table], [], now + Duration::from_millis(100));
+                    hints.settle(actor, Some(address), now, &ended);
+                    hints.finish(address, ended, quiet, now);
+                    now += WALK_GAP;
+                }
+                let walked = hints.next(now);
+                if mutant {
+                    assert!(walked.is_none(), "{case}: passed over");
+                    return;
+                }
+                let (dialled, repair) = walked.expect(&case);
+                assert_eq!(dialled, address, "{case}");
+                assert!(repair.leads(&table), "{case}");
+            });
         }
-        let expected = if mutant { vec![] } else { vec![seats[0].0] };
-        assert_eq!(walked, expected, "MUTANT {mutant}");
     }
 }
 
@@ -2018,7 +2153,7 @@ fn a_seat_whose_walk_dial_failed_is_handed_the_table_at_its_retry() {
             let start = Instant::now();
             let seat = seats(&mut hints, 1, start)[0];
             let now = start + Duration::from_secs(1);
-            hints.moved(Subject::Table(table), [], now);
+            hints.moved(Subject::Table(table), None, [], now);
             let (address, repair) = hints.next(now).unwrap();
             assert!(address == seat.0 && repair.leads(&table));
             hints.finish(address, Repair::heard_from(seat.1), Outcome::Busy, now);
@@ -2032,43 +2167,85 @@ fn a_seat_whose_walk_dial_failed_is_handed_the_table_at_its_retry() {
     }
 }
 
-/// A seat whose last round's lists left a moved table out holds none of it, or cannot take it:
-/// the walk passes it over for that table, and no dial of it is handed the table, so a move of a
-/// table few seats hold costs no round with the rest. A seat that listed it is walked.
-/// MUTANT (`WALKS_UNLISTED`): the seat that left it out is walked and handed it too.
+/// The walk offers a moved table to each seat as the newest lists with it tell, whichever side
+/// began their round (`crate::replica::Listing::takes`). A seat whose lists left out a table this
+/// Mac listed holds none of it, or cannot take it: the walk passes it over, and no dial of it is
+/// handed the table, so a move of a table few seats hold costs no round with the rest. A seat
+/// that listed it beside this Mac is walked. A table this Mac did not list with a seat is offered
+/// to it only where this Mac's store of it is younger than those lists (one this Mac took up
+/// since, as `transport::tests`'
+/// `a_table_taken_up_since_the_last_lists_is_offered_to_the_peer_when_written_here` shows across
+/// real rounds); one this Mac held then and did not list (its policy excludes it) costs that seat
+/// no round, however often it is written.
+/// MUTANT (`WALKS_UNLISTED`): every seat is walked and handed it.
+/// MUTANT (`crate::replica::TAKES_ANY_UNLISTED`): seat 2 is walked for a table this Mac held
+/// before its lists with seat 2 and did not list.
+/// MUTANT (`crate::replica::TAKES_ONLY_LISTED`): seat 2 is passed over for a table this Mac took
+/// up since.
 #[test]
-fn a_walk_passes_over_a_seat_whose_lists_left_the_table_out() {
-    for mutant in [false, true] {
-        under(mutant.then_some(&WALKS_UNLISTED), || {
-            let (table, other) = ([7; 32], [8; 32]);
-            let mut hints = hints();
-            let start = Instant::now();
-            let seats = seats(&mut hints, 2, start);
-            for ((address, actor), lists) in seats.iter().zip([vec![other], vec![table, other]]) {
-                hints.finish(
-                    *address,
-                    Repair::heard_from(*actor).listing(lists),
-                    Outcome::Repaired { transferred: false },
-                    start,
-                );
-            }
-            let now = start + Duration::from_secs(1);
-            hints.moved(Subject::Table(table), [], now);
-            let mut walked = Vec::new();
-            while let Some((address, repair)) = hints.next(now) {
-                assert!(repair.leads(&table), "a walk's dial is handed the table");
-                walked.push(address);
-                let seat = *seats.iter().find(|(known, _)| *known == address).unwrap();
-                completes(&mut hints, seat, Some(over(table, 0)), now, now);
-                assert!(walked.len() <= seats.len(), "a seat was dialled twice");
-            }
-            let expected = if mutant {
-                vec![seats[0].0, seats[1].0]
-            } else {
-                vec![seats[1].0]
-            };
-            assert_eq!(walked, expected, "MUTANT {mutant}");
-        });
+fn a_walk_offers_a_table_as_each_seats_last_lists_tell() {
+    use crate::replica::{TAKES_ANY_UNLISTED, TAKES_ONLY_LISTED};
+    let (table, other) = ([7; 32], [8; 32]);
+    let mutants: [(
+        &str,
+        Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+    ); 4] = [
+        ("none", None),
+        ("WALKS_UNLISTED", Some(&WALKS_UNLISTED)),
+        ("TAKES_ANY_UNLISTED", Some(&TAKES_ANY_UNLISTED)),
+        ("TAKES_ONLY_LISTED", Some(&TAKES_ONLY_LISTED)),
+    ];
+    for taken_up in [false, true] {
+        for (mutant, cell) in mutants {
+            under(cell, || {
+                let mut hints = hints();
+                let start = Instant::now();
+                let seats = seats(&mut hints, 3, start);
+                let listed = start + Duration::from_millis(100);
+                // Seat 0 left out the table this Mac listed, seat 1 listed it beside this Mac,
+                // and this Mac did not list it with seat 2.
+                let lists = [
+                    (vec![table, other], vec![table]),
+                    (vec![table, other], vec![]),
+                    (vec![other], vec![]),
+                ];
+                for ((address, actor), (ours, left_out)) in seats.iter().zip(lists) {
+                    hints.finish(
+                        *address,
+                        Repair::heard_from(*actor).listing_at(ours, left_out, listed),
+                        Outcome::Repaired { transferred: false },
+                        start,
+                    );
+                }
+                let held = if taken_up {
+                    listed + Duration::from_millis(100)
+                } else {
+                    start
+                };
+                let now = start + Duration::from_secs(1);
+                hints.moved(Subject::Table(table), Some(held), [], now);
+                let mut walked = Vec::new();
+                while let Some((address, repair)) = hints.next(now) {
+                    assert!(repair.leads(&table), "a walk's dial is handed the table");
+                    walked.push(address);
+                    let seat = *seats.iter().find(|(known, _)| *known == address).unwrap();
+                    // A round over the table that neither sent it nor caught the seat up: no cold
+                    // answer ends the walk before the third seat, and no follow-up holds it.
+                    let short = crate::replica::Report {
+                        table: Some(table),
+                        ..Default::default()
+                    };
+                    completes(&mut hints, seat, Some(short), now, now);
+                    assert!(walked.len() <= seats.len(), "a seat was dialled twice");
+                }
+                let expected = match (mutant, taken_up) {
+                    ("WALKS_UNLISTED", _) => vec![seats[0].0, seats[1].0, seats[2].0],
+                    ("TAKES_ANY_UNLISTED", _) | ("none", true) => vec![seats[1].0, seats[2].0],
+                    _ => vec![seats[1].0],
+                };
+                assert_eq!(walked, expected, "MUTANT {mutant}, taken up {taken_up}");
+            });
+        }
     }
 }
 
@@ -2089,7 +2266,7 @@ fn an_incoming_table_discovery_enables_its_reverse_walk_without_replacing_repair
                 hints.finish(
                     *address,
                     Repair::heard_from(*actor)
-                        .listing_at([other], start)
+                        .listing_at([table, other], [table], start)
                         .swept(1),
                     quiet,
                     start,
@@ -2106,8 +2283,11 @@ fn an_incoming_table_discovery_enables_its_reverse_walk_without_replacing_repair
                 peer.verified,
                 peer.failures,
             );
-            let incoming = Repair::heard_from(actor)
-                .listing_at([table, other], start + Duration::from_secs(1));
+            let incoming = Repair::heard_from(actor).listing_at(
+                [table, other],
+                [],
+                start + Duration::from_secs(1),
+            );
             hints.settle(actor, None, start, &incoming);
             let peer = &hints.peers[&address];
             assert_eq!(
@@ -2123,13 +2303,17 @@ fn an_incoming_table_discovery_enables_its_reverse_walk_without_replacing_repair
             );
             assert!(peer.repair.leads(&other) && peer.repair.audited() && peer.repair.cycled());
             assert!(
-                !peer.repair.listed().unwrap().contains(&table),
+                !peer.repair.listed().unwrap().takes(&table, None),
                 "the outgoing repair snapshot was not replaced"
             );
-            assert_eq!(may_take(peer, &Subject::Table(table)), !mutant);
-            assert!(!may_take(&hints.peers[&seats[1].0], &Subject::Table(table)));
+            assert_eq!(may_take(peer, &Subject::Table(table), &unheld()), !mutant);
+            assert!(!may_take(
+                &hints.peers[&seats[1].0],
+                &Subject::Table(table),
+                &unheld()
+            ));
             let now = start + Duration::from_secs(2);
-            hints.moved(Subject::Table(table), [], now);
+            hints.moved(Subject::Table(table), None, [], now);
             let dial = hints.next(now);
             assert_eq!(
                 dial.as_ref().map(|(address, _)| *address),
@@ -2163,19 +2347,30 @@ fn an_outgoing_completion_cannot_roll_back_incoming_table_lists() {
             let began = hints.next_at(address);
             let (chosen, _) = hints.next(began).unwrap();
             assert_eq!(chosen, address);
-            let incoming = Repair::heard_from(actor)
-                .listing_at([table, other], began + Duration::from_secs(2));
+            let incoming = Repair::heard_from(actor).listing_at(
+                [table, other],
+                [],
+                began + Duration::from_secs(2),
+            );
             hints.settle(actor, None, began, &incoming);
             assert!(hints.peers[&address].busy);
             assert_eq!(hints.peers[&address].repair.actor(), None);
-            assert!(may_take(&hints.peers[&address], &Subject::Table(table)));
+            assert!(may_take(
+                &hints.peers[&address],
+                &Subject::Table(table),
+                &unheld()
+            ));
             let returned = Repair::heard_from(actor).applied(crate::replica::Report {
                 regular: true,
                 witnesses_asked: true,
                 ..over(other, 0)
             });
             let returned = match listed_second {
-                Some(second) => returned.listing_at([other], began + Duration::from_secs(second)),
+                Some(second) => returned.listing_at(
+                    [table, other],
+                    [table],
+                    began + Duration::from_secs(second),
+                ),
                 None => returned,
             }
             .swept(1);
@@ -2192,7 +2387,7 @@ fn an_outgoing_completion_cannot_roll_back_incoming_table_lists() {
                 hints.next_at(address) > now,
                 "its ordinary audit is still later"
             );
-            hints.moved(Subject::Table(table), [], now);
+            hints.moved(Subject::Table(table), None, [], now);
             let expects_walk = !mutant && listed_second != Some(3);
             assert_eq!(
                 hints.next(now).map(|(address, repair)| {
@@ -2222,16 +2417,16 @@ fn tied_incoming_table_lists_keep_a_reverse_write_walkable() {
             let at = start + Duration::from_secs(2);
             hints.finish(
                 address,
-                Repair::heard_from(actor).listing_at([other], at),
+                Repair::heard_from(actor).listing_at([table, other], [table], at),
                 quiet,
                 at,
             );
-            let incoming = Repair::heard_from(actor).listing_at([table, other], at);
+            let incoming = Repair::heard_from(actor).listing_at([table, other], [], at);
             hints.settle(actor, None, at, &incoming);
-            let old = Repair::heard_from(actor).listing_at([other], start);
+            let old = Repair::heard_from(actor).listing_at([table, other], [table], start);
             hints.finish(address, old, quiet, at + Duration::from_secs(1));
             let now = at + Duration::from_secs(2);
-            hints.moved(Subject::Table(table), [], now);
+            hints.moved(Subject::Table(table), None, [], now);
             assert_eq!(
                 hints.next(now).map(|(address, repair)| {
                     assert!(repair.leads(&table));
@@ -2240,9 +2435,17 @@ fn tied_incoming_table_lists_keep_a_reverse_write_walkable() {
                 (!mutant).then_some(address),
                 "MUTANT {mutant}"
             );
-            let newer = Repair::heard_from(actor).listing_at([other], at + Duration::from_secs(3));
+            let newer = Repair::heard_from(actor).listing_at(
+                [table, other],
+                [table],
+                at + Duration::from_secs(3),
+            );
             hints.settle(actor, None, now, &newer);
-            assert!(!may_take(&hints.peers[&address], &Subject::Table(table)));
+            assert!(!may_take(
+                &hints.peers[&address],
+                &Subject::Table(table),
+                &unheld()
+            ));
         });
     }
 }
@@ -2259,21 +2462,37 @@ fn incoming_table_lists_belong_to_the_authenticated_seat() {
     let quiet = Outcome::Repaired { transferred: false };
     hints.finish(
         address,
-        Repair::heard_from(first).listing_at([other], start),
+        Repair::heard_from(first).listing_at([table, other], [table], start),
         quiet,
         start,
     );
-    assert!(!may_take(&hints.peers[&address], &Subject::Table(table)));
+    assert!(!may_take(
+        &hints.peers[&address],
+        &Subject::Table(table),
+        &unheld()
+    ));
     hints.finish(address, Repair::heard_from(second), quiet, start);
     assert!(
-        may_take(&hints.peers[&address], &Subject::Table(table)),
+        may_take(&hints.peers[&address], &Subject::Table(table), &unheld()),
         "new seat has no lists yet"
     );
-    let incoming = Repair::heard_from(second).listing_at([other], start + Duration::from_secs(1));
+    let incoming = Repair::heard_from(second).listing_at(
+        [table, other],
+        [table],
+        start + Duration::from_secs(1),
+    );
     hints.settle(second, None, start, &incoming);
-    let former = Repair::heard_from(first).listing_at([table], start + Duration::from_secs(2));
+    let former = Repair::heard_from(first).listing_at(
+        [table, other],
+        [other],
+        start + Duration::from_secs(2),
+    );
     hints.settle(first, None, start, &former);
-    assert!(!may_take(&hints.peers[&address], &Subject::Table(table)));
+    assert!(!may_take(
+        &hints.peers[&address],
+        &Subject::Table(table),
+        &unheld()
+    ));
 }
 
 /// A seat with two endpoints (a Mac on Wi-Fi and Ethernet) is walked at one of them: while a
@@ -2294,7 +2513,7 @@ fn a_walk_dials_a_seat_at_one_endpoint_at_a_time() {
             hints.finish(address, Repair::heard_from(seat), quiet, start);
         }
         let now = start + Duration::from_secs(1);
-        hints.moved(Subject::Control, [], now);
+        hints.moved(Subject::Control, None, [], now);
         assert_eq!(hints.next(now).unwrap().0, ends[0]);
         let beside = under(mutant.then_some(&TWIN_WALKED), || {
             hints.next(now).map(|(address, _)| address)
@@ -2321,7 +2540,7 @@ fn a_dial_handed_a_table_asks_after_two_minutes_without_a_round() {
         let start = Instant::now();
         let seat = seats(&mut hints, 1, start)[0];
         let now = start + Duration::from_secs(gap);
-        hints.moved(Subject::Table([7; 32]), [], now);
+        hints.moved(Subject::Table([7; 32]), None, [], now);
         let (address, repair) = under(mutant.then_some(&WALK_UNASKED), || hints.next(now).unwrap());
         assert!(address == seat.0 && repair.pending());
         assert_eq!(
@@ -2345,7 +2564,7 @@ fn the_next_dial_is_due_now_while_a_walk_has_a_seat_to_dial() {
     let now = start + Duration::from_secs(1);
     let rest = hints.next_dial_at(now, false).unwrap();
     assert!(rest > now, "both seats rest");
-    hints.moved(Subject::Control, [], now);
+    hints.moved(Subject::Control, None, [], now);
     for established_only in [true, false] {
         assert!(hints.next_dial_at(now, !established_only).unwrap() <= now);
     }
@@ -2883,7 +3102,7 @@ fn catalog_leads(flag: Option<&'static std::thread::LocalKey<std::cell::Cell<boo
         led.push(dial(&mut hints, 2, 660, true).leads(&CATALOG));
         hints.told(CATALOG, after(660), false);
         quiet(&mut hints, 2, 660);
-        hints.moved(Subject::Table(MOVED), [], after(670));
+        hints.moved(Subject::Table(MOVED), None, [], after(670));
         let handed = dial(&mut hints, 2, 670, true);
         assert!(
             handed.leads(&MOVED),

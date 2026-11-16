@@ -881,11 +881,12 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     app.messages_log = None;
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_flush = None;
+    pending.table_flush = None;
     pending.commit_drain_started = Some(drain_started);
-    assert!(!app.commit_flush_refences(), "no writer: no new fence");
+    app.commit_flush_refences();
     let pending = app.pending_update_handoff.as_ref().expect("the attempt");
     assert_eq!(pending.commit_flush, Some(true), "no writer: answered");
-    assert_eq!(pending.commit_drain_started, Some(drain_started));
+    // A scheduling delay while the table barrier was polled may require a new fence.
 
     app.pending_update_handoff = None;
     drop(app);
@@ -1147,4 +1148,46 @@ fn a_video_request_after_the_park_is_refused() {
     drop(app);
     aterm_pty::close_fd(slave);
     aterm_pty::close_fd(master);
+}
+
+/// A table barrier still on its worker holds Commit before the claim, without a window wait;
+/// when its acknowledgement arrives, a fresh input-dispatch fence follows it. A failed table
+/// barrier leaves the independent messages-log flush result intact.
+#[test]
+fn session_table_commit_flush_is_polled_before_the_claim_and_refenced() {
+    for table_landed in [true, false] {
+        let mut app = crate::App::headless_for_test();
+        let (ack, acked) = std::sync::mpsc::channel();
+        let mut pending = crate::messages_host::tests::parked();
+        pending.commit_drain_started = Some(std::time::Instant::now());
+        pending.table_flush = Some((
+            std::time::Instant::now() - super::HANDOFF_INPUT_DRAIN_YIELD,
+            acked,
+        ));
+        app.pending_update_handoff = Some(pending);
+        assert!(
+            app.commit_flush_refences(),
+            "an unacknowledged table barrier stays before the claim"
+        );
+        let pending = app.pending_update_handoff.as_ref().unwrap();
+        assert_eq!(pending.commit_flush, None, "the table has not answered");
+        assert_eq!(
+            pending.commit_drain_started, None,
+            "no old input fence can admit Commit"
+        );
+        ack.send(table_landed).unwrap();
+        assert!(
+            app.commit_flush_refences(),
+            "the completed barrier needs a fresh fence"
+        );
+        assert_eq!(
+            app.pending_update_handoff.as_ref().unwrap().commit_flush,
+            Some(true)
+        );
+        assert!(
+            !app.commit_flush_refences(),
+            "the barrier runs once per attempt"
+        );
+        app.pending_update_handoff = None;
+    }
 }

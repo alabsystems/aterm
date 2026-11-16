@@ -42,6 +42,17 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     /// `comps` with every symbolic link resolved (the Read rule's resolver).
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>>;
 
+    /// Where the folder spelled `spelled` (a session's working folder as its process spells it)
+    /// leads on this machine, read as the folder judgment reads a folder
+    /// ([`super::rm_breaker::folder_components`]): its final path, every link on the way
+    /// followed. The folder-trust dialog asks it on Windows, where a process keeps the spelling
+    /// it was handed, links and all.
+    /// # Errors
+    /// The folder cannot be resolved or is no folder the judgment reads; or, on Windows, a
+    /// directory on its way tells names apart by case (`aterm_sysprobe::case_sensitive_dir`),
+    /// which the judgment's comparison does not, or whether one does could not be read.
+    fn folder_leads(&self, spelled: &Path) -> Result<Vec<String>, String>;
+
     /// Where the absolute path `comps` leads on the disk as the kernel walks it for `rm`.
     /// # Errors
     /// A link climbs out of a missing directory, the links do not end.
@@ -232,6 +243,10 @@ impl PolicyProbe for NoLook {
         unreachable!("{NO_LOOK}")
     }
 
+    fn folder_leads(&self, _: &Path) -> Result<Vec<String>, String> {
+        unreachable!("{NO_LOOK}")
+    }
+
     fn rm_physical(&self, _: &[String]) -> Result<OnDisk, String> {
         unreachable!("{NO_LOOK}")
     }
@@ -281,6 +296,11 @@ impl Requests<'_> {
     /// The absolute path `comps` as the run's roots write it.
     fn comps(&self, comps: &[String]) -> Vec<u8> {
         (self.path)(Path::new(&format!("/{}", comps.join("/"))))
+    }
+
+    /// A folder asked about as it is spelled (`folder=`), as the run's roots write it.
+    fn folder(&self, spelled: &Path) -> Vec<u8> {
+        self.lines(&[("folder", Field::Path(spelled))])
     }
 
     /// `key=value` lines, each path as the run's roots write it.
@@ -406,6 +426,14 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
             doors::PROBE_REAL_COMPONENTS,
             || self.request(|r| r.comps(comps)),
             || self.live.real_components(comps),
+        )
+    }
+
+    fn folder_leads(&self, spelled: &Path) -> Result<Vec<String>, String> {
+        self.fx.exchange(
+            doors::PROBE_FOLDER_LEADS,
+            || self.request(|r| r.folder(spelled)),
+            || self.live.folder_leads(spelled),
         )
     }
 
@@ -577,6 +605,10 @@ impl PolicyProbe for KeyedProbe {
         self.answer(doors::PROBE_REAL_COMPONENTS, |r| r.comps(comps), |_| None)
     }
 
+    fn folder_leads(&self, spelled: &Path) -> Result<Vec<String>, String> {
+        self.answer(doors::PROBE_FOLDER_LEADS, |r| r.folder(spelled), Err)
+    }
+
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String> {
         self.answer(doors::PROBE_RM_PHYSICAL, |r| r.comps(comps), Err)
     }
@@ -722,6 +754,17 @@ impl TapeValue for Result<Below, String> {
                 }),
             }
         })
+    }
+}
+
+/// Where a folder leads ([`PolicyProbe::folder_leads`]), its components, or why not.
+impl TapeValue for Result<Vec<String>, String> {
+    fn to_tape(&self) -> Vec<u8> {
+        answer(self, Clone::clone)
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        answer_of(bytes, Ok)
     }
 }
 

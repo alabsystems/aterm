@@ -49,6 +49,8 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant, SystemTime};
 
+use atpkg::build_cache::gone_entries;
+pub use atpkg::build_cache::gone_entries::{create_ref, ref_name};
 use atpkg::build_cache::retired::{self, Admitted, Git, Pinned};
 
 /// The most bytes of untracked, ignored and changed files one worktree's snapshot reads.
@@ -92,27 +94,10 @@ const BACKOFF_MOST: u64 = 7 * 24 * 60 * 60;
 /// How many paths one `git check-attr` reads.
 const ATTR_BATCH: usize = 512;
 
-/// The config every git run here is given: no file system monitor or untracked cache answers
-/// for a file git did not read itself, no hook runs, no split index, no submodule recursion, no
-/// automatic maintenance and no signing program.
-const CONFIG: &[&str] = &[
-    "-c",
-    "core.fsmonitor=false",
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "submodule.recurse=false",
-    "-c",
-    "maintenance.auto=false",
-    "-c",
-    "gc.auto=0",
-    "-c",
-    "commit.gpgsign=false",
-    "-c",
-    "core.splitIndex=false",
-    "-c",
-    "core.untrackedCache=false",
-];
+/// The config every git run here is given: atpkg's for a pin (no file system monitor or
+/// untracked cache, no hook, no split index, no submodule recursion, no automatic maintenance
+/// and no signing program).
+const CONFIG: &[&str] = gone_entries::CONFIG;
 
 /// What git answered.
 struct Ran {
@@ -182,34 +167,6 @@ fn oid_shaped(oid: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// The name a worktree's pins carry: its folder's name less `.noindex`, each character git
-/// does not take in a ref name's part made `-`.
-#[must_use]
-pub fn ref_name(wt: &Path) -> String {
-    let folder = wt
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let folder = folder.strip_suffix(".noindex").unwrap_or(&folder);
-    let mut name: String = folder
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    name.truncate(96);
-    let name = name.trim_matches('-');
-    if name.is_empty() {
-        "worktree".to_owned()
-    } else {
-        name.to_owned()
-    }
-}
-
 /// One ref a pin wrote, with the repository whose origin it goes to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Push {
@@ -261,32 +218,6 @@ impl Pins {
         }
         all.join(", ")
     }
-}
-
-/// Create `name` at `oid` in the repository `dir` (a `--git-dir` in `prefix` when given) only
-/// where no ref stands by that name; one that already names `oid` is the same pin.
-fn create_ref(
-    git: &dyn Git,
-    dir: &Path,
-    prefix: &[&str],
-    name: &str,
-    oid: &str,
-) -> Result<(), String> {
-    let mut args = prefix.to_vec();
-    args.extend(["update-ref", "--no-deref", name, oid, ""]);
-    if read(git, dir, &args).ok() {
-        return Ok(());
-    }
-    let mut args = prefix.to_vec();
-    args.extend(["rev-parse", "--verify", "--quiet", name]);
-    let now = read(git, dir, &args);
-    if now.ok() && now.out.trim() == oid {
-        return Ok(());
-    }
-    Err(format!(
-        "its pin {name} could not be made at {}: a ref of that name names another commit",
-        short(oid)
-    ))
 }
 
 /// The untracked (`??`) and ignored (`!!`) rows of `git status` in `wt` (submodules not read),
@@ -803,56 +734,17 @@ pub fn pin(
 fn pin_modules(git: &dyn Git, checkout: &Path, wt: &Path, name: &str) -> Result<Vec<Push>, String> {
     let mut pushes = Vec::new();
     for unrooted in retired::unrooted_module_roots(git, checkout, wt)? {
-        let git_dir = format!("--git-dir={}", arg(&unrooted.witness)?);
-        let store = arg(&unrooted.store)?;
         let mut refs = Vec::new();
         for root in &unrooted.roots {
-            if !oid_shaped(root) {
-                return Err(format!(
-                    "its submodule store names {root}, no commit git writes"
-                ));
-            }
             let pin = format!("refs/snapshots/{name}/{}", short(root));
-            let had = read(
+            gone_entries::root_module_commit(
                 git,
+                checkout,
                 &unrooted.witness,
-                &[&git_dir, "rev-parse", "--verify", "--quiet", &pin],
-            );
-            if !(had.ok() && had.out.trim() == root) {
-                read(
-                    git,
-                    &unrooted.witness,
-                    &[
-                        git_dir.as_str(),
-                        "-c",
-                        "protocol.version=2",
-                        "-c",
-                        "protocol.allow=never",
-                        "-c",
-                        "protocol.file.allow=always",
-                        "-c",
-                        "uploadpack.allowAnySHA1InWant=true",
-                        "-c",
-                        "fetch.writeCommitGraph=false",
-                        "fetch",
-                        "--quiet",
-                        "--no-write-fetch-head",
-                        "--no-tags",
-                        "--recurse-submodules=no",
-                        store,
-                        root,
-                    ],
-                )
-                .line("copy a submodule commit into the checkout's module store")?;
-                let commit = format!("{root}^{{commit}}");
-                read(
-                    git,
-                    &unrooted.witness,
-                    &[git_dir.as_str(), "cat-file", "-e", &commit],
-                )
-                .line("find the submodule commit it copied")?;
-                create_ref(git, &unrooted.witness, &[git_dir.as_str()], &pin, root)?;
-            }
+                &unrooted.store,
+                root,
+                &pin,
+            )?;
             refs.push([pin, root.clone()]);
         }
         pushes.push(Push {
@@ -942,6 +834,85 @@ fn kind(url: &str) -> Option<Origin> {
         && !url.contains(':')
         && !url.chars().any(char::is_control);
     local.then_some(Origin::Local)
+}
+
+/// Every branch (`refs/heads/…`) `repo`'s origin holds, each with the commit it names, read
+/// from the server itself: a local origin by `git ls-remote --heads`, a GitHub one by
+/// `aterm agh repo refs` (the whole advertisement). What a local `fetch --prune` did or did not
+/// do is never read.
+///
+/// # Errors
+/// Why the server's branches could not be read.
+pub fn origin_heads(
+    git: &dyn Git,
+    agh: Agh<'_>,
+    repo: &Path,
+) -> Result<BTreeMap<String, String>, String> {
+    let rows: Vec<(String, String)> = match origin_of(git, repo)? {
+        Origin::Local => {
+            let mut args: Vec<String> = repo_prefix(repo)?;
+            args.extend(
+                [
+                    "-c",
+                    "protocol.allow=never",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "ls-remote",
+                    "--heads",
+                    "origin",
+                ]
+                .map(str::to_owned),
+            );
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let listed = read(git, repo, &args);
+            if !listed.ok() {
+                return Err(format!(
+                    "git could not read its origin's branches: {}",
+                    listed.err
+                ));
+            }
+            listed
+                .out
+                .lines()
+                .filter_map(|l| l.split_once('\t'))
+                .map(|(oid, name)| (name.trim().to_owned(), oid.trim().to_owned()))
+                .collect()
+        }
+        Origin::GitHub(slug) => {
+            let out = agh(&["repo", "refs", &slug])?;
+            if !out.status.success() {
+                let words = agh_words(&out);
+                return Err(format!("its origin's refs could not be read: {words}"));
+            }
+            let value: aterm_json::Value = aterm_json::from_slice(&out.stdout)
+                .map_err(|e| format!("agh repo refs answered no JSON: {e}"))?;
+            let value = value.get("answer").unwrap_or(&value);
+            let rows = value
+                .as_array()
+                .ok_or("agh repo refs answered no ref array")?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (Some(name), Some(oid)) = (row["ref"].as_str(), row["oid"].as_str()) else {
+                    return Err("agh repo refs answered a row with no ref or commit".to_owned());
+                };
+                out.push((name.to_owned(), oid.to_owned()));
+            }
+            out
+        }
+    };
+    let mut heads = BTreeMap::new();
+    for (name, oid) in rows {
+        if !name.starts_with("refs/heads/") {
+            continue;
+        }
+        if !oid_shaped(&oid) {
+            return Err(format!(
+                "its origin read {name} as {oid}, no commit git writes"
+            ));
+        }
+        heads.insert(name, oid);
+    }
+    Ok(heads)
 }
 
 /// `aterm agh <args>`, its output when it ran.
@@ -1456,22 +1427,79 @@ pub fn owe(path: &Path, worktree: &Path, pushes: &[Push], at: u64) -> Result<Vec
     if pushes.iter().all(|p| p.refs.is_empty()) {
         return Ok(Vec::new());
     }
+    let entries = pushes
+        .iter()
+        .filter(|p| !p.refs.is_empty())
+        .map(|push| Owed {
+            push: push.clone(),
+            worktree: worktree.to_path_buf(),
+            since: at,
+            why: String::new(),
+            intent: None,
+            tries: 0,
+            next: 0,
+            removed: false,
+        });
+    owe_entries(path, entries).map(|(_, dropped)| dropped)
+}
+
+/// Add to the file at `path` each of `entries` whose push it does not owe already: how many it
+/// added, and the pushes the file then had no room for. Where it adds none it is not written.
+///
+/// # Errors
+/// Why the file could not be read or written: none of them is then on record.
+pub fn owe_entries(
+    path: &Path,
+    entries: impl IntoIterator<Item = Owed>,
+) -> Result<(usize, Vec<Owed>), String> {
     let mut owed = load(path)?;
-    for push in pushes.iter().filter(|p| !p.refs.is_empty()) {
-        if !owed.iter().any(|o| o.push == *push) {
-            owed.push(Owed {
-                push: push.clone(),
-                worktree: worktree.to_path_buf(),
-                since: at,
-                why: String::new(),
-                intent: None,
-                tries: 0,
-                next: 0,
-                removed: false,
-            });
+    let before = owed.len();
+    for entry in entries {
+        if !owed.iter().any(|o| o.push == entry.push) {
+            owed.push(entry);
         }
     }
-    save(path, &owed)
+    let added = owed.len() - before;
+    if added == 0 {
+        return Ok((0, Vec::new()));
+    }
+    save(path, &owed).map(|dropped| (added, dropped))
+}
+
+/// Record in the file at `path` what one try of `entry`'s push outside a round came to
+/// (`tried`, at `now` in seconds since the epoch), as [`push_owed`] records its own: a push that
+/// went or was parked leaves the file, and one still owed keeps the intent its try left open
+/// and waits [`backoff`] before its next. A push the file no longer owes is left out of it.
+///
+/// # Errors
+/// Why the file could not be read or written.
+pub fn settle(path: &Path, entry: &Owed, tried: &Tried, now: u64) -> Result<(), String> {
+    let mut owed = load(path)?;
+    let Some(at) = owed.iter().position(|o| o.push == entry.push) else {
+        return Ok(());
+    };
+    match tried {
+        Tried::Pushed | Tried::Parked(_) => {
+            owed.remove(at);
+        }
+        Tried::Owed(why) => {
+            let stored = &mut owed[at];
+            stored.tries = stored.tries.saturating_add(1);
+            stored.next = now.saturating_add(backoff(stored.tries));
+            stored.why.clone_from(why);
+            stored.intent.clone_from(&entry.intent);
+        }
+    }
+    save(path, &owed).map(drop)
+}
+
+/// How long a push whose `tries`-th try failed waits before its next: [`BACKOFF_FIRST`],
+/// doubled at each later failure, up to [`BACKOFF_MOST`].
+#[must_use]
+pub fn backoff(tries: u32) -> u64 {
+    BACKOFF_FIRST
+        .saturating_mul(1u64 << tries.saturating_sub(1).min(16))
+        .min(BACKOFF_MOST)
 }
 
 /// Drop from the file at `path` the pushes of `worktree` among `pushes` whose worktree has not
@@ -1562,10 +1590,7 @@ pub fn push_owed(git: &dyn Git, agh: Agh<'_>, path: &Path, now: u64, until: Inst
             }
             Tried::Owed(why) => {
                 entry.tries = entry.tries.saturating_add(1);
-                let wait = BACKOFF_FIRST
-                    .saturating_mul(1u64 << entry.tries.saturating_sub(1).min(16))
-                    .min(BACKOFF_MOST);
-                entry.next = now.saturating_add(wait);
+                entry.next = now.saturating_add(backoff(entry.tries));
                 if entry.why != why {
                     entry.why = why;
                     round.changed.push(entry.clone());

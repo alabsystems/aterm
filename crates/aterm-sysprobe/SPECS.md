@@ -3,12 +3,11 @@
 
 # aterm-sysprobe: spec recovery from its unit tests
 
-Source: `crates/aterm-sysprobe`. The recovered spec table below maps 49 `#[test]` functions across
-`src/tests.rs` (19), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and `src/linux_tests.rs` (5),
-recounted from §2's rows on 2026-11-04. Nothing was compiled or run for this file; the claims come
-from reading the code.
+Source: `crates/aterm-sysprobe`. The recovered spec table below maps 56 test functions
+across the files listed in §2. The statements describe the mapped code and test samples;
+they are not proof claims.
 
-Result: **29 specs**, covering **49 tests**. Every mapped test is a spec sample (§4).
+Result: **34 specs**, covering **56 tests**. Every mapped test is a spec sample (§4).
 
 ## 0. Notation used in the statements
 
@@ -38,6 +37,7 @@ Result: **29 specs**, covering **49 tests**. Every mapped test is a spec sample 
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+path-key-native-oracles	other	aterm_path::{windows_key, windows_under}, win_paths::upcase	On Windows, each non-surrogate BMP character keys identically to its kernel upcase; the shared lexical path key agrees with opening the tested simple-uppercase name pairs on the temporary filesystem, while the multi-character STRASSE spelling stays distinct from straße. The deterministic parser and folding controls live in aterm-path; these tests retain the live operating-system oracles.		Windows kernel upcase and temporary directory name lookups	0,1,3,5,7,13
 whole-lines-torn-tail-ignored	invariant	linux::whole_lines, linux::keyed, linux::mem_total_kib, linux::swap_pages	∀ P ∈ {mem_total_kib, swap_pages}, ∀ t that is empty or ends with '\n', ∀ s with no '\n': P(t ++ s) = P(t). Equivalently, P(x) depends only on WL(x). Corollary: when x is t cut at any byte c that does not fall right after a '\n', the line containing c is never parsed, so no number's prefix (e.g. `pswpout 34` of `pswpout 3400`) is ever read as a value.	(secondary only: T::every_proc_read_is_bounded_to_4_kib, torn vmstat part)	&str slicing at rfind, Iterator::lines/find_map with closures, Option	0,1,3,5,7,13
 meminfo-facts	contract	linux::mem_total_kib, linux::keyed	∀ text: mem_total_kib(text) = Key(text,"MemTotal"), whatever else the text holds or lacks.	T::meminfo_gives_the_total	&str parsing via keyed (iterator, closures), Option	0,1,3,5,7,13
 swap-pages-sum	contract	linux::swap_pages	∀ vmstat: swap_pages(vmstat) = Some(a sat+ b) when Key(vmstat,"pswpin") = Some(a) and Key(vmstat,"pswpout") = Some(b), otherwise None.	T::vmstat_sums_swap_in_and_out	&str, Option `?`, composition with keyed (the meminfo-facts Key lemma)	0,1,3,4,5,7,13
@@ -73,18 +73,18 @@ socket-read-gate	other	jobs::macos::{fds,spawning,spawning_with,sockets_readable
 complete-event-queues	contract	jobs::JobsReader::event_queues, jobs::macos::event_queues, jobs::event_queues::{read_complete,complete_bytes,complete_notes,exact_record,known_queue}	Queue-only observation lists at most MAX_FDS descriptors and spends at most MAX_FD_DETAILS detail reads on queues alone. Each strict libproc read clears and captures errno: a zero refusal, negative result, partial/misaligned byte count or overflow cannot prove emptiness. Only a complete positive KQUEUEINFO admits EXTINFO, whose result counts notes, not bytes; fewer than MAX_KNOTES known notes are required. A cut descriptor list, over-budget queue set, unread or saturated notes, wrong descriptor/kind, unsupported platform, unread process or changed/exiting BSD birth returns None. Unrelated files, pipes and sockets spend no queue-detail slots; ordinary sampling retains its existing shared budget. These observations confer no control authority and do not freeze the descriptor table. A real isolated late kqueue remains readable after unrelated descriptors exhaust ordinary sampling; zero/refusal/cut/unread/saturation controls establish no absence.	src/jobs/event_queues_tests.rs::{only_a_complete_queue_scope_admits_absence_and_unrelated_descriptors_spend_no_queue_budget,zero_refused_short_and_misaligned_libproc_answers_cannot_prove_empty_scope,an_unsupported_queue_reader_returns_unknown_instead_of_an_empty_set,a_real_late_kqueue_is_read_without_spending_the_ordinary_detail_budget}	Bounded libproc listing/detail reads, same-birth bracket, strict result decoders, pure complete-scope admission and an owned isolated process	0,1,7,8
 ```
 
-### Kinds (29)
+### Kinds (34)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 15 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, memory-used, mac-available, stat-pgrp, children-pids, program-check-judge, procargs-parse, vnode-terminal, fresh-dylib, unix-listener-decode, unix-diag-listeners, socket-settled |
+| contract | 19 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, memory-used, mac-available, activity-between, activity-member, stat-pgrp, children-pids, program-check-judge, program-check-stranded, procargs-parse, vnode-terminal, fresh-dylib, unix-listener-decode, unix-diag-listeners, socket-settled, complete-event-queues |
 | table-property | 1 | pressure-level-table |
 | invariant | 1 | whole-lines-torn-tail-ignored |
 | refinement | 1 | swap-meter-rate |
 | round-trip | 1 | memory-wire-codecs |
-| other (effectful host facts) | 10 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate |
+| other (effectful host facts) | 11 | path-key-native-oracles, process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate |
 
-Total: 15 + 1 + 1 + 1 + 1 + 10 = 29.
+Total: 19 + 1 + 1 + 1 + 1 + 11 = 34.
 
 ## 2. Test → spec map (TSV)
 
@@ -92,6 +92,8 @@ Total: 15 + 1 + 1 + 1 + 1 + 10 = 29.
 
 ```tsv
 file	test	primary	also
+src/paths_tests.rs	every_bmp_character_keys_as_the_system_upcases_it	path-key-native-oracles	-
+src/paths_tests.rs	ntfs_opens_a_simple_uppercase_pair_as_one_name	path-key-native-oracles	-
 src/tests.rs	meminfo_gives_the_total	meminfo-facts	
 src/tests.rs	vmstat_sums_swap_in_and_out	swap-pages-sum	
 src/tests.rs	the_auxiliary_vector_gives_the_page_size	auxv-lookup	
@@ -171,3 +173,11 @@ and the latency ceiling `a_reading_and_a_sweep_cost_milliseconds_not_more`) were
    spec bound.
 6. **Resolved — swap counter test checks monotonicity only.** `the_swap_counter_reads_on_this_host_and_never_runs_backwards`
    now asserts only `second >= first`, dropping the `< 1 GiB` host-load heuristic.
+
+## Native lexical-path conformance
+
+The spelling and containment rules live in the dependency-free `aterm-path` crate.
+The Windows path tests in `src/paths_tests.rs` keep both native conformance checks:
+`every_bmp_character_keys_as_the_system_upcases_it` compares its keys with
+`RtlUpcaseUnicodeChar`, and `ntfs_opens_a_simple_uppercase_pair_as_one_name`
+checks actual directory opens. The lexical rule itself makes neither system call.

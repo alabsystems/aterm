@@ -58,20 +58,20 @@ fn log_actor_matrix() {
         );
     }
     assert_eq!(log_actor(Scope::Owner, &target.ctx), Actor::Ctl, "restored");
-    let grant = |src: &str| {
+    let grant = |src: &SessionId| {
         target
             .ctx
             .edges
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .grant(
-                SessionId::new(src),
+                src.clone(),
                 target.sid.clone(),
                 Op::WriteInput,
                 target.ctx.nonce,
             )
     };
-    let minted = grant(caller.sid.as_str());
+    let minted = grant(&caller.sid);
     assert_eq!(
         log_actor(Scope::Edge(minted), &target.ctx).word(),
         caller.sid.as_str()
@@ -79,11 +79,12 @@ fn log_actor_matrix() {
     for chosen in [
         "harness", "human", "ctl", "bridge", "aterm", "s-boss", "s-1",
     ] {
-        let tok = grant(chosen);
-        assert_eq!(
-            log_actor(Scope::Edge(tok), &target.ctx),
-            Actor::Nobody,
-            "an edge granted as {chosen:?} is nobody"
+        // A chosen word names no session, so no edge holds it as its source: the grant refuses it.
+        assert_eq!(SessionId::parse(chosen), None, "{chosen:?}");
+        let reply = cmd_grant(&target.ctx, Scope::Owner, &format!("{chosen} write-input"));
+        assert!(
+            reply.starts_with("ERR "),
+            "an edge granted as {chosen:?}: {reply}"
         );
     }
     assert_eq!(

@@ -91,7 +91,13 @@ pub fn gone_placed(
 
 const FINDER_LITTER: &[&str] = &[".DS_Store", ".localized"];
 
-fn empty_folder(p: &Path) -> std::io::Result<bool> {
+/// Whether the folder `p` holds nothing but what Finder leaves in a folder it shows
+/// (`.DS_Store`, `.localized`): an unmounted mount point it opened is no less empty.
+///
+/// # Errors
+///
+/// Why `p` could not be listed.
+pub fn empty_folder(p: &Path) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(p)? {
         let name = entry?.file_name();
         if !FINDER_LITTER.iter().any(|l| name == *l) {
@@ -275,7 +281,7 @@ fn placed_gone(
 fn mounted_between(m: &Path, ancestor: &Path, checkout: &Path) -> bool {
     #[cfg(windows)]
     {
-        use aterm_sysprobe::paths::{is_under, windows_key};
+        use aterm_path::{is_under, windows_key};
         if m.as_os_str() == aterm_sysprobe::volumes::NETWORK {
             return false;
         }
@@ -315,12 +321,11 @@ pub fn never_looked_at(checkout: &Path, home: Option<&Path>) -> Option<String> {
 
 /// Windows' [`VOLUME_ROOTS`]: the place `checkout` lies in when it is not on
 /// `$HOME`'s own drive (or share) — by the root of the key of
-/// `aterm_sysprobe::paths` (`C:\`, `\\SRV\SHARE\`), any spelling — or when
+/// `aterm_path` (`C:\`, `\\SRV\SHARE\`), any spelling — or when
 /// there is no `$HOME` to name that drive, or either path cannot be keyed.
 #[cfg(windows)]
 fn off_home_drive(checkout: &Path, home: Option<&Path>) -> Option<String> {
-    let on_home_drive =
-        home.is_some_and(|h| aterm_sysprobe::paths::windows_under(checkout, h).is_some());
+    let on_home_drive = home.is_some_and(|h| aterm_path::windows_under(checkout, h).is_some());
     (!on_home_drive).then(|| {
         "where volumes come and go (a drive other than $HOME's, or no $HOME to name its drive)"
             .to_owned()
@@ -331,10 +336,10 @@ fn below(path: &Path, root: &Path) -> Option<Vec<std::ffi::OsString>> {
     #[cfg(windows)]
     {
         let (key, root) = (
-            aterm_sysprobe::paths::windows_key(path)?,
-            aterm_sysprobe::paths::windows_key(root)?,
+            aterm_path::windows_key(path)?,
+            aterm_path::windows_key(root)?,
         );
-        if !aterm_sysprobe::paths::key_under(&key, &root) {
+        if !aterm_path::key_under(&key, &root) {
             return None;
         }
         let rest = key.get(root.len()..)?.trim_start_matches('\\');
@@ -370,7 +375,7 @@ fn same_name(component: &std::ffi::OsStr, name: &str) -> bool {
         let fold = |n: &std::ffi::OsStr| {
             let mut p = std::ffi::OsString::from(r"\\?\C:\");
             p.push(n);
-            aterm_sysprobe::paths::windows_key(Path::new(&p))
+            aterm_path::windows_key(Path::new(&p))
                 .and_then(|k| k.get(3..).map(str::to_owned))
                 .filter(|k| !k.is_empty() && !k.contains('\\'))
         };

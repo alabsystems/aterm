@@ -295,13 +295,13 @@ pub struct TippyPass {
     pub args: Vec<String>,
 }
 
-/// What every lint pass ends with: cargo's coverage flags, then the lint driver's arguments, which reach workspace members only (targo-tippy hands them to `tippy-driver`, cargo's `RUSTC_WORKSPACE_WRAPPER`), so the dependencies stay fresh. The arguments deny every rustc warning and, of clippy, only the `correctness` and `suspicious` groups and the `clippy.toml` bans: `-A clippy::all` silences the style, complexity and perf groups, a later flag overrides an earlier one, and a source `#[expect(clippy::…)]` still sets its own scope's level, so an expectation stays fulfilled where its lint fires and is an error where it does not.
+/// What every lint pass ends with: cargo's coverage flags, then the lint driver's arguments, which reach workspace members only (targo-tippy hands them to `tippy-driver`, cargo's `RUSTC_WORKSPACE_WRAPPER`), so the dependencies stay fresh. The arguments deny a named list, never every warning: of rustc, `unused_must_use` (a dropped `Result` or `#[must_use]` value); of clippy, the `correctness` and `suspicious` groups and the `clippy.toml` bans. `-A clippy::all` silences the style, complexity and perf groups, and a later flag overrides an earlier one. Any other warning (dead code, an unused variable, an expectation no longer fulfilled) is printed and reds nothing, so a warning main already carries stops no landing of a branch that did not write it (LS-78). A source `#[expect(clippy::…)]` still sets its own scope's level, so an expectation stays fulfilled where its lint fires.
 pub const LINT_TAIL: [&str; 17] = [
     "--all-targets",
     "--keep-going",
     "--",
     "-D",
-    "warnings",
+    "unused_must_use",
     "-A",
     "clippy::all",
     "-D",
@@ -2035,7 +2035,7 @@ fn tippy_scope(
     borrowed: &str,
 ) -> bool {
     if scope.selects_nothing() {
-        r.skip(format!("tippy -D warnings{borrowed} {EMPTY_CONE}"));
+        r.skip(format!("tippy -D unused_must_use{borrowed} {EMPTY_CONE}"));
         return true;
     }
     let mut passed = true;
@@ -2046,7 +2046,7 @@ fn tippy_scope(
         if !compile_labeled(
             ctx,
             r,
-            &format!("tippy {} -D warnings{borrowed}", pass.label),
+            &format!("tippy {} -D unused_must_use{borrowed}", pass.label),
             &tippy_cmd(ctx, bin, pass.args),
         ) {
             passed = false;
@@ -2396,7 +2396,7 @@ impl LintScheduleOps for RealLintScheduleOps<'_> {
         let mut passed = true;
         for (index, command) in commands.iter().enumerate() {
             let label = format!(
-                "tippy -p {} content pass {}/{} -D warnings{}",
+                "tippy -p {} content pass {}/{} -D unused_must_use{}",
                 package.spec,
                 index + 1,
                 commands.len(),
@@ -2804,7 +2804,7 @@ fn census(ctx: &Ctx, r: &mut Report) {
     walks(ctx, r, "census");
 }
 
-/// `targo --unverified run --profile test -q -p aterm-models --bin spec-check`, in the main target once the test compile is done ([`MAIN_PROFILE`]; the bin links every domain's models through `aterm_models::link_all`); under `release` with `-- --full`, which adds the minutes-class `ay` row.
+/// `targo --unverified run --profile test -q -p aterm-spec-closure --bin spec-check`, in the main target once the test compile is done ([`MAIN_PROFILE`]; the bin links every domain's models through `aterm_models::link_all`); under `release` with `-- --full`, which adds the minutes-class `ay` row.
 #[must_use]
 pub fn spec_check_cmd(ctx: &Ctx) -> Cmd {
     let mut args: Vec<String> = [
@@ -2814,7 +2814,7 @@ pub fn spec_check_cmd(ctx: &Ctx) -> Cmd {
         MAIN_PROFILE[1],
         "-q",
         "-p",
-        "aterm-models",
+        "aterm-spec-closure",
         "--bin",
         "spec-check",
     ]

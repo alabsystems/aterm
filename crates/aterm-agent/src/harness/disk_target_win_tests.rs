@@ -403,7 +403,7 @@ fn tier_3_judges_the_file_it_listed_never_one_renamed_into_its_name() {
         &mut || Ok(()),
         &mut |stage, _| {
             // Listed, not yet judged.
-            if stage == Stage::Deleting {
+            if stage == Stage::Staging {
                 std::fs::rename(debug.join("lay.pdb"), debug.join("lay.pdb.listed"))
                     .expect("the listed file moved aside");
                 std::fs::hard_link(deps.join("lay.pdb"), debug.join("lay.pdb"))
